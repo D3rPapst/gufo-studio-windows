@@ -3,7 +3,11 @@
 > [!NOTE]
 > **This is the `gemma4-ext` branch of [akamotaco/gufo_win](https://github.com/akamotaco/gufo_win):**
 > [franzmoca/gemma4-gufo-extension](https://github.com/franzmoca/gemma4-gufo-extension) `main`
-> plus four changes for native Windows:
+> plus four changes for native Windows and one for extension API 0.3:
+>
+> - The runner declares a scheduling profile (512-token passes, one layer group,
+>   decode width 1: what the host used before for runners without one) and the
+>   manifest asks for `>= 0.3.0`. Gufo 0.3 (#1175) rejects runners without a profile.
 >
 > - `extension.json` lists `windows` among the platforms.
 > - Cache gather copies use a pointer only where it is also the device address
