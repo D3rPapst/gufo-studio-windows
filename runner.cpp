@@ -257,6 +257,15 @@ public:
                 .in_pass_checkpoint = true,
             },
         .sampling_defaults = SamplingDefaults(),
+        // Extension API 0.3 requires a profile. These are the values the host
+        // used for runners without one (512-token passes beside decoders,
+        // unsplit, one decoder per step), so scheduling is unchanged.
+        .scheduling =
+            ext::TextSchedulingProfile{
+                .pass_tokens = 512,
+                .max_layer_groups = 1,
+                .max_yield_decode_width = 1,
+            },
     };
   }
 
