@@ -79,19 +79,6 @@ struct Interrupted : std::runtime_error {
 
 constexpr std::string_view kWorkDir = ".gufo-work";
 
-/// The caller the gate names (auth.hpp kUserHeader/kRightsHeader): empty
-/// when it is no user (router, loopback, auth = off) or an admin; such a
-/// caller may stop or remove any prompt, a user only its own.
-std::string RestrictedUser(const HttpRequest& request) {
-  const std::string user = request.header("X-Gufo-User");
-  if (user.empty())
-    return {};
-  const std::string rights = request.header("X-Gufo-Rights");
-  if (rights == "rolle=admin" || rights.starts_with("rolle=admin;"))
-    return {};
-  return user;
-}
-
 fs::path U8Path(std::string_view text) {
   return fs::path(std::u8string(text.begin(), text.end()));
 }
@@ -620,6 +607,19 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
   return std::nullopt;
 }
 
+// The caller the gate names (auth.hpp kUserHeader/kRightsHeader): empty
+// when it is no user (router, loopback, auth = off) or an admin; such a
+// caller may stop or remove any prompt, a user only its own.
+std::string RestrictedUser(const HttpRequest& request) {
+  const std::string user = request.header("X-Gufo-User");
+  if (user.empty())
+    return {};
+  const std::string rights = request.header("X-Gufo-Rights");
+  if (rights == "rolle=admin" || rights.starts_with("rolle=admin;"))
+    return {};
+  return user;
+}
+
 HttpResponse Adapter::Submit(const HttpRequest& request) {
   json::Value body;
   try {
@@ -691,7 +691,10 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
                       return std::holds_alternative<ImageTask>(task.spec) ||
                              std::holds_alternative<VideoTask>(task.spec);
                     }) > 1;
-  RegisterPreviews(job);
+  if (!RegisterPreviews(job))
+    return ErrorResponse(400, "invalid_prompt",
+                         "extra_data.gufo_preview_id is in use by another "
+                         "user's prompt");
   json::Value reply = json::Value::object();
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -1646,7 +1649,7 @@ std::string Adapter::TaskPreview(const Job& job, const Task& task) const {
   return TaskPreviewId(job.preview_base, task.node_id, job.several_previews);
 }
 
-void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
+bool Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
   const auto now = std::chrono::steady_clock::now();
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   // Ended prompts keep their ids for ten minutes (late readers still find
@@ -1674,14 +1677,26 @@ void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
       break;
     preview_ids_.erase(oldest);
   }
+  // Another user's live prompt keeps its id: no redirect of its preview.
+  for (const Task& task : job->plan.tasks) {
+    if (!std::holds_alternative<ImageTask>(task.spec) &&
+        !std::holds_alternative<VideoTask>(task.spec))
+      continue;
+    const auto it = preview_ids_.find(TaskPreview(*job, task));
+    if (it != preview_ids_.end() && !it->second.ended &&
+        it->second.user != job->user)
+      return false;
+  }
   for (const Task& task : job->plan.tasks) {
     if (!std::holds_alternative<ImageTask>(task.spec) &&
         !std::holds_alternative<VideoTask>(task.spec))
       continue;
     PreviewEntry entry;
     entry.job = job;
+    entry.user = job->user;
     preview_ids_[TaskPreview(*job, task)] = std::move(entry);
   }
+  return true;
 }
 
 void Adapter::SetPreviewTarget(const std::string& id, std::string target,
@@ -1717,10 +1732,14 @@ void Adapter::EndPreviews(const Job& job) {
 }
 
 std::optional<Adapter::PreviewRoute> Adapter::FindPreview(
-    std::string_view id) {
+    std::string_view id, std::string_view user) {
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   const auto it = preview_ids_.find(id);
   if (it == preview_ids_.end())
+    return std::nullopt;
+  // A signed-in user (no admin) sees the previews of its own prompts and
+  // of prompts without a user (the router's, loopback's).
+  if (!user.empty() && !it->second.user.empty() && it->second.user != user)
     return std::nullopt;
   if (it->second.target.empty() &&
       (it->second.ended || it->second.job.expired())) {
