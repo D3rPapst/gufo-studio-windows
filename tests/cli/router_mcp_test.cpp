@@ -393,8 +393,29 @@ std::vector<json::Value> Blocks(const HttpResponse& r) {
                                                    : std::vector<json::Value>();
 }
 
+/// The details of a tool failure: the JSON on the last line of its text
+/// block (null for a success or another shape).
+json::Value Failure(const HttpResponse& r) {
+  if (!IsToolError(r))
+    return json::Value();
+  const std::vector<json::Value> blocks = Blocks(r);
+  if (blocks.empty())
+    return json::Value();
+  const std::string text = blocks[0].member_str("text");
+  const std::size_t newline = text.rfind('\n');
+  if (newline == std::string::npos)
+    return json::Value();
+  try {
+    return json::parse(text.substr(newline + 1));
+  } catch (const std::exception&) {
+    return json::Value();
+  }
+}
+
 /// A tool result is well formed: content[0] is the text mirror of
-/// structuredContent (or the error text) and the flags fit.
+/// structuredContent, or for an error "<status> <code>: <message>" and the
+/// details as JSON, without structuredContent (it would not match the
+/// outputSchema; ultra review #16, finding 1); the flags fit.
 void CheckShape(const HttpResponse& r, bool error) {
   CHECK_EQ(RpcCode(r), 0);
   CHECK_EQ(IsToolError(r), error);
@@ -403,26 +424,32 @@ void CheckShape(const HttpResponse& r, bool error) {
   if (blocks.empty())
     return;
   CHECK_EQ(blocks[0].member_str("type"), std::string("text"));
-  const json::Value structured = Structured(r);
-  CHECK(structured.is_object());
   if (error) {
-    CHECK(structured.find("http_status") != nullptr);
-    CHECK(!structured.member_str("code").empty());
-    CHECK(!structured.member_str("message").empty());
-    CHECK(blocks[0].member_str("text").find(structured.member_str("code")) !=
-          std::string::npos);
+    CHECK(CallResult(r).find("structuredContent") == nullptr);
+    const json::Value detail = Failure(r);
+    CHECK(detail.is_object());
+    CHECK(detail.find("http_status") != nullptr);
+    CHECK(!detail.member_str("code").empty());
+    CHECK(!detail.member_str("message").empty());
+    const std::string text = blocks[0].member_str("text");
+    CHECK(text.starts_with(
+        std::to_string(static_cast<int>(detail.member_double("http_status"))) +
+        " " + detail.member_str("code") + ": " + detail.member_str("message") +
+        "\n"));
   } else {
+    const json::Value structured = Structured(r);
+    CHECK(structured.is_object());
     CHECK_EQ(blocks[0].member_str("text"), structured.dump());
   }
 }
 
 /// The error code of a tool failure ("" for a success).
 std::string FailureCode(const HttpResponse& r) {
-  return IsToolError(r) ? Structured(r).member_str("code") : std::string();
+  return IsToolError(r) ? Failure(r).member_str("code") : std::string();
 }
 
 int FailureStatus(const HttpResponse& r) {
-  return static_cast<int>(Structured(r).member_double("http_status"));
+  return static_cast<int>(Failure(r).member_double("http_status"));
 }
 
 /// The parsed JSON body of a request (null when none).
@@ -888,8 +915,8 @@ void TestVisibility() {
         CHECK_EQ(content->items()[0].member_str("type"), std::string("text"));
         CHECK(content->items()[0].member_str("text").starts_with("403 forbidden"));
       }
-      const json::Value* structured = result->find("structuredContent");
-      CHECK(structured != nullptr && structured->member_str("code") == "forbidden");
+      CHECK(result->find("structuredContent") == nullptr);
+      CHECK_EQ(Failure(r).member_str("code"), std::string("forbidden"));
     }
     CHECK(f.Logged({"\tmaler\t", "mcp:bild_erzeugen:abgelehnt:forbidden"}, 3));
   }
@@ -1037,6 +1064,22 @@ void TestModelle() {
   CHECK_EQ(FailureCode(r), std::string("pool_busy"));
   CHECK_EQ(FailureStatus(r), 503);
   CHECK(f.Logged({"mcp:modelle:abgelehnt:pool_busy"}, 2));
+  // With a Retry-After header: retry_after in the details, still no
+  // structuredContent (a client checking the outputSchema of `modelle`
+  // must see the reason, not a schema error).
+  f.fake = [](const HttpRequest&) -> std::optional<HttpResponse> {
+    HttpResponse busy = ErrorAnswer(429, "rate_limited", "zu viele Anfragen");
+    busy.headers.emplace_back("Retry-After", "30");
+    return busy;
+  };
+  r = f.Call("modelle", "{}");
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 429);
+  CHECK_EQ(FailureCode(r), std::string("rate_limited"));
+  CHECK_EQ(Failure(r).member_double("retry_after"), 30.0);
+  CHECK(Blocks(r)[0].member_str("text").starts_with(
+      "429 rate_limited: zu viele Anfragen\n"));
+  CHECK(f.Logged({"mcp:modelle:abgelehnt:rate_limited"}, 2));
   // A 2xx that is no model list.
   f.fake = [](const HttpRequest&) -> std::optional<HttpResponse> {
     return FileAnswer("<html>", "text/html");
@@ -1271,7 +1314,7 @@ void TestChat() {
   CHECK_EQ(FailureCode(r), std::string("daily_limit"));
   CHECK_EQ(FailureStatus(r), 429);
   // The gate sends no Retry-After for the daily limit: no retry_after.
-  CHECK(Structured(r).find("retry_after") == nullptr);
+  CHECK(Failure(r).find("retry_after") == nullptr);
   CHECK(f.Logged({"\tknapp\t", "mcp:chat:abgelehnt:daily_limit"}, 3));
   // An answer without choices.
   f.fake = [](const HttpRequest&) -> std::optional<HttpResponse> {
@@ -1490,7 +1533,7 @@ void TestJobs() {
   CheckShape(r, true);
   CHECK_EQ(FailureStatus(r), 409);
   CHECK_EQ(FailureCode(r), std::string("job_finished"));
-  CHECK_EQ(Structured(r).member_str("status"), std::string("completed"));
+  CHECK_EQ(Failure(r).member_str("status"), std::string("completed"));
   CHECK_EQ(count_deletes(), std::size_t(0));
   r = f.Call("auftrag_abbrechen", "{\"auftrag_id\":\"j1\",\"loeschen\":true}", kLan,
              Fixture::Bearer(tim));
@@ -1591,7 +1634,7 @@ void TestJobs() {
   r = f.Call("ablage_lesen", "{\"auftrag_id\":\"j3\"}", kLan, Fixture::Bearer(tim));
   CheckShape(r, true);
   CHECK_EQ(FailureCode(r), std::string("file_not_found"));
-  CHECK_EQ(Structured(r).member_str("status"), std::string("queued"));
+  CHECK_EQ(Failure(r).member_str("status"), std::string("queued"));
   r = f.Call("ablage_lesen", "{\"auftrag_id\":\"j1\"}", kLan, Fixture::Bearer(bob));
   CheckShape(r, true);
   CHECK_EQ(FailureStatus(r), 404);

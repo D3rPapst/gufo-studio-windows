@@ -864,29 +864,48 @@ json::Value ToolResult(json::Value structured,
   return result;
 }
 
-/// An execution error with the router's error shape: isError, the text
-/// "<status> <code>: <message>" and structuredContent {http_status, code,
-/// message, retry_after?} (plus `extra` members).
+/// An execution error with the router's error shape: isError and one
+/// text block, "<status> <code>: <message>" and on the next line the JSON
+/// {http_status, code, message, retry_after?} (plus `extra` members).
+/// No structuredContent: it would not match the tool's outputSchema, and
+/// clients that check it (the TypeScript SDK of Claude Code) would throw
+/// a schema error instead of showing the reason (ultra review #16,
+/// finding 1; MCP 2025-06-18 asks the schema only of results without
+/// isError).
 json::Value ToolFailure(int status, std::string code, std::string message,
                         long long retry_after = 0,
                         json::Value extra = json::Value()) {
-  json::Value structured = json::Value::object();
-  structured["http_status"] = status;
-  structured["code"] = code;
-  structured["message"] = message;
+  json::Value detail = json::Value::object();
+  detail["http_status"] = status;
+  detail["code"] = code;
+  detail["message"] = message;
   if (retry_after > 0)
-    structured["retry_after"] = retry_after;
+    detail["retry_after"] = retry_after;
   if (extra.is_object())
     for (const auto& [key, value] : extra.members())
-      structured[key] = value;
+      detail[key] = value;
   json::Value content = json::Value::array();
-  content.push_back(
-      TextBlock(std::to_string(status) + " " + code + ": " + message));
+  content.push_back(TextBlock(std::to_string(status) + " " + code + ": " +
+                              message + "\n" + detail.dump()));
   json::Value result = json::Value::object();
   result["content"] = std::move(content);
-  result["structuredContent"] = std::move(structured);
   result["isError"] = true;
   return result;
+}
+
+/// The error code of a ToolFailure result: the word after the status on
+/// the text's first line ("fehler" when there is none).
+std::string FailureCodeOf(const json::Value& result) {
+  const json::Value* content = result.find("content");
+  if (content == nullptr || !content->is_array() || content->size() == 0)
+    return "fehler";
+  const std::string text = content->items()[0].member_str("text");
+  const std::size_t space = text.find(' ');
+  const std::size_t colon = text.find(": ");
+  if (space == std::string::npos || colon == std::string::npos ||
+      colon <= space + 1)
+    return "fehler";
+  return text.substr(space + 1, colon - space - 1);
 }
 
 /// The tool failure for an inner answer >= 400: code and message from the
@@ -2463,11 +2482,7 @@ json::Value McpService::Call(std::string_view name, const json::Value& args,
     return out;
   }
   if (IsError(result)) {
-    std::string code = "fehler";
-    if (const json::Value* structured = result.find("structuredContent"))
-      if (!structured->member_str("code").empty())
-        code = structured->member_str("code");
-    log("abgelehnt:" + code);
+    log("abgelehnt:" + FailureCodeOf(result));
   } else {
     log("ok");
   }

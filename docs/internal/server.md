@@ -1890,14 +1890,19 @@ router's internal key): area, model list, word filter, daily limit
 (counted once, by the inner request; `/mcp` itself counts nothing), own
 jobs, `X-Gufo-User` and the access log hold unchanged, and the inner
 paths are a fixed list (`/v1/models`, `/v1/chat/completions`,
-`/v1/jobs...`; never `/mcp`). Every result carries `structuredContent`
-(the tool's `outputSchema`) and its JSON as `content[0]` text for clients
-without structured content. A refusal or a router error of the inner
-request (status >= 400) is a tool result with `isError: true`, the text
-`<status> <code>: <message>` and `structuredContent {http_status, code,
-message, retry_after?}` with the router's error code (`403 forbidden`,
-`403 model_forbidden`, `400 content_filtered`, `429 daily_limit` with
-`retry_after`, `404 job_not_found`/`not_found` for another user's job,
+`/v1/jobs...`; never `/mcp`). Every successful result carries
+`structuredContent` (the tool's `outputSchema`) and its JSON as
+`content[0]` text for clients without structured content. A refusal or a
+router error of the inner request (status >= 400) is a tool result with
+`isError: true` and no `structuredContent` (it would not match the
+`outputSchema`, and a client that checks it, such as the TypeScript SDK
+of Claude Code, would throw a schema error instead of showing the
+reason); its one text block is `<status> <code>: <message>` and on the
+next line the JSON `{http_status, code, message, retry_after?}` (plus
+`auftrag_id`/`status` where named below) with the router's error code
+(`403 forbidden`, `403 model_forbidden`, `400 content_filtered`, `429
+daily_limit` with `retry_after`, `404 job_not_found`/`not_found` for
+another user's job,
 `503 pool_busy`, ...); a 2xx that is not the expected JSON is
 `unexpected_answer`. Missing or wrong arguments are JSON-RPC `-32602`
 naming the field (`arguments.<name> ...`). The access log carries
