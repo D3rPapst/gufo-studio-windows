@@ -96,6 +96,24 @@ public:
       const std::string& filename, const std::string& subfolder,
       const std::string& type);
 
+  /// Where the live preview of a prompt's image or video task renders
+  /// (2.1). Each such task has a stable preview id known at POST /prompt:
+  /// extra_data.gufo_preview_id or else the prompt id, with "_" + node id
+  /// appended when the prompt has more than one image or video task
+  /// (TaskPreviewId). `target` is the worker preview id: the same id for an
+  /// image, the video job id for a video; empty while the prompt waits or
+  /// runs and the task's request is not sent yet.
+  struct PreviewRoute {
+    std::string target;
+    bool video{false};
+    /// The image model the task's request names ("" for a video).
+    std::string model;
+  };
+  /// nullopt: no preview of this adapter, or its prompt ended (or left the
+  /// queue) before the task started. Safe with the router's state mutex
+  /// held (own mutex, nothing called under it).
+  [[nodiscard]] std::optional<PreviewRoute> FindPreview(std::string_view id);
+
   struct Job;
 
 private:
@@ -148,7 +166,18 @@ private:
                  std::string* error);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string body,
-                   std::string content_type);
+                   std::string content_type,
+                   const std::string& preview_id = {});
+  /// The preview id of `task` (Adapter::FindPreview).
+  std::string TaskPreview(const Job& job, const Task& task) const;
+  /// Registers the preview ids of a queued prompt (no target yet).
+  void RegisterPreviews(const std::shared_ptr<Job>& job);
+  /// The task's request is about to go out: its preview renders as `target`.
+  void SetPreviewTarget(const std::string& id, std::string target, bool video,
+                        std::string model);
+  /// The prompt ended: ids without a target are forgotten at once, the
+  /// others after a while.
+  void EndPreviews(const Job& job);
 
   void Emit(const std::string& client, std::string_view type, json::Value data);
   /// Polls the worker preview `preview_id` until `stop`, while a socket of
@@ -213,6 +242,18 @@ private:
   std::chrono::steady_clock::time_point http_watch_until_{};
   std::uint64_t next_preview_{1};
   std::uint64_t next_event_{1};
+  /// Preview ids of queued, running and recently finished prompts
+  /// (FindPreview); guarded by preview_mutex_ alone.
+  struct PreviewEntry {
+    std::weak_ptr<Job> job;
+    std::string target;
+    bool video{false};
+    std::string model;
+    bool ended{false};
+    std::chrono::steady_clock::time_point ended_at{};
+  };
+  std::mutex preview_mutex_;
+  std::map<std::string, PreviewEntry, std::less<>> preview_ids_;
   std::uint64_t work_counter_{0};
 };
 

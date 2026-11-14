@@ -60,6 +60,10 @@ struct Adapter::Job {
   std::atomic<bool> cancel{false};
   /// Warnings found while running (worker thread only).
   std::vector<std::string> warnings;
+  /// Live preview ids (2.1, TaskPreviewId): extra_data.gufo_preview_id or
+  /// the prompt id; several = more than one image or video task.
+  std::string preview_base;
+  bool several_previews{false};
 };
 
 namespace {
@@ -535,6 +539,18 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
   if (const json::Value* extra = body.find("extra_data");
       extra != nullptr && extra->is_object())
     job->extra_data = *extra;
+  // The live preview id the client may watch (GET /v1/previews/<id>/events)
+  // from the moment /prompt answers: its own, or the prompt id.
+  if (const json::Value* wanted = job->extra_data.find("gufo_preview_id");
+      wanted != nullptr && !wanted->is_null()) {
+    if (!wanted->is_string() || !IsPreviewId(wanted->str()))
+      return ErrorResponse(400, "invalid_prompt",
+                           "extra_data.gufo_preview_id must be 1..128 "
+                           "characters [A-Za-z0-9._-]");
+    job->preview_base = wanted->str();
+  } else {
+    job->preview_base = job->id;
+  }
   if (!job->client_id.empty())
     job->extra_data["client_id"] = job->client_id;
   job->extra_data["create_time"] = NowMs();
@@ -567,6 +583,13 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
   for (const Task& task : job->plan.tasks)
     for (const OutputTarget& target : task.outputs)
       job->outputs.push_back(target.node_id);
+  job->several_previews =
+      std::count_if(job->plan.tasks.begin(), job->plan.tasks.end(),
+                    [](const Task& task) {
+                      return std::holds_alternative<ImageTask>(task.spec) ||
+                             std::holds_alternative<VideoTask>(task.spec);
+                    }) > 1;
+  RegisterPreviews(job);
   json::Value reply = json::Value::object();
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -1400,6 +1423,7 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
           .count();
+  EndPreviews(*job);
   Logger::Info("comfy", "event=prompt_done prompt_id=" + job->id +
                             " status=" + (ok ? "success" : "error") +
                             " seconds=" + std::to_string(seconds));
@@ -1420,15 +1444,99 @@ json::Value Adapter::RunTask(const std::shared_ptr<Job>& job,
   return RunVideo(job, task, std::get<VideoTask>(task.spec));
 }
 
+std::string Adapter::TaskPreview(const Job& job, const Task& task) const {
+  return TaskPreviewId(job.preview_base, task.node_id, job.several_previews);
+}
+
+void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
+  const auto now = std::chrono::steady_clock::now();
+  const std::lock_guard<std::mutex> lock(preview_mutex_);
+  // Ended prompts keep their ids for ten minutes (late readers still find
+  // the worker preview); at most 1024 entries.
+  std::erase_if(preview_ids_, [&](const auto& entry) {
+    return entry.second.ended &&
+           now - entry.second.ended_at > std::chrono::minutes(10);
+  });
+  while (preview_ids_.size() >= 1024) {
+    auto oldest = preview_ids_.end();
+    for (auto it = preview_ids_.begin(); it != preview_ids_.end(); ++it)
+      if (it->second.ended &&
+          (oldest == preview_ids_.end() ||
+           it->second.ended_at < oldest->second.ended_at))
+        oldest = it;
+    if (oldest == preview_ids_.end())
+      break;
+    preview_ids_.erase(oldest);
+  }
+  for (const Task& task : job->plan.tasks) {
+    if (!std::holds_alternative<ImageTask>(task.spec) &&
+        !std::holds_alternative<VideoTask>(task.spec))
+      continue;
+    PreviewEntry entry;
+    entry.job = job;
+    preview_ids_[TaskPreview(*job, task)] = std::move(entry);
+  }
+}
+
+void Adapter::SetPreviewTarget(const std::string& id, std::string target,
+                               bool video, std::string model) {
+  const std::lock_guard<std::mutex> lock(preview_mutex_);
+  PreviewEntry& entry = preview_ids_[id];
+  entry.target = std::move(target);
+  entry.video = video;
+  entry.model = std::move(model);
+}
+
+void Adapter::EndPreviews(const Job& job) {
+  const auto now = std::chrono::steady_clock::now();
+  const std::lock_guard<std::mutex> lock(preview_mutex_);
+  for (const Task& task : job.plan.tasks) {
+    if (!std::holds_alternative<ImageTask>(task.spec) &&
+        !std::holds_alternative<VideoTask>(task.spec))
+      continue;
+    const auto it = preview_ids_.find(TaskPreview(job, task));
+    if (it == preview_ids_.end() || it->second.ended)
+      continue;
+    // Another prompt may have taken the id since; only this job's entry.
+    const auto owner = it->second.job.lock();
+    if (owner != nullptr && owner.get() != &job)
+      continue;
+    if (it->second.target.empty()) {
+      preview_ids_.erase(it);
+      continue;
+    }
+    it->second.ended = true;
+    it->second.ended_at = now;
+  }
+}
+
+std::optional<Adapter::PreviewRoute> Adapter::FindPreview(
+    std::string_view id) {
+  const std::lock_guard<std::mutex> lock(preview_mutex_);
+  const auto it = preview_ids_.find(id);
+  if (it == preview_ids_.end())
+    return std::nullopt;
+  if (it->second.target.empty() &&
+      (it->second.ended || it->second.job.expired())) {
+    // Deleted from the queue (or ended) before the task started.
+    preview_ids_.erase(it);
+    return std::nullopt;
+  }
+  return PreviewRoute{it->second.target, it->second.video, it->second.model};
+}
+
 FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
                           std::string path, std::string body,
-                          std::string content_type) {
+                          std::string content_type,
+                          const std::string& preview_id) {
   HttpRequest request;
   request.method = std::move(method);
   request.path = std::move(path);
   request.body = std::move(body);
   if (!content_type.empty())
     request.headers.emplace_back("Content-Type", std::move(content_type));
+  if (!preview_id.empty())
+    request.headers.emplace_back(kPreviewIdHeader, preview_id);
   request.request_id = "comfy-" + job->id;
   // placement = pool: the graph's own LLM calls are not held back by the
   // busy rule its own queue entry triggers.
@@ -1515,9 +1623,12 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       extension["base_strength"] = spec.base_strength;
   }
   const json::Value loras = ImageLoras(spec);
-  // Live preview under this id; the worker renders it only while the relay
-  // below polls it for a connected /ws client.
-  const std::string preview_id = PreviewId(job->id, task.node_id);
+  // Live preview under this id (TaskPreview: the prompt id or
+  // extra_data.gufo_preview_id, known to the client since /prompt); the
+  // worker renders it only while someone watches: the relay below for a
+  // connected /ws client or /filmstudio poll, or a client's own
+  // GET /v1/previews/<id>[/events].
+  const std::string preview_id = TaskPreview(*job, task);
   const auto gufo_fields = [&](bool with_extension, bool with_preview) {
     json::Value fields =
         with_extension ? extension : json::Value(json::Value::object());
@@ -1551,7 +1662,7 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
       if (!loras.is_null())
         body["loras"] = loras;
       return Call(job, "POST", "/v1/images/generations", body.dump(),
-                  "application/json");
+                  "application/json", with_preview ? preview_id : "");
     }
     std::vector<MultipartPart> parts = {
         {"model", "", "", spec.model},
@@ -1603,8 +1714,10 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
     const std::string boundary = "gufocomfy" + NewUuid();
     return Call(job, "POST", "/v1/images/edits",
                 BuildMultipart(parts, boundary),
-                "multipart/form-data; boundary=" + boundary);
+                "multipart/form-data; boundary=" + boundary,
+                with_preview ? preview_id : "");
   };
+  SetPreviewTarget(preview_id, preview_id, false, spec.model);
   std::jthread relay([&](std::stop_token stop) {
     RelayPreviews(job, task, preview_id, spec.model, true, stop);
   });
@@ -2065,6 +2178,8 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     throw std::runtime_error("gufo video response has no id");
   Logger::Info("comfy", "event=video_created prompt_id=" + job->id +
                             " video=" + video_id + " model=" + spec.model);
+  // The task's preview id now leads to the video job's preview (2.1).
+  SetPreviewTarget(TaskPreview(*job, task), video_id, true, "");
   // The middle frame of the worker's preview loop, while a /ws client looks.
   std::jthread relay([&](std::stop_token stop) {
     RelayPreviews(job, task, video_id, "", false, stop);

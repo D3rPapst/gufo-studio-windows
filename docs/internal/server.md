@@ -665,7 +665,7 @@ section (`ParseHint`) and never reach the worker. They tune
 
 | Key | Value | Effect |
 | --- | --- | --- |
-| `router-gpu-gb` | number >= 0 | Expected GPU memory of the loaded worker in GB; replaces the memory guard's estimate for this id (preset keys win over the learned `.memory.json` values). |
+| `router-gpu-gb` | number >= 0 | Expected GPU memory of the loaded worker in GB; replaces the memory guard's estimate for this id (it wins over the `estimate_*` values of `.memory.json`, not over the learned ones, see below). |
 | `router-host-gb` | number >= 0 | Expected host RAM in GB; used together with `router-gpu-gb` (without it the value is not applied). |
 | `router-exclusive` | `true` or `false` | `true`: nothing else may stay loaded beside this model; the guard evicts the others first. |
 | `router-idle-seconds` | number >= 0 | Idle unload for this model instead of `--sleep-idle-seconds`. |
@@ -673,13 +673,36 @@ section (`ParseHint`) and never reach the worker. They tune
 Any other `router-*` key is `unknown router key` and stops the start.
 In `[remote/<id>]` sections router hints are rejected.
 
+`router-gpu-gb` / `router-host-gb` only set the estimate. What the memory
+guard reserves for an id comes from the memory file (`--memory-file`,
+`MemoryBook::Need`), per GPU layout (dedicated GPU memory):
+
+- a complete learned peak for this layout (`learned_complete: true`):
+  that peak times `--memory-learned-factor`; the estimate, and with it the
+  preset value, is ignored;
+- a learned peak that is not complete yet: the larger of estimate times
+  `--memory-factor` and peak times `--memory-learned-factor` (a learned
+  peak only raises the reservation);
+- no peak for this layout, but one in `learned_layouts` from another
+  layout: that peak scaled to this layout, times `--memory-learned-factor`;
+- nothing learned: estimate times `--memory-factor`.
+
+So lowering `router-gpu-gb` does not lower the reservation of a model that
+already has a learned peak. To drop a stale peak (after a fix that made the
+worker smaller, or one measured in a different setup), stop the router (it
+keeps the book in memory and writes it back), remove `learned_gpu_gb`,
+`learned_host_gb`, `learned_shared_gb`, `learned_at`, `learned_complete`,
+`learned_layout_gb` and, if present, `learned_layouts` from that id's entry
+under `models` (or delete the whole entry), and start the router again.
+The preset values then apply until the next load measures a new peak.
+
 ### Routing and proxying
 
 | Endpoint | Model source |
 | --- | --- |
-| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template` | JSON `model` field |
+| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template`, `/v1/systemone` | JSON `model` field |
 | `/v1/audio/transcriptions` (multipart) | `model` form field |
-| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter |
+| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter; the router opens the worker WebSocket on the same path and query and forwards `Sec-WebSocket-Protocol` (realtime sessions of `gufo serve asr` require `realtime`) |
 | `GET /v1/audio/voices`, `GET /props`, `GET /sdapi/v1/loras` | `model` query parameter (loads the model) |
 | `/v1/videos/<id>` status/content | router job table |
 | `GET /v1/audio/music/<id>` status/content (`"async": true`) | `model` query parameter, else router job table |
@@ -719,6 +742,24 @@ only in the worker's memory, so a read for a job whose worker is no longer
 loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
 /embeddings` goes to the embedding model named in its body.
+ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
+previews under an id known from the answer on: `extra_data.gufo_preview_id`
+(1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with
+`_<node id>` appended when the prompt has more than one image or video
+task. `GET /v1/previews/<id>/events` (SSE: `event: preview` with `mime`,
+`data`, `step`, `steps`, `seq`; `event: done` at the end) may be opened
+right after `/prompt`; `?model=` is not needed. While the prompt waits
+in the queue (or the pool has not placed the request, or the worker
+loads) the router keeps the stream open with `: waiting` comments and
+then relays the worker's stream; a prompt that ends without the task
+(deleted from the queue, failed earlier) ends it with `event: done` and
+`"state": "failed"`; after 30 min of waiting it ends the same way. A
+plain read answers `pending` (204, or JSON for `format=json|frame-json`)
+meanwhile. For a video task the id leads to the video job's preview
+(H3: a WebP loop with a JPEG middle frame for `format=frame`). The worker
+renders previews only while someone watches (an open stream, a read in
+the last 10 s, or the adapter's relay for a `/ws` client), so an idle
+graph costs nothing.
 A ComfyUI graph that loads a video (`LoadVideo` -> `RIFE VFI`) takes
 the RIFE rate from the file's probed frame rate (ffprobe next to
 `--comfy-ffmpeg`; 24 fps assumed when it is missing): x5 of a 12 fps shot
@@ -968,6 +1009,16 @@ log).
 Limits: the pool has exactly one partner; the image preview of a pulled job runs on the requester's
 worker, so the owner shows no live step for it; a job with a multipart
 body states its LoRAs only through a `loras` JSON part.
+
+**Previews (2.1).** When the pool picks a side for an image request, it
+records the request's preview id (`X-Gufo-Preview-Id`, which the ComfyUI
+adapter sets, or a JSON body's `gufo.preview.id`; a direct multipart
+request is not read) for an hour. `GET /v1/previews/<id>[/events]` of a
+pool model then goes to that side, with `?model=` added for the partner
+when the client left it out. Before 2.1 the read went to the local
+worker, so a ComfyUI graph on one router whose image the pool sent to the
+partner never showed a preview (14.11.: Qwen-Image keyframes of the .56
+adapter rendered on the .198 with `preview_published=0`).
 
 ### Pool failures (after 1.4.24)
 
@@ -1517,8 +1568,8 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   json_object` for `json`, the messages system -> verlauf -> user. An
   entry of `bilder` is a `data:` URL (sent as an `image_url` part) or an
   Ablage path `/v1/jobs/{id}/files/{name}`, which the router reads
-  through the gate first (area ablage, own jobs) and sends as a data URL.
-  A streamed worker answer is collected. The answer is
+  through the gate first (area ablage, own jobs) and sends as a data URL;
+  all images together at most 20 MB (`-32602` naming the entry). A streamed worker answer is collected. The answer is
   `{text, gedanken?, model, usage {prompt_tokens, completion_tokens},
   finish_reason}`; `gedanken` is the message's `reasoning_content` or a
   leading `<think>...</think>` block split off the text.
@@ -1548,7 +1599,9 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   the file is at most `min(max_bytes, [router] mcp-inline-mb)`, else the
   link; a video or any other type is always the link. Only an embedded
   file (or one the job's list does not name) is read through
-  `GET /v1/jobs/{id}/files/{name}`.
+  `GET /v1/jobs/{id}/files/{name}`, capped at that size: a streamed
+  answer stops there, a larger file is not kept (the link without
+  `bytes`).
 
 Media job tools: each one `POST /v1/jobs` around the endpoint the
 matching page uses, with the body that page sends (pages/bild, video,
@@ -1563,7 +1616,9 @@ field's description). Input files (`startbild`, `probe`, `bild`, `datei`,
 `bilder[]`, `maske`, `ton`, `endbild`) are an Ablage path
 `/v1/jobs/{id}/files/{name}` (read through the gate: another user's job
 is the gate's 404, so an agent can only use its own results) or a base64
-`data:` URL (`-32602` for anything else, an empty file or one over 20 MB);
+`data:` URL (`-32602` for anything else, an empty file or one over 20 MB;
+a streamed Ablage answer, e.g. the partner's, is read only up to that
+cap, a larger file's bytes are not kept);
 the router sends them on as data URLs (the workers do not fetch router
 paths). The answer is `{auftrag_id, status, url, modell, position?,
 geschaetzt?}` from the job store's 202 and the text "Auftrag <id>
@@ -1700,11 +1755,13 @@ in `/v1/models`. After every case `POST /models/unload`. The cases come
 from `einrichtung.json` next to the preset (`modelle`, `antworten`), or
 the request names them in `tests`. A router in `--einrichtung` mode starts
 the production router from the preset's `# start:` line (`# start-opt:`
-and `# env:` applied, `--host`/`--port` replaced by `127.0.0.1` and a
-free port) as a child process (`Worker::Spawn`, its output in the log as
-`model=selbsttest-router`), waits for `/ready` (180 s), runs the cases
-over HTTP and stops the child at the end; a router that already runs a
-preset is asked directly. Each case has 15 minutes; red cases carry the
+and `# env:` applied to the child's environment only, `--host`/`--port`
+replaced by `127.0.0.1` and a free port) as a child process
+(`Worker::Spawn`, its output in the log as `model=selbsttest-router`),
+waits for `/ready` (180 s), runs the cases over HTTP and stops the child
+at the end; a router that already runs a preset is asked directly,
+through its own loopback with its internal key (never a second router
+from the same preset: worker ports and memory would collide). Each case has 15 minutes; red cases carry the
 filtered cause in `hinweis` ("zu wenig Speicher" for `507` /
 ResourceExhausted, the missing file, the worker error) and the target's
 message in `log`. Results (txt, png, wav, mp4, glb) land in
@@ -1752,7 +1809,7 @@ the chat case answered, the child was stopped; see the C5 commit.
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `POST` | `/v1/images/upscale` | `gufo serve upscale` (Real-ESRGAN on the NPU, GPU or CPU); sync, or `"async": true` for a job read at `/v1/images/upscale/{id}[/content]` |
-| `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
+| `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](../models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
 | `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header |
 | `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds}}` |
 | `GET` | `/v1/3d/generations/{id}/content` | The finished GLB (`model/gltf-binary`, `Content-Disposition: attachment`) |

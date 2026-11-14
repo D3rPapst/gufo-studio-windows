@@ -32,6 +32,29 @@ python -I tools/upscale/convert_realesrgan_pth.py realesr-animevideov3.pth \
   realesr-animevideov3.safetensors
 ```
 
+### Converted weights
+
+The three converted files are published as
+[D3rPapst/realesrgan-srvgg-gufo](https://huggingface.co/D3rPapst/realesrgan-srvgg-gufo)
+(BSD-3-Clause, licence text included; converted from the v0.2.5.0 `.pth` files, SHA-256 of
+the sources on the card). The metadata of each file records `format=realesrgan-srvgg`,
+`num_conv`, `num_feat=64`, `upscale=4` and `source=<pth name>`, so the header check at
+start-up works as with a local conversion.
+
+```powershell
+hf download D3rPapst/realesrgan-srvgg-gufo --local-dir D:\llm-modelle\gufo\modelle\upscale
+```
+
+| File | Size | Variant |
+|---|---:|---|
+| `realesr-general-x4v3.safetensors` | 4.9 MB | `general` (32 body convolutions) |
+| `realesr-general-wdn-x4v3.safetensors` | 4.9 MB | `wdn` (32) |
+| `realesr-animevideov3.safetensors` | 2.5 MB | `anime` (16) |
+
+That folder is what the `[external/gufo-upscale]` section under
+[Router section](#router-section) loads (`model =` the general file, `--model wdn=...` and
+`--model anime=...` the other two).
+
 ## CLI
 
 ```sh

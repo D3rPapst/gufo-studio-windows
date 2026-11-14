@@ -125,6 +125,47 @@ def check_forwarded_stays_local(router, remote):
     running.join(10)
 
 
+def image_with_preview(router, preview_id, prompt="", header=False):
+    body = {"model": "twin", "prompt": prompt, "size": "16x16"}
+    headers = None
+    if header:
+        headers = {"X-Gufo-Preview-Id": preview_id}  # the ComfyUI adapter's way
+    else:
+        body["gufo"] = {"preview": {"id": preview_id}}
+    return router.json("POST", "/v1/images/generations", body, headers)
+
+
+def check_preview_follows_pool(router, remote):
+    """2.1: /v1/previews/<id> of a pool model goes to the machine the pool
+    sent that image request to (by gufo.preview.id or X-Gufo-Preview-Id),
+    not to whichever worker is loaded here."""
+    remote.clear()
+    running, result = rp.in_background(lambda: rp.chat(router, "twin", "SLEEP 3"))
+    time.sleep(0.6)
+    for preview_id, header in (("pv-remote-json", False), ("pv-remote-header", True)):
+        code, answer = image_with_preview(router, preview_id, header=header)
+        assert code == 200 and "data" in answer, (code, answer)
+        assert len(remote.entries("/v1/images/generations")) >= 1
+        code, answer = router.json("GET", "/v1/previews/%s?model=twin&format=json"
+                                   % preview_id)
+        hits = remote.entries("/v1/previews/" + preview_id)
+        assert hits, (preview_id, code, answer)
+        assert "model=twin" in hits[-1]["path"], hits[-1]
+    # Without ?model= the record names the model; the SSE stream relays.
+    code, payload = router.request("GET", "/v1/previews/pv-remote-json/events")
+    assert code == 200 and b'"seq": 3' in payload, (code, payload)
+    assert "model=twin" in remote.entries("/v1/previews/pv-remote-json/events")[-1]["path"]
+    running.join(10)
+    assert result["value"][0] == 200
+    # Idle: the request runs here, and so does its preview.
+    remote.clear()
+    code, answer = image_with_preview(router, "pv-local")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    code, answer = router.json("GET", "/v1/previews/pv-local?model=twin")
+    assert code == 200 and rp.where(answer) == "local", (code, answer)
+    assert not remote.entries("/v1/previews/pv-local")
+
+
 def check_remote_activity(router, remote):
     for flags in ({"busy": True, "gpu_busy": False, "others_busy": False},
                   {"busy": False, "gpu_busy": True, "others_busy": True}):
@@ -262,6 +303,8 @@ def main():
                 ("both busy waits", lambda: check_both_busy_waits(router, remote)),
                 ("forwarded stays local",
                  lambda: check_forwarded_stays_local(router, remote)),
+                ("preview follows pool",
+                 lambda: check_preview_follows_pool(router, remote)),
                 ("remote activity", lambda: check_remote_activity(router, remote)),
                 ("lora side", lambda: check_lora_side(router, remote)),
                 ("remote failure retries local",

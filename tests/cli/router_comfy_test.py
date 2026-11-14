@@ -904,6 +904,98 @@ def check_websocket(router):
     assert "execution_success" in seen, seen
 
 
+def read_events(router, path, out, timeout=60):
+    """Reads a whole /v1/previews/.../events answer into out["status"],
+    out["text"] (the router ends it once the relayed stream ends)."""
+    conn = http.client.HTTPConnection("127.0.0.1", router.port, timeout=timeout)
+    conn.request("GET", path)
+    response = conn.getresponse()
+    out["status"] = response.status
+    out["type"] = response.getheader("Content-Type")
+    out["text"] = response.read().decode(errors="replace")
+    conn.close()
+
+
+def check_preview_ids(router):
+    """2.1: every image task's live preview id is known when /prompt
+    answers: the prompt id (or extra_data.gufo_preview_id), with "_" + node
+    id when the prompt has more than one image or video task, and
+    /v1/previews/<id>[/events] finds it without ?model=, also while the
+    prompt still waits in the queue."""
+    # Own id from extra_data.
+    status, body = router.json("POST", "/prompt", {
+        "prompt": qwen_graph(prefix="film/stil/own-id"), "client_id": "studio",
+        "extra_data": {"gufo_preview_id": "take-7_keyframe.a"}})
+    assert status == 200, body
+    router.wait(body["prompt_id"])
+    call = [e for e in router.fake_entries() if e.get("path") == "/v1/images/generations"][-1]
+    assert call["preview"]["id"] == "take-7_keyframe.a", call
+    # Checked like gufo.preview.id.
+    for bad in ("with space", "x" * 129, "", 7):
+        status, body = router.json("POST", "/prompt", {
+            "prompt": qwen_graph(), "extra_data": {"gufo_preview_id": bad}})
+        assert status == 400 and "gufo_preview_id" in json.dumps(body), (bad, status, body)
+    # Two image tasks: one id per KSampler node.
+    graph = qwen_graph(prompt="first", prefix="film/stil/pair")
+    second = qwen_graph(prompt="second", prefix="film/stil/pair")
+    for node, value in second.items():
+        if node in ("5", "6", "7", "8"):
+            value = json.loads(json.dumps(value).replace('["5"', '["15"')
+                               .replace('["6"', '["16"').replace('["7"', '["17"'))
+            graph["1" + node] = value
+    before = len(router.fake_entries())
+    status, body = router.json("POST", "/prompt", {
+        "prompt": graph, "extra_data": {"gufo_preview_id": "pair"}})
+    assert status == 200, body
+    router.wait(body["prompt_id"])
+    ids = sorted(e["preview"]["id"] for e in router.fake_entries()[before:]
+                 if e.get("path") == "/v1/images/generations")
+    assert ids == ["pair_16", "pair_6"], ids
+
+    # A prompt waiting behind another: its preview answers "pending", an
+    # /events stream waits and then relays the worker's.
+    first = router.submit(qwen_graph(prompt="SLOW ahead", prefix="film/stil/ahead"))
+    queued = router.submit(qwen_graph(prompt="SLOW queued", prefix="film/stil/queued"))
+    status, body = router.json("GET", "/v1/previews/%s?format=json" % queued)
+    assert status == 200 and body["state"] == "pending" and body["id"] == queued, (status, body)
+    assert router.request("GET", "/v1/previews/" + queued)[0] == 204
+    stream = {}
+    reader = threading.Thread(target=read_events,
+                              args=(router, "/v1/previews/%s/events" % queued, stream))
+    reader.start()
+    router.wait(first)
+    # Running: the plain read reaches the worker without ?model=.
+    deadline = time.monotonic() + 30
+    seen = None
+    while time.monotonic() < deadline and seen is None:
+        status, body = router.json("GET", "/v1/previews/%s?format=frame-json" % queued)
+        if status == 200 and body.get("state") == "running":
+            seen = body
+        time.sleep(0.05)
+    assert seen and seen["id"] == queued, seen
+    router.wait(queued)
+    reader.join(30)
+    assert stream["status"] == 200 and stream["type"] == "text/event-stream", stream
+    # The fake worker answers its preview JSON instead of an SSE stream.
+    assert stream["text"].startswith(": waiting") and queued in stream["text"], stream
+
+    # A prompt deleted from the queue before it ran ends its stream.
+    first = router.submit(qwen_graph(prompt="SLOW ahead again", prefix="film/stil/ahead"))
+    victim = router.submit(qwen_graph(prompt="never", prefix="film/stil/never"))
+    stream = {}
+    reader = threading.Thread(target=read_events,
+                              args=(router, "/v1/previews/%s/events" % victim, stream))
+    reader.start()
+    time.sleep(0.5)
+    status, _ = router.request("POST", "/queue", {"delete": [victim]})
+    assert status == 200
+    reader.join(30)
+    assert "event: done" in stream["text"] and '"failed"' in stream["text"], stream
+    router.wait(first)
+    status, body = router.json("GET", "/v1/previews/%s?format=json" % victim)
+    assert status == 404, (status, body)
+
+
 def check_filmstudio(router):
     """/filmstudio/progress and /filmstudio/preview answer like the film
     studio's filmstudio_progress ComfyUI plugin: the running prompt for any
@@ -939,10 +1031,12 @@ def check_previews(router):
     one is connected, and /v1/previews routes through the router."""
     # Nobody watches: the image request names a preview, nobody polls it.
     before = len([e for e in router.fake_entries() if e["path"] == "/v1/previews"])
-    router.run(qwen_graph(prompt="SLOW unwatched", prefix="film/stil/unwatched"),
-               client_id="nobody")
+    prompt_id = router.submit(qwen_graph(prompt="SLOW unwatched", prefix="film/stil/unwatched"),
+                              client_id="nobody")
+    router.wait(prompt_id)
     call = router.fake_entries()[-1]
-    assert call["preview"]["id"].endswith("_6"), call
+    # 2.1: a prompt with one image task previews under its prompt id.
+    assert call["preview"]["id"] == prompt_id, (call, prompt_id)
     polls = [e for e in router.fake_entries() if e["path"] == "/v1/previews"]
     assert len(polls) == before, polls[before:]
 
@@ -1164,6 +1258,7 @@ def main():
         check_errors(router)
         check_websocket(router)
         check_previews(router)
+        check_preview_ids(router)
         check_filmstudio(router)
         remaining = check_queue_history_free(router)
     except BaseException:

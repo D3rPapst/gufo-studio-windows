@@ -25,6 +25,32 @@ ComfyUI-Frame-Interpolation downloads `rife49.pth` (its default) and
 `rife47.pth` from its release mirrors, e.g.
 `https://huggingface.co/marduk191/rife/resolve/main/rife49.pth`.
 
+### Converted weights
+
+Both converted checkpoints are published as
+[D3rPapst/rife-ifnet-gufo](https://huggingface.co/D3rPapst/rife-ifnet-gufo) (MIT, Practical-RIFE
+licence text included; SHA-256 of the source `.pth` files on the card): `rife49.safetensors`
+and `rife47.safetensors` (21.3 MB each, 124 FP32 tensors, metadata `format=rife-ifnet`,
+`source=<pth>`) plus the tensor lists `rife49.convert.txt` / `rife47.convert.txt`.
+
+```powershell
+hf download D3rPapst/rife-ifnet-gufo --local-dir D:\llm-modelle\gufo\modelle\rife\weights
+```
+
+Every video section of the production preset points at that file:
+
+```ini
+[external/wan2.2-ti2v-5b]
+command = D:\llm-modelle\gufo\app\gufo-2.1.0-2026-11-14\gufo.exe
+args = serve video
+model = D:\llm-modelle\gufo\modelle\Wan-AI\Wan2.2-TI2V-5B-Diffusers
+root = D:\llm-modelle\gufo\video-jobs-wan
+rife-model = D:\llm-modelle\gufo\modelle\rife\weights\rife49.safetensors
+```
+
+(The production preset uses the same `rife-model =` line in its other video sections and in
+`[external/gufo-rife]`.)
+
 ## CLI
 
 ```sh

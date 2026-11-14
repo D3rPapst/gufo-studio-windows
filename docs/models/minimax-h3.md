@@ -3,11 +3,9 @@
 MiniMax H3 generates short videos with sound from a text prompt. Gufo runs its
 text-to-video-and-audio path, FL2VA, from BF16 weights and writes an MP4.
 
-It can also start from a first frame, end on a last frame, or both.
-gufo-studio-windows adds guide frames in between, a step-distilled LoRA, RIFE
-interpolation and Real-ESRGAN upscaling; see
-[gufo-studio-windows additions](#gufo-studio-windows-additions). Image
-references, reference videos (Ref2VA) and 2K regeneration aren't supported.
+It can also start from a first frame, end on a last frame, or both; see
+[gufo-studio-windows additions](#gufo-studio-windows-additions) for the rest.
+Image references, reference videos (Ref2VA) and 2K regeneration aren't supported.
 
 ## Files
 
@@ -34,9 +32,8 @@ python3 tools/h3/gufo-h3-manifest.py \
   --verify src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
 ```
 
-The check runs from a Gufo source checkout and executes no code from the
-download. Gufo also checks the files when it loads them and refuses missing,
-partial or modified files.
+The check runs from a Gufo source checkout and executes no code from the download.
+Gufo also checks the files when it loads them and refuses missing, partial or modified files.
 
 ## Presets
 
@@ -48,9 +45,8 @@ partial or modified files.
 | `aggressive` | 512 × 512 | Like `fast`, skipping more; approximate. |
 | `dev` | 256 × 256 frames | Four steps and three frames, no audio, for checking a setup. |
 
-"Steps" is the denoiser evaluation count of the preset
-(`src/models/minimax_h3/generation.cpp`, `ResolveGenerationPreset`); a
-request's `gufo.steps` (2 to 1000) replaces it.
+"Steps" is the preset's denoiser evaluation count (`ResolveGenerationPreset`
+in `src/models/minimax_h3/generation.cpp`); `gufo.steps` (2 to 1000) replaces it.
 
 ## Run
 
@@ -87,17 +83,10 @@ gufo serve --host 127.0.0.1 --port 8080 video \
 ## First and last frames
 
 Pass `first_frame` and `last_frame` (or OpenAI's `input_reference` for the
-first frame) to `POST /v1/videos` as multipart file parts or base64 `data:`
-URLs; gufo-studio-windows adds `gufo.keyframes` for frames in between and
-`gufo.guide_video`. The `gufo video` CLI of this build has no keyframe flags. The server never fetches remote URLs. PNG, JPEG and WebP
-work.
-
-The first frame (or a lone last frame) sets the video's aspect ratio, between
-1:4 and 4:1; the preset sets its size. A 1664 × 928 frame gives a 1376 × 768
-video with `exact-1344x768` and 672 × 384 with `exact`. A last frame next to a
-first one is cropped to fit. With `dev`, keyframes far from square are refused
-because the video would be too small. `fast` and `aggressive` follow the frames less
-closely than `exact`.
+first frame) to `POST /v1/videos` as multipart files or base64 `data:` URLs in
+PNG, JPEG or WebP; the server never fetches remote URLs. The first frame sets
+the aspect ratio, between 1:4 and 4:1. Sizes, cropping, `gufo.keyframes` and
+`gufo.guide_video`: [fork notes](../internal/models/minimax-h3/FORK.md#first-and-last-frames).
 
 ## Limits
 
@@ -118,29 +107,11 @@ Saved job status keeps a hash of the prompt, never the prompt itself.
 
 ## gufo-studio-windows additions
 
-The fork's `gufo serve video` takes these options (`gufo serve video
---help`, 2.0.4) and request fields (`src/models/minimax_h3/request.cpp`):
-
-| Option | Enables |
-| --- | --- |
-| `--lora <NAME=PATH[,steps=N][,strength=S]>` | A transformer LoRA for requests, `"gufo": {"lora": NAME}` (and `lora_strength`); repeatable. A LoRA registered with `steps=N` sets the step count unless the request sends `gufo.steps`, and then runs every step on every block: a step-distilled LoRA (the 8-step turbo LoRA) cannot afford the `fast`/`aggressive` step reuse and block skipping. |
-| `--vision-projector <GGUF>` | Qwen3-VL vision tower for keyframe prompt blocks. |
-| `--rife-model <SAFETENSORS>` | RIFE 4.7 weights; `"gufo": {"interpolate": N}` or `{"interpolate": {"fps": N}}` and `source_video` jobs. See [RIFE](rife/README.md). |
-| `--upscale-model <[NAME=]SAFETENSORS>` | Real-ESRGAN SRVGGNetCompact weights (converted); `"gufo": {"upscale": {"width", "height", "fit", "model"}}`; repeatable, the first is the default. See [Real-ESRGAN](realesrgan/README.md). |
-
-Keyframes: `first_frame` (or OpenAI's `input_reference`, the same anchor;
-both together are `400 invalid_input_reference`) and `last_frame` anchor the
-first and the last frame of the video, as JSON image values or multipart
-files of those names. `"gufo": {"keyframes": [{"frame": N, "image": ...}]}`
-and multipart files `keyframe_<N>` add guide frames at frame N (negative N
-counts from the end); each frame may carry one image and must lie inside the
-video. `exact` at a canvas other than `512x512`/`256x256` runs as
-`exact-<W>x<H>`; a canvas has sides of 256 to 1344 pixels in multiples of
-32 and at most 768 × 1344 pixels.
-
-The production preset of the two Strix Halo machines registers the
-`turbo` LoRA with `steps=8`, the vision projector and the RIFE weights
-(`gufo-router-combo7.ini`, `[external/minimax-h3]`).
+The fork's `gufo serve video` adds `--lora` (such as the 8-step turbo LoRA),
+`--vision-projector` for keyframe prompts, [RIFE](rife/README.md)
+interpolation, [Real-ESRGAN](realesrgan/README.md) upscaling and
+`gufo.keyframes` guide frames. Every option, request field and the production
+preset are in the [fork notes](../internal/models/minimax-h3/FORK.md).
 
 ## Performance
 
