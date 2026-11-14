@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "ccip/ccip.hpp"
+#include "ccip/ocr.hpp"
 #include "src/core/image.hpp"
 
 namespace gufo::router::vision {
@@ -26,6 +27,12 @@ using server::HttpRequest;
 using server::HttpResponse;
 
 constexpr std::size_t kAblageBytesLimit = static_cast<std::size_t>(20) << 20;
+
+// imgutils.ocr defaults (ocr/entry.py): PP-OCRv4 mobile from deepghs/paddleocr.
+constexpr const char* kOcrTask = "ocr";
+constexpr const char* kOcrRepo = "deepghs/paddleocr";
+constexpr const char* kOcrDet = "ch_PP-OCRv4_det";
+constexpr const char* kOcrRec = "ch_PP-OCRv4_rec";
 
 HttpResponse JsonResponse(int status, std::string reason, std::string body) {
   HttpResponse response;
@@ -69,6 +76,17 @@ float Threshold(const json::Value& value, const std::string& what) {
   if (!(v > 0.0 && v <= 1.0))
     throw std::invalid_argument(what + " must be in (0, 1]");
   return static_cast<float>(v);
+}
+
+/// The same check for the ocr thresholds, kept as double (imgutils compares
+/// the box score against the Python float).
+double OcrThreshold(const json::Value& value, const std::string& what) {
+  if (!value.is_number())
+    throw std::invalid_argument(what + " must be a number");
+  const double v = value.as_double();
+  if (!(v > 0.0 && v <= 1.0))
+    throw std::invalid_argument(what + " must be in (0, 1]");
+  return v;
 }
 
 /// The caller waits here until it is first in line and the CPU is free.
@@ -187,7 +205,7 @@ const std::vector<TaskSpec>& DetectorTasks() {
 }
 
 const std::vector<std::string>& PlannedTasks() {
-  static const std::vector<std::string> tasks = {"ocr", "wd14_tags"};
+  static const std::vector<std::string> tasks = {"wd14_tags"};
   return tasks;
 }
 
@@ -224,7 +242,8 @@ Request ParseRequest(const json::Value& body) {
   for (const std::string& name : names) {
     const auto& known = DetectorTasks();
     const auto& planned = PlannedTasks();
-    if (std::none_of(known.begin(), known.end(),
+    if (name != kOcrTask &&
+        std::none_of(known.begin(), known.end(),
                      [&](const TaskSpec& spec) { return spec.task == name; }) &&
         std::find(planned.begin(), planned.end(), name) == planned.end())
       throw std::invalid_argument("unknown task " + name +
@@ -259,12 +278,28 @@ Request ParseRequest(const json::Value& body) {
       throw std::invalid_argument("brighten_dark must be true, false or {below, gamma}");
     }
   }
+  request.ocr = std::find(names.begin(), names.end(), kOcrTask) != names.end();
   if (const json::Value* thresholds = body.find("thresholds");
       thresholds != nullptr && !thresholds->is_null()) {
     if (!thresholds->is_object())
       throw std::invalid_argument("thresholds must be an object by task");
     for (const auto& [key_task, values] : thresholds->members()) {
       const std::string& task = key_task;
+      if (task == kOcrTask) {
+        if (!request.ocr)
+          throw std::invalid_argument("thresholds.ocr: task not requested");
+        if (!values.is_object())
+          throw std::invalid_argument("thresholds.ocr must be an object");
+        for (const auto& [key, value] : values.members()) {
+          if (key == "heat")
+            request.ocr_heat = OcrThreshold(value, "thresholds.ocr.heat");
+          else if (key == "box")
+            request.ocr_box = OcrThreshold(value, "thresholds.ocr.box");
+          else
+            throw std::invalid_argument("thresholds.ocr." + key + ": use heat or box");
+        }
+        continue;
+      }
       auto spec = std::find_if(request.tasks.begin(), request.tasks.end(),
                                [&task](const TaskSpec& s) { return s.task == task; });
       if (spec == request.tasks.end())
@@ -288,6 +323,7 @@ Request ParseRequest(const json::Value& body) {
 struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
+  std::unique_ptr<models::ccip::TextOcr> ocr;
   FifoGate gate;
 
   /// The detector of `spec`, loaded on first use; null with *error set.
@@ -319,6 +355,38 @@ struct VisionState {
     detectors.emplace(spec.model, std::move(net));
     return loaded;
   }
+
+  /// The text recognizer (detector + recognizer + dictionary), loaded on
+  /// first use; null with *error set.
+  const models::ccip::TextOcr* GetOcr(const Options& options, std::string* error) {
+    std::lock_guard<std::mutex> lock(load_mutex);
+    if (ocr != nullptr)
+      return ocr.get();
+    if (options.model_dir.empty()) {
+      *error = "image recognition is not configured: start the router with --vision-dir";
+      return nullptr;
+    }
+    const std::string det = kOcrDet, rec = kOcrRec;
+    for (const std::string& name : {det + ".safetensors", det + ".json", rec + ".safetensors",
+                                    rec + ".json", rec + ".dict.txt"}) {
+      const std::filesystem::path path = options.model_dir / name;
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) {
+        *error = "model file missing: " + path.string() + " (convert " + kOcrRepo +
+                 " det/" + det + " and rec/" + rec +
+                 " with extensions-ours/ccip/reference/convert_ocr.py)";
+        return nullptr;
+      }
+    }
+    std::string load_error;
+    auto loaded = models::ccip::TextOcr::Load(options.model_dir, det, rec, &load_error);
+    if (loaded == nullptr) {
+      *error = "ocr: " + load_error;
+      return nullptr;
+    }
+    ocr = std::move(loaded);
+    return ocr.get();
+  }
 };
 
 VisionService::VisionService(Options options)
@@ -349,6 +417,13 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     if (net == nullptr)
       return Error(503, "Service Unavailable", error, "vision_unavailable");
     nets.push_back(net);
+  }
+  const models::ccip::TextOcr* ocr = nullptr;
+  if (parsed.ocr) {
+    std::string error;
+    ocr = state_->GetOcr(options_, &error);
+    if (ocr == nullptr)
+      return Error(503, "Service Unavailable", error, "vision_unavailable");
   }
   // Input before the queue: reading an Ablage path goes through the gate
   // and must not hold the CPU turn.
@@ -432,6 +507,41 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       model["conf"] = std::round(static_cast<double>(spec.conf) * 1e6) / 1e6;
       model["iou"] = std::round(static_cast<double>(spec.iou) * 1e6) / 1e6;
       used[spec.task] = std::move(model);
+    }
+    if (ocr != nullptr) {
+      models::ccip::OcrOptions ocr_options;
+      ocr_options.heat_threshold = parsed.ocr_heat;
+      ocr_options.box_threshold = parsed.ocr_box;
+      const auto round6 = [](double v) { return std::round(v * 1e6) / 1e6; };
+      json::Value list = json::Value::array();
+      for (const models::ccip::OcrText& t : ocr->Run(image, ocr_options)) {
+        json::Value box = json::Value::array();
+        for (int v : t.box)
+          box.push_back(v);
+        json::Value points = json::Value::array();
+        for (const auto& p : t.points) {
+          json::Value xy = json::Value::array();
+          xy.push_back(p[0]);
+          xy.push_back(p[1]);
+          points.push_back(std::move(xy));
+        }
+        json::Value entry = json::Value::object();
+        entry["box"] = std::move(box);
+        entry["points"] = std::move(points);
+        entry["text"] = t.text;
+        entry["score"] = t.score;
+        entry["det_score"] = t.det_score;
+        entry["text_score"] = t.text_score;
+        list.push_back(std::move(entry));
+      }
+      detections[kOcrTask] = std::move(list);
+      json::Value model = json::Value::object();
+      model["repo"] = kOcrRepo;
+      model["model"] = kOcrDet;
+      model["rec_model"] = kOcrRec;
+      model["heat"] = round6(parsed.ocr_heat);
+      model["box"] = round6(parsed.ocr_box);
+      used[kOcrTask] = std::move(model);
     }
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),

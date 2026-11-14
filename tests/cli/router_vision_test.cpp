@@ -130,11 +130,41 @@ void TestParse() {
   }));
   bool planned = false;
   try {
-    (void)vision::ParseRequest(Body("AAAA", {"face", "ocr"}));
+    (void)vision::ParseRequest(Body("AAAA", {"face", "wd14_tags"}));
   } catch (const std::domain_error&) {
     planned = true;
   }
   assert(planned);
+  // ocr: opt-in, thresholds heat/box, kept as double.
+  r = vision::ParseRequest(Body("AAAA", {"ocr"}));
+  assert(r.ocr && r.tasks.empty() && r.ocr_heat == 0.3 && r.ocr_box == 0.7);
+  r = vision::ParseRequest(Body("AAAA", {}));
+  assert(!r.ocr);
+  json::Value ocr_body = Body("AAAA", {"ocr", "face"});
+  json::Value ocr_th = json::Value::object();
+  json::Value ocr_values = json::Value::object();
+  ocr_values["heat"] = 0.4;
+  ocr_values["box"] = 0.6;
+  ocr_th["ocr"] = std::move(ocr_values);
+  ocr_body["thresholds"] = std::move(ocr_th);
+  r = vision::ParseRequest(ocr_body);
+  assert(r.ocr && r.tasks.size() == 1 && r.ocr_heat == 0.4 && r.ocr_box == 0.6);
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"ocr"});
+    json::Value t = json::Value::object();
+    json::Value o = json::Value::object();
+    o["iou"] = 0.5;
+    t["ocr"] = std::move(o);
+    bad["thresholds"] = std::move(t);
+    (void)vision::ParseRequest(bad);
+  }));
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"face"});
+    json::Value t = json::Value::object();
+    t["ocr"] = json::Value::object();
+    bad["thresholds"] = std::move(t);
+    (void)vision::ParseRequest(bad);
+  }));
 }
 
 // Pillow values: (255,0,0) -> L 76, (10,200,30) -> L 124, mean 100.0;
@@ -184,6 +214,9 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"face"})));
   assert(response->status == 503);
   assert(response->body.find("face_detect_v1.4_s.safetensors") != std::string::npos);
+  response = service_missing.Handle(Post(Body("AAAA", {"ocr"})));
+  assert(response->status == 503);
+  assert(response->body.find("ch_PP-OCRv4_det.safetensors") != std::string::npos);
 }
 
 std::string ReadFile(const std::filesystem::path& path) {
@@ -224,6 +257,21 @@ void TestReal(const char* dir, const char* frame) {
     assert(answer.find("detections")->find(task) != nullptr);
   assert(answer.find("brightened") != nullptr && !answer.find("brightened")->as_bool());
   const std::size_t persons = answer.find("detections")->find("person")->size();
+  assert(answer.find("detections")->find("ocr") == nullptr);
+  // ocr when the converted PP-OCRv4 files are in the same directory.
+  if (std::filesystem::exists(std::filesystem::path(dir) / "ch_PP-OCRv4_rec.dict.txt")) {
+    response = service.Handle(Post(Body(data_url, {"ocr"})));
+    std::cout << response->body.substr(0, 600) << '\n';
+    assert(response->status == 200);
+    const json::Value texts = json::parse(response->body);
+    const json::Value* list = texts.find("detections")->find("ocr");
+    assert(list != nullptr && list->is_array());
+    for (const json::Value& t : list->items()) {
+      assert(t.find("text")->is_string());
+      assert(t.find("points")->size() == 4 && t.find("box")->size() == 4);
+    }
+    assert(texts.find("models")->find("ocr")->member_str("rec_model") == "ch_PP-OCRv4_rec");
+  }
   // Ablage path through the scripted gate: same answer.
   HttpRequest ablage = Post(Body("/v1/jobs/abc/files/frame.png", {"person"}));
   ablage.headers.emplace_back("Authorization", "Bearer test");

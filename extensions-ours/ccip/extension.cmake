@@ -31,6 +31,9 @@ gufo_extension_target(
     cpu/kernels.cpp
     cpu/caformer.cpp
     cpu/yolo.cpp
+    cpu/ocr_net.cpp
+    ocr.cpp
+    ocr_post.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     Threads::Threads
@@ -50,6 +53,18 @@ if(TARGET gufo_ccip)
     endif()
   elseif(MSVC)
     set_source_files_properties("${_ccip_simd}" PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  endif()
+  # The OCR box geometry repeats OpenCV's and Clipper's float/double steps
+  # exactly (imgutils parity): no FMA contraction there.
+  set(_ccip_ocr_post "${GUFO_EXTENSION_BUILD_ROOT}/ocr_post.cpp")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+      set_source_files_properties("${_ccip_ocr_post}" PROPERTIES COMPILE_OPTIONS "/clang:-ffp-contract=off")
+    else()
+      set_source_files_properties("${_ccip_ocr_post}" PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
+  elseif(MSVC)
+    set_source_files_properties("${_ccip_ocr_post}" PROPERTIES COMPILE_OPTIONS "/fp:precise")
   endif()
 endif()
 
@@ -76,6 +91,27 @@ gufo_extension_target(
     gufo_ccip
     gufo_ext_runtime
 )
+
+# /v1/vision/detect "ocr" against dghs-imgutils (reference/make_ocr_oracle.py).
+# Needs GUFO_OCR_DIR (ch_PP-OCRv4_det/rec from reference/convert_ocr.py) and
+# GUFO_OCR_ORACLE (manifest.json + ocr_*.safetensors); skips (77) otherwise.
+gufo_extension_target(
+  NAME ocr_oracle_test
+  SOURCES
+    tests/ocr_oracle_test.cpp
+  LINK_LIBRARIES
+    gufo_ccip
+    gufo_ext_runtime
+)
+
+if(TARGET ocr_oracle_test)
+  ccip_use_openmp(ocr_oracle_test)
+  add_test(NAME ccip.ocr_oracle COMMAND ocr_oracle_test)
+  set_tests_properties(ccip.ocr_oracle PROPERTIES
+    LABELS "ccip;cpu;quality;external-model"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 1200)
+endif()
 
 if(TARGET vision_oracle_test)
   ccip_use_openmp(vision_oracle_test)

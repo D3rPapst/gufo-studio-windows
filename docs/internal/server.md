@@ -834,8 +834,8 @@ weights 19595/38470/7471) is below 70, the detectors see a copy with
 `kopf`, `gesicht`, `hand` = `detections.person|head|face|hand` as
 `box + [round(score, 2)]`.
 
-`ocr` and `wd14_tags` are accepted task names that answer
-`501 task_not_available` until their models are ported. The detectors live in
+`wd14_tags` is an accepted task name that answers `501 task_not_available`
+until its model is ported. The detectors live in
 `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) as
 `<model>.safetensors` + `.json` from
 `extensions-ours/ccip/reference/convert_weights.py yolo <model.onnx> <dir> <model>`
@@ -854,6 +854,53 @@ Tests: `router_vision_test` (parsing and errors; with `GUFO_VISION_DIR` and
 `GUFO_VISION_FRAME` real detections, the Ablage path and the queue) and
 `ccip.vision_oracle` (`vision_oracle_test` against
 `reference/make_vision_oracle.py`, which runs imgutils itself).
+
+#### Text recognition (task `ocr`)
+
+`ocr` is `imgutils.ocr.ocr` with its defaults: PaddleOCR PP-OCRv4 mobile from
+`deepghs/paddleocr` (`det/ch_PP-OCRv4_det`, DBNet with a PP-LCNetV3 backbone,
+4.7 MB; `rec/ch_PP-OCRv4_rec`, SVTR-LCNet with CTC over `<blank>` + 6623
+`dict.txt` symbols + space, 10.8 MB; PaddleOCR Apache-2.0). It is not part of
+the default task list. `thresholds.ocr` takes `heat` (0.3) and `box` (0.7).
+Steps (`gufo_ccip` `TextOcr`, `extensions-ours/ccip/ocr.hpp`):
+
+1. Detector input at full resolution, padded right/bottom with zeros to
+   multiples of 64, `x/255`, then normalised with the CLIP mean/std (an
+   imgutils choice, computed in float64 like numpy).
+2. Heat map cropped to the image; `heat >= 0.3` gives the bitmap; contours as
+   OpenCV `findContours(RETR_LIST, CHAIN_APPROX_SIMPLE)`; per contour (at most
+   1000) `minAreaRect` (short side >= 3), score = mean heat inside the box
+   (`fillPoly` mask), dropped below 0.7; the box grows by
+   `area * 2.0 / perimeter` with a Clipper round offset, `minAreaRect` again
+   (short side >= 5), corners rounded half to even and clipped to the image.
+3. Per box the axis-aligned rectangle is cropped, turned by Pillow's
+   `rotate(90)` without expand when its height is >= 1.5 x its width (the
+   picture keeps its size, so tall boxes mostly read as empty text, as in
+   imgutils), resized to height 48 with BICUBIC, `(x/255 - 0.5)/0.5`; CTC
+   greedy decoding drops blanks and keeps repeats (imgutils'
+   `is_remove_duplicate=False`); text score = mean of the step maxima.
+4. `score = box score x text score`, sorted descending.
+
+The networks run on a small graph runtime (`cpu/ocr_net.cpp`, NCHW fp32,
+OpenMP) over the node list that `reference/convert_ocr.py` writes from the
+paddle2onnx export (float constants to `<stem>.safetensors`, int64 constants
+and nodes to `<stem>.json`; ops the runtime lacks are refused at conversion).
+The geometry of step 2 is ported line by line from OpenCV 4.11 (contours,
+convex hull, rotating calipers, `boxPoints`, `fillPoly`) and Clipper 6.4.2
+(round offset), so on the same heat map the boxes equal imgutils'. Files in
+`--vision-dir`: `ch_PP-OCRv4_det.{safetensors,json}`,
+`ch_PP-OCRv4_rec.{safetensors,json}`, `ch_PP-OCRv4_rec.dict.txt` (~16 MB,
+loaded on the first ocr request; missing: `503 vision_unavailable`). An
+empty rectangle gives empty text with score 0 (imgutils would raise).
+Test: `ccip.ocr_oracle` (`ocr_oracle_test`, env `GUFO_OCR_DIR`,
+`GUFO_OCR_ORACLE`) against `reference/make_ocr_oracle.py`, which runs
+imgutils itself (`--render` draws German and English name plates, signs and
+screens): detector input and recognizer crops bit-exact, boxes on the
+onnxruntime heat map identical, end to end same texts, rectangles within
+2 px, scores within 1e-3.
+Measured on the six rendered images (640x480 to 1344x768, 8 threads, Ryzen AI
+Max+ 395): 0.56-1.76 s per image, mean 1.06 s; imgutils with onnxruntime
+0.63 s. Rectangles were identical, scores within 5e-6.
 
 ### Video concat (`POST /v1/videos/concat`)
 

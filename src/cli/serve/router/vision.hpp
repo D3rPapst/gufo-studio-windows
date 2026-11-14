@@ -3,13 +3,15 @@
 
 // Image recognition for the film pipeline (`POST /v1/vision/detect`): the
 // detectors of dghs-imgutils (detect_person, detect_heads, detect_faces,
-// detect_hands) with the same default models and thresholds, natively on the
-// CPU (gufo_ccip YoloDetector, OpenMP), without Python or ONNX at run time.
+// detect_hands) and its text recognition (imgutils.ocr.ocr) with the same
+// default models and thresholds, natively on the CPU (gufo_ccip YoloDetector
+// and TextOcr, OpenMP), without Python or ONNX at run time.
 //
 //   POST /v1/vision/detect
 //     {"image": "<data URL | base64 | https URL | /v1/jobs/<id>/files/<name>>",
-//      "tasks": ["person", "head", "face", "hand"],
-//      "thresholds": {"person": {"conf": 0.3, "iou": 0.5}}}   optional
+//      "tasks": ["person", "head", "face", "hand", "ocr"],
+//      "thresholds": {"person": {"conf": 0.3, "iou": 0.5},
+//                     "ocr": {"heat": 0.3, "box": 0.7}}}       optional
 //     ("bild" and "aufgaben" are accepted for image and tasks.)
 //     "brighten_dark": true | {"below": 70, "gamma": 0.5}   optional: when
 //     the mean luma (Pillow "L") is below `below`, the detectors run on a
@@ -22,12 +24,18 @@
 //       (score: the float32 value as imgutils returns it, unrounded)
 //       "models": {"person": {"repo", "model", "conf", "iou"}, ...},
 //       "seconds": compute time, "queue_seconds": wait before it}
+//   "ocr" (not in the default task list) answers
+//     [{"box": [x0, y0, x1, y1], "points": [[x, y] x 4], "text": "...",
+//       "score": det * text, "det_score", "text_score"}, ...]
+//   with models.ocr = {"repo", "model", "rec_model", "heat", "box"}.
 //   Boxes are integer pixels of the input image, sorted by score (imgutils
-//   order). "ocr" and "wd14_tags" are known tasks that this build does not
-//   run yet: 501 "task_not_available". Unknown task or bad threshold: 400.
+//   order). "wd14_tags" is a known task that this build does not run yet:
+//   501 "task_not_available". Unknown task or bad threshold: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
 //   use and kept (person m ~100 MB, the s models ~43 MB each, host RAM);
+//   ocr: ch_PP-OCRv4_det.*, ch_PP-OCRv4_rec.* and ch_PP-OCRv4_rec.dict.txt
+//   from extensions-ours/ccip/reference/convert_ocr.py (~16 MB);
 //   503 "vision_unavailable" when a file is missing.
 //   Queue: one request computes at a time (FIFO, --vision-threads OpenMP
 //   threads), so parallel callers wait instead of fighting for the cores;
@@ -73,11 +81,17 @@ struct Request {
   bool brighten_dark{false};
   double dark_below{70.0};
   double dark_gamma{0.5};  // models::ccip::MeanLuma / ApplyGamma
+  /// "ocr" requested (imgutils.ocr.ocr), with its two thresholds
+  /// (heat_threshold, box_threshold; imgutils defaults).
+  bool ocr = false;
+  double ocr_heat = 0.3;
+  double ocr_box = 0.7;
 };
 
 /// Parses and checks a request body; throws std::invalid_argument with a
 /// message for the 400 answer, and std::domain_error naming a planned task
-/// (501). Tasks default to all four detectors; duplicates are dropped.
+/// (501). Tasks default to all four detectors (ocr only on request);
+/// duplicates are dropped.
 Request ParseRequest(const json::Value& body);
 
 struct Options {
