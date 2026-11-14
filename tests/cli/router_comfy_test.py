@@ -290,7 +290,8 @@ def free_port():
 
 
 class Router:
-    def __init__(self, binary, tmp, comfy_dir, ffmpeg=None):
+    def __init__(self, binary, tmp, comfy_dir, ffmpeg=None, extra_args=(),
+                 extra_preset=""):
         self.port = free_port()
         self.tmp = tmp
         self.fake_log = os.path.join(tmp, "fake.jsonl")
@@ -304,6 +305,8 @@ class Router:
                       "ace-step-1.5-xl-turbo", "wan2.1-uni3c"):
             sections.append("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
                             "served-model-name = %s\n" % (model, python, THIS, model))
+        if extra_preset:
+            sections.append(extra_preset)
         with open(preset, "w") as handle:
             handle.write("\n".join(sections))
         env = {k: v for k, v in os.environ.items()
@@ -313,6 +316,7 @@ class Router:
                 "--port", str(self.port), "--models-max", "1", "--comfy-dir", comfy_dir]
         if ffmpeg:
             args += ["--comfy-ffmpeg", ffmpeg]
+        args += list(extra_args)
         self.log = open(os.path.join(tmp, "router.log"), "ab")
         self.proc = subprocess.Popen(args, env=env, stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 20
@@ -1127,6 +1131,148 @@ def check_queue_history_free(router):
     return list(router.json("GET", "/history")[1])
 
 
+def wait_until(what, check, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(0.05)
+    raise AssertionError("timed out waiting for " + what)
+
+
+def running_ids(router, path="/queue"):
+    status, queue = router.json("GET", path)
+    assert status == 200, queue
+    return [item[1] for item in queue["queue_running"]]
+
+
+def check_parallel(router):
+    """--comfy-parallel 2: two prompts run at the same time, a third waits;
+    /queue, /prompt, /filmstudio/progress, /ws, /interrupt and /history keep
+    each prompt apart."""
+    ws = WsClient(router.port, "/ws?clientId=par")
+    assert ws.message()["type"] == "status"
+    first = router.submit(qwen_graph(prompt="SLOW par one", prefix="film/par/one"),
+                          client_id="par")
+    second = router.submit(qwen_graph(prompt="SLOW par two", prefix="film/par/two"),
+                           client_id="par")
+    third = router.submit(qwen_graph(prompt="SLOW par three", prefix="film/par/three"),
+                          client_id="par")
+    wait_until("two running prompts",
+               lambda: running_ids(router) == [first, second])
+    status, queue = router.json("GET", "/queue")
+    assert [item[1] for item in queue["queue_pending"]] == [third], queue
+    assert router.json("GET", "/prompt")[1] == {"exec_info": {"queue_remaining": 3}}
+    # Without ?pool=1 nothing about a partner is added.
+    assert "partner" not in queue, queue
+    progress = wait_until(
+        "film studio progress of both",
+        lambda: (lambda body: body if len(body["running"]) == 2 else None)(
+            router.json("GET", "/filmstudio/progress")[1]))
+    assert progress["prompt_id"] == first, progress
+    assert [item["prompt_id"] for item in progress["running"]] == [first, second]
+    assert all(item["node"] == "6" for item in progress["running"]), progress
+    status, picked = router.json("GET", "/filmstudio/progress?prompt_id=" + second)
+    assert picked["prompt_id"] == second, picked
+    # Interrupt names one prompt: only that one stops.
+    assert router.request("POST", "/interrupt", {"prompt_id": second})[0] == 200
+    done = {}
+    events = {first: [], second: [], third: []}
+    deadline = time.monotonic() + 60
+    while len(done) < 3 and time.monotonic() < deadline:
+        message = ws.message()
+        prompt_id = message["data"].get("prompt_id")
+        if prompt_id not in events:
+            continue
+        events[prompt_id].append(message["type"])
+        if message["type"] == "executing" and message["data"]["node"] is None:
+            done[prompt_id] = True
+    ws.close()
+    assert len(done) == 3, (done, events)
+    assert events[first][0] == "execution_start", events
+    assert "execution_success" in events[first], events
+    assert "execution_interrupted" in events[second], events
+    assert "execution_success" not in events[second], events
+    assert "execution_success" in events[third], events
+    status, history = router.json("GET", "/history")
+    assert history[first]["status"]["status_str"] == "success"
+    assert history[second]["status"]["status_str"] == "error"
+    assert history[third]["status"]["status_str"] == "success"
+    names = {history[p]["outputs"]["8"]["images"][0]["filename"]
+             for p in (first, third)}
+    assert names == {"one_00001_.png", "three_00001_.png"}, names
+    wait_until("an empty queue", lambda: router.json("GET", "/queue")[1] ==
+               {"queue_running": [], "queue_pending": []})
+    status, body = router.json("GET", "/filmstudio/progress")
+    assert body["prompt_id"] is None and body["running"] == [], body
+
+    # Interrupt without a prompt id stops every running prompt.
+    first = router.submit(qwen_graph(prompt="SLOW all one", prefix="film/par/all"))
+    second = router.submit(qwen_graph(prompt="SLOW all two", prefix="film/par/all"))
+    wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+    assert router.request("POST", "/interrupt", b"")[0] == 200
+    for prompt_id in (first, second):
+        entry = router.wait(prompt_id)
+        assert entry["status"]["status_str"] == "error", entry["status"]
+        kinds = [m[0] for m in entry["status"]["messages"]]
+        assert "execution_interrupted" in kinds, kinds
+
+
+def check_pool_view(binary, tmp, partner):
+    """GET /queue?pool=1 adds the partner router's ComfyUI queue (each item
+    names its router in extra_data.gufo_router); /prompt?pool=1 counts it."""
+    view_tmp = os.path.join(tmp, "view")
+    os.makedirs(view_tmp, exist_ok=True)
+    remote = ("[remote/partner-image]\nurl = http://127.0.0.1:%d\n"
+              "modality = image\n" % partner.port)
+    viewer = Router(binary, view_tmp, os.path.join(view_tmp, "comfy"),
+                    extra_args=["--remote-allow", "127.0.0.1"],
+                    extra_preset=remote)
+    partner_name = "http://127.0.0.1:%d" % partner.port
+    try:
+        status, queue = viewer.json("GET", "/queue?pool=1")
+        assert queue == {"queue_running": [], "queue_pending": [],
+                         "partner": partner_name}, queue
+        # The partner itself has no partner.
+        status, queue = partner.json("GET", "/queue?pool=1")
+        assert queue["partner"] == "none", queue
+        busy = partner.submit(qwen_graph(prompt="SLOW pool view", prefix="film/par/view"))
+        wait_until("the partner's prompt in the pool view",
+                   lambda: running_ids(viewer, "/queue?pool=1") == [busy])
+        status, queue = viewer.json("GET", "/queue?scope=pool")
+        item = queue["queue_running"][0]
+        assert item[3]["gufo_router"] == partner_name, item[3]
+        # Plain /queue and a relayed one stay local.
+        assert running_ids(viewer) == []
+        status, payload = viewer.request("GET", "/queue?pool=1",
+                                         headers={"X-Gufo-Relay": "1"})
+        assert json.loads(payload) == {"queue_running": [], "queue_pending": []}, payload
+        status, info = viewer.json("GET", "/prompt?pool=1")
+        assert info["exec_info"]["queue_remaining"] == 1, info
+        assert info["partner"] == partner_name, info
+        # A local prompt is tagged "local".
+        own = viewer.submit(qwen_graph(prompt="SLOW pool own", prefix="film/par/own"))
+        status, queue = viewer.json("GET", "/queue?pool=1")
+        tags = {item[1]: item[3]["gufo_router"]
+                for key in ("queue_running", "queue_pending") for item in queue[key]}
+        assert tags.get(own) == "local", tags
+        partner.wait(busy)
+        viewer.wait(own)
+        wait_until("an idle pool", lambda: viewer.json("GET", "/prompt?pool=1")[1]
+                   ["exec_info"]["queue_remaining"] == 0)
+        # A partner that is gone: "unreachable", the local queue still comes.
+        partner.stop()
+        status, queue = viewer.json("GET", "/queue?pool=1")
+        assert status == 200 and queue["partner"] == "unreachable", queue
+        assert queue["queue_running"] == [] and queue["queue_pending"] == [], queue
+    except BaseException:
+        print(viewer.tail())
+        raise
+    finally:
+        viewer.stop()
+
+
 def check_autoload_retry(binary, tmp):
     """A failed --autoload keeps the router up: the model is listed as
     failed, other models and pages answer, and a later retry loads it."""
@@ -1274,6 +1420,20 @@ def main():
         assert entry["outputs"]["8"]["images"][0]["filename"] == "demo_00003_.png"
     finally:
         router.stop()
+    # Two prompts at once (2.1) and the pool view of the queue.
+    par_tmp = os.path.join(tmp, "parallel")
+    os.makedirs(par_tmp, exist_ok=True)
+    router = Router(binary, par_tmp, os.path.join(par_tmp, "comfy"),
+                    extra_args=["--comfy-parallel", "2"])
+    try:
+        check_parallel(router)
+        check_pool_view(binary, tmp, router)
+    except BaseException:
+        print(router.tail())
+        raise
+    finally:
+        if router.proc.poll() is None:
+            router.stop()
     if not os.environ.get("COMFY_SKIP_AUTOLOAD"):
         check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)

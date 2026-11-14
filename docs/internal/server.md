@@ -491,6 +491,8 @@ Router:
   --comfy-ffmpeg <FILE>         ffmpeg for the ComfyUI API: FLAC audio, PNG frames from videos,
                                 non-WAV voice references; also POST /v1/videos/concat
                                 (ffprobe is expected next to it)
+  --comfy-parallel <N>          ComfyUI prompts running at the same time (default: --jobs-parallel);
+                                with placement = pool the second one's requests can run on the partner
   --names-file <FILE>           Serve GET /v1/names and /v1/names/origins from FILE
                                 (UTF-8 lines kind<TAB>name<TAB>origin<TAB>gender, kind nach|vor)
   --ccip-model-dir <DIR>        CCIP character fingerprints for POST /v1/figuren "verfahren": "ccip"
@@ -773,6 +775,55 @@ is 60 fps, so a `CreateVideo` at 60 fps and a `SaveImage` of the same
 graph name one output. Outputs of one video job must share the RIFE
 multiplier and the upscale; target frame rates only have to agree with
 each other within 0.5 % (59.94 ~ 60), and the error names what differs.
+
+**Parallel prompts and the pool view (2.1).** The adapter runs up to
+`--comfy-parallel` prompts at once (default: `--jobs-parallel`, at least
+1; with 1 everything behaves as before), first in, first out: a prompt
+starts as soon as a slot is free. Each running prompt has its own
+cancel flag, live state and preview id; `/history`, the `/ws` events
+(every event names its `prompt_id`) and the previews never mix two
+prompts. `GET /queue` lists every running prompt in `queue_running`
+(oldest start first) and `queue_remaining` counts running plus waiting.
+`POST /interrupt` with `{"prompt_id": id}` stops only that prompt, an
+empty body stops every running prompt (ComfyUI's global interrupt);
+waiting prompts are removed with `POST /queue {"delete": [...]}` as
+before. `GET /filmstudio/progress` keeps its top-level fields for the
+oldest running prompt (or the one `?prompt_id=` names) and adds
+`"running"`: the same fields for each running prompt; `GET
+/filmstudio/preview?prompt_id=` answers that prompt's newest preview
+(204 while it has none).
+
+The prompts' requests go through the router like any client (origin
+`comfy`), so with placement = pool each request is placed on its own:
+while the first prompt's image or video model works here (`gpu_busy`:
+another GPU model of this machine is busy), the second prompt's request
+of another pool model goes to a free partner, and two requests of the
+same model take the warm machine first and spill to the partner after
+`kPoolSpillAfter` (10 s), like any two pool requests. A model in use is
+never evicted: when the partner is busy too, the request waits in the
+pool (`choice=wait reason="both busy"`); a model that is not a pool
+model loads here only when the memory guard finds room (evicting idle
+models only) and otherwise waits for it within `--load-timeout-seconds`,
+so two long prompts with different large local-only models can time out
+the second one's load. The adapter's queue counts as GPU work for the
+partner's view either way (`activity.gpu_busy`), so pool requests of
+other clients avoid a machine with running ComfyUI prompts.
+
+`GET /queue?pool=1` (also `?scope=pool`) adds the partner router's
+ComfyUI queue (the pool partner as for `GET /v1/jobs?scope=pool`; its
+`GET /queue`, 3 s to connect and answer): its items follow this router's
+in `queue_running` and `queue_pending`, every item of the pool view
+carries `extra_data.gufo_router` (`"local"` or the partner's
+`http://host:port`), and `"partner"` says what was read: the partner's
+address, `"unreachable"` (the local queue still comes; the partner is
+not asked again for 10 s), `"no_comfy"` (its router answers 404, no
+`--comfy-dir`) or `"none"` (no partner). `GET /prompt?pool=1` adds the
+partner's running and waiting prompts to `exec_info.queue_remaining`
+and names `"partner"` the same way. A request with `X-Gufo-Relay` or
+`X-Gufo-Forwarded` is answered locally, so the two routers never ask
+each other in a loop. A pipeline that waits until both machines are free
+of ComfyUI work polls one router's `GET /queue?pool=1` until both lists
+are empty and `"partner"` is not `"unreachable"`.
 
 ### Figure check (`POST /v1/figuren`)
 

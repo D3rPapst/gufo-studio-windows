@@ -40,6 +40,7 @@
 #include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/pool.hpp"
+#include "src/cli/serve/router/remote.hpp"
 #include "src/cli/serve/websocket.hpp"
 
 namespace gufo::router::comfy {
@@ -412,19 +413,108 @@ Adapter::~Adapter() {
 }
 
 void Adapter::Start() {
-  worker_ = std::thread([this] { WorkerMain(); });
+  const std::size_t threads = std::max<std::size_t>(1, options_.parallel);
+  for (std::size_t i = 0; i < threads; ++i)
+    workers_.emplace_back([this] { WorkerMain(); });
 }
 
 void Adapter::Stop() {
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     stopping_ = true;
-    if (running_)
-      running_->cancel.store(true);
+    for (const auto& job : running_)
+      job->cancel.store(true);
   }
   wake_.notify_all();
-  if (worker_.joinable())
-    worker_.join();
+  for (std::thread& worker : workers_)
+    if (worker.joinable())
+      worker.join();
+  workers_.clear();
+}
+
+void Adapter::SetPartner(std::string name, Fetch fetch) {
+  partner_name_ = std::move(name);
+  partner_fetch_ = std::move(fetch);
+}
+
+namespace {
+
+/// GET /queue?pool=1 (or scope=pool) asks for the pool view; a request
+/// another router relayed is always answered locally, so the two routers
+/// cannot ask each other in a loop.
+bool WantsPoolView(const HttpRequest& request) {
+  if (!request.header(jobs::kRelayHeader).empty() ||
+      !request.header(kForwardedHeader).empty())
+    return false;
+  const std::string pool = request.query_param("pool");
+  return pool == "1" || pool == "true" ||
+         request.query_param("scope") == "pool";
+}
+
+/// A queue item ([number, id, prompt, extra_data, outputs]) with
+/// extra_data.gufo_router = `router` ("local" or the partner's URL).
+json::Value TagQueueItem(const json::Value& item, const std::string& router) {
+  if (!item.is_array())
+    return item;
+  json::Value out = json::Value::array();
+  std::size_t index = 0;
+  for (const json::Value& part : item.items()) {
+    if (index++ == 3 && part.is_object()) {
+      json::Value extra = part;
+      extra["gufo_router"] = router;
+      out.push_back(std::move(extra));
+    } else {
+      out.push_back(part);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+std::optional<json::Value> Adapter::PartnerQueue(std::string* state) {
+  if (!partner_fetch_) {
+    *state = "none";
+    return std::nullopt;
+  }
+  {
+    const std::lock_guard<std::mutex> lock(partner_mutex_);
+    if (std::chrono::steady_clock::now() < partner_retry_at_) {
+      *state = "unreachable";
+      return std::nullopt;
+    }
+  }
+  HttpRequest ask;
+  ask.method = "GET";
+  ask.path = "/queue";
+  ask.request_id = "comfy-pool-queue";
+  ask.headers.emplace_back(jobs::kRelayHeader, "1");
+  FetchResult answer;
+  try {
+    answer = partner_fetch_(ask);
+  } catch (const std::exception&) {
+    answer.status = 0;
+  }
+  if (answer.status == 200) {
+    try {
+      json::Value body = json::parse(answer.body);
+      if (body.is_object()) {
+        *state = partner_name_;
+        return body;
+      }
+    } catch (const std::exception&) {
+    }
+  }
+  if (answer.status == 404 || answer.status == 405) {
+    *state = "no_comfy";  // the partner runs no --comfy-dir
+    return std::nullopt;
+  }
+  *state = "unreachable";
+  const std::lock_guard<std::mutex> lock(partner_mutex_);
+  // One slow answer per 10 s at most while the partner is gone.
+  partner_retry_at_ =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  return std::nullopt;
 }
 
 std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
@@ -444,15 +534,10 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
         return Submit(request);
       if (auto bad = only("GET"))
         return bad;
-      const std::lock_guard<std::mutex> lock(mutex_);
-      json::Value info = json::Value::object();
-      info["queue_remaining"] = QueueRemainingLocked();
-      json::Value body = json::Value::object();
-      body["exec_info"] = std::move(info);
-      return JsonResponse(200, body);
+      return PromptGet(request);
     }
     if (path == "/queue")
-      return method == "POST" ? QueuePost(request) : QueueGet();
+      return method == "POST" ? QueuePost(request) : QueueGet(request);
     if (path == "/history")
       return method == "POST" ? HistoryPost(request) : HistoryGet(request, "");
     if (path.starts_with("/history/")) {
@@ -504,12 +589,12 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
     if (path == "/filmstudio/progress") {
       if (auto bad = only("GET"))
         return bad;
-      return FilmstudioProgress();
+      return FilmstudioProgress(request);
     }
     if (path == "/filmstudio/preview") {
       if (auto bad = only("GET"))
         return bad;
-      return FilmstudioPreview();
+      return FilmstudioPreview(request);
     }
   } catch (const std::exception& error) {
     Logger::Warn("comfy", std::string("event=request_failed path=") +
@@ -631,20 +716,68 @@ json::Value Adapter::QueueItemLocked(const Job& job) const {
 }
 
 int Adapter::QueueRemainingLocked() const {
-  return static_cast<int>(pending_.size()) + (running_ ? 1 : 0);
+  return static_cast<int>(pending_.size() + running_.size());
 }
 
-HttpResponse Adapter::QueueGet() {
-  const std::lock_guard<std::mutex> lock(mutex_);
+HttpResponse Adapter::QueueGet(const HttpRequest& request) {
+  const bool pool = WantsPoolView(request);
+  // The partner first, without the lock (up to a few seconds).
+  std::string partner_state;
+  std::optional<json::Value> partner;
+  if (pool)
+    partner = PartnerQueue(&partner_state);
   json::Value running = json::Value::array();
-  if (running_)
-    running.push_back(QueueItemLocked(*running_));
   json::Value pending = json::Value::array();
-  for (const auto& job : pending_)
-    pending.push_back(QueueItemLocked(*job));
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& job : running_)
+      running.push_back(pool ? TagQueueItem(QueueItemLocked(*job), "local")
+                             : QueueItemLocked(*job));
+    for (const auto& job : pending_)
+      pending.push_back(pool ? TagQueueItem(QueueItemLocked(*job), "local")
+                             : QueueItemLocked(*job));
+  }
+  if (partner.has_value()) {
+    if (const json::Value* items = partner->find("queue_running");
+        items != nullptr && items->is_array())
+      for (const json::Value& item : items->items())
+        running.push_back(TagQueueItem(item, partner_name_));
+    if (const json::Value* items = partner->find("queue_pending");
+        items != nullptr && items->is_array())
+      for (const json::Value& item : items->items())
+        pending.push_back(TagQueueItem(item, partner_name_));
+  }
   json::Value body = json::Value::object();
   body["queue_running"] = std::move(running);
   body["queue_pending"] = std::move(pending);
+  if (pool)
+    body["partner"] = partner_state;
+  return JsonResponse(200, body);
+}
+
+HttpResponse Adapter::PromptGet(const HttpRequest& request) {
+  const bool pool = WantsPoolView(request);
+  std::string partner_state;
+  std::optional<json::Value> partner;
+  if (pool)
+    partner = PartnerQueue(&partner_state);
+  int remaining = 0;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    remaining = QueueRemainingLocked();
+  }
+  if (partner.has_value()) {
+    for (const char* key : {"queue_running", "queue_pending"})
+      if (const json::Value* items = partner->find(key);
+          items != nullptr && items->is_array())
+        remaining += static_cast<int>(items->size());
+  }
+  json::Value info = json::Value::object();
+  info["queue_remaining"] = remaining;
+  json::Value body = json::Value::object();
+  body["exec_info"] = std::move(info);
+  if (pool)
+    body["partner"] = partner_state;
   return JsonResponse(200, body);
 }
 
@@ -714,10 +847,14 @@ HttpResponse Adapter::Interrupt(const HttpRequest& request) {
     } catch (const std::exception&) {
     }
   }
+  // Without a prompt id every running prompt stops (ComfyUI's global
+  // interrupt); with one only that prompt.
   const std::lock_guard<std::mutex> lock(mutex_);
-  if (running_ && (wanted.empty() || wanted == running_->id)) {
-    running_->cancel.store(true);
-    Logger::Info("comfy", "event=interrupt prompt_id=" + running_->id);
+  for (const auto& job : running_) {
+    if (!wanted.empty() && wanted != job->id)
+      continue;
+    job->cancel.store(true);
+    Logger::Info("comfy", "event=interrupt prompt_id=" + job->id);
   }
   return EmptyOk();
 }
@@ -983,10 +1120,12 @@ void Adapter::Emit(const std::string& client, std::string_view type,
   const std::string prompt_id = progress ? data.member_str("prompt_id") : "";
   message["data"] = std::move(data);
   const std::lock_guard<std::mutex> lock(mutex_);
-  if (progress && prompt_id == live_.prompt_id) {
-    live_.value = value;
-    live_.max = max;
-    live_.has_progress = true;
+  if (progress) {
+    if (const auto live = live_.find(prompt_id); live != live_.end()) {
+      live->second.value = value;
+      live->second.max = max;
+      live->second.has_progress = true;
+    }
   }
   events_.push_back(Event{next_event_++, client, message.dump()});
   while (events_.size() > 4096)
@@ -1009,6 +1148,8 @@ void Adapter::EmitPreview(const std::string& client,
   previews_[client] =
       Preview{next_preview_++, prompt_id, node_id, std::move(jpeg)};
   last_preview_ = previews_[client];
+  if (live_.contains(prompt_id))
+    prompt_previews_[prompt_id] = last_preview_;
 }
 
 void Adapter::RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
@@ -1068,46 +1209,71 @@ void Adapter::RelayPreviews(const std::shared_ptr<Job>& job, const Task& task,
   }
 }
 
-HttpResponse Adapter::FilmstudioProgress() {
+HttpResponse Adapter::FilmstudioProgress(const HttpRequest& request) {
   const double now = std::chrono::duration<double>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+  const std::string wanted = request.query_param("prompt_id");
   const std::lock_guard<std::mutex> lock(mutex_);
   http_watch_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  const auto describe = [this](const Live& live, json::Value* out) {
+    json::Value& body = *out;
+    body["prompt_id"] = live.prompt_id;
+    body["node"] = live.node;
+    body["class_type"] = live.class_type;
+    if (live.has_progress) {
+      body["value"] = live.value;
+      body["max"] = live.max;
+    } else {
+      body["value"] = 0;
+      body["max"] = 1;
+    }
+    body["nodes_done"] = live.nodes_done;
+    body["nodes_total"] = live.nodes_total;
+    if (const auto preview = prompt_previews_.find(live.prompt_id);
+        preview != prompt_previews_.end() && !preview->second.jpeg.empty())
+      body["preview"] = static_cast<double>(preview->second.seq);
+    else
+      body["preview"] = nullptr;
+  };
+  // Every running prompt in start order (2.1: several run at once); the
+  // top-level fields describe the oldest one, or the one ?prompt_id= names.
+  json::Value all = json::Value::array();
+  const Live* top = nullptr;
+  for (const auto& job : running_) {
+    const auto live = live_.find(job->id);
+    if (live == live_.end() || live->second.node.empty())
+      continue;  // picked up, its first task has not started yet
+    json::Value item = json::Value::object();
+    describe(live->second, &item);
+    all.push_back(std::move(item));
+    if (wanted.empty() ? top == nullptr : wanted == job->id)
+      top = &live->second;
+  }
   json::Value body = json::Value::object();
-  if (live_.prompt_id.empty()) {
+  if (top == nullptr)
     body["prompt_id"] = nullptr;
-    body["time"] = now;
-    return JsonResponse(200, body);
-  }
-  body["prompt_id"] = live_.prompt_id;
-  body["time"] = now;
-  body["node"] = live_.node;
-  body["class_type"] = live_.class_type;
-  if (live_.has_progress) {
-    body["value"] = live_.value;
-    body["max"] = live_.max;
-  } else {
-    body["value"] = 0;
-    body["max"] = 1;
-  }
-  body["nodes_done"] = live_.nodes_done;
-  body["nodes_total"] = live_.nodes_total;
-  if (!last_preview_.jpeg.empty() && last_preview_.prompt_id == live_.prompt_id)
-    body["preview"] = static_cast<double>(last_preview_.seq);
   else
-    body["preview"] = nullptr;
+    describe(*top, &body);
+  body["time"] = now;
+  body["running"] = std::move(all);
   return JsonResponse(200, body);
 }
 
-HttpResponse Adapter::FilmstudioPreview() {
+HttpResponse Adapter::FilmstudioPreview(const HttpRequest& request) {
+  const std::string wanted = request.query_param("prompt_id");
   const std::lock_guard<std::mutex> lock(mutex_);
   http_watch_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  if (last_preview_.jpeg.empty())
+  const Preview* preview = &last_preview_;
+  if (!wanted.empty()) {
+    const auto found = prompt_previews_.find(wanted);
+    preview = found == prompt_previews_.end() ? nullptr : &found->second;
+  }
+  if (preview == nullptr || preview->jpeg.empty())
     return HttpResponse{.status = 204, .reason = "No Content"};
   return HttpResponse{.status = 200,
                       .reason = "OK",
-                      .body = last_preview_.jpeg,
+                      .body = preview->jpeg,
                       .headers = {{"Content-Type", "image/jpeg"},
                                   {"Cache-Control", "no-store"}}};
 }
@@ -1270,13 +1436,16 @@ void Adapter::WorkerMain() {
         return;
       job = pending_.front();
       pending_.pop_front();
-      running_ = job;
+      running_.push_back(job);
+      live_[job->id].prompt_id = job->id;
       EmitStatusLocked();
     }
     Execute(job);
     {
       const std::lock_guard<std::mutex> lock(mutex_);
-      running_.reset();
+      std::erase(running_, job);
+      live_.erase(job->id);
+      prompt_previews_.erase(job->id);
       EmitStatusLocked();
     }
   }
@@ -1316,14 +1485,15 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
     Emit(job->client_id, "executing", std::move(executing));
     {
       const std::lock_guard<std::mutex> lock(mutex_);
-      live_.prompt_id = job->id;
-      live_.node = task.node_id;
-      live_.class_type = task.class_type;
-      live_.value = 0;
-      live_.max = 0;
-      live_.has_progress = false;
-      live_.nodes_done = static_cast<int>(executed.size());
-      live_.nodes_total = static_cast<int>(job->plan.tasks.size());
+      Live& live = live_[job->id];
+      live.prompt_id = job->id;
+      live.node = task.node_id;
+      live.class_type = task.class_type;
+      live.value = 0;
+      live.max = 0;
+      live.has_progress = false;
+      live.nodes_done = static_cast<int>(executed.size());
+      live.nodes_total = static_cast<int>(job->plan.tasks.size());
     }
     try {
       if (job->cancel.load())
@@ -1389,7 +1559,8 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
   Emit(job->client_id, "executing", std::move(done));
   {
     const std::lock_guard<std::mutex> lock(mutex_);
-    live_ = Live{};
+    live_.erase(job->id);
+    prompt_previews_.erase(job->id);
   }
   json::Value status = json::Value::object();
   status["status_str"] = ok ? "success" : "error";
