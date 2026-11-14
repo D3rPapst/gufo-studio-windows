@@ -4196,7 +4196,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &ccip_threads);
   parser.AddOption("", "--vision-dir", "DIR",
                    "Models for POST /v1/vision/detect (tasks person, head, face, "
-                   "hand, ocr, wd14_tags: <model>.safetensors + .json, ocr also "
+                   "hand, pose, pose_wholebody, ocr, wd14_tags: <model>.safetensors "
+                   "+ .json, ocr also "
                    "ch_PP-OCRv4_rec.dict.txt; each loaded on first use)",
                    "Router", &vision_dir);
   parser.AddOption("", "--vision-threads", "N",

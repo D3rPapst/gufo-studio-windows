@@ -499,7 +499,7 @@ Router:
   --ccip-face-dir <DIR>         Anime face detector for "verfahren": "ccip"
   --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
   --vision-dir <DIR>            Models for POST /v1/vision/detect (tasks person, head, face, hand,
-                                ocr, wd14_tags: <model>.safetensors + .json, ocr also
+                                pose, pose_wholebody, ocr, wd14_tags: <model>.safetensors + .json, ocr also
                                 ch_PP-OCRv4_rec.dict.txt; each loaded on first use)
   --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
   --vision-queue <N>            Requests of the shared CPU queue (/v1/vision/detect, /v1/figuren

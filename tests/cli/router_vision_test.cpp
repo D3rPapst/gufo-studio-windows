@@ -300,7 +300,7 @@ void TestErrors() {
   // Unknown task: 400 naming every task; no --vision-dir: 503 for each task.
   auto response = service.Handle(Post(Body("AAAA", {"cat"})));
   assert(response->status == 400);
-  assert(response->body.find("person, head, face, hand, ocr, wd14_tags") != std::string::npos);
+  assert(response->body.find("person, head, face, hand, pose, pose_wholebody, ocr, wd14_tags") != std::string::npos);
   for (const char* task : {"person", "ocr", "wd14_tags"}) {
     response = service.Handle(Post(Body("AAAA", {task})));
     assert(response->status == 503);
