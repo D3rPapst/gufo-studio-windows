@@ -132,15 +132,33 @@ bool SendAll(int fd, std::string_view payload) {
 
 /// The pinned interface carries no client request, so the upgrade targets the
 /// worker root; the worker owns routing from the protocol onward.
-std::string BuildHandshake(const UpstreamTarget& target, std::string_view key) {
-  return "GET / HTTP/1.1\r\n"
-         "Host: " +
-         target.host + ":" + std::to_string(target.port) +
-         "\r\nUpgrade: websocket\r\n"
-         "Connection: Upgrade\r\n"
-         "Sec-WebSocket-Version: 13\r\n"
-         "Sec-WebSocket-Key: " +
-         std::string(key) + "\r\n\r\n";
+std::string BuildHandshake(const UpstreamTarget& target, std::string_view key,
+                           std::string_view request_target = "/",
+                           std::string_view protocol = {}) {
+  // Request target and subprotocol come from the router's own parsed request;
+  // reject anything that could split the request line or a header.
+  const auto safe = [](std::string_view text) {
+    return text.find_first_of("\r\n ") == std::string_view::npos;
+  };
+  const std::string_view path =
+      !request_target.empty() && request_target.front() == '/' &&
+              safe(request_target)
+          ? request_target
+          : std::string_view("/");
+  std::string head = "GET " + std::string(path) +
+                     " HTTP/1.1\r\n"
+                     "Host: " +
+                     target.host + ":" + std::to_string(target.port) +
+                     "\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Version: 13\r\n"
+                     "Sec-WebSocket-Key: " +
+                     std::string(key) + "\r\n";
+  if (!protocol.empty() &&
+      protocol.find_first_of("\r\n") == std::string_view::npos) {
+    head += "Sec-WebSocket-Protocol: " + std::string(protocol) + "\r\n";
+  }
+  return head + "\r\n";
 }
 
 /// Status line plus headers, bounded in time and size like the HTTP relay.
@@ -388,6 +406,13 @@ void Pump(int front_fd, int worker_fd, WebSocket& front, std::string pending) {
 
 bool RelayWebSocket(const UpstreamTarget& target,
                     gufo::server::WebSocket& front, std::string* error) {
+  return RelayWebSocket(target, front, "/", {}, error);
+}
+
+bool RelayWebSocket(const UpstreamTarget& target,
+                    gufo::server::WebSocket& front,
+                    std::string_view request_target,
+                    std::string_view protocol, std::string* error) {
   std::string scratch;
   std::string& failure = error != nullptr ? *error : scratch;
   failure.clear();
@@ -412,7 +437,8 @@ bool RelayWebSocket(const UpstreamTarget& target,
     return false;
   }
   const std::string key = FreshKey();
-  if (!SendAll(worker_fd, BuildHandshake(target, key))) {
+  if (!SendAll(worker_fd,
+               BuildHandshake(target, key, request_target, protocol))) {
     failure = "failed to send the websocket handshake";
     net::CloseSocket(worker_fd);
     return false;

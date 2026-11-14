@@ -1360,10 +1360,17 @@ public:
       // closes.
       auto sockets = std::make_shared<HeldWebSocket>(mutex, registry, model_id);
       const std::string ws_model = model_id;
+      // The worker routes by path and checks the subprotocol (realtime
+      // sessions of `gufo serve asr`), so hand both on.
+      const std::string ws_target =
+          req.path + (req.query.empty() ? "" : "?" + req.query);
+      const std::string ws_protocol = req.header("Sec-WebSocket-Protocol");
       HttpResponse upgrade = server::UpgradeWebSocket(
-          req, [target, ws_model, sockets](server::WebSocket& front) {
+          req, [target, ws_model, sockets, ws_target,
+                ws_protocol](server::WebSocket& front) {
             std::string error;
-            if (!router::RelayWebSocket(target, front, &error)) {
+            if (!router::RelayWebSocket(target, front, ws_target, ws_protocol,
+                                        &error)) {
               Logger::Warn("router", "event=ws_relay_end model=" + ws_model +
                                          " error=" + error);
             }
