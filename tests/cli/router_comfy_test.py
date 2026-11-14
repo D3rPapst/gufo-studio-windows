@@ -1005,6 +1005,11 @@ def check_preview_ids(router):
     status, _ = router.request("GET", "/v1/previews/made-up-id/events?model=minimax-h3")
     assert status == 404 and time.monotonic() - started < 5, status
 
+    # No id: 404 (2.1.1 answered /v1/previews/events with a 500).
+    for path in ("/v1/previews/events", "/v1/previews//events", "/v1/previews/"):
+        status, payload = router.request("GET", path)
+        assert status == 404, (path, status, payload)
+
     # At most 4 streams wait at once; the next one is 503 busy.
     first = router.submit(qwen_graph(prompt="SLOW ahead limit", prefix="film/stil/ahead"))
     queued = router.submit(qwen_graph(prompt="SLOW queued limit", prefix="film/stil/queued"))
