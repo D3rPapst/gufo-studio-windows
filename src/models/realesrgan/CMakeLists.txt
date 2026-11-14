@@ -6,12 +6,17 @@
 # (cpu_post), the safetensors header / architecture check of the converted
 # weights (srvgg_weights), and the run-time loaded ONNX Runtime sessions
 # (ort_upscaler).
-add_library(gufo_realesrgan_cpu STATIC cpu_post.cpp srvgg_weights.cpp)
-target_include_directories(gufo_realesrgan_cpu PUBLIC ${PROJECT_SOURCE_DIR})
+# cpu_post is its own library: the HIP upscaler's fit "crop" uses the same
+# INTER_AREA port without pulling in ONNX Runtime's loader.
+add_library(gufo_realesrgan_post STATIC cpu_post.cpp)
+target_include_directories(gufo_realesrgan_post PUBLIC ${PROJECT_SOURCE_DIR})
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
-  target_link_libraries(gufo_realesrgan_cpu PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(gufo_realesrgan_post PRIVATE OpenMP::OpenMP_CXX)
 endif()
+add_library(gufo_realesrgan_cpu STATIC srvgg_weights.cpp)
+target_include_directories(gufo_realesrgan_cpu PUBLIC ${PROJECT_SOURCE_DIR})
+target_link_libraries(gufo_realesrgan_cpu PUBLIC gufo_realesrgan_post)
 if (GUFO_ENABLE_ONNXRUNTIME)
   target_sources(gufo_realesrgan_cpu PRIVATE ort_upscaler.cpp)
   target_include_directories(gufo_realesrgan_cpu PRIVATE
@@ -64,7 +69,8 @@ if (ENGINE_ENABLE_HIP)
     upscale_video.cpp)
   target_include_directories(gufo_realesrgan PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_realesrgan PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
-  target_link_libraries(gufo_realesrgan PUBLIC gufo_rife hip::host)
+  target_link_libraries(gufo_realesrgan PUBLIC gufo_rife gufo_realesrgan_post
+    hip::host)
 
   # Standalone driver with the same options as `gufo video-upscale`.
   add_executable(gufo-upscale EXCLUDE_FROM_ALL

@@ -65,6 +65,26 @@ void ShuffleResidual(const float* body, const std::uint8_t* rgb24, int w,
 bool ResizeAreaRgb8(const std::uint8_t* src, int src_w, int src_h, int src_stride,
                     int dst_w, int dst_h, std::uint8_t* dst, std::string* error);
 
+/// ResizeAreaRgb8 as data for a GPU port with the same float operations:
+/// kCopy (same size), kInteger (OpenCV's integer-factor fast path, factors
+/// sx / sy; 2x2: (sum + 2) >> 2, else round(sum * inv_area)) or kGeneral
+/// (OpenCV's area tables; destination column / row i uses the taps
+/// [first[i], first[i] + count[i]) of `src` (source pixel / row) and `alpha`
+/// in OpenCV's order).
+struct AreaTaps {
+  std::vector<int> first, count, src;
+  std::vector<float> alpha;
+};
+struct AreaResizePlan {
+  enum class Kind : std::uint8_t { kCopy, kInteger, kGeneral };
+  Kind kind{Kind::kCopy};
+  int sx{1}, sy{1};
+  float inv_area{1.0F};
+  AreaTaps x, y;
+};
+bool PlanAreaResize(int src_w, int src_h, int dst_w, int dst_h,
+                    AreaResizePlan* plan, std::string* error);
+
 /// How the x4 picture (in_w x in_h) becomes out_w x out_h with the aspect
 /// ratio kept and the output filled:
 ///   - if cropping the source to the output aspect ratio is exact in whole

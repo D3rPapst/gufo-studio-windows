@@ -19,7 +19,9 @@ All are x4 models with 64 features and PReLU activations. The network follows
 to `3 * 4 * 4` channels, `PixelShuffle(4)` plus the nearest-neighbour
 upsampled input, clamped to [0, 1] (RGB in [0, 1] as `RealESRGANer` feeds it).
 The x4 picture is then resized to the requested size with an antialiased
-Lanczos-3 filter.
+Lanczos-3 filter (`pad`, `stretch`, and `crop` to a size larger than x4);
+`fit crop` cuts like Take One: first in the x4 picture, then `INTER_AREA`
+(see below).
 
 ## Weights
 
@@ -59,9 +61,10 @@ gufo video-upscale --model realesr-animevideov3.safetensors \
 
 `--fit pad` (default) keeps the aspect ratio and the whole picture with black
 bars (832x480 -> picture 1872x1080 at x 24 in 1920x1080); `--fit crop` keeps
-the aspect ratio and fills the frame (centre crop); `--fit stretch` scales each
-axis on its own. Picture sizes and offsets are even, so 4:2:0 chroma stays
-aligned. The output keeps the input frame rate and copies the audio
+the aspect ratio and fills the frame (centre crop, Take One's geometry, see
+below); `--fit stretch` scales each axis on its own. For `pad` and `stretch`
+picture sizes and offsets are even, so 4:2:0 chroma stays aligned. The output
+keeps the input frame rate and copies the audio
 (`--no-audio` drops it); `--crf N` sets the H.264 quality (default 18). An
 output ending in `.png` writes the first frame as an image, so
 `--input key.png --output key-1920.png` upscales a still.
@@ -136,8 +139,27 @@ then OpenCV `INTER_AREA` (bit-exact port) and a centre crop: 896x512 ->
 rows 16..2031 of the x4 picture -> 1920x1080; 832x512 -> 1950x1200 ->
 columns 15..1934 -> 1920x1200 (`fit: "crop"`; this is Take One's NPU path,
 the film itself uses 1920x1080). `pad` and `stretch` use the
-same area filter. One model name may have several files, one per frame
-width; the request's frame picks the file.
+same area filter.
+
+`fit crop` cuts like Take One on every device: first in the x4 picture, then
+`INTER_AREA`. The GPU does the same (after 2.1.3) whenever the output is not
+larger than the x4 picture: the network output is rounded to uint8
+(`uint8(v*255+0.5)`), cropped in whole rows / columns and resized by a GPU
+kernel with the same float operations and OpenCV area tables as the bit-exact
+`INTER_AREA` port (896x512 -> rows 16..2031 of 3584x2048 -> 1920x1080, 8.57
+output lines off top and bottom; 640x480 -> rows 240..1679 of 2560x1920).
+Up to 2.1.3 the GPU resized the whole x4 picture with Lanczos-3 to 1920x1098
+and cut at the even row 8 instead of 8.57, one line off Take One (25-29 dB
+against Take One's crop of the same x4 picture); now the result equals
+`cv2.resize(x4[16:2032], (1920, 1080), interpolation=cv2.INTER_AREA)` (OpenCV
+5.0) pixel for pixel. The GPU's x4 picture differs from the int8 NPU body by
+its quantisation only (~38-39 dB). `scale: 2` with `fit crop` is therefore a
+2x2 area mean on the GPU too. `pad`, `stretch` and `crop` to a size larger
+than x4 keep the GPU's Lanczos-3 placement (`PlaceContent`: even sizes and
+offsets).
+
+One model name may have several files, one per frame width; the request's
+frame picks the file.
 
 ### `POST /v1/images/upscale`
 
@@ -151,8 +173,9 @@ width; the request's frame picks the file.
 - `images`: a list of 1..32 such images (or `{"image": ...}` objects) with
   the same settings, answered in order as `data[i]` with `width`, `height`
   and `input`; sync and `b64_json` only.
-- `scale`: 4 (native) or 2 (the x4 picture resized to half: Lanczos-3 on
-  the GPU, OpenCV-exact `INTER_AREA` on the NPU / CPU). `size: "WxH"` or
+- `scale`: 4 (native) or 2 (the x4 picture resized to half: OpenCV-exact
+  `INTER_AREA` with `fit crop` on every device, Lanczos-3 on the GPU with
+  `pad` / `stretch`). `size: "WxH"` or
   `width` + `height` (at most 8192 on a side) replace the scale and use
   `fit` (`crop` default, `pad`, `stretch`).
 - `output`: `png` (default) or `jpg` (`quality` 1..100, default 90).

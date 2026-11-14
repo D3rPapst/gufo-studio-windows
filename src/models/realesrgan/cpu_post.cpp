@@ -226,6 +226,59 @@ bool ResizeAreaRgb8(const std::uint8_t* src, int src_w, int src_h,
   return true;
 }
 
+namespace {
+
+AreaTaps ToTaps(const std::vector<AreaTap>& tab, int dsize) {
+  AreaTaps t;
+  t.first.assign(static_cast<std::size_t>(dsize), 0);
+  t.count.assign(static_cast<std::size_t>(dsize), 0);
+  t.src.reserve(tab.size());
+  t.alpha.reserve(tab.size());
+  for (std::size_t k = 0; k < tab.size(); ++k) {
+    const auto d = static_cast<std::size_t>(tab[k].di);
+    if (t.count[d] == 0)
+      t.first[d] = static_cast<int>(k);
+    ++t.count[d];
+    t.src.push_back(tab[k].si);
+    t.alpha.push_back(tab[k].alpha);
+  }
+  return t;
+}
+
+}  // namespace
+
+bool PlanAreaResize(int src_w, int src_h, int dst_w, int dst_h,
+                    AreaResizePlan* plan, std::string* error) {
+  if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 ||
+      dst_w > src_w || dst_h > src_h) {
+    if (error != nullptr)
+      *error = "area resize needs 0 < output <= input (" +
+               std::to_string(src_w) + "x" + std::to_string(src_h) + " -> " +
+               std::to_string(dst_w) + "x" + std::to_string(dst_h) + ")";
+    return false;
+  }
+  *plan = AreaResizePlan{};
+  if (dst_w == src_w && dst_h == src_h)
+    return true;
+  // The same decisions as ResizeAreaRgb8.
+  const double scale_x = 1.0 / (static_cast<double>(dst_w) / src_w);
+  const double scale_y = 1.0 / (static_cast<double>(dst_h) / src_h);
+  const int iscale_x = static_cast<int>(std::lround(scale_x));
+  const int iscale_y = static_cast<int>(std::lround(scale_y));
+  if (std::abs(scale_x - iscale_x) < DBL_EPSILON &&
+      std::abs(scale_y - iscale_y) < DBL_EPSILON) {
+    plan->kind = AreaResizePlan::Kind::kInteger;
+    plan->sx = iscale_x;
+    plan->sy = iscale_y;
+    plan->inv_area = 1.0F / static_cast<float>(iscale_x * iscale_y);
+    return true;
+  }
+  plan->kind = AreaResizePlan::Kind::kGeneral;
+  plan->x = ToTaps(AreaTable(src_w, dst_w, 1, scale_x), dst_w);
+  plan->y = ToTaps(AreaTable(src_h, dst_h, 1, scale_y), dst_h);
+  return true;
+}
+
 AreaCropPlan PlanAreaCrop(int in_w, int in_h, int out_w, int out_h) {
   AreaCropPlan p;
   p.crop_w = in_w;

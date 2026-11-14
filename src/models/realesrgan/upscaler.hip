@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <gufo/ext/json.hpp>
+#include "src/models/realesrgan/cpu_post.hpp"
 #include "src/models/realesrgan/tile_plan.hpp"
 #include "src/models/realesrgan/upscaler.hpp"
 
@@ -24,7 +25,10 @@
 // Zero padding at the frame border is the convolution's own padding, and the
 // halo covers the receptive field, so tiles reproduce the whole-frame result.
 // The assembled S x picture (FP32) is resized to the output with separable
-// antialiased Lanczos-3 (horizontal, then vertical into RGB24).
+// antialiased Lanczos-3 (horizontal, then vertical into RGB24). Fit::kCrop to
+// a size not larger than the S x picture instead follows Take One's NPU
+// worker: uint8(v * 255 + 0.5), a centre crop in whole source rows / columns
+// and OpenCV's INTER_AREA with the tables of cpu_post.hpp (AreaKernel).
 
 namespace gufo::models::realesrgan {
 namespace {
@@ -296,6 +300,96 @@ __global__ void AssembleKernel(const float* raw, int tw, int x0, int y0,
     const float v = r[c * S * S + sy * S + sx] + base[c] / 255.0F;
     out[c] = fminf(fmaxf(v, 0.0F), 1.0F);
   }
+}
+
+// One x4 value as Take One stores it: numpy's
+// (np.clip(v, 0, 1) * 255 + 0.5).astype(np.uint8) - float32 product, float32
+// sum, truncation (the picture is already clamped). contract(off) keeps the
+// compiler from fusing the two steps into one FMA (__fmul_rn / __fadd_rn do
+// not: they are ordinary contractable operations after inlining).
+__device__ __forceinline__ int QuantizeU8(float v) {
+#pragma clang fp contract(off)
+  const float scaled = v * 255.0F;
+  return static_cast<int>(scaled + 0.5F);
+}
+
+// OpenCV saturate_cast<uchar>(float): round half to even, clamp.
+__device__ __forceinline__ std::uint8_t RoundU8(float v) {
+  return static_cast<std::uint8_t>(fminf(fmaxf(rintf(v), 0.0F), 255.0F));
+}
+
+struct AreaArgs {
+  const float* picture;  // [H, W, 3] FP32 x4 picture
+  int W;
+  int crop_x, crop_y;    // source crop (whole pixels)
+  int mode;              // 0 copy, 1 integer factors, 2 OpenCV area tables
+  int sx, sy;            // integer factors
+  float inv_area;
+  const int* x_first;    // per resized column: taps, source column
+  const int* x_count;
+  const int* x_src;
+  const float* x_alpha;
+  const int* y_first;    // per resized row: taps, source row
+  const int* y_count;
+  const int* y_src;
+  const float* y_alpha;
+  int out_w, out_h;      // output = resized picture from (out_x, out_y)
+  int out_x, out_y;
+  std::uint8_t* out24;
+};
+
+// cv::resize(INTER_AREA) of the uint8 x4 picture's crop, operation by
+// operation as cpu::ResizeAreaRgb8 (ResizeAreaGeneral / ResizeAreaInteger),
+// one output pixel per thread. HIP contracts a * b + c into an FMA by
+// default, which changes the last bit, hence contract(off).
+__global__ void AreaKernel(AreaArgs a) {
+#pragma clang fp contract(off)
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= static_cast<std::size_t>(a.out_w) * a.out_h)
+    return;
+  const int dy = static_cast<int>(index / a.out_w) + a.out_y;
+  const int dx = static_cast<int>(index % a.out_w) + a.out_x;
+  std::uint8_t* o = a.out24 + index * 3;
+  const auto pixel = [&](int y, int x) {
+    return a.picture + (static_cast<std::size_t>(a.crop_y + y) * a.W +
+                        (a.crop_x + x)) * 3;
+  };
+  if (a.mode == 0) {
+    const float* p = pixel(dy, dx);
+    for (int c = 0; c < 3; ++c)
+      o[c] = static_cast<std::uint8_t>(QuantizeU8(p[c]));
+    return;
+  }
+  if (a.mode == 1) {
+    for (int c = 0; c < 3; ++c) {
+      int sum = 0;
+      for (int y = 0; y < a.sy; ++y)
+        for (int x = 0; x < a.sx; ++x)
+          sum += QuantizeU8(pixel(dy * a.sy + y, dx * a.sx + x)[c]);
+      o[c] = (a.sx == 2 && a.sy == 2)
+                 ? static_cast<std::uint8_t>((sum + 2) >> 2)
+                 : RoundU8(static_cast<float>(sum) * a.inv_area);
+    }
+    return;
+  }
+  float sum[3] = {0.0F, 0.0F, 0.0F};
+  const int y0 = a.y_first[dy], y1 = y0 + a.y_count[dy];
+  const int x0 = a.x_first[dx], x1 = x0 + a.x_count[dx];
+  for (int j = y0; j < y1; ++j) {
+    const float beta = a.y_alpha[j];
+    float buf[3] = {0.0F, 0.0F, 0.0F};
+    for (int k = x0; k < x1; ++k) {
+      const float alpha = a.x_alpha[k];
+      const float* p = pixel(a.y_src[j], a.x_src[k]);
+      for (int c = 0; c < 3; ++c)
+        buf[c] = buf[c] + static_cast<float>(QuantizeU8(p[c])) * alpha;
+    }
+    for (int c = 0; c < 3; ++c)
+      sum[c] = sum[c] + beta * buf[c];
+  }
+  for (int c = 0; c < 3; ++c)
+    o[c] = RoundU8(sum[c]);
 }
 
 // Antialiased Lanczos-3 (PIL's filter: support 3 * max(1, ratio), window
@@ -594,7 +688,10 @@ struct Upscaler::Impl {
   std::vector<Conv> convs;
   std::size_t weight_bytes{0};
   std::size_t tile_pixels{kDefaultTilePixels};
-  Buffer frame24, tile_in, act[2], raw, picture, rows, out24;
+  Buffer frame24, tile_in, act[2], raw, picture, rows, out24, taps;
+  // Area tables in `taps` for this source crop -> resize size.
+  int taps_key[4]{0, 0, 0, 0};
+  cpu::AreaResizePlan area;
 
   ~Impl() {
     for (Conv& c : convs) {
@@ -603,7 +700,7 @@ struct Upscaler::Impl {
       (void)hipFree(c.slope);
     }
     for (Buffer* b : {&frame24, &tile_in, &act[0], &act[1], &raw, &picture,
-                      &rows, &out24})
+                      &rows, &out24, &taps})
       b->Release();
   }
 
@@ -774,6 +871,76 @@ struct Upscaler::Impl {
     return true;
   }
 
+  // Fit::kCrop as Take One's npu_upscale_worker.fit_1080 into out24 (on
+  // the device): the uint8 x4 picture is cropped in whole rows / columns and
+  // area-resized with OpenCV's tables (cpu::PlanAreaResize), then the centre
+  // of a covering resize is cut.
+  bool CropArea(int W, const cpu::AreaCropPlan& plan, int out_w, int out_h,
+                std::string* error) {
+    const int key[4] = {plan.crop_w, plan.crop_h, plan.resize_w,
+                        plan.resize_h};
+    if (!std::equal(key, key + 4, taps_key)) {
+      if (!cpu::PlanAreaResize(plan.crop_w, plan.crop_h, plan.resize_w,
+                               plan.resize_h, &area, error))
+        return false;
+      // 32-bit blocks: x first, count, src, alpha; then the same for y.
+      std::vector<std::uint32_t> bits;
+      for (const cpu::AreaTaps* t : {&area.x, &area.y}) {
+        for (const std::vector<int>* v : {&t->first, &t->count, &t->src})
+          for (int i : *v)
+            bits.push_back(static_cast<std::uint32_t>(i));
+        for (float f : t->alpha) {
+          std::uint32_t u = 0;
+          std::memcpy(&u, &f, 4);
+          bits.push_back(u);
+        }
+      }
+      if (bits.empty())
+        bits.push_back(0);
+      if (!taps.Reserve(bits.size() * 4, error) ||
+          !Check(hipMemcpy(taps.data, bits.data(), bits.size() * 4,
+                           hipMemcpyHostToDevice),
+                 "area tables", error))
+        return false;
+      std::copy(key, key + 4, taps_key);
+    }
+    AreaArgs a{};
+    a.picture = picture.as<float>();
+    a.W = W;
+    a.crop_x = plan.crop_x;
+    a.crop_y = plan.crop_y;
+    a.mode = area.kind == cpu::AreaResizePlan::Kind::kCopy      ? 0
+             : area.kind == cpu::AreaResizePlan::Kind::kInteger ? 1
+                                                                : 2;
+    a.sx = area.sx;
+    a.sy = area.sy;
+    a.inv_area = area.inv_area;
+    const std::uint32_t* at = taps.as<std::uint32_t>();
+    const auto next = [&at](std::size_t n) {
+      const std::uint32_t* p = at;
+      at += n;
+      return p;
+    };
+    const std::size_t nx = area.x.first.size(), tx = area.x.src.size();
+    const std::size_t ny = area.y.first.size(), ty = area.y.src.size();
+    a.x_first = reinterpret_cast<const int*>(next(nx));
+    a.x_count = reinterpret_cast<const int*>(next(nx));
+    a.x_src = reinterpret_cast<const int*>(next(tx));
+    a.x_alpha = reinterpret_cast<const float*>(next(tx));
+    a.y_first = reinterpret_cast<const int*>(next(ny));
+    a.y_count = reinterpret_cast<const int*>(next(ny));
+    a.y_src = reinterpret_cast<const int*>(next(ty));
+    a.y_alpha = reinterpret_cast<const float*>(next(ty));
+    a.out_w = out_w;
+    a.out_h = out_h;
+    a.out_x = plan.out_x;
+    a.out_y = plan.out_y;
+    a.out24 = out24.as<std::uint8_t>();
+    AreaKernel<<<Grid(static_cast<std::size_t>(out_w) * out_h), kThreads>>>(
+        a);
+    return Check(hipGetLastError(), "area resize", error);
+  }
+
   bool UploadFrame(const std::uint8_t* rgb24, int w, int h,
                    std::string* error) {
     const std::size_t bytes = static_cast<std::size_t>(w) * h * 3;
@@ -862,6 +1029,21 @@ bool Upscaler::Upscale(const std::uint8_t* rgb24, int w, int h, int out_w,
   const Placement place = PlaceContent(w, h, out_w, out_h, fit);
   const int H = h * impl_->scale, W = w * impl_->scale;
   Impl& m = *impl_;
+  if (fit == Fit::kCrop) {
+    // Take One's geometry whenever the output does not enlarge the S x
+    // picture: crop in whole rows / columns first, then INTER_AREA.
+    const cpu::AreaCropPlan plan = cpu::PlanAreaCrop(W, H, out_w, out_h);
+    if (plan.resize_w > 0 && plan.resize_w <= plan.crop_w &&
+        plan.resize_h <= plan.crop_h)
+      return m.UploadFrame(rgb24, w, h, error) && m.Network(w, h, error) &&
+             m.out24.Reserve(static_cast<std::size_t>(out_w) * out_h * 3,
+                             error) &&
+             m.CropArea(W, plan, out_w, out_h, error) &&
+             Check(hipMemcpy(out24, m.out24.data,
+                             static_cast<std::size_t>(out_w) * out_h * 3,
+                             hipMemcpyDeviceToHost),
+                   "download", error);
+  }
   if (!m.UploadFrame(rgb24, w, h, error) || !m.Network(w, h, error) ||
       !m.rows.Reserve(static_cast<std::size_t>(H) * out_w * 3 * sizeof(float),
                       error) ||
@@ -897,7 +1079,8 @@ std::size_t Upscaler::weight_bytes() const {
 std::size_t Upscaler::workspace_bytes() const {
   const Impl& m = *impl_;
   return m.frame24.bytes + m.tile_in.bytes + m.act[0].bytes + m.act[1].bytes +
-         m.raw.bytes + m.picture.bytes + m.rows.bytes + m.out24.bytes;
+         m.raw.bytes + m.picture.bytes + m.rows.bytes + m.out24.bytes +
+         m.taps.bytes;
 }
 
 }  // namespace gufo::models::realesrgan

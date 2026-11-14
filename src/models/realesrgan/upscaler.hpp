@@ -19,7 +19,10 @@ enum class Precision : std::uint8_t { kFp16, kFp32 };
 /// How the upscaled picture is fitted into the requested output size.
 /// kPad keeps the aspect ratio and the whole picture (black bars), kCrop
 /// keeps the aspect ratio and fills the output (centre crop), kStretch
-/// scales each axis on its own.
+/// scales each axis on its own. kCrop to a size not larger than the x4
+/// picture cuts like Take One's NPU worker: uint8 x4 picture, centre crop in
+/// whole rows / columns (cpu::PlanAreaCrop), then OpenCV INTER_AREA; larger
+/// outputs and kPad / kStretch use PlaceContent and Lanczos-3.
 enum class Fit : std::uint8_t { kPad, kCrop, kStretch };
 
 [[nodiscard]] bool ParseFit(std::string_view text, Fit* fit);
@@ -43,7 +46,8 @@ struct Placement {
 /// basicsr/archs/srvgg_arch.py computes it on RGB in [0, 1], output clamped
 /// to [0, 1]. Frames are processed in tiles whose halo equals the number of
 /// convolutions, so tiling does not change the result. The x4 picture is
-/// then resized to the requested size with an antialiased Lanczos-3 filter.
+/// then resized to the requested size with an antialiased Lanczos-3 filter
+/// (or, for Fit::kCrop, Take One's crop + INTER_AREA, see Fit).
 class Upscaler {
 public:
   /// Loads an FP32 safetensors file (tools/upscale/convert_realesrgan_pth.py).

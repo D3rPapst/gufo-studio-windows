@@ -31,6 +31,7 @@
 #include "src/core/base64.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
+#include "src/models/realesrgan/cpu_post.hpp"
 #include "src/models/rife/video_io.hpp"
 
 namespace server = gufo::server;
@@ -556,6 +557,33 @@ void TestPostProcessParser() {
 
 }  // namespace
 
+// fit "crop" geometry of every device (the GPU too, after 2.1.3): Take One's
+// npu_upscale_worker.fit_1080 crops the x4 picture in whole rows first and
+// then area-resizes. 896x512 -> 3584x2048: rows 16..2031 (2016 rows), so the
+// 1080 output loses 8.57 lines top and bottom; the old GPU Lanczos placement
+// (content 1098 rows, offset 8) sat one line off.
+void TestUpscaleCropGeometry() {
+  namespace cpu = gufo::models::realesrgan::cpu;
+  const cpu::AreaCropPlan film = cpu::PlanAreaCrop(3584, 2048, 1920, 1080);
+  assert(film.crop_x == 0 && film.crop_w == 3584);
+  assert(film.crop_y == 16 && film.crop_h == 2016);
+  assert(film.resize_w == 1920 && film.resize_h == 1080);
+  assert(film.out_x == 0 && film.out_y == 0);
+  // 4:3 (640x480 -> 2560x1920): rows 240..1679, then 1920x1080.
+  const cpu::AreaCropPlan four_three =
+      cpu::PlanAreaCrop(2560, 1920, 1920, 1080);
+  assert(four_three.crop_x == 0 && four_three.crop_w == 2560);
+  assert(four_three.crop_y == 240 && four_three.crop_h == 1440);
+  assert(four_three.resize_w == 1920 && four_three.resize_h == 1080);
+  // 1344x768 (vision-detect frames) -> 5376x3072: rows 24..3047.
+  const cpu::AreaCropPlan frames = cpu::PlanAreaCrop(5376, 3072, 1920, 1080);
+  assert(frames.crop_y == 24 && frames.crop_h == 3024);
+  // x4 without a size: the whole picture, no resize.
+  const cpu::AreaCropPlan same = cpu::PlanAreaCrop(3584, 2048, 3584, 2048);
+  assert(same.crop_y == 0 && same.crop_h == 2048 && same.resize_w == 3584 &&
+         same.resize_h == 2048);
+}
+
 int main() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() / "gufo-media-services-test";
@@ -564,6 +592,7 @@ int main() {
   std::filesystem::create_directories(root);
   TestFastPng();
   TestUpscaleService();
+  TestUpscaleCropGeometry();
   TestVideoPngZip(root);
   TestMusicAndFoleyStartup(root);
   TestServeOptions(root);
