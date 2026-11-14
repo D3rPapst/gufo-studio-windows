@@ -12,10 +12,13 @@
 // image inlined for the partner (with the ocr options and thresholds), the
 // ocr models missing here, X-Gufo-Pool local/remote, the partner's 503
 // falling back here, and /v1/figuren "ccip" over the same queue/relay.
+// Request limits: encoded bytes and decoded pixels over all pictures,
+// decoding only after the CPU turn.
 // Written with AI assistance (Claude Code).
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -27,6 +30,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <png.h>
 
 #include "ccip/image_ops.hpp"
 #include "ccip/wd14.hpp"
@@ -470,6 +475,47 @@ void TestPool() {
   assert(response->status == 503);
 }
 
+/// A grey RGB PNG of width x height (compresses to a few hundred KB).
+std::string UniformPng(int width, int height) {
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  image.width = static_cast<png_uint_32>(width);
+  image.height = static_cast<png_uint_32>(height);
+  image.format = PNG_FORMAT_RGB;
+  const std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 3, 128);
+  png_alloc_size_t size = 0;
+  assert(png_image_write_to_memory(&image, nullptr, &size, 0, pixels.data(), 0, nullptr));
+  std::string out(size, '\0');
+  assert(png_image_write_to_memory(&image, out.data(), &size, 0, pixels.data(), 0, nullptr));
+  out.resize(size);
+  return out;
+}
+
+/// All pictures of one request share kMaxRequestBytes (encoded): four
+/// Ablage pictures of 20 MB each are refused before anything is decoded.
+void TestRequestBytes() {
+  vision::Options options;
+  options.serve = [](const HttpRequest&) {
+    HttpResponse response;
+    response.body.assign(static_cast<std::size_t>(20'000'000), 'x');
+    response.headers = {{"Content-Type", "image/png"}};
+    return response;
+  };
+  const vision::VisionService service(options);
+  json::Value body = Body("/v1/jobs/abc/files/a.png", {"wd14_tags"});
+  json::Value opt = json::Value::object();
+  json::Value pictures = json::Value::array();
+  for (const char* name : {"/v1/jobs/abc/files/b.png", "/v1/jobs/abc/files/c.png",
+                           "/v1/jobs/abc/files/d.png"})
+    pictures.push_back(std::string(name));
+  opt["images"] = std::move(pictures);
+  body["wd14_tags"] = std::move(opt);
+  const auto response = service.Handle(Post(body));
+  assert(response->status == 400);
+  assert(response->body.find("together exceed 64 MB") != std::string::npos);
+  assert(response->body.find("wd14_tags.images[2]") != std::string::npos);
+}
+
 std::string ReadFile(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -590,6 +636,31 @@ void TestReal(const char* dir, const char* frame) {
     queue->Leave();
     busy = busy_service.Handle(relayed);
     assert(busy->status == 200);
+    // Decoding waits for the CPU turn: a broken picture is only refused
+    // once the request's turn has come (waiting requests hold no pixels).
+    assert(queue->Enter({}) == cpu::CpuQueue::Result::kOk);
+    auto waiting = std::async(std::launch::async, [&] {
+      return busy_service.Handle(Post(Body("AAAA", {"face"})));
+    });
+    assert(waiting.wait_for(std::chrono::milliseconds(400)) == std::future_status::timeout);
+    queue->Leave();
+    assert(waiting.get()->status == 400);
+  }
+  // All pictures of one request together stay within kMaxRequestPixels:
+  // 32 MP each, the image and two wd14_tags pictures (96 MP) are refused.
+  {
+    const std::string big = "data:image/png;base64," +
+                            gufo::core::EncodeBase64(std::string_view(UniformPng(8000, 4000)));
+    json::Value many = Body(big, {"wd14_tags"});
+    json::Value opt = json::Value::object();
+    json::Value pictures = json::Value::array();
+    pictures.push_back(big);
+    pictures.push_back(big);
+    opt["images"] = std::move(pictures);
+    many["wd14_tags"] = std::move(opt);
+    response = service.Handle(Post(many));
+    assert(response->status == 400);
+    assert(response->body.find("megapixels") != std::string::npos);
   }
   // wd14_tags: whole frame, the person cut-outs (8 % margin), an explicit
   // region and a further picture (the frame again, so the same tags).
@@ -667,6 +738,7 @@ int main() {
   TestLumaGamma();
   TestErrors();
   TestPool();
+  TestRequestBytes();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')

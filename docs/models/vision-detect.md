@@ -61,9 +61,8 @@ queues the requests instead of letting several processes compete for the cores.
 }
 ```
 
-- `box` is `[x0, y0, x1, y1]` in whole pixels of your image, each list is sorted by
-  score, and `score` is the unrounded value imgutils returns. `seconds` is the compute
-  time, `queue_seconds` the wait for the CPU.
+- `box` is `[x0, y0, x1, y1]` in whole pixels of your image, lists are sorted by score,
+  `score` is imgutils' unrounded value; `seconds`: compute time, `queue_seconds`: CPU wait.
 - `ocr`: the box, its four corners and the text; `score` is the box score times the
   text score. When you send `ocr` as a list, `detections.ocr` and `models.ocr` are
   lists with one entry per pass.
@@ -75,12 +74,11 @@ queues the requests instead of letting several processes compete for the cores.
 
 `pose` and `pose_wholebody` find the persons with RT-DETR (label person, score above
 `min_score`, the `max_persons` best) and add `"poses"` in score order, each
-`{"box": [x0, y0, x1, y1] (decimals), "score", "keypoints", "wholebody"}`.
-`keypoints` (with `pose`) are the 17 COCO points of ViTPose, `wholebody` (with
-`pose_wholebody`) the 133 COCO-WholeBody points of DWPose: 0-16 body, 17-22 feet,
-23-90 face (68, mouth 48-67 counted from 23), 91-111 left and 112-132 right hand; each
-`[x, y, score]` in image pixels. Poses always use the original image,
-also with `brighten_dark`.
+`{"box": [x0, y0, x1, y1] (decimals), "score", "keypoints", "wholebody"}`. `keypoints`
+(`pose`): the 17 COCO points of ViTPose; `wholebody` (`pose_wholebody`): the 133
+COCO-WholeBody points of DWPose (0-16 body, 17-22 feet, 23-90 face (68, mouth 48-67
+counted from 23), 91-111 left and 112-132 right hand); each `[x, y, score]` in image
+pixels of the original image, also with `brighten_dark`.
 
 ## Models
 
@@ -97,9 +95,9 @@ also with `brighten_dark`.
 | `pose_wholebody` | `yzd-v/DWPose` `dw-ll_ucoco_384.onnx` | RTMPose-l | - | 134 MB | Apache-2.0 |
 
 The detectors, OCR and tagger are the defaults of dghs-imgutils 0.19, the pose models
-follow the film pipeline (transformers 5.18, onnxruntime). The router reads
-the converted files from `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`)
-and loads each on its first use; the converters are in the server reference below.
+follow the film pipeline (transformers 5.18, onnxruntime). The router loads the converted
+files from `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`)
+on first use; the converters are in the server reference below.
 
 The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and
 `ß`; those come out as similar letters (`Bahnhofstraße` reads as `BahnhofstraBe`).
@@ -108,10 +106,12 @@ The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä
 
 - One request computes at a time, in one queue with the CCIP figure check;
   `--vision-threads` (default 8) sets its CPU threads. Up to `--vision-queue`
-  (default 4) more wait; the next one gets `503 busy` with `Retry-After: 5`.
+  (default 4) more wait; the next one gets `503 busy` with `Retry-After: 5`. Pictures are
+  decoded only once the request's turn comes; all of a request's pictures together may
+  have at most 64 MB encoded and 64 megapixels decoded (more: `400`).
 - Tags take about 0.6 s per picture or cut-out (8 threads); the tagger keeps ~470 MB RAM.
   An enlarged OCR pass may be at most 24 megapixels (3 × a 1920 × 1080 frame fits).
-- `400 invalid_request`: unknown task, bad option, unreadable image, region outside it.
+- `400 invalid_request`: unknown task, bad option, unreadable image, region outside it, limit.
 - `404`: an Ablage path of a job you can't read; `503 vision_unavailable`: a model is missing.
 - The request needs the `bild` area and doesn't count against the daily limit.
 - With a pool partner, a request goes there when this machine is busy or lacks the models

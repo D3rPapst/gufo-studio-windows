@@ -293,23 +293,42 @@ std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& 
 
 /// Bytes of one input picture: an Ablage path through the gate, else a
 /// data URL, https URL or bare base64. A refusal of the gate is returned in
-/// *failure; anything else unreadable throws.
+/// *failure; anything else unreadable throws. `budget` is shared by all
+/// pictures of the request (kMaxRequestBytes); each read gets 15 s.
 std::vector<std::uint8_t> ReadInput(const Options& options, const HttpRequest& outer,
-                                    const std::string& source,
+                                    const std::string& source, core::ImageReadBudget& budget,
                                     std::optional<HttpResponse>* failure) {
-  if (IsAblagePath(source))
-    return ReadAblage(options, outer, source, failure);
-  const std::string url = source.starts_with("data:") || source.starts_with("https://")
-                              ? source
-                              : "data:image/png;base64," + source;
-  core::ImageReadBudget budget;
-  return core::ReadImageUrl(url, budget);
+  std::vector<std::uint8_t> bytes;
+  if (IsAblagePath(source)) {
+    bytes = ReadAblage(options, outer, source, failure);
+  } else {
+    const std::string url = source.starts_with("data:") || source.starts_with("https://")
+                                ? source
+                                : "data:image/png;base64," + source;
+    budget.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const std::size_t before = budget.remaining_bytes;
+    bytes = core::ReadImageUrl(url, budget);
+    if (budget.remaining_bytes != before)
+      return bytes;  // ReadImageUrl counted them itself
+  }
+  if (bytes.size() > budget.remaining_bytes)
+    throw std::invalid_argument("all pictures of the request together exceed " +
+                                std::to_string(kMaxRequestBytes >> 20) + " MB");
+  budget.remaining_bytes -= bytes.size();
+  return bytes;
 }
 
 /// RGB8 pixels of encoded bytes, the alpha channel dropped (the pipeline
-/// opens its pictures with .convert("RGB")).
-models::ccip::RgbImage DecodeRgb(const std::vector<std::uint8_t>& bytes) {
+/// opens its pictures with .convert("RGB")). `pixels_left` is the request's
+/// remaining kMaxRequestPixels.
+models::ccip::RgbImage DecodeRgb(const std::vector<std::uint8_t>& bytes,
+                                 std::int64_t* pixels_left) {
   core::Image rgb = core::DecodeImage(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+  const auto pixels = static_cast<std::int64_t>(rgb.width) * static_cast<std::int64_t>(rgb.height);
+  if (pixels > *pixels_left)
+    throw std::invalid_argument("all pictures of the request together exceed " +
+                                std::to_string(kMaxRequestPixels / 1000000) + " megapixels");
+  *pixels_left -= pixels;
   models::ccip::RgbImage image;
   image.width = static_cast<int>(rgb.width);
   image.height = static_cast<int>(rgb.height);
@@ -642,9 +661,11 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   // and must not hold the CPU turn.
   std::vector<std::uint8_t> bytes;
   std::vector<std::vector<std::uint8_t>> wd14_bytes;
+  core::ImageReadBudget budget;
+  budget.remaining_bytes = kMaxRequestBytes;
   try {
     std::optional<HttpResponse> failure;
-    bytes = ReadInput(options_, request, parsed.image, &failure);
+    bytes = ReadInput(options_, request, parsed.image, budget, &failure);
     if (failure.has_value())
       return std::move(*failure);
   } catch (const std::exception& error) {
@@ -653,7 +674,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   for (std::size_t i = 0; i < parsed.wd14.images.size(); ++i) {
     try {
       std::optional<HttpResponse> failure;
-      wd14_bytes.push_back(ReadInput(options_, request, parsed.wd14.images[i], &failure));
+      wd14_bytes.push_back(
+          ReadInput(options_, request, parsed.wd14.images[i], budget, &failure));
       if (failure.has_value())
         return std::move(*failure);
     } catch (const std::exception& error) {
@@ -685,25 +707,41 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     return Error(503, "Service Unavailable", missing, "vision_unavailable");
   if (route == cpu::Route::kLocalIfIdle && !queue.Idle())
     return cpu::Busy("image recognition");
+  // The CPU turn first, then decoding: a waiting request holds only its
+  // encoded bytes (kMaxRequestBytes), never decoded pixels.
+  const auto queued = std::chrono::steady_clock::now();
+  switch (queue.Enter(request.is_cancelled)) {
+    case cpu::CpuQueue::Result::kOk:
+      break;
+    case cpu::CpuQueue::Result::kFull:
+      return cpu::Busy("image recognition");
+    case cpu::CpuQueue::Result::kCancelled:
+      return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
+  }
+  const cpu::CpuQueue::Turn turn(queue);
+  const auto started = std::chrono::steady_clock::now();
   models::ccip::RgbImage image;
   std::vector<models::ccip::RgbImage> wd14_images;
+  std::int64_t pixels_left = kMaxRequestPixels;
   try {
     // RGB8 with the alpha channel dropped (imgutils puts RGBA on white).
-    image = DecodeRgb(bytes);
+    image = DecodeRgb(bytes, &pixels_left);
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", std::string("image: ") + error.what(), "invalid_request");
   }
+  bytes.clear();
+  bytes.shrink_to_fit();
   for (std::size_t i = 0; i < wd14_bytes.size(); ++i) {
     try {
-      wd14_images.push_back(DecodeRgb(wd14_bytes[i]));
+      wd14_images.push_back(DecodeRgb(wd14_bytes[i], &pixels_left));
     } catch (const std::exception& error) {
       return Error(400, "Bad Request",
                    "wd14_tags.images[" + std::to_string(i) + "]: " + error.what(),
                    "invalid_request");
     }
+    wd14_bytes[i].clear();
+    wd14_bytes[i].shrink_to_fit();
   }
-  bytes.clear();
-  bytes.shrink_to_fit();
   wd14_bytes.clear();
   // Explicit wd14 regions must leave a cut-out inside the image.
   for (std::size_t i = 0; i < parsed.wd14.boxes.size(); ++i) {
@@ -734,18 +772,6 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   if (brightened)
     detect_image = models::ccip::ApplyGamma(image, parsed.dark_gamma);
   const models::ccip::RgbImage& detector_input = brightened ? detect_image : image;
-
-  const auto queued = std::chrono::steady_clock::now();
-  switch (queue.Enter(request.is_cancelled)) {
-    case cpu::CpuQueue::Result::kOk:
-      break;
-    case cpu::CpuQueue::Result::kFull:
-      return cpu::Busy("image recognition");
-    case cpu::CpuQueue::Result::kCancelled:
-      return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
-  }
-  const cpu::CpuQueue::Turn turn(queue);
-  const auto started = std::chrono::steady_clock::now();
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();
   std::vector<std::array<int, 4>> persons;  // for wd14_tags regions "person"

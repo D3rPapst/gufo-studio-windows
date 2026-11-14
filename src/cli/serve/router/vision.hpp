@@ -64,6 +64,9 @@
 //   marks its answer.
 //   An Ablage path is read through the gate with the caller's own
 //   Authorization (another user's job is the gate's 404), at most 20 MB.
+//   Limits per request (400 beyond): kMaxRequestBytes encoded over all
+//   input pictures, kMaxRequestPixels decoded over all of them (decoded
+//   only once the request has its CPU turn).
 
 #include <cstddef>
 #include <cstdint>
@@ -107,6 +110,13 @@ inline constexpr std::size_t kMaxOcrPasses = 4;
 inline constexpr int kMaxOcrScale = 4;
 /// Largest enlarged OCR input (3x of 1920x1080 is 18.7 megapixels).
 inline constexpr std::int64_t kMaxOcrPixels = 24'000'000;
+/// Encoded bytes of all input pictures of one request together (image and
+/// wd14_tags.images; data URLs, https URLs and Ablage paths alike).
+inline constexpr std::size_t kMaxRequestBytes = static_cast<std::size_t>(64) << 20;
+/// Decoded pixels of all input pictures of one request together (RGB8:
+/// about 192 MB). Pictures are decoded only once the request has its turn
+/// in the CPU queue, so waiting requests hold encoded bytes only.
+inline constexpr std::int64_t kMaxRequestPixels = 64'000'000;
 
 struct Request {
   std::string image;

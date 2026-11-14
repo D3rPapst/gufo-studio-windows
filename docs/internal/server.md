@@ -941,8 +941,15 @@ Pool: see below; the relayed body carries the image and the further
 member as sent (`thresholds`, `ocr` passes, `wd14_tags` options). A missing
 OCR or tagger file counts as missing models, so the partner gets the request.
 All tasks share one input reader (`ReadInput` for every picture before the
-queue, `DecodeRgb` to RGB8 in it); detectors may see the brightened copy, OCR
-and tags always the original pixels.
+queue, `DecodeRgb` to RGB8 only once the request has its CPU turn, so a
+waiting request holds encoded bytes only); detectors may see the brightened
+copy, OCR and tags always the original pixels. Limits per request, `400`
+beyond: all pictures together (image and `wd14_tags.images`, whatever their
+source) at most 64 MiB encoded (`kMaxRequestBytes`, one shared
+`ImageReadBudget`; each https read keeps its own 15 s) and 64 megapixels
+decoded (`kMaxRequestPixels`, about 192 MB RGB8). With the brightened copy,
+the OCR enlargements and the tagger's cut-outs a request stays well below
+1 GB of pictures; waiting requests (at most `--vision-queue`) hold no pixels.
 Tests: `router_vision_test` (parsing and errors, ocr passes, the relayed ocr
 options; with `GUFO_VISION_DIR` and `GUFO_VISION_FRAME` real detections, the
 Ablage path, the queue, `ocr` plain, under `brighten_dark` (same texts) and
