@@ -16,7 +16,8 @@ namespace gufo::server {
 
 bool IsMediaServeCommand(std::string_view subcommand) {
   return subcommand == "music" || subcommand == "foley" ||
-         subcommand == "upscale" || subcommand == "omni";
+         subcommand == "upscale" || subcommand == "omni" ||
+         subcommand == "vision";
 }
 
 std::string MediaServeCommandsHelp() {
@@ -38,6 +39,12 @@ std::string MediaServeDescription(std::string_view subcommand) {
     return "Serve MMAudio large_44k_v2 video/text-to-audio.";
   if (subcommand == "omni")
     return "Serve Qwen3-Omni-30B-A3B-Captioner audio captions.";
+  if (subcommand == "vision")
+    return "Serve depth (Depth Anything V2 large / small, Distill-Any-Depth, "
+           "POST /v1/vision/depth), open-vocabulary boxes (Grounding DINO base, "
+           "LLMDet, POST /v1/vision/find) and masks (SAM ViT-H, POST "
+           "/v1/vision/segment) on the GPU in FP32, from Hugging Face "
+           "snapshot directories. Models load on first use.";
   return "Serve Real-ESRGAN image upscaling (POST /v1/images/upscale, sync or "
          "async) and video upscaling (POST /v1/videos/upscale, async job; "
          "frames through FFmpeg, audio copied) on the AMD NPU (ONNX Runtime "
@@ -105,6 +112,57 @@ void AddMediaServeOptions(std::string_view subcommand, cli::ArgParser& parser,
                      "Model", &args->max_tokens);
     parser.AddOption("", "--served-model-name", "NAME",
                      "Public API model ID (default: qwen3-omni-captioner)",
+                     "Model", &args->name);
+    return;
+  }
+  if (subcommand == "vision") {
+    args->name = "vision";
+    VisionServeOptions& vision = args->vision;
+    parser.AddCustomOption(
+        "", "--depth-model", "NAME=DIR",
+        "Depth Anything V2 snapshot (config.json + model.safetensors), NAME "
+        "large | base | small; repeatable, the first is the default",
+        "Model",
+        [&vision](std::string_view, std::string_view value,
+                  std::string* error) {
+          const std::size_t equals = value.find('=');
+          if (equals == std::string_view::npos || equals == 0 ||
+              equals + 1 == value.size()) {
+            *error = "--depth-model expects NAME=DIR";
+            return false;
+          }
+          vision.depth.emplace_back(
+              std::string(value.substr(0, equals)),
+              std::filesystem::path(std::string(value.substr(equals + 1))));
+          return true;
+        });
+    parser.AddCustomOption(
+        "", "--find-model", "[NAME=]DIR",
+        "Grounding DINO or MM-Grounding-DINO / LLMDet snapshot; repeatable, "
+        "the first is the default (NAME default: grounding-dino)",
+        "Model",
+        [&vision](std::string_view, std::string_view value,
+                  std::string* error) {
+          const std::size_t equals = value.find('=');
+          std::string name = equals == std::string_view::npos
+                                 ? std::string("grounding-dino")
+                                 : std::string(value.substr(0, equals));
+          std::filesystem::path dir(std::string(
+              equals == std::string_view::npos ? value
+                                               : value.substr(equals + 1)));
+          if (name.empty() || dir.empty()) {
+            *error = "--find-model expects [NAME=]DIR";
+            return false;
+          }
+          vision.find.emplace_back(std::move(name), std::move(dir));
+          return true;
+        });
+    parser.AddOption("", "--segment-model", "DIR",
+                     "SAM snapshot (facebook/sam-vit-huge)", "Model",
+                     &vision.segment);
+    parser.AddOption("", "--served-model-name", "NAME",
+                     "Public API model ID (default: vision; the router "
+                     "passes the section id)",
                      "Model", &args->name);
     return;
   }
@@ -185,6 +243,34 @@ bool ValidateMediaServeArgs(std::string_view subcommand, MediaServeArgs* args,
     }
     return true;
   }
+  if (subcommand == "vision") {
+    const VisionServeOptions& vision = args->vision;
+    if (vision.depth.empty() && vision.find.empty() && vision.segment.empty()) {
+      *error = "vision server needs --depth-model, --find-model or "
+               "--segment-model";
+      return false;
+    }
+    std::error_code ec;
+    for (const auto& [name, dir] : vision.depth)
+      if (!std::filesystem::is_regular_file(dir / "model.safetensors", ec)) {
+        *error = "--depth-model " + name + ": no model.safetensors in " +
+                 dir.string();
+        return false;
+      }
+    for (const auto& [name, dir] : vision.find)
+      if (!std::filesystem::is_regular_file(dir / "model.safetensors", ec)) {
+        *error = "--find-model " + name + ": no model.safetensors in " +
+                 dir.string();
+        return false;
+      }
+    for (const auto& dir : {vision.segment})
+      if (!dir.empty() &&
+          !std::filesystem::is_regular_file(dir / "model.safetensors", ec)) {
+        *error = "no model.safetensors in " + dir.string();
+        return false;
+      }
+    return true;
+  }
   UpscaleServeOptions& options = args->upscale;
   if (options.device != "npu" && options.device != "gpu" &&
       options.device != "cpu") {
@@ -210,6 +296,10 @@ bool ValidateMediaServeArgs(std::string_view subcommand, MediaServeArgs* args,
 
 std::filesystem::path MediaServeArtifact(std::string_view subcommand,
                                          const MediaServeArgs& args) {
+  if (subcommand == "vision")
+    return !args.vision.depth.empty() ? args.vision.depth.front().second
+           : !args.vision.find.empty() ? args.vision.find.front().second
+                                       : args.vision.segment;
   if (subcommand == "upscale")
     return args.upscale.models.empty() ? std::filesystem::path()
                                        : args.upscale.models.front().path;
@@ -278,6 +368,16 @@ std::shared_ptr<MediaService> LoadMediaService(std::string_view subcommand,
     *error = "this gufo build has no Qwen3-Omni support (needs HIP)";
     return nullptr;
 #endif
+  }
+  if (subcommand == "vision") {
+    VisionBackends backends;
+    if (!BuildVisionBackends(args.vision, &backends, error))
+      return nullptr;
+    *details = "model=" + args.name + " depth=" +
+               std::to_string(args.vision.depth.size()) +
+               " find=" + std::to_string(args.vision.find.size()) +
+               " segment=" + (args.vision.segment.empty() ? "no" : "yes");
+    return std::make_shared<VisionModelService>(args.name, std::move(backends));
   }
   std::string engine_error;
   std::unique_ptr<UpscaleEngine> engine =

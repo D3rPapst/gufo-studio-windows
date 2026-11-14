@@ -22,7 +22,8 @@ to run the model and what speed to expect.
 Fork pages outside the generated table: [Qwen3-Omni captioner](qwen3-omni-captioner.md),
 [ACE-Step 1.5](ace-step-1.5.md), [MOSS-Music](moss-music.md), [TripoSG](triposg.md),
 [TRELLIS.2](trellis2.md), [RIFE](rife/README.md), [Real-ESRGAN](realesrgan/README.md),
-[image recognition (imgutils detectors)](vision-detect.md).
+[image recognition (imgutils detectors)](vision-detect.md),
+[depth, open-vocabulary boxes and masks](vision-dsg.md).
 
 Gufo doesn't ship weights; download them from Hugging Face as each page shows.
 Every speed on these pages was measured on Strix Halo with 128 GB of memory,

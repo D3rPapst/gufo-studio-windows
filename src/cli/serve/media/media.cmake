@@ -30,6 +30,8 @@ add_subdirectory(src/models/rife)
 add_subdirectory(src/models/ace_step)
 add_subdirectory(src/models/mmaudio)
 add_subdirectory(src/models/realesrgan)
+# Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).
+add_subdirectory(src/models/vision_dsg)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
 add_subdirectory(src/models/qwen3_omni)
 
@@ -40,6 +42,8 @@ add_library(gufo_media STATIC
   src/cli/serve/media/foley_api.cpp
   src/cli/serve/media/omni_api.cpp
   src/cli/serve/media/upscale_api.cpp
+  src/cli/serve/media/vision_api.cpp
+  src/cli/serve/media/vision_backends.cpp
   src/cli/serve/media/video_rife.cpp
   src/cli/serve/media/video_upscale.cpp
 )
@@ -53,6 +57,10 @@ if (ENGINE_ENABLE_HIP)
   # `gufo video-interpolate` / `gufo video-upscale` (HIP only).
   target_sources(gufo PRIVATE src/cli/video/video_interpolate.cpp
                               src/cli/video/video_upscale.cpp)
+endif()
+if (TARGET gufo_vision_dsg)
+  target_link_libraries(gufo_media PUBLIC gufo_vision_dsg)
+  target_compile_definitions(gufo_media PRIVATE GUFO_HAVE_VISION_DSG=1)
 endif()
 if (TARGET gufo_qwen3_omni)
   target_link_libraries(gufo_media PUBLIC gufo_qwen3_omni)
@@ -77,6 +85,14 @@ if (BUILD_TESTING)
   add_test(NAME media_services_test COMMAND media_services_test)
   set_tests_properties(media_services_test PROPERTIES
     LABELS "cpu;server;media" TIMEOUT 60)
+
+  # gufo serve vision request handling with fake models (no GPU).
+  add_executable(vision_api_test tests/cli/vision_api_test.cpp)
+  target_link_libraries(vision_api_test PRIVATE gufo_media)
+  target_compile_options(vision_api_test PRIVATE ${gufo_media_test_undebug})
+  add_test(NAME vision_api_test COMMAND vision_api_test)
+  set_tests_properties(vision_api_test PROPERTIES
+    LABELS "cpu;server;media;vision" TIMEOUT 60)
 
   # /v1/audio/music response_format / bitrate_kbps parsing, the FFmpeg
   # argument list and a real mp3 transcode of a tiny WAV (skips without

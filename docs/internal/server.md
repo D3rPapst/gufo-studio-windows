@@ -878,6 +878,65 @@ carries `X-Gufo-Ran-On: partner`. Images must be inline in the relayed body:
 `/v1/vision/detect` inlines an Ablage path itself; `/v1/figuren` takes only
 data URLs, base64 and https anyway.
 
+### Vision worker (`gufo serve vision`)
+
+`POST /v1/vision/depth`, `/v1/vision/find` and `/v1/vision/segment` are worker
+routes: the router proxies them by the JSON `model` like `/v1/images/upscale`
+(`IsJsonModelPost`), so pool, memory guard, idle unloading and jobs apply. The
+worker is a media service (`src/cli/serve/media/vision_api.cpp`,
+`vision_backends.cpp`) started from an `[external/<id>]` section with
+`args = serve vision` and `--depth-model NAME=DIR`, `--find-model [NAME=]DIR`
+(both repeatable, the first is the default; requests choose with `size` /
+`depth_model` and `detector`), `--segment-model DIR`. Public page with requests, answers and licences:
+[docs/models/vision-dsg.md](../models/vision-dsg.md).
+
+The models (`src/models/vision_dsg`, HIP only, FP32 rocBLAS SGEMM, weights read
+from the Hugging Face `model.safetensors` without conversion) follow
+transformers 5.18.0:
+
+- Depth Anything V2 (`depth_anything.hip`, `depth_preprocess.cpp`):
+  DPTImageProcessorPil (518, keep aspect, multiples of 14 rounded half to even,
+  Pillow BICUBIC via the ccip extension's `ResizeBicubic`), DINOv2 with bicubic
+  position interpolation, DPT neck and head, bicubic to the image size.
+- Grounding DINO (`grounding_dino.hip`, `grounding_cpu.cpp`): image processor
+  (800 / 1333, Pillow BILINEAR), BERT WordPiece (ASCII lower-casing), the
+  phrase-block text mask and position ids
+  (`generate_masks_with_special_tokens_and_transfer_map`), Swin-B with shifted
+  windows, BERT-base, six encoder layers (bi-attention fusion, text enhancer,
+  multi-scale deformable attention), two-stage top-900 query selection, six
+  decoder layers with box refinement, `post_process_grounded_object_detection`.
+  One image and one prompt, no padding masks. MM-Grounding-DINO checkpoints
+  (`model_type` `mm-grounding-dino`, e.g. LLMDet base) use the same code with
+  contrastive logits / sqrt(256) plus the learned class bias and one box head
+  per decoder layer (`bbox_embed.0`, `model.decoder.bbox_embed.1..5`).
+  transformers 5.18 ties these heads wrongly without a warning (Grounding DINO:
+  the shared decoder head stays randomly initialised from the process's RNG
+  state; MM-Grounding-DINO: head 0 and class bias 0 in every layer); gufo and
+  `make_find_oracle.py --file-bbox` use the heads in the file.
+  Distill-Any-Depth Large is a Depth Anything V2 checkpoint and needs nothing
+  extra.
+- SAM ViT-H (`sam.hip`, `sam_cpu.cpp`): SamImageProcessorPil (longest side 1024,
+  BILINEAR, zero padding), ViT-H with 14 x 14 windows, global layers and
+  decomposed relative positions, neck, prompt encoder, two-way mask decoder,
+  `post_process_masks` (> 0). Each box is decoded on its own, as transformers
+  does for a batch of boxes.
+
+`hip_ops.hip` holds the shared pieces (weight store, linear / convolution /
+attention, layer and group norm, window partition, resampling). Requests run one
+at a time (`VisionModelService::run_mutex_`); each model loads on first use under
+its own mutex and stays until the worker exits.
+
+Oracle: `src/models/vision_dsg/reference/make_{depth,find,segment}_oracle.py`
+run transformers on the CPU (venv with transformers 5.18.0, torch 2.13,
+numpy 2.5.3, pillow 12.3.0, `python -I`); `vision-dsg-probe depth|find|segment`
+(build target, not shipped) writes the same raw tensors;
+`compare_depth.py` (cosine >= 0.9999, max-abs <= 1e-3 of the range) and
+`compare_find_segment.py` (detections paired by nearest box: boxes +-1 px,
+scores +-1e-3, same labels; mask IoU >= 0.999) decide. Near-equal encoder
+scores can swap places in the top-900 selection; `GUFO_VISION_TOPK=<file>`
+(one token index per line) forces the reference order and
+`GUFO_VISION_DUMP=<dir>` writes intermediate tensors of the find model. Request handling without a GPU: `vision_api_test`.
+
 ### Video concat (`POST /v1/videos/concat`)
 
 The front joins several finished clips into one mp4 itself, with the ffmpeg
