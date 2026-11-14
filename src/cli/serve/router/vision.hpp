@@ -23,7 +23,17 @@
 //       "models": {"person": {"repo", "model", "conf", "iou"}, ...},
 //       "seconds": compute time, "queue_seconds": wait before it}
 //   Boxes are integer pixels of the input image, sorted by score (imgutils
-//   order). "ocr" and "wd14_tags" are known tasks that this build does not
+//   order).
+//   "pose" / "pose_wholebody" (film pipeline posen_erkennung.erkenne):
+//   RT-DETR r50vd finds the persons (label person, score > min_score 0.35,
+//   at most max_persons 4 by score; "pose_options": {"min_score",
+//   "max_persons"}), on the original image even with brighten_dark;
+//   "pose" adds ViTPose base (17 COCO points), "pose_wholebody" DWPose
+//   dw-ll_ucoco_384 (133 COCO-WholeBody points) per person:
+//     "poses": [{"box": [x0, y0, x1, y1] (float), "score",
+//                "keypoints": [[x, y, score] x 17],      with "pose"
+//                "wholebody": [[x, y, score] x 133]}]    with "pose_wholebody"
+//   in score order; the point names are in "models". "ocr" and "wd14_tags" are known tasks that this build does not
 //   run yet: 501 "task_not_available". Unknown task or bad threshold: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -76,7 +86,15 @@ struct Request {
   bool brighten_dark{false};
   double dark_below{70.0};
   double dark_gamma{0.5};  // models::ccip::MeanLuma / ApplyGamma
+  /// "pose" (ViTPose) and/or "pose_wholebody" (DWPose) on RT-DETR persons.
+  bool pose{false};
+  bool pose_wholebody{false};
+  float pose_min_score{0.35f};
+  int pose_max_persons{4};
 };
+
+/// The pose tasks ("pose", "pose_wholebody").
+const std::vector<std::string>& PoseTasks();
 
 /// Parses and checks a request body; throws std::invalid_argument with a
 /// message for the 400 answer, and std::domain_error naming a planned task

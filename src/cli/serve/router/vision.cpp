@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "ccip/ccip.hpp"
+#include "ccip/pose.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/image.hpp"
 
@@ -157,6 +158,11 @@ const std::vector<TaskSpec>& DetectorTasks() {
   return tasks;
 }
 
+const std::vector<std::string>& PoseTasks() {
+  static const std::vector<std::string> tasks = {"pose", "pose_wholebody"};
+  return tasks;
+}
+
 const std::vector<std::string>& PlannedTasks() {
   static const std::vector<std::string> tasks = {"ocr", "wd14_tags"};
   return tasks;
@@ -195,11 +201,13 @@ Request ParseRequest(const json::Value& body) {
   for (const std::string& name : names) {
     const auto& known = DetectorTasks();
     const auto& planned = PlannedTasks();
+    const auto& poses = PoseTasks();
     if (std::none_of(known.begin(), known.end(),
                      [&](const TaskSpec& spec) { return spec.task == name; }) &&
-        std::find(planned.begin(), planned.end(), name) == planned.end())
+        std::find(planned.begin(), planned.end(), name) == planned.end() &&
+        std::find(poses.begin(), poses.end(), name) == poses.end())
       throw std::invalid_argument("unknown task " + name +
-                                  " (person, head, face, hand, ocr, wd14_tags)");
+                                  " (person, head, face, hand, pose, pose_wholebody, ocr, wd14_tags)");
   }
   for (const std::string& name : names) {
     const auto& planned = PlannedTasks();
@@ -210,6 +218,21 @@ Request ParseRequest(const json::Value& body) {
   for (const TaskSpec& spec : DetectorTasks()) {
     if (std::find(names.begin(), names.end(), spec.task) != names.end())
       request.tasks.push_back(spec);
+  }
+  request.pose = std::find(names.begin(), names.end(), "pose") != names.end();
+  request.pose_wholebody = std::find(names.begin(), names.end(), "pose_wholebody") != names.end();
+  if (const json::Value* po = body.find("pose_options"); po != nullptr && !po->is_null()) {
+    if (!po->is_object())
+      throw std::invalid_argument("pose_options must be an object");
+    for (const auto& [key, value] : po->members()) {
+      if (key == "min_score")
+        request.pose_min_score = Threshold(value, "pose_options.min_score");
+      else if (key == "max_persons" && value.is_number() && value.as_double() >= 1 &&
+               value.as_double() <= 32 && value.as_double() == std::floor(value.as_double()))
+        request.pose_max_persons = static_cast<int>(value.as_double());
+      else
+        throw std::invalid_argument("pose_options: min_score in (0, 1], max_persons 1-32");
+    }
   }
   if (const json::Value* dark = body.find("brighten_dark"); dark != nullptr && !dark->is_null()) {
     if (dark->is_bool()) {
@@ -259,6 +282,39 @@ Request ParseRequest(const json::Value& body) {
 struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
+  std::unique_ptr<models::ccip::RtDetr> rtdetr;
+  std::unique_ptr<models::ccip::VitPose> vitpose;
+  std::unique_ptr<models::ccip::DwPose> dwpose;
+
+  /// A pose network (stem = file stem), loaded on first use; false with *error set.
+  template <typename Net>
+  bool GetPose(const Options& options, std::unique_ptr<Net>* slot, const char* stem,
+               const char* converter, std::string* error) {
+    std::lock_guard<std::mutex> lock(load_mutex);
+    if (*slot != nullptr)
+      return true;
+    if (options.model_dir.empty()) {
+      *error = "image recognition is not configured: start the router with --vision-dir";
+      return false;
+    }
+    for (const char* ext : {".safetensors", ".json"}) {
+      const std::filesystem::path path = options.model_dir / (std::string(stem) + ext);
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) {
+        *error = "model file missing: " + path.string() + " (convert with extensions-ours/ccip/reference/" +
+                 converter + ")";
+        return false;
+      }
+    }
+    std::string load_error;
+    auto net = Net::Load(options.model_dir, &load_error);
+    if (net == nullptr) {
+      *error = std::string(stem) + ": " + load_error;
+      return false;
+    }
+    *slot = std::move(net);
+    return true;
+  }
 
   /// The detector of `spec`, loaded on first use; null with *error set.
   const models::ccip::YoloDetector* Get(const Options& options, const TaskSpec& spec,
@@ -325,6 +381,12 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       break;
     nets.push_back(net);
   }
+  if (missing.empty() && (parsed.pose || parsed.pose_wholebody))
+    state_->GetPose(options_, &state_->rtdetr, "rtdetr_r50vd_coco_o365", "convert_pose.py rtdetr", &missing);
+  if (missing.empty() && parsed.pose)
+    state_->GetPose(options_, &state_->vitpose, "vitpose_base_simple", "convert_pose.py vitpose", &missing);
+  if (missing.empty() && parsed.pose_wholebody)
+    state_->GetPose(options_, &state_->dwpose, "dwpose_wholebody", "convert_dwpose.py", &missing);
   // Input before the queue: reading an Ablage path goes through the gate
   // and must not hold the CPU turn.
   std::vector<std::uint8_t> bytes;
@@ -402,6 +464,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const auto started = std::chrono::steady_clock::now();
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();
+  json::Value out_poses;
   try {
     models::ccip::SetCpuThreads(options_.threads);
     for (std::size_t i = 0; i < parsed.tasks.size(); ++i) {
@@ -426,6 +489,68 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       model["iou"] = std::round(static_cast<double>(spec.iou) * 1e6) / 1e6;
       used[spec.task] = std::move(model);
     }
+    if (parsed.pose || parsed.pose_wholebody) {
+      // posen_erkennung.erkenne on the original image (not the brightened copy).
+      std::vector<models::ccip::ObjectBox> persons;
+      for (const auto& o : state_->rtdetr->Detect(image, parsed.pose_min_score)) {
+        if (o.label == 0)
+          persons.push_back(o);
+      }
+      std::stable_sort(persons.begin(), persons.end(),
+                       [](const auto& a, const auto& b) { return a.score > b.score; });
+      if (persons.size() > static_cast<std::size_t>(parsed.pose_max_persons))
+        persons.resize(static_cast<std::size_t>(parsed.pose_max_persons));
+      auto points = [](const std::vector<models::ccip::Keypoint>& kps) {
+        json::Value list = json::Value::array();
+        for (const auto& k : kps) {
+          json::Value p = json::Value::array();
+          p.push_back(static_cast<double>(k.x));
+          p.push_back(static_cast<double>(k.y));
+          p.push_back(static_cast<double>(k.score));
+          list.push_back(std::move(p));
+        }
+        return list;
+      };
+      json::Value poses = json::Value::array();
+      for (const auto& person : persons) {
+        json::Value entry = json::Value::object();
+        json::Value box = json::Value::array();
+        for (float v : person.box)
+          box.push_back(static_cast<double>(v));
+        entry["box"] = std::move(box);
+        entry["score"] = static_cast<double>(person.score);
+        if (parsed.pose)
+          entry["keypoints"] = points(state_->vitpose->Estimate(image, person.box));
+        if (parsed.pose_wholebody)
+          entry["wholebody"] = points(state_->dwpose->Estimate(image, person.box));
+        poses.push_back(std::move(entry));
+      }
+      out_poses = std::move(poses);
+      json::Value det = json::Value::object();
+      det["repo"] = "PekingU/rtdetr_r50vd_coco_o365";
+      det["model"] = "rtdetr_r50vd_coco_o365";
+      det["min_score"] = std::round(static_cast<double>(parsed.pose_min_score) * 1e6) / 1e6;
+      det["max_persons"] = parsed.pose_max_persons;
+      used["pose_detector"] = std::move(det);
+      if (parsed.pose) {
+        json::Value m = json::Value::object();
+        m["repo"] = "usyd-community/vitpose-base-simple";
+        m["model"] = "vitpose_base_simple";
+        json::Value names = json::Value::array();
+        for (const auto& n : state_->vitpose->KeypointNames())
+          names.push_back(n);
+        m["keypoints"] = std::move(names);
+        used["pose"] = std::move(m);
+      }
+      if (parsed.pose_wholebody) {
+        json::Value m = json::Value::object();
+        m["repo"] = "yzd-v/DWPose";
+        m["model"] = "dw-ll_ucoco_384";
+        m["layout"] = "COCO-WholeBody: 0-16 body, 17-22 feet, 23-90 face (68), 91-111 left hand, "
+                      "112-132 right hand";
+        used["pose_wholebody"] = std::move(m);
+      }
+    }
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),
                  "vision_failed");
@@ -442,6 +567,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   out["mean_luma"] = std::round(mean_luma * 1000.0) / 1000.0;
   out["brightened"] = brightened;
   out["detections"] = std::move(detections);
+  if (parsed.pose || parsed.pose_wholebody)
+    out["poses"] = std::move(out_poses);
   out["models"] = std::move(used);
   out["seconds"] = seconds(started, done);
   out["queue_seconds"] = seconds(queued, started);

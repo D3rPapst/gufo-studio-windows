@@ -30,6 +30,13 @@ struct RgbImage {
 // default of Image.resize), same fixed-point path as ResizeBilinear.
 [[nodiscard]] RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height);
 
+// torchvision resize(uint8 tensor, BILINEAR, antialias=True) on the CPU
+// (torch UpSampleKernelAVXAntialias): Pillow-style triangle weights in
+// double, stored as int16 with a precision picked from the largest weight,
+// horizontal pass first. Matches transformers' torchvision image processors
+// (RT-DETR) bit for bit.
+[[nodiscard]] RgbImage ResizeBilinearTorchAA(const RgbImage& in, int out_width, int out_height);
+
 // Pillow ImageStat.Stat(image.convert("L")).mean[0]: L = (R*19595 +
 // G*38470 + B*7471 + 0x8000) >> 16 per pixel, averaged.
 [[nodiscard]] double MeanLuma(const RgbImage& image);

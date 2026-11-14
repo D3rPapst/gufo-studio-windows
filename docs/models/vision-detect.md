@@ -1,8 +1,8 @@
 # Image recognition (imgutils detectors)
 
 `POST /v1/vision/detect` finds people, heads, faces and hands in an image with the
-anime detectors of dghs-imgutils, on the router's CPU, with the same models,
-thresholds and box rounding as `imgutils.detect`.
+anime detectors of dghs-imgutils, and body poses with RT-DETR, ViTPose and DWPose, on
+the router's CPU with the same models, thresholds and rounding as the Python originals.
 
 Use it when a pipeline today calls `detect_person`, `detect_heads`, `detect_faces` or
 `detect_hands` in Python: the answers match, so earlier measurements stay comparable,
@@ -22,8 +22,11 @@ the cores.
 - `image`: a `data:` URL, plain base64, a public `https://` URL or an Ablage path
   `/v1/jobs/{id}/files/{name}` of one of your own jobs. PNG, JPEG or WebP, at most
   20 MB. An alpha channel is dropped.
-- `tasks`: any of `person`, `head`, `face`, `hand`; all four when left out. `ocr` and
-  `wd14_tags` are reserved names and answer `501 task_not_available`.
+- `tasks`: any of `person`, `head`, `face`, `hand`, `pose`, `pose_wholebody`; the four
+  detectors when left out. `ocr` and `wd14_tags` are reserved names and answer
+  `501 task_not_available`.
+- `pose_options`: optional `min_score` (default 0.35) and `max_persons` (default 4) for
+  the person search of the pose tasks.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per task, each in (0, 1].
 - `brighten_dark`: optional. `true` runs the detectors on a brightened copy
@@ -58,6 +61,23 @@ An answer for two tasks (example values):
 `box` is `[x0, y0, x1, y1]` in whole pixels of your image, each list is sorted by
 score, and `score` is the unrounded value imgutils returns. `seconds` is the compute time, `queue_seconds` the wait for the CPU.
 
+## Poses
+
+`pose` and `pose_wholebody` find the persons with RT-DETR (label person, score above
+`min_score`, the `max_persons` best) and add a `poses` list in score order:
+
+```json
+{"poses": [{"box": [412.3, 96.1, 705.8, 767.2], "score": 0.93,
+            "keypoints": [[530.1, 140.7, 0.91]],
+            "wholebody": [[531.0, 141.2, 0.88]]}]}
+```
+
+`keypoints` (with `pose`) are the 17 COCO points of ViTPose, `wholebody` (with
+`pose_wholebody`) the 133 COCO-WholeBody points of DWPose: 0-16 body, 17-22 feet,
+23-90 face (68, mouth 48-67 counted from 23), 91-111 left and 112-132 right hand; each
+`[x, y, score]` in image pixels (shortened above). Poses always use the original image,
+also with `brighten_dark`.
+
 ## Models
 
 | Task | Hugging Face model | Network | Default conf / iou | ONNX size | Licence |
@@ -67,8 +87,14 @@ score, and `score` is the unrounded value imgutils returns. `seconds` is the com
 | `face` | `deepghs/anime_face_detection` `face_detect_v1.4_s` | YOLOv8s | 0.25 / 0.7 | 45 MB | MIT |
 | `hand` | `deepghs/anime_hand_detection` `hand_detect_v1.0_s` | YOLOv8s | 0.35 / 0.7 | 45 MB | OpenRAIL |
 
-These are the defaults of dghs-imgutils 0.19. Convert each `model.onnx` once (Python
-with `onnx`, `numpy` and `safetensors`):
+| `pose` (persons) | `PekingU/rtdetr_r50vd_coco_o365` | RT-DETR R50-vd | 0.35, 4 persons | 172 MB | Apache-2.0 |
+| `pose` | `usyd-community/vitpose-base-simple` | ViTPose-B | - | 344 MB | Apache-2.0 |
+| `pose_wholebody` | `yzd-v/DWPose` `dw-ll_ucoco_384.onnx` | RTMPose-l | - | 134 MB | Apache-2.0 |
+
+The detectors are the defaults of dghs-imgutils 0.19; the pose models and their
+processing follow transformers 5.18 and onnxruntime as the film pipeline runs them.
+Convert the pose models with `convert_pose.py rtdetr|vitpose <hf folder> <dir>` and
+`convert_dwpose.py <onnx> <dir>`, each detector `model.onnx` once (Python with `onnx`):
 
 ```powershell
 python -I extensions-ours\ccip\reference\convert_weights.py yolo `
