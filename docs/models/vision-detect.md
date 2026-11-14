@@ -66,11 +66,11 @@ with `onnx`, `numpy` and `safetensors`):
 
 ```powershell
 python -I extensions-ours\ccip\reference\convert_weights.py yolo `
-  <hf-cache>\person_detect_v1.1_m\model.onnx D:\llm-modelle\deepghs\vision\gufo person_detect_v1.1_m
+  <hf-cache>\person_detect_v1.1_m\model.onnx D:\llm-modelle\gufo\modelle\deepghs\vision\gufo person_detect_v1.1_m
 ```
 
 The router reads `<model>.safetensors` and `<model>.json` from `--vision-dir` (Windows
-default `D:\llm-modelle\deepghs\vision\gufo`) and loads each model on its first use.
+default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) and loads each model on its first use.
 
 ## Limits and errors
 

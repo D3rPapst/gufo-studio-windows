@@ -828,7 +828,7 @@ BILINEAR, `face_detect_v1.4_n`, from `ccip_ref.py`).
 
 `ocr` and `wd14_tags` are accepted task names that answer
 `501 task_not_available` until their models are ported. The detectors live in
-`--vision-dir` (Windows default `D:\llm-modelle\deepghsision\gufo`) as
+`--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) as
 `<model>.safetensors` + `.json` from
 `extensions-ours/ccip/reference/convert_weights.py yolo <model.onnx> <dir> <model>`
 (class names and `imgsz` from the ONNX metadata); each loads on first use

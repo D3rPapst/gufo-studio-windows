@@ -4096,7 +4096,7 @@ int RunRouter(std::span<const char* const> args) {
   // POST /v1/vision/detect: converted imgutils detectors (person, head,
   // face, hand). Default: the .198 install path on Windows.
 #ifdef _WIN32
-  std::filesystem::path vision_dir = "D:\\llm-modelle\\deepghs\\vision\\gufo";
+  std::filesystem::path vision_dir = "D:\\llm-modelle\\gufo\\modelle\\deepghs\\vision\\gufo";
 #else
   std::filesystem::path vision_dir;
 #endif

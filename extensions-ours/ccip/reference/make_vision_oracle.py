@@ -7,6 +7,8 @@
 # Run in the venv that has dghs-imgutils (same version as the film pipeline), with the HF cache that holds
 # the detector ONNX files (HF_HUB_OFFLINE=1 to make sure nothing is downloaded):
 #   python -I make_vision_oracle.py <out_dir> k1.png k2.png ...
+# --local-root DIR reads the ONNX files from DIR/<owner>__<repo>/<model>/... (the gufo download layout,
+# QUELLE.txt) instead of the Hugging Face cache; nothing is fetched then.
 import argparse
 import json
 import os
@@ -28,11 +30,31 @@ TASKS = {
 }
 
 
+def use_local_root(root):
+    import imgutils.generic.yolo as yolo
+    try:
+        from huggingface_hub.errors import EntryNotFoundError
+    except ImportError:  # older huggingface_hub
+        from huggingface_hub.utils import EntryNotFoundError
+
+    def local_download(repo_id, filename, **_kwargs):
+        path = os.path.join(root, repo_id.replace("/", "__"), *filename.split("/"))
+        if not os.path.isfile(path):
+            raise EntryNotFoundError(f"{repo_id}/{filename} not in {root}")
+        return path
+
+    yolo.hf_hub_download = local_download
+    yolo.YOLOModel._check_model_name = lambda self, name: None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
     ap.add_argument("images", nargs="+")
+    ap.add_argument("--local-root")
     args = ap.parse_args()
+    if args.local_root:
+        use_local_root(args.local_root)
     os.makedirs(args.out_dir, exist_ok=True)
     manifest = {"imgutils": getattr(imgutils, "__version__", None), "images": []}
     try:
