@@ -476,6 +476,17 @@ void TestPool() {
   partner->status = 0;
   response = service.Handle(Post(Body("AAAA", {"face"})));
   assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  // A wrong pool key (401/403) or a partner error (500): back here as well.
+  for (int status : {401, 403, 500}) {
+    partner->status = status;
+    response = service.Handle(Post(Body("AAAA", {"face"})));
+    assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  }
+  // A 400 of the partner (the request is wrong) is the answer.
+  partner->status = 400;
+  response = service.Handle(Post(Body("AAAA", {"face"})));
+  assert(response->status == 400);
+  partner->status = 0;
   // Pinned here: never relayed.
   const int before = partner->calls;
   HttpRequest local = Post(Body("AAAA", {"face"}));

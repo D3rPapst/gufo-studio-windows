@@ -1009,8 +1009,9 @@ or lacks the models, unless it was relayed already (`X-Gufo-Forwarded`) or is
 pinned (`X-Gufo-Pool: local`, also set by the gate for users with
 `pool = false`). It travels with the partner key and `X-Gufo-If-Idle: 1`; a
 partner whose queue is not idle answers `503 busy` at once. A partner that
-is unreachable or answers 404 (older router), 502, 503 or 504 does not count:
-the request queues here. `X-Gufo-Pool: remote` sends it without the idle
+is unreachable or answers anything but a success or `400` (a wrong pool key
+401/403, 404 of an older router, 429, any 5xx such as an OOM) does not count:
+the request queues here; a `400` (the request itself is wrong) is the answer. `X-Gufo-Pool: remote` sends it without the idle
 condition (`503 remote_unavailable` without a partner). A partner's answer
 carries `X-Gufo-Ran-On: partner`. Images must be inline in the relayed body:
 `/v1/vision/detect` inlines an Ablage path itself; `/v1/figuren` takes only
