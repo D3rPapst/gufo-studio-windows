@@ -49,6 +49,10 @@
 //                "keypoints": [[x, y, score] x 17],      with "pose"
 //                "wholebody": [[x, y, score] x 133]}]    with "pose_wholebody"
 //   in score order; the point names are in "models".
+//   "pose_boxes": [[x0, y0, x1, y1], ...] (at most kMaxPoseBoxes) skips
+//   RT-DETR: ViTPose / DWPose run in exactly these boxes, in this order
+//   (the film pipeline's mundmessung.py keeps the first frame's box for
+//   every frame); the poses then carry no "score".
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -68,6 +72,7 @@
 //   input pictures, kMaxRequestPixels decoded over all of them (decoded
 //   only once the request has its CPU turn).
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -139,7 +144,11 @@ struct Request {
   bool pose_wholebody{false};
   float pose_min_score{0.35f};
   int pose_max_persons{4};
+  /// "pose_boxes": the persons' boxes given by the caller (RT-DETR skipped).
+  std::vector<std::array<float, 4>> pose_boxes;
 };
+/// Most "pose_boxes" per request.
+inline constexpr std::size_t kMaxPoseBoxes = 16;
 
 /// The pose tasks ("pose", "pose_wholebody").
 const std::vector<std::string>& PoseTasks();

@@ -6,8 +6,8 @@ with its WD14 tagger and finds body poses with RT-DETR, ViTPose and DWPose, on t
 router's CPU with the same models, thresholds and rounding as the Python originals.
 
 Use it instead of `detect_person`, `detect_heads`, `detect_faces`, `detect_hands`, `ocr`,
-`get_wd14_tags` or the pipeline's pose code in Python: the answers match, and the router
-queues the requests instead of letting several processes compete for the cores.
+`get_wd14_tags` or the pipeline's pose code in Python: the answers match, and the router queues
+the requests instead of letting several processes compete for the cores.
 
 ## Request
 
@@ -78,7 +78,9 @@ queues the requests instead of letting several processes compete for the cores.
 (`pose`): the 17 COCO points of ViTPose; `wholebody` (`pose_wholebody`): the 133
 COCO-WholeBody points of DWPose (0-16 body, 17-22 feet, 23-90 face (68, mouth 48-67
 counted from 23), 91-111 left and 112-132 right hand); each `[x, y, score]` in image
-pixels of the original image, also with `brighten_dark`.
+pixels of the original image, also with `brighten_dark`. `"pose_boxes": [[x0, y0, x1, y1], ...]`
+(up to 16) skips RT-DETR: the poses are made in exactly these boxes, in your order, without
+`score` (the film pipeline keeps the first frame's box for a whole shot).
 
 ## Models
 
@@ -95,12 +97,10 @@ pixels of the original image, also with `brighten_dark`.
 | `pose_wholebody` | `yzd-v/DWPose` `dw-ll_ucoco_384.onnx` | RTMPose-l | - | 134 MB | Apache-2.0 |
 
 The detectors, OCR and tagger are the defaults of dghs-imgutils 0.19, the pose models
-follow the film pipeline (transformers 5.18, onnxruntime). The router loads the converted
-files from `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`)
+follow the film pipeline (transformers 5.18, onnxruntime). The router loads the converted files from `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`)
 on first use; the converters are in the server reference below.
 
-The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and
-`ß`; those come out as similar letters (`Bahnhofstraße` reads as `BahnhofstraBe`).
+The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and `ß`; those come out as similar letters (`Bahnhofstraße` reads as `BahnhofstraBe`).
 
 ## Limits and errors
 
