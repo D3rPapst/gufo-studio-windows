@@ -4086,6 +4086,8 @@ int RunRouter(std::span<const char* const> args) {
 #endif
   std::size_t ccip_threads = 8;
   std::size_t jobs_parallel = 1;
+  // 0 = as many as --jobs-parallel.
+  std::size_t comfy_parallel = 0;
   std::string jobs_webhook_allow;
   std::string remote_allow;
   std::string jobs_webhook_secret;
@@ -4147,6 +4149,11 @@ int RunRouter(std::span<const char* const> args) {
                    "videos, non-WAV voice references; also POST "
                    "/v1/videos/concat (ffprobe is expected next to it)",
                    "Router", &comfy_ffmpeg);
+  parser.AddOption("", "--comfy-parallel", "N",
+                   "ComfyUI prompts running at the same time (default: "
+                   "--jobs-parallel); with placement = pool the second one's "
+                   "requests can run on the partner",
+                   "Router", &comfy_parallel);
   parser.AddOption("", "--jobs-dir", "DIR",
                    "Serve the job API (/v1/jobs): wrapped image, video, "
                    "audio and chat requests run in the background; DIR holds "
@@ -4675,6 +4682,9 @@ int RunRouter(std::span<const char* const> args) {
       comfy_options.models.available.push_back(model.id);
     comfy_options.fetch = self_fetch;
     comfy_options.unload = [raw] { raw->UnloadIdle(); };
+    comfy_options.parallel = comfy_parallel > 0
+                                 ? comfy_parallel
+                                 : std::max<std::size_t>(1, jobs_parallel);
     try {
       state->comfy =
           std::make_unique<router::comfy::Adapter>(std::move(comfy_options));
@@ -4715,6 +4725,27 @@ int RunRouter(std::span<const char* const> args) {
       if (!reachable.empty())
         state->self_name = reachable;
     }
+  }
+  // ComfyUI pool view (GET /queue?pool=1): the partner router's own queue,
+  // 3 s to connect and answer; its answer is local (X-Gufo-Relay).
+  if (state->comfy != nullptr && state->partner_spec.has_value()) {
+    const router::RemoteSpec spec = *state->partner_spec;
+    const std::string relay_id = state->router_id;
+    state->comfy->SetPartner(
+        state->partner_name,
+        [spec, relay_id](const HttpRequest& req) -> router::comfy::FetchResult {
+          router::UpstreamTarget target = router::RemoteTarget(spec, relay_id);
+          target.connect_timeout = std::chrono::seconds(3);
+          target.head_timeout = std::chrono::seconds(3);
+          HttpRequest copy = req;
+          const auto deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          copy.is_cancelled = [deadline] {
+            return std::chrono::steady_clock::now() >= deadline;
+          };
+          // Anything but 200 or 404 counts as unreachable for the view.
+          return CollectResponse(router::ProxyToWorker(target, copy));
+        });
   }
   if (!jobs_dir.empty()) {
     router::jobs::Options jobs_options;
@@ -4862,6 +4893,11 @@ int RunRouter(std::span<const char* const> args) {
   if (state->comfy != nullptr) {
     state->comfy->Start();
     Logger::Info("router", "event=comfy_api dir=" + comfy_dir.string() +
+                               " parallel=" +
+                               std::to_string(comfy_parallel > 0
+                                                  ? comfy_parallel
+                                                  : std::max<std::size_t>(
+                                                        1, jobs_parallel)) +
                                " ffmpeg=" +
                                (comfy_ffmpeg.empty() ? std::string("none")
                                                      : comfy_ffmpeg.string()));

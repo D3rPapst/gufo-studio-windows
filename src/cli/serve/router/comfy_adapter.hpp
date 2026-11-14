@@ -3,8 +3,10 @@
 
 // ComfyUI-compatible front for the router (`gufo router --comfy-dir DIR`):
 // POST /prompt takes an API-format workflow, comfy_graph maps it to gufo
-// endpoints, and one worker thread runs the jobs in order through the
-// router's own OpenAI-style API. Results are served the ComfyUI way:
+// endpoints, and `AdapterOptions::parallel` worker threads run the jobs in
+// order (up to that many at once, 2.1) through the router's own
+// OpenAI-style API, so with placement = pool two prompts can compute on
+// both machines at the same time. Results are served the ComfyUI way:
 // /history/{id}, /view?filename=.., /queue, /upload/image, /free,
 // /interrupt, /system_stats, /object_info and the /ws progress socket.
 //
@@ -66,6 +68,11 @@ struct AdapterOptions {
   /// Preview poll interval while a /ws client watches.
   std::chrono::milliseconds preview_poll{std::chrono::milliseconds(400)};
   std::size_t history_limit{2000};
+  /// Prompts that run at the same time (worker threads, 2.1); 0 counts as 1.
+  /// A second prompt's requests go through the router's pool like any
+  /// other, so they compute on the partner while this machine's GPU is
+  /// busy with the first one.
+  std::size_t parallel{1};
 };
 
 class Adapter {
@@ -76,8 +83,15 @@ public:
   Adapter& operator=(const Adapter&) = delete;
 
   void Start();
-  /// Cancels the running job and joins the worker.
+  /// Cancels the running jobs and joins the workers.
   void Stop();
+
+  /// The pool partner's ComfyUI front (placement = pool, 2.1): `GET
+  /// /queue?pool=1` and `GET /prompt?pool=1` add its queue, read with
+  /// `fetch` (a `GET /queue` to the partner router, which answers it
+  /// locally). Call before Start(); `name` is the partner's
+  /// `http://host:port`.
+  void SetPartner(std::string name, Fetch fetch);
 
   /// The ComfyUI response for `request`, or nullopt when the path is not
   /// one of ComfyUI's (the router then routes it as usual).
@@ -118,7 +132,11 @@ public:
 
 private:
   server::HttpResponse Submit(const server::HttpRequest& request);
-  server::HttpResponse QueueGet();
+  server::HttpResponse QueueGet(const server::HttpRequest& request);
+  server::HttpResponse PromptGet(const server::HttpRequest& request);
+  /// The partner's /queue for a pool view: its body, or nullopt with
+  /// *state "none" (no partner), "unreachable" or "no_comfy".
+  std::optional<json::Value> PartnerQueue(std::string* state);
   server::HttpResponse QueuePost(const server::HttpRequest& request);
   server::HttpResponse HistoryGet(const server::HttpRequest& request,
                                   std::string_view id);
@@ -130,8 +148,8 @@ private:
   server::HttpResponse SystemStats();
   server::HttpResponse ObjectInfo(std::string_view class_type);
   server::HttpResponse Socket(const server::HttpRequest& request);
-  server::HttpResponse FilmstudioProgress();
-  server::HttpResponse FilmstudioPreview();
+  server::HttpResponse FilmstudioProgress(const server::HttpRequest& request);
+  server::HttpResponse FilmstudioPreview(const server::HttpRequest& request);
 
   void WorkerMain();
   void Execute(const std::shared_ptr<Job>& job);
@@ -198,14 +216,21 @@ private:
   std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<std::shared_ptr<Job>> pending_;
-  std::shared_ptr<Job> running_;
+  /// Running prompts, oldest start first (at most options_.parallel).
+  std::vector<std::shared_ptr<Job>> running_;
   /// QueueRemainingLocked() as of the last EmitStatusLocked().
   std::atomic<int> queue_remaining_{0};
   std::map<std::string, json::Value> history_;
   std::vector<std::string> history_order_;
   long long next_number_{0};
   bool stopping_{false};
-  std::thread worker_;
+  std::vector<std::thread> workers_;
+  /// SetPartner(); read-only once Start() ran.
+  std::string partner_name_;
+  Fetch partner_fetch_;
+  /// An unreachable partner is not asked again before this (pool view).
+  std::mutex partner_mutex_;
+  std::chrono::steady_clock::time_point partner_retry_at_{};
 
   struct Event {
     std::uint64_t seq;
@@ -224,7 +249,7 @@ private:
   };
   std::map<std::string, Preview, std::less<>> previews_;
   /// Film studio polling (/filmstudio/progress, /filmstudio/preview, as the
-  /// filmstudio_progress ComfyUI plugin): the running prompt for any client.
+  /// filmstudio_progress ComfyUI plugin): the running prompts for any client.
   struct Live {
     std::string prompt_id;
     std::string node;
@@ -235,9 +260,12 @@ private:
     int nodes_done{0};
     int nodes_total{0};
   };
-  Live live_;
+  /// Per running prompt id (Execute sets it, the prompt's end erases it).
+  std::map<std::string, Live, std::less<>> live_;
   /// Newest preview of any client, for /filmstudio/preview.
   Preview last_preview_;
+  /// Newest preview per running prompt (/filmstudio/*?prompt_id=).
+  std::map<std::string, Preview, std::less<>> prompt_previews_;
   /// A /filmstudio poll counts as watching for 10 s: previews get rendered.
   std::chrono::steady_clock::time_point http_watch_until_{};
   std::uint64_t next_preview_{1};
@@ -254,7 +282,7 @@ private:
   };
   std::mutex preview_mutex_;
   std::map<std::string, PreviewEntry, std::less<>> preview_ids_;
-  std::uint64_t work_counter_{0};
+  std::atomic<std::uint64_t> work_counter_{0};
 };
 
 }  // namespace gufo::router::comfy
