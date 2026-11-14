@@ -1,4 +1,5 @@
-// YOLOv8n face detector (deepghs face_detect_v1.4_n), CPU fp32, NCHW.
+// YOLOv8 detectors (deepghs face_detect_v1.4_n for /v1/figuren; any n/s/m
+// person/head/face/hand export for /v1/vision/detect), CPU fp32, NCHW.
 // Topology (read off model.onnx; conv shapes/strides/pads come from the JSON):
 //   0 Conv/2, 1 Conv/2, 2 C2f, 3 Conv/2, 4 C2f, 5 Conv/2, 6 C2f, 7 Conv/2, 8 C2f, 9 SPPF,
 //   10 up(9), 11 cat(10,6), 12 C2f, 13 up(12), 14 cat(13,4), 15 C2f (P3),
@@ -39,13 +40,13 @@ struct ConvW {
   bool silu{false};
 };
 
-class CpuYolo final : public FaceDetector {
+class CpuYolo final : public FaceDetector, public YoloDetector {
 public:
-  bool Init(const std::filesystem::path& dir, std::string* error) {
-    if (!weights_.Load(dir / "face_yolov8n.safetensors", error)) return false;
-    std::ifstream in(dir / "face_yolov8n.json", std::ios::binary);
+  bool Init(const std::filesystem::path& dir, const std::string& stem, std::string* error) {
+    if (!weights_.Load(dir / (stem + ".safetensors"), error)) return false;
+    std::ifstream in(dir / (stem + ".json"), std::ios::binary);
     if (!in) {
-      if (error) *error = "missing " + (dir / "face_yolov8n.json").string();
+      if (error) *error = "missing " + (dir / (stem + ".json")).string();
       return false;
     }
     std::stringstream ss;
@@ -71,13 +72,27 @@ public:
       }
       for (const auto& s : arch.find("strides")->items()) strides_.push_back(static_cast<float>(s.as_double()));
       reg_max_ = static_cast<int>(arch.member_size("reg_max", 16));
-      classes_ = static_cast<int>(arch.find("classes")->size());
+      // "names" (ONNX metadata, newer converter) or "classes" (face_yolov8n).
+      const json::Value* names = arch.find("names");
+      if (names == nullptr) names = arch.find("classes");
+      for (const auto& n : names->items()) labels_.push_back(n.str());
+      classes_ = static_cast<int>(labels_.size());
+      if (const json::Value* imgsz = arch.find("imgsz"); imgsz != nullptr) {
+        const auto& dims = imgsz->items();
+        if (dims.size() != 2 || dims[0].as_double() != dims[1].as_double())
+          throw std::runtime_error("imgsz must be square");
+        input_size_ = static_cast<int>(dims[0].as_double());
+      }
+      if (classes_ < 1) throw std::runtime_error("no class names");
     } catch (const std::exception& e) {
-      if (error) *error = std::string("face detector: ") + e.what();
+      if (error) *error = std::string("detector ") + stem + ": " + e.what();
       return false;
     }
     return true;
   }
+
+  const std::vector<std::string>& Labels() const override { return labels_; }
+  int InputSize() const override { return input_size_; }
 
   std::vector<float> Raw(const float* chw, int size, int* anchors) const override {
     Map x{3, size, size, std::vector<float>(chw, chw + static_cast<std::size_t>(3) * size * size)};
@@ -285,6 +300,8 @@ private:
   std::vector<float> strides_;
   int reg_max_{16};
   int classes_{1};
+  int input_size_{640};
+  std::vector<std::string> labels_;
 };
 
 }  // namespace
@@ -292,8 +309,86 @@ private:
 std::unique_ptr<FaceDetector> FaceDetector::Load(const std::filesystem::path& dir,
                                                  std::string* error) {
   auto m = std::make_unique<CpuYolo>();
-  if (!m->Init(dir, error)) return nullptr;
+  if (!m->Init(dir, "face_yolov8n", error)) return nullptr;
   return m;
+}
+
+std::unique_ptr<YoloDetector> YoloDetector::Load(const std::filesystem::path& dir,
+                                                 const std::string& stem, std::string* error) {
+  auto m = std::make_unique<CpuYolo>();
+  if (!m->Init(dir, stem, error)) return nullptr;
+  return m;
+}
+
+std::vector<Detection> DecodeDetections(const std::vector<float>& raw, int anchors, int classes,
+                                        int input_size, int width, int height, float conf,
+                                        float iou) {
+  // imgutils.generic.yolo._nms_postprocess, float32 like numpy on the
+  // float32 output.
+  struct Cand {
+    float x0, y0, x1, y1;
+    float score;
+    int label;
+  };
+  std::vector<Cand> cands;
+  for (int a = 0; a < anchors; ++a) {
+    int best = 0;
+    float best_score = raw[static_cast<std::size_t>(4) * anchors + a];
+    for (int k = 1; k < classes; ++k) {
+      const float s = raw[static_cast<std::size_t>(4 + k) * anchors + a];
+      if (s > best_score) {  // numpy argmax: first maximum wins
+        best_score = s;
+        best = k;
+      }
+    }
+    if (!(best_score > conf)) continue;
+    const float cx = raw[a];
+    const float cy = raw[static_cast<std::size_t>(anchors) + a];
+    const float w = raw[static_cast<std::size_t>(2) * anchors + a];
+    const float h = raw[static_cast<std::size_t>(3) * anchors + a];
+    cands.push_back({cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, best_score, best});
+  }
+  // scores.argsort()[::-1]: descending; ties keep the reversed index order.
+  std::vector<int> order(cands.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int i, int j) { return cands[i].score < cands[j].score; });
+  std::reverse(order.begin(), order.end());
+  auto area = [](const Cand& c) { return (c.x1 - c.x0 + 1.0f) * (c.y1 - c.y0 + 1.0f); };
+  // _xy_postprocess: x / new_w * old_w, clipped to [0, old], numpy round
+  // (half to even).
+  auto px = [input_size](float v, int limit) {
+    const double x = static_cast<double>(v) / input_size * limit;
+    return static_cast<int>(std::nearbyint(std::clamp(x, 0.0, static_cast<double>(limit))));
+  };
+  std::vector<Detection> out;
+  while (!order.empty()) {
+    const Cand& ci = cands[static_cast<std::size_t>(order.front())];
+    std::vector<int> rest;
+    for (std::size_t t = 1; t < order.size(); ++t) {
+      const Cand& cj = cands[static_cast<std::size_t>(order[t])];
+      const float iw = std::max(0.0f, std::min(ci.x1, cj.x1) - std::max(ci.x0, cj.x0) + 1.0f);
+      const float ih = std::max(0.0f, std::min(ci.y1, cj.y1) - std::max(ci.y0, cj.y0) + 1.0f);
+      const float inter = iw * ih;
+      if (inter / (area(ci) + area(cj) - inter) <= iou) rest.push_back(order[t]);
+    }
+    Detection d;
+    d.box = {px(ci.x0, width), px(ci.y0, height), px(ci.x1, width), px(ci.y1, height)};
+    d.label = ci.label;
+    d.score = ci.score;
+    out.push_back(d);
+    order = std::move(rest);
+  }
+  return out;
+}
+
+std::vector<Detection> YoloDetector::Detect(const RgbImage& image, float conf, float iou) const {
+  const int size = InputSize();
+  const std::vector<float> chw = StretchInput(image, size, size);
+  int anchors = 0;
+  const std::vector<float> raw = Raw(chw.data(), size, &anchors);
+  return DecodeDetections(raw, anchors, static_cast<int>(Labels().size()), size, image.width,
+                          image.height, conf, iou);
 }
 
 std::vector<Face> DecodeFaces(const std::vector<float>& raw, int anchors,

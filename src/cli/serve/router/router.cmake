@@ -18,6 +18,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/auth.cpp
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/cpu_pool.cpp
   src/cli/serve/router/download.cpp
   src/cli/serve/router/einrichtung.cpp
   src/cli/serve/router/figuren.cpp
@@ -34,6 +35,8 @@ add_library(gufo_router STATIC
   src/cli/serve/router/rgba_image.cpp
   src/cli/serve/router/router.cpp
   src/cli/serve/router/selbsttest.cpp
+  src/cli/serve/router/vision.cpp
+  src/cli/serve/router/vision_wd14.cpp
   src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
 )
@@ -76,7 +79,8 @@ if (BUILD_TESTING)
       router_preset_test router_registry_test router_memory_test
       router_names_test router_figuren_test router_proxy_remote_test
       router_jobs_test router_pool_test router_figuren_ccip_endpoint_test
-      router_auth_test router_mcp_test router_einrichtung_test)
+      router_auth_test router_mcp_test router_einrichtung_test
+      router_vision_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})

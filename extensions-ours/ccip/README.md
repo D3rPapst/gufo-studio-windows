@@ -9,6 +9,13 @@ Native C++ runtime (CPU fp32, OpenMP) for
   0.1785 (deepghs metrics).
 - **face_detect_v1.4_n** (deepghs, MIT): YOLOv8n, one class, letterbox 640,
   conf 0.25, NMS IoU 0.7.
+- **YoloDetector**: any converted deepghs YOLOv8 detector (`/v1/vision/detect`).
+- **TextOcr** (`ocr.hpp`): `imgutils.ocr.ocr` with PaddleOCR PP-OCRv4 mobile
+  (deepghs/paddleocr, Apache-2.0): DBNet text detector + SVTR-LCNet CTC
+  recognizer on a small ONNX-node runtime (`cpu/ocr_net.cpp`), box geometry
+  ported from OpenCV/Clipper (`ocr_post.cpp`). Converter
+  `reference/convert_ocr.py`, test `ccip.ocr_oracle`
+  (`reference/make_ocr_oracle.py`, env `GUFO_OCR_DIR`, `GUFO_OCR_ORACLE`).
 
 No Python or ONNX at run time. Written with AI assistance (Claude Code).
 
@@ -39,7 +46,9 @@ asserts the block patterns it relies on.
 `image_ops.cpp` reproduces Pillow `Image.resize(BILINEAR)` for RGB8 bit for
 bit (support-scaled triangle filter, 22-bit fixed point, uint8 after each
 pass, Pillow's pass-order rule), so inputs equal the Python reference
-(`ccip_ref.py` / deepghs imgutils) exactly.
+(`ccip_ref.py` / deepghs imgutils) exactly. BICUBIC (`ResizeBicubic`, the
+detectors, OCR crops and the tagger) and LANCZOS (`ResizeLanczos`, the 3x
+OCR pass of the film pipeline) use the same fixed-point path.
 
 ## Test
 

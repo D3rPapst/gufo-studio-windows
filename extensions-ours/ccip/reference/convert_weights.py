@@ -6,7 +6,10 @@
 #
 # Usage (venv with onnx, numpy, safetensors; run with python -I):
 #   python -I convert_weights.py ccip  <model_feat.onnx> <out_dir>
-#   python -I convert_weights.py yolo  <model.onnx>      <out_dir>
+#   python -I convert_weights.py yolo  <model.onnx>      <out_dir> [<name>]
+# <name> is the deepghs model folder (person_detect_v1.1_m, head_detect_v2.0_s,
+# face_detect_v1.4_s, hand_detect_v1.0_s); the files are then <name>.safetensors/.json
+# (/v1/vision/detect). Without it: face_yolov8n.* for /v1/figuren as before.
 import json
 import os
 import re
@@ -229,7 +232,19 @@ def convert_ccip(path, out_dir):
 
 
 # ----------------------------------------------------------------------------- YOLOv8 face detector
-def convert_yolo(path, out_dir):
+def onnx_metadata(model):
+    # ultralytics export metadata: names "{0: 'person'}", imgsz "[640, 640]" (imgutils reads both).
+    import ast
+    meta = {p.key: p.value for p in model.metadata_props}
+    names = ast.literal_eval(meta["names"]) if "names" in meta else None
+    imgsz = json.loads(meta["imgsz"]) if "imgsz" in meta else [640, 640]
+    if names is not None:
+        assert sorted(names) == list(range(len(names))), names
+        names = [names[i] for i in range(len(names))]
+    return names, imgsz, meta
+
+
+def convert_yolo(path, out_dir, name=None):
     g = Graph(path)
     tensors = OrderedDict()
     convs = OrderedDict()
@@ -271,12 +286,22 @@ def convert_yolo(path, out_dir):
     dfl_w = tensors["model.22.dfl.conv.weight"].reshape(-1)
     assert np.allclose(dfl_w, np.arange(dfl_w.size)), dfl_w
     strides = [scalar(g.value(g.node(f"/model.22/{n}").input[1])) for n in ("Add_2", "Add_5", "Add_8")]
-    arch = OrderedDict(model="face_detect_v1.4_n", source=os.path.basename(path), classes=["face"],
-                       input={"size": 640, "pad_value": 114, "scale": 1.0 / 255.0},
+    names, imgsz, meta = onnx_metadata(g.model)
+    if name is None:
+        assert names in (None, ["face"]), names
+        names = ["face"]
+    assert names, "ONNX metadata has no class names"
+    assert len(imgsz) == 2 and imgsz[0] == imgsz[1], imgsz
+    n_cls = convs["22.cv3.0.2"]["out"]
+    assert n_cls == len(names), (n_cls, names)
+    arch = OrderedDict(model=name or "face_detect_v1.4_n", source=os.path.basename(path), classes=names,
+                       names=names, imgsz=imgsz,
+                       onnx_metadata={k: meta[k] for k in sorted(meta) if k in ("version", "date", "stride", "task")},
+                       input={"size": int(imgsz[0]), "pad_value": 114, "scale": 1.0 / 255.0},
                        strides=strides, reg_max=int(dfl_w.size), c2f=c2f, convs=convs,
                        sppf={"pool_kernel": 5, "pools": 3}, upsample="nearest x2",
                        output="[1, 4 + classes, anchors]: cx, cy, w, h in input pixels, class sigmoid")
-    write(out_dir, "face_yolov8n", tensors, arch)
+    write(out_dir, name or "face_yolov8n", tensors, arch)
     print("yolo tensors", len(tensors))
 
 
@@ -290,4 +315,5 @@ def write(out_dir, stem, tensors, arch):
 
 if __name__ == "__main__":
     kind, src, dst = sys.argv[1:4]
-    {"ccip": convert_ccip, "yolo": convert_yolo}[kind](src, dst)
+    extra = sys.argv[4:]
+    {"ccip": convert_ccip, "yolo": convert_yolo}[kind](src, dst, *extra)

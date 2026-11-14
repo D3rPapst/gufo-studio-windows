@@ -26,6 +26,26 @@ struct RgbImage {
 };
 
 [[nodiscard]] RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height);
+// Pillow Image.resize(..., BICUBIC) (a = -0.5, support 2; the Pillow >= 7
+// default of Image.resize), same fixed-point path as ResizeBilinear.
+[[nodiscard]] RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height);
+// Pillow Image.resize(..., LANCZOS) (sinc windowed by sinc, a = 3, support
+// 3), same fixed-point path: the film pipeline's 3x enlargement before OCR
+// (erkennung_schrift.py).
+[[nodiscard]] RgbImage ResizeLanczos(const RgbImage& in, int out_width, int out_height);
+
+// Pillow ImageStat.Stat(image.convert("L")).mean[0]: L = (R*19595 +
+// G*38470 + B*7471 + 0x8000) >> 16 per pixel, averaged.
+[[nodiscard]] double MeanLuma(const RgbImage& image);
+// image.point(lambda v: round(255 * (v / 255) ** gamma)) on every channel
+// (Python round, half to even): the film pipeline's brightening of dark
+// keyframes before detection (gamma 0.5 below mean luma 70).
+[[nodiscard]] RgbImage ApplyGamma(const RgbImage& image, double gamma);
+
+// imgutils generic YOLO input (allow_dynamic=False): stretched to
+// width x height with ResizeBicubic (no letterbox), (x / 255.0) as float32,
+// 3 x height x width.
+[[nodiscard]] std::vector<float> StretchInput(const RgbImage& image, int width, int height);
 
 // Pillow Image.crop for a box inside the image (x1/y1 exclusive); parts
 // outside the image are black like Pillow's.

@@ -18,6 +18,36 @@ double BilinearFilter(double x) {
   return 0.0;
 }
 
+// Pillow bicubic_filter (a = -0.5), support 2.
+double BicubicFilter(double x) {
+  constexpr double a = -0.5;
+  if (x < 0.0) x = -x;
+  if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+  if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+  return 0.0;
+}
+
+// Pillow sinc_filter / lanczos_filter (a = 3), support 3.
+double SincFilter(double x) {
+  if (x == 0.0) return 1.0;
+  x = x * 3.14159265358979323846;  // M_PI
+  return std::sin(x) / x;
+}
+
+double LanczosFilter(double x) {
+  // Truncated sinc; -3 <= x < 3.
+  if (-3.0 <= x && x < 3.0) return SincFilter(x) * SincFilter(x / 3);
+  return 0.0;
+}
+
+struct Filter {
+  double (*fn)(double);
+  double support;
+};
+constexpr Filter kBilinear{&BilinearFilter, 1.0};
+constexpr Filter kBicubic{&BicubicFilter, 2.0};
+constexpr Filter kLanczos{&LanczosFilter, 3.0};
+
 struct Coeffs {
   int ksize{0};
   std::vector<int> bounds;   // per output: xmin, count
@@ -25,12 +55,11 @@ struct Coeffs {
 };
 
 // precompute_coeffs + normalize_coeffs_8bpc for box [in0, in1) of the input.
-Coeffs Precompute(int in_size, float in0, float in1, int out_size) {
-  constexpr double kSupport = 1.0;  // bilinear
+Coeffs Precompute(int in_size, float in0, float in1, int out_size, const Filter& filter) {
   double scale = static_cast<double>(in1 - in0) / out_size;
   double filterscale = scale;
   if (filterscale < 1.0) filterscale = 1.0;
-  const double support = kSupport * filterscale;
+  const double support = filter.support * filterscale;
   Coeffs c;
   c.ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
   c.bounds.resize(static_cast<std::size_t>(out_size) * 2);
@@ -46,7 +75,7 @@ Coeffs Precompute(int in_size, float in0, float in1, int out_size) {
     xmax -= xmin;
     double* k = &kd[static_cast<std::size_t>(xx) * c.ksize];
     for (int x = 0; x < xmax; ++x) {
-      const double w = BilinearFilter((x + xmin - center + 0.5) * ss);
+      const double w = filter.fn((x + xmin - center + 0.5) * ss);
       k[x] = w;
       ww += w;
     }
@@ -124,17 +153,16 @@ RgbImage Vertical(const RgbImage& src, const Coeffs& cv, int out_height) {
   return outimg;
 }
 
-}  // namespace
-
-RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height) {
+// ImagingResample for RGB8 with `filter` (Pillow 10+ pass order).
+RgbImage Resample(const RgbImage& in, int out_width, int out_height, const Filter& filter) {
   if (in.width <= 0 || in.height <= 0 || out_width <= 0 || out_height <= 0) {
-    throw std::invalid_argument("ResizeBilinear: empty image");
+    throw std::invalid_argument("Resize: empty image");
   }
   if (out_width == in.width && out_height == in.height) return in;  // Image.resize returns a copy
   const bool need_h = out_width != in.width;
   const bool need_v = out_height != in.height;
-  const Coeffs ch = Precompute(in.width, 0.0f, static_cast<float>(in.width), out_width);
-  Coeffs cv = Precompute(in.height, 0.0f, static_cast<float>(in.height), out_height);
+  const Coeffs ch = Precompute(in.width, 0.0f, static_cast<float>(in.width), out_width, filter);
+  Coeffs cv = Precompute(in.height, 0.0f, static_cast<float>(in.height), out_height, filter);
   // Pillow 10+: the vertical pass runs first only when the height shrinks by
   // more than twice as many pixels as the width does.
   const int dh = in.height - out_height;
@@ -161,6 +189,57 @@ RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height) {
   }
   if (!need_h) return cur;
   return Horizontal(*src, ch, out_width, 0, src->height);
+}
+
+}  // namespace
+
+RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height) {
+  return Resample(in, out_width, out_height, kBilinear);
+}
+
+RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height) {
+  return Resample(in, out_width, out_height, kBicubic);
+}
+
+RgbImage ResizeLanczos(const RgbImage& in, int out_width, int out_height) {
+  return Resample(in, out_width, out_height, kLanczos);
+}
+
+double MeanLuma(const RgbImage& image) {
+  const std::size_t pixels = static_cast<std::size_t>(image.width) * image.height;
+  if (pixels == 0) return 0.0;
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < pixels; ++i) {
+    sum += (static_cast<std::uint32_t>(image.rgb[i * 3]) * 19595u +
+            static_cast<std::uint32_t>(image.rgb[i * 3 + 1]) * 38470u +
+            static_cast<std::uint32_t>(image.rgb[i * 3 + 2]) * 7471u + 0x8000u) >>
+           16;
+  }
+  return static_cast<double>(sum) / static_cast<double>(pixels);
+}
+
+RgbImage ApplyGamma(const RgbImage& image, double gamma) {
+  std::uint8_t lut[256];
+  for (int v = 0; v < 256; ++v) {
+    const double y = std::nearbyint(255.0 * std::pow(v / 255.0, gamma));
+    lut[v] = static_cast<std::uint8_t>(std::clamp(y, 0.0, 255.0));
+  }
+  RgbImage out = image;
+  for (std::uint8_t& c : out.rgb) c = lut[c];
+  return out;
+}
+
+std::vector<float> StretchInput(const RgbImage& image, int width, int height) {
+  const RgbImage r = ResizeBicubic(image, width, height);
+  const std::size_t plane = static_cast<std::size_t>(width) * height;
+  std::vector<float> x(plane * 3);
+  for (std::size_t i = 0; i < plane; ++i) {
+    for (int c = 0; c < 3; ++c) {
+      // imgutils rgb_encode: (array / 255.0).astype(np.float32).
+      x[c * plane + i] = static_cast<float>(static_cast<double>(r.rgb[i * 3 + c]) / 255.0);
+    }
+  }
+  return x;
 }
 
 RgbImage Crop(const RgbImage& in, int x0, int y0, int x1, int y1) {
