@@ -2005,6 +2005,10 @@ model_forbidden`, `400 content_filtered`, `429 daily_limit`) or the
 router's (`507 insufficient_memory`, `503 ...`) is the tool's `isError`.
 As for the pages, the submit itself needs the `ablage` area (`/v1/jobs`):
 a user with `bild` alone sees `bild_erzeugen` but gets `403 forbidden`.
+This stays on purpose (ultra review of 14.11., finding 5): `tools/list`
+shows a tool by its own area, as the page menu does, and the 403 names
+the missing area, so an admin grants `ablage` together with the media
+areas instead of the list hiding why a tool is missing.
 
 - `bild_erzeugen` `{prompt, negativ?, model?, breite?+hoehe? (multiples
   of 32, at most 4 MP), schritte?, seed?, anzahl? (1-4), lora? [{name,
