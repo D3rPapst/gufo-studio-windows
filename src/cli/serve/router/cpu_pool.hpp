@@ -100,7 +100,8 @@ enum class Route {
                            bool local_busy, bool local_missing);
 
 /// Whether a partner answer counts (returned to the caller) or means "not
-/// there" (run here instead): 404, 502, 503 and 504 do not count.
+/// there" (run here instead): only 2xx/3xx and 400 (a bad request) count;
+/// 401/403 (pool key), 404, 429 and 5xx run here.
 [[nodiscard]] bool PartnerAnswered(const server::HttpResponse& answer);
 
 /// 503 busy with Retry-After: 5 (queue full, or not idle for a relayed
