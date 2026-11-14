@@ -682,9 +682,14 @@ std::vector<Tool> BuildTools(const Options& options) {
         "auftrag_id": {"type": "string"},
         "datei": {"type": "string", "description": "Dateiname, z. B. image-1.png; Vorgabe: die erste Mediendatei (file name; default: the first media file)"},
         "inhalt": {"type": "boolean", "default": false, "description": "Inhalt eingebettet liefern (embed the content)"},
-        "max_bytes": {"type": "integer", "minimum": 1, "default": 4194304, "description": "Größte eingebettete Datei; darüber nur der Link (inline limit)"}
+        "max_bytes": {"type": "integer", "minimum": 1, "description": "Größte eingebettete Datei; darüber nur der Link (inline limit)"}
       }
     })json");
+    // The default is the router's cap ([router] mcp-inline-mb); at 0
+    // nothing is embedded and the schema names no default.
+    if (options.inline_limit > 0)
+      t.input_schema["properties"]["max_bytes"]["default"] =
+          static_cast<long long>(options.inline_limit);
     t.output_schema = json::parse(R"json({
       "type": "object",
       "required": ["auftrag_id", "name", "url"],

@@ -927,6 +927,12 @@ void TestVisibility() {
         CHECK_EQ(model.member_str("default"), std::string("ace-step-1.5-xl-turbo"));
         CHECK(model.member_str("description").find("moss-music") !=
               std::string::npos);
+      } else if (name == "ablage_lesen") {
+        // The router's inline cap (4 MiB in this fixture), not a constant.
+        CHECK_EQ(input->find("properties")
+                     ->find("max_bytes")
+                     ->member_double("default"),
+                 4194304.0);
       } else if (name == "objekt_3d") {
         // trellis2 is not in this preset: the first 3D model instead.
         CHECK_EQ(input->find("properties")->find("model")->member_str("default"),
@@ -1572,6 +1578,28 @@ void TestJobs() {
     CHECK(!Structured(r).find("eingebettet")->as_bool());
     CHECK_EQ(Blocks(r)[1].member_str("type"), std::string("resource_link"));
     CHECK_EQ(g.Requests("/v1/jobs/j1/files/image-1.png").size(), std::size_t(0));
+    // The schema's default is that cap (ultra review #16, finding 10).
+    bool seen = false;
+    for (const mcp::Tool& tool : g.service->tools())
+      if (tool.name == "ablage_lesen") {
+        seen = true;
+        CHECK_EQ(tool.input_schema.find("properties")
+                     ->find("max_bytes")
+                     ->member_double("default"),
+                 10.0);
+      }
+    CHECK(seen);
+  }
+  // No inline cap ([router] mcp-inline-mb = 0): no default below minimum 1.
+  {
+    Fixture::Config config;
+    config.inline_limit = 0;
+    Fixture g(config);
+    for (const mcp::Tool& tool : g.service->tools())
+      if (tool.name == "ablage_lesen")
+        CHECK(tool.input_schema.find("properties")
+                  ->find("max_bytes")
+                  ->find("default") == nullptr);
   }
   // The job tools need the job API.
   {

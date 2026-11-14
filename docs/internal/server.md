@@ -1880,7 +1880,9 @@ field of a tool carries the preset's default and names the preset's
 models of that modality in its description (no `enum`: a model the user
 may not use is the gate's `403 model_forbidden` at call time). Files
 travel as `/v1/jobs/{id}/files/{name}` links; `ablage_lesen` embeds an
-image or audio file as base64 only on request and up to 4 MiB.
+image or audio file as base64 only on request and up to `[router]
+mcp-inline-mb` (4 MiB unless set; `ablage_lesen`'s `max_bytes` default
+is this cap, without a default at 0).
 
 Every `tools/call` is one inner request through the same gate and
 dispatch as an HTTP client's, under the caller's token (never the
