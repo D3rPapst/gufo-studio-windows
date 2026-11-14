@@ -10,3 +10,10 @@ checkpoints are unsupported. Official Python is an offline oracle only.
 voices replaces it. This preserves generated audio and reduces warm latency.
 
 ## Sampling and streaming
+
+## Served model names
+
+The production preset of gufo-studio-windows (`gufo-router-combo7.ini`) sets
+`served-model-name` per section: `qwen3-tts` (CustomVoice),
+`qwen3-tts-voicedesign` (VoiceDesign) and `qwen3-tts-clone` (Base with
+registered voices). `GET /v1/models` on the router lists the names in use.
