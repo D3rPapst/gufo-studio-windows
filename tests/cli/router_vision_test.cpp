@@ -602,6 +602,15 @@ void TestReal(const char* dir, const char* frame) {
   assert(answer.find("detections")->find("ocr") == nullptr);
   // ocr when the converted PP-OCRv4 files are in the same directory.
   if (std::filesystem::exists(std::filesystem::path(dir) / "ch_PP-OCRv4_rec.dict.txt")) {
+    // kMaxOcrPixels holds for a pass without enlargement too: 400.
+    {
+      const std::string large = "data:image/png;base64," +
+                                gufo::core::EncodeBase64(std::string_view(UniformPng(6000, 4100)));
+      const auto refused = service.Handle(Post(Body(large, {"ocr"})));
+      assert(refused->status == 400);
+      assert(refused->body.find("ocr scale 1: 6000x4100 is more than 24 megapixels") !=
+             std::string::npos);
+    }
     response = service.Handle(Post(Body(data_url, {"ocr"})));
     std::cout << response->body.substr(0, 600) << '\n';
     assert(response->status == 200);

@@ -110,7 +110,7 @@ The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä
   decoded only once the request's turn comes; all of a request's pictures together may
   have at most 64 MB encoded and 64 megapixels decoded (more: `400`).
 - Tags take about 0.6 s per picture or cut-out (8 threads); the tagger keeps ~470 MB RAM.
-  An enlarged OCR pass may be at most 24 megapixels (3 × a 1920 × 1080 frame fits).
+  Every OCR pass, enlarged or not, may be at most 24 megapixels (3 × a 1920 × 1080 frame fits).
 - `400 invalid_request`: unknown task, bad option, unreadable image, region outside it, limit.
 - `404`: an Ablage path of a job you can't read; `503 vision_unavailable`: a model is missing.
 - The request needs the `bild` area and doesn't count against the daily limit.

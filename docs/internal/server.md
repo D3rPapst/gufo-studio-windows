@@ -1027,8 +1027,12 @@ list of up to 4 passes (`Request::ocr`, `OcrPass`): `heat_threshold`,
 (Pillow `Image.resize(..., LANCZOS)` bit for bit: sinc windowed by sinc,
 support 3, Pillow's fixed-point passes like BICUBIC/BILINEAR in
 `image_ops.cpp`) and answers its boxes and corners divided by s as decimals;
-one enlargement per scale is made per request, at most 24 megapixels
-(`kMaxOcrPixels`, else 400). This is `erkennung_schrift.py`
+one enlargement per scale is made per request. Every pass, `scale` 1
+included, is at most 24 megapixels (`kMaxOcrPixels`, else 400): imgutils
+itself has no limit (it pads to a multiple of 32 and runs DBNet on the whole
+picture), but the detector's float32 feature maps of a larger input need
+several GB of host RAM; gufo refuses rather than shrinking, so the boxes
+never differ from imgutils. This is `erkennung_schrift.py`
 (`ocr(im, box_threshold=0.5)` and the same on a 3x LANCZOS copy, boxes / 3)
 in one request; with a list, `detections.ocr` and `models.ocr` are lists per
 pass. OCR always reads the original pixels, never the `brighten_dark` copy.
