@@ -35,9 +35,27 @@ struct TranscriptionRequest {
   std::function<bool(std::string_view)> on_text;
 };
 
+/// One timed stretch of the transcript, as models with timestamp tokens
+/// (Whisper) produce it.
+struct TranscriptionSegment {
+  /// Seconds from the start of the audio.
+  double start{0.0};
+  double end{0.0};
+  std::string text;
+  /// Model token IDs of the segment, timestamps included.
+  std::vector<std::uint32_t> tokens;
+  double avg_logprob{0.0};
+  double no_speech_prob{0.0};
+};
+
+/// Defined while TranscriptionResult carries segments (extension API 0.3.8).
+#define GUFO_EXT_ASR_SEGMENTS 1
+
 struct TranscriptionResult {
   std::string language;
   std::string text;
+  /// Timed segments in order; empty when the model returns none.
+  std::vector<TranscriptionSegment> segments;
   std::string decoded;
   std::vector<std::uint32_t> generated_ids;
   std::uint32_t sample_rate{16000};

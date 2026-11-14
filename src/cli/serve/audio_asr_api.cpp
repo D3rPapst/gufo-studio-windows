@@ -296,6 +296,22 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
       body["duration"] =
           static_cast<double>(result.audio_samples) / result.sample_rate;
       body["segments"] = json::Value::array();
+      for (std::size_t i = 0; i < result.segments.size(); ++i) {
+        const auto& source = result.segments[i];
+        json::Value segment = json::Value::object();
+        segment["id"] = static_cast<double>(i);
+        segment["start"] = source.start;
+        segment["end"] = source.end;
+        segment["text"] = core::Utf8Decoder{}.Push(source.text, true);
+        json::Value tokens = json::Value::array();
+        for (const auto token : source.tokens)
+          tokens.push_back(static_cast<double>(token));
+        segment["tokens"] = std::move(tokens);
+        segment["temperature"] = 0.0;
+        segment["avg_logprob"] = source.avg_logprob;
+        segment["no_speech_prob"] = source.no_speech_prob;
+        body["segments"].push_back(std::move(segment));
+      }
     }
     response.body = body.dump();
   }
