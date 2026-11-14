@@ -1081,8 +1081,6 @@ bool InnerPathAllowed(std::string_view path) {
 
 /// Reference images of an edit, together (the Bild page's limit).
 constexpr std::size_t kEditBytesLimit = static_cast<std::size_t>(20) << 20;
-/// A single input file of any media tool (the video anchors' limit).
-constexpr std::size_t kMediaBytesLimit = static_cast<std::size_t>(20) << 20;
 /// The images of one chat call, together (review finding 5).
 constexpr std::size_t kChatImagesLimit = static_cast<std::size_t>(20) << 20;
 
@@ -1342,6 +1340,26 @@ McpService::InnerAnswer McpService::Inner(
     throw std::logic_error("mcp: inner path not allowed: " + path);
   if (!options_.serve)
     throw std::logic_error("mcp: no inner dispatch (Options::serve)");
+  // The front's body limit holds for the bodies the tools build as well
+  // (a job submit carries its input files as base64; ultra review #16,
+  // finding 6): the front's own 413.
+  if (options_.max_request_bytes > 0 &&
+      body.size() > options_.max_request_bytes) {
+    InnerAnswer refused;
+    refused.status = 413;
+    refused.content_type = "application/json";
+    json::Value detail = json::Value::object();
+    detail["message"] = "request body is too large (" +
+                        std::to_string(body.size()) + " bytes, at most " +
+                        std::to_string(options_.max_request_bytes) +
+                        ", --max-request-bytes); send smaller files";
+    detail["type"] = "invalid_request_error";
+    detail["code"] = "payload_too_large";
+    json::Value error = json::Value::object();
+    error["error"] = std::move(detail);
+    refused.body = error.dump();
+    return refused;
+  }
   HttpRequest inner;
   inner.method = std::move(method);
   inner.path = std::move(path);
@@ -1516,18 +1534,16 @@ json::Value McpService::RunChat(const json::Value& args,
       if (!bild.is_string())
         throw InvalidParams(where + " must be a string");
       std::string url = bild.str();
-      if (url.starts_with("/v1/jobs/") && url.find("/files/") != std::string::npos) {
-        const InnerAnswer file =
-            Inner(outer, "GET", url, {}, {}, {}, kChatImagesLimit - total);
-        if (file.status >= 400)
-          return HttpFailure(file);
-        if (file.truncated)
-          throw too_large(where);
-        total += file.body.size();
-        const std::string type = file.content_type.empty()
-                                     ? std::string("application/octet-stream")
-                                     : file.content_type;
-        url = "data:" + type + ";base64," + comfy::Base64Encode(file.body);
+      if (IsAblagePath(url)) {
+        // ReadMedia as for the media tools (empty file, type without
+        // parameters), capped at what is left of the 20 MB (ultra review
+        // #16, finding 6).
+        Media media = ReadMedia(outer, url, where, kChatImagesLimit - total,
+                                too_large(where).what());
+        if (media.failure.has_value())
+          return std::move(*media.failure);
+        total += media.bytes.size();
+        url = DataUrlOf(media);
       } else if (url.starts_with("data:")) {
         // The decoded size, about 3/4 of the base64 text.
         total += (url.size() - std::min(url.size(), url.find(',') + 1)) / 4 * 3;
@@ -1829,39 +1845,51 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
 
 McpService::Media McpService::ReadMedia(const HttpRequest& outer,
                                         const std::string& value,
-                                        const std::string& field) const {
+                                        const std::string& field,
+                                        std::size_t limit,
+                                        const std::string& too_large) const {
+  const auto refuse = [&field, &too_large]() {
+    return InvalidParams(too_large.empty()
+                             ? field +
+                                   " is larger than 20 MB (use a smaller or "
+                                   "shorter file)"
+                             : too_large);
+  };
   Media media;
   if (IsAblagePath(value)) {
     // Through the gate: another user's job is 404, a missing file too.
-    // Read at most 20 MB: a longer answer stops in the body callback.
-    InnerAnswer file =
-        Inner(outer, "GET", value, {}, {}, {}, kMediaBytesLimit);
+    // Read at most `limit`: a longer answer stops in the body callback.
+    InnerAnswer file = Inner(outer, "GET", value, {}, {}, {}, limit);
     if (file.status >= 400) {
       media.failure = HttpFailure(file);
       return media;
     }
     if (file.truncated)
-      throw InvalidParams(field +
-                          " is larger than 20 MB (use a smaller or shorter "
-                          "file)");
+      throw refuse();
     media.bytes = std::move(file.body);
     media.content_type = file.content_type.empty()
                              ? std::string("application/octet-stream")
                              : file.content_type.substr(0, file.content_type.find(';'));
     media.name = value.substr(value.rfind('/') + 1);
-  } else if (auto data = ParseDataUrl(value)) {
+  } else {
+    // A data URL's size from its base64 text (3 bytes per 4 characters,
+    // padding aside) before it is decoded.
+    if (const auto comma = value.find(',');
+        value.starts_with("data:") && comma != std::string::npos &&
+        (value.size() - comma - 1) / 4 * 3 > limit + 2)
+      throw refuse();
+    auto data = ParseDataUrl(value);
+    if (!data.has_value())
+      throw InvalidParams(field +
+                          " must be /v1/jobs/<id>/files/<name> or a base64 "
+                          "data: URL");
     media.bytes = std::move(data->first);
     media.content_type = std::move(data->second);
-  } else {
-    throw InvalidParams(field +
-                        " must be /v1/jobs/<id>/files/<name> or a base64 data: URL");
   }
   if (media.bytes.empty())
     throw InvalidParams(field + " is an empty file");
-  if (media.bytes.size() > kMediaBytesLimit)
-    throw InvalidParams(field +
-                        " is larger than 20 MB (use a smaller or shorter "
-                        "file)");
+  if (media.bytes.size() > limit)
+    throw refuse();
   return media;
 }
 

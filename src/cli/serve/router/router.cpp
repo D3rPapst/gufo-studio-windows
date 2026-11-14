@@ -4964,6 +4964,7 @@ int RunRouter(std::span<const char* const> args) {
         static_cast<std::size_t>(std::stoull(router_section.mcp_inline_mb))
         << 20;
     mcp_options.jobs_api = state->jobs != nullptr;
+    mcp_options.max_request_bytes = max_request_body_bytes;
     state->mcp =
         std::make_unique<router::mcp::McpService>(std::move(mcp_options));
     Logger::Info("router",

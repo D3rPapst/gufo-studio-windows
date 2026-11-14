@@ -173,6 +173,7 @@ struct FixtureConfig {
   bool jobs_api{true};
   std::string version;
   std::size_t inline_limit{static_cast<std::size_t>(4) << 20};
+  std::size_t max_request_bytes{0};
 };
 
 /// A JSON answer of the fake router.
@@ -259,6 +260,7 @@ struct Fixture {
     options.jobs_api = config.jobs_api;
     options.version = config.version;
     options.inline_limit = config.inline_limit;
+    options.max_request_bytes = config.max_request_bytes;
     options.self_name = "http://192.168.178.198:8081";
     options.serve = [this](const HttpRequest& inner) {
       return gate->Serve(inner, dispatch);
@@ -2592,6 +2594,110 @@ void TestByteCaps() {
   }
 }
 
+void TestMediaChecks() {
+  // Ultra review #16, finding 6: chat's Ablage images go through ReadMedia
+  // (empty file, type without parameters, the 20 MB cap), a data URL's
+  // size is checked before it is decoded, and the bodies the tools build
+  // keep the front's --max-request-bytes.
+  Fixture::Config config;
+  config.max_request_bytes = 4096;
+  Fixture f(config);
+  auth::Rights rights;
+  rights.bereiche = {"text", "bild", "ablage"};
+  f.AddUser("mia", "nutzer", rights);
+  const std::string mia = f.Token("mia");
+  f.owners["j1"] = "mia";
+  f.fake = [&](const HttpRequest& req) -> std::optional<HttpResponse> {
+    const std::string& p = req.path;
+    if (req.method == "GET" && p == "/v1/jobs/j1/files/leer.png")
+      return FileAnswer("", "image/png");
+    if (req.method == "GET" && p == "/v1/jobs/j1/files/typ.png")
+      return FileAnswer("PNG", "image/png; charset=binary");
+    if (req.method == "POST" && p == "/v1/jobs") {
+      json::Value view =
+          JobView("n1", "queued", "mia", WrappedPath(BodyOf(req)));
+      return JsonAnswer(202, view);
+    }
+    if (req.method == "POST" && p == "/v1/chat/completions") {
+      json::Value message = json::Value::object();
+      message["role"] = "assistant";
+      message["content"] = "ok";
+      json::Value choice = json::Value::object();
+      choice["message"] = std::move(message);
+      choice["finish_reason"] = "stop";
+      json::Value choices = json::Value::array();
+      choices.push_back(std::move(choice));
+      json::Value body = json::Value::object();
+      body["choices"] = std::move(choices);
+      return JsonAnswer(200, body);
+    }
+    return std::nullopt;
+  };
+
+  // An empty Ablage file is -32602, as for the media tools.
+  HttpResponse r = f.Call(
+      "chat", "{\"nachricht\":\"x\",\"bilder\":[\"/v1/jobs/j1/files/leer.png\"]}",
+      kLan, Fixture::Bearer(mia));
+  CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+  CHECK(RpcMessage(r).find("arguments.bilder[0] is an empty file") !=
+        std::string::npos);
+  CHECK(f.Requests("/v1/chat/completions").empty());
+  // The data URL carries the type without its parameters.
+  r = f.Call("chat",
+             "{\"nachricht\":\"x\",\"bilder\":[\"/v1/jobs/j1/files/typ.png\"]}",
+             kLan, Fixture::Bearer(mia));
+  CheckShape(r, false);
+  {
+    const std::vector<HttpRequest> sent = f.Requests("/v1/chat/completions");
+    CHECK_EQ(sent.size(), std::size_t(1));
+    if (sent.size() == 1) {
+      const json::Value body = BodyOf(sent[0]);
+      const json::Value& user = body.find("messages")->items().back();
+      CHECK_EQ(user.find("content")->items()[1].find("image_url")->member_str("url"),
+               "data:image/png;base64," + gufo::router::comfy::Base64Encode("PNG"));
+    }
+  }
+
+  // A data URL over 20 MB is refused by its length, before decoding: the
+  // text here is no base64 at all, and the answer still names the size.
+  {
+    const std::string huge =
+        "data:image/png;base64," + std::string((21u << 20) / 3 * 4, '!');
+    json::Value args = json::Value::object();
+    args["datei"] = huge;
+    r = f.Call("hochskalieren", args.dump(), kLan, Fixture::Bearer(mia));
+    CHECK_EQ(RpcCode(r), mcp::kInvalidParams);
+    CHECK(RpcMessage(r).find("arguments.datei is larger than 20 MB") !=
+          std::string::npos);
+  }
+
+  // --max-request-bytes holds for the inner bodies: a short prompt passes,
+  // a long one is the front's 413 payload_too_large and never reaches the
+  // job store or the chat model.
+  json::Value args = json::Value::object();
+  args["prompt"] = std::string(100, 'p');
+  r = f.Call("bild_erzeugen", args.dump(), kLan, Fixture::Bearer(mia));
+  CHECK_EQ(RpcCode(r), 0);
+  CHECK(!IsToolError(r));
+  const std::size_t posts = f.Requests("/v1/jobs").size();
+  CHECK_EQ(posts, std::size_t(1));
+  args["prompt"] = std::string(5000, 'p');
+  r = f.Call("bild_erzeugen", args.dump(), kLan, Fixture::Bearer(mia));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 413);
+  CHECK_EQ(FailureCode(r), std::string("payload_too_large"));
+  CHECK(Failure(r).member_str("message").find("--max-request-bytes") !=
+        std::string::npos);
+  CHECK_EQ(f.Requests("/v1/jobs").size(), posts);
+  CHECK(f.Logged({"mcp:bild_erzeugen:abgelehnt:payload_too_large"}, 2));
+  json::Value chat = json::Value::object();
+  chat["nachricht"] = std::string(5000, 'n');
+  r = f.Call("chat", chat.dump(), kLan, Fixture::Bearer(mia));
+  CheckShape(r, true);
+  CHECK_EQ(FailureStatus(r), 413);
+  CHECK_EQ(f.Requests("/v1/chat/completions").size(), std::size_t(1));
+}
+
 int main() {
   TestClassifyAndPreset();
   TestFrame();
@@ -2604,6 +2710,7 @@ int main() {
   TestMediaJobs();
   TestModernEra();
   TestByteCaps();
+  TestMediaChecks();
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
     return 1;

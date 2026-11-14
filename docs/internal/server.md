@@ -1911,7 +1911,10 @@ naming the field (`arguments.<name> ...`). The access log carries
 `POST`, such as the chat; the gate logs no `GET`, so a model list, a job
 read or a file read has only the mcp line). `retry_after` appears only
 when the refusal carries a `Retry-After` header (the daily limit sends
-none).
+none). An inner body the router builds (the chat request with its
+images, a job submit with its input files as base64) is held to the
+front's `--max-request-bytes` like a client's: above it the tool answers
+`413 payload_too_large` without sending it.
 
 The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
 `auftrag_abbrechen`, `ablage_lesen` and the media job tools below):
@@ -1929,8 +1932,11 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   json_object` for `json`, the messages system -> verlauf -> user. An
   entry of `bilder` is a `data:` URL (sent as an `image_url` part) or an
   Ablage path `/v1/jobs/{id}/files/{name}`, which the router reads
-  through the gate first (area ablage, own jobs) and sends as a data URL;
-  all images together at most 20 MB (`-32602` naming the entry). A streamed worker answer is collected. The answer is
+  through the gate first (area ablage, own jobs) as the media tools read
+  their input files (an empty file is `-32602`, the type loses its
+  parameters) and sends as a data URL; all images together at most 20 MB
+  (`-32602` naming the entry). A streamed worker answer is collected. The
+  answer is
   `{text, gedanken?, model, usage {prompt_tokens, completion_tokens},
   finish_reason}`; `gedanken` is the message's `reasoning_content` or a
   leading `<think>...</think>` block split off the text.
@@ -1984,7 +1990,8 @@ field's description). Input files (`startbild`, `probe`, `bild`, `datei`,
 is the gate's 404, so an agent can only use its own results) or a base64
 `data:` URL (`-32602` for anything else, an empty file or one over 20 MB;
 a streamed Ablage answer, e.g. the partner's, is read only up to that
-cap, a larger file's bytes are not kept);
+cap, a larger file's bytes are not kept; a data URL's size is checked on
+its base64 text before it is decoded);
 the router sends them on as data URLs (the workers do not fetch router
 paths). The answer is `{auftrag_id, status, url, modell, position?,
 geschaetzt?}` from the job store's 202 and the text "Auftrag <id>

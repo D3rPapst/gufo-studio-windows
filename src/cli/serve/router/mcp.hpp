@@ -141,6 +141,10 @@ struct Options {
   /// size (`[router] mcp-inline-mb`, default 4); a call's max_bytes may
   /// lower it, never raise it.
   std::size_t inline_limit{static_cast<std::size_t>(4) << 20};
+  /// The front's --max-request-bytes: an inner request body the router
+  /// builds (a job submit with the input files as base64) above it is
+  /// refused like a client's, 413 payload_too_large (0 = no limit).
+  std::size_t max_request_bytes{0};
   /// `[router] mcp = on|off`: off answers 404.
   bool enabled{true};
   /// The router runs the job API (--jobs-dir); without it the job tools
@@ -222,9 +226,17 @@ private:
   /// The documented default of a tool's `model` field.
   [[nodiscard]] std::string DefaultModel(std::string_view tool) const;
 
+  /// A single input file of any media tool (the video anchors' limit).
+  static constexpr std::size_t kMediaBytesLimit =
+      static_cast<std::size_t>(20) << 20;
+  /// An Ablage path (through the gate) or a base64 data URL, at most
+  /// `limit` bytes (checked before the bytes are read or decoded) and not
+  /// empty; `too_large` replaces the "larger than 20 MB" message.
   [[nodiscard]] Media ReadMedia(const server::HttpRequest& outer,
                                 const std::string& value,
-                                const std::string& field) const;
+                                const std::string& field,
+                                std::size_t limit = kMediaBytesLimit,
+                                const std::string& too_large = {}) const;
   /// `POST /v1/jobs` around `path` with a JSON `body` or a raw body of
   /// `content_type` (base64 in the submit), `vorrang` as X-Gufo-Priority,
   /// `metadata` (quelle mcp is added): the uniform job tool result, whose
