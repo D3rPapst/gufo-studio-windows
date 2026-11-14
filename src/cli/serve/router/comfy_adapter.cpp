@@ -1650,7 +1650,15 @@ void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
   const auto now = std::chrono::steady_clock::now();
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   // Ended prompts keep their ids for ten minutes (late readers still find
-  // the worker preview); at most 1024 entries.
+  // the worker preview); at most 1024 entries. A prompt that is gone
+  // without ending (deleted or cleared from the queue) counts as ended
+  // from now on, so its ids leave as well.
+  for (auto& [id, entry] : preview_ids_) {
+    if (!entry.ended && entry.job.expired()) {
+      entry.ended = true;
+      entry.ended_at = now;
+    }
+  }
   std::erase_if(preview_ids_, [&](const auto& entry) {
     return entry.second.ended &&
            now - entry.second.ended_at > std::chrono::minutes(10);
