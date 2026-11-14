@@ -976,8 +976,17 @@ node list run in order; cv2-style warp of the float image, SimCC arg-max / 2) 13
 Files from `reference/convert_pose.py` and `reference/convert_dwpose.py` in
 `--vision-dir`; host RAM after loading: about 170 + 345 + 135 MB. The film
 pipeline's body-point merge (per point the surer of ViTPose and DWPose) and the
-mouth measurement stay with the caller. Test: `ccip.pose_oracle`
-(`pose_oracle_test` against `reference/make_pose_oracle.py`).
+mouth measurement stay with the caller. `"pose_boxes": [[x0, y0, x1, y1], ...]`
+(1 to `kMaxPoseBoxes` = 16, each with x1 > x0, y1 > y0 and |v| <= 1e6, only
+with a pose task; else 400) skips RT-DETR (not even loaded): ViTPose and
+DWPose run in exactly these boxes, in the caller's order, with the same
+preparation (box x 1.25 at 192:256 / 288:384), as `mundmessung.py`'s
+`wholebody(img, box)` with the first frame's box for every frame of a shot.
+Those poses carry no `score`; `models.pose_detector` is
+`{"model": "pose_boxes", "boxes": n}`. Test: `ccip.pose_oracle`
+(`pose_oracle_test` against `reference/make_pose_oracle.py`, including the
+reference boxes) and `router_vision_test` (the RT-DETR boxes given back as
+`pose_boxes` give the same points).
 
 ### CPU queue and pool for the router services
 

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -197,6 +198,34 @@ void TestParse() {
     bad["pose_options"] = std::move(o);
     (void)vision::ParseRequest(bad);
   }));
+  // pose_boxes: given boxes instead of RT-DETR, at most kMaxPoseBoxes.
+  {
+    json::Value given = Body("AAAA", {"pose_wholebody"});
+    given["pose_boxes"] = json::parse("[[10, 20, 110, 220.5], [0, 0, 5, 5]]");
+    r = vision::ParseRequest(given);
+    assert(r.pose_boxes.size() == 2 && r.pose_boxes[0][3] == 220.5f);
+    json::Value many = json::Value::array();
+    for (std::size_t i = 0; i <= vision::kMaxPoseBoxes; ++i)
+      many.push_back(json::parse("[0, 0, 1, 1]"));
+    for (const char* bad_boxes : {"[]", "[[0, 0, 1]]", "[[5, 0, 1, 1]]", "[[0, 0, 1e12, 1]]",
+                                  "\"person\""}) {
+      assert(Throws([&] {
+        json::Value bad = Body("AAAA", {"pose"});
+        bad["pose_boxes"] = json::parse(bad_boxes);
+        (void)vision::ParseRequest(bad);
+      }));
+    }
+    assert(Throws([&] {
+      json::Value bad = Body("AAAA", {"pose"});
+      bad["pose_boxes"] = many;
+      (void)vision::ParseRequest(bad);
+    }));
+    assert(Throws([&] {  // without a pose task
+      json::Value bad = Body("AAAA", {"face"});
+      bad["pose_boxes"] = json::parse("[[0, 0, 1, 1]]");
+      (void)vision::ParseRequest(bad);
+    }));
+  }
   }
   assert(Throws([&] {
     json::Value bad = Body("AAAA", {"face"});
@@ -719,6 +748,45 @@ void TestReal(const char* dir, const char* frame) {
     oo["regions"] = json::parse("[[5000, 5000, 6000, 6000]]");
     outside["wd14_tags"] = std::move(oo);
     assert(service.Handle(Post(outside))->status == 400);
+  }
+  // pose_boxes: the boxes RT-DETR found, given back, give the same points
+  // (ViTPose / DWPose in exactly these boxes); no "score", no RT-DETR info.
+  {
+    const auto found = service.Handle(Post(Body(data_url, {"pose", "pose_wholebody"})));
+    assert(found->status == 200);
+    const json::Value jf = json::parse(found->body);
+    const auto& poses = jf.find("poses")->items();
+    std::cout << "pose persons found: " << poses.size() << '
+';
+    if (!poses.empty()) {
+      json::Value boxes = json::Value::array();
+      for (const json::Value& p : poses)
+        boxes.push_back(*p.find("box"));
+      json::Value again = Body(data_url, {"pose", "pose_wholebody"});
+      again["pose_boxes"] = std::move(boxes);
+      const auto given = service.Handle(Post(again));
+      assert(given->status == 200);
+      const json::Value jg = json::parse(given->body);
+      const auto& gposes = jg.find("poses")->items();
+      assert(gposes.size() == poses.size());
+      double worst = 0;
+      for (std::size_t i = 0; i < poses.size(); ++i) {
+        assert(gposes[i].find("score") == nullptr);
+        for (const char* key : {"keypoints", "wholebody"}) {
+          const auto& a = poses[i].find(key)->items();
+          const auto& b = gposes[i].find(key)->items();
+          assert(a.size() == b.size());
+          for (std::size_t k = 0; k < a.size(); ++k)
+            for (std::size_t c = 0; c < 3; ++c)
+              worst = std::max(worst, std::fabs(a[k].items()[c].as_double() -
+                                                b[k].items()[c].as_double()));
+        }
+      }
+      std::cout << "pose_boxes vs RT-DETR boxes: max diff " << worst << '
+';
+      assert(worst <= 1e-4);  // the boxes round-trip through JSON doubles
+      assert(jg.find("models")->find("pose_detector")->member_str("model") == "pose_boxes");
+    }
   }
   // Two at once: one waits for the other.
   auto a = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });

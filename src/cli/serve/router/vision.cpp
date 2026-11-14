@@ -417,6 +417,27 @@ Request ParseRequest(const json::Value& body) {
         throw std::invalid_argument("pose_options: min_score in (0, 1], max_persons 1-32");
     }
   }
+  if (const json::Value* boxes = body.find("pose_boxes"); boxes != nullptr && !boxes->is_null()) {
+    if (!request.pose && !request.pose_wholebody)
+      throw std::invalid_argument("pose_boxes needs the task pose or pose_wholebody");
+    if (!boxes->is_array() || boxes->empty() || boxes->size() > kMaxPoseBoxes)
+      throw std::invalid_argument("pose_boxes must list 1 to " + std::to_string(kMaxPoseBoxes) +
+                                  " boxes [x0, y0, x1, y1]");
+    for (const json::Value& box : boxes->items()) {
+      if (!box.is_array() || box.size() != 4)
+        throw std::invalid_argument("pose_boxes: every box is [x0, y0, x1, y1]");
+      std::array<float, 4> b{};
+      for (std::size_t i = 0; i < 4; ++i) {
+        const json::Value& v = box.items()[i];
+        if (!v.is_number() || !(std::fabs(v.as_double()) <= 1e6))
+          throw std::invalid_argument("pose_boxes: box values must be numbers within +-1e6");
+        b[i] = static_cast<float>(v.as_double());
+      }
+      if (!(b[2] > b[0] && b[3] > b[1]))
+        throw std::invalid_argument("pose_boxes: every box needs x1 > x0 and y1 > y0");
+      request.pose_boxes.push_back(b);
+    }
+  }
   if (const json::Value* dark = body.find("brighten_dark"); dark != nullptr && !dark->is_null()) {
     if (dark->is_bool()) {
       request.brighten_dark = dark->as_bool();
@@ -651,7 +672,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const models::ccip::TextOcr* ocr = nullptr;
   if (!parsed.ocr.empty() && missing.empty())
     ocr = state_->GetOcr(options_, &missing);
-  if (missing.empty() && (parsed.pose || parsed.pose_wholebody))
+  if (missing.empty() && (parsed.pose || parsed.pose_wholebody) && parsed.pose_boxes.empty())
     state_->GetPose(options_, &state_->rtdetr, "rtdetr_r50vd_coco_o365", "convert_pose.py rtdetr", &missing);
   if (missing.empty() && parsed.pose)
     state_->GetPose(options_, &state_->vitpose, "vitpose_base_simple", "convert_pose.py vitpose", &missing);
@@ -843,15 +864,25 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     }
     if (parsed.pose || parsed.pose_wholebody) {
       // posen_erkennung.erkenne on the original image (not the brightened copy).
+      // pose_boxes: the caller's boxes, in its order, without RT-DETR.
+      const bool given = !parsed.pose_boxes.empty();
       std::vector<models::ccip::ObjectBox> pose_persons;
-      for (const auto& o : state_->rtdetr->Detect(image, parsed.pose_min_score)) {
-        if (o.label == 0)
+      if (given) {
+        for (const auto& box : parsed.pose_boxes) {
+          models::ccip::ObjectBox o;
+          o.box = box;
           pose_persons.push_back(o);
+        }
+      } else {
+        for (const auto& o : state_->rtdetr->Detect(image, parsed.pose_min_score)) {
+          if (o.label == 0)
+            pose_persons.push_back(o);
+        }
+        std::stable_sort(pose_persons.begin(), pose_persons.end(),
+                         [](const auto& a, const auto& b) { return a.score > b.score; });
+        if (pose_persons.size() > static_cast<std::size_t>(parsed.pose_max_persons))
+          pose_persons.resize(static_cast<std::size_t>(parsed.pose_max_persons));
       }
-      std::stable_sort(pose_persons.begin(), pose_persons.end(),
-                       [](const auto& a, const auto& b) { return a.score > b.score; });
-      if (pose_persons.size() > static_cast<std::size_t>(parsed.pose_max_persons))
-        pose_persons.resize(static_cast<std::size_t>(parsed.pose_max_persons));
       auto points = [](const std::vector<models::ccip::Keypoint>& kps) {
         json::Value list = json::Value::array();
         for (const auto& k : kps) {
@@ -870,7 +901,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         for (float v : person.box)
           box.push_back(static_cast<double>(v));
         entry["box"] = std::move(box);
-        entry["score"] = static_cast<double>(person.score);
+        if (!given)
+          entry["score"] = static_cast<double>(person.score);
         if (parsed.pose)
           entry["keypoints"] = points(state_->vitpose->Estimate(image, person.box));
         if (parsed.pose_wholebody)
@@ -879,10 +911,15 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       }
       out_poses = std::move(poses);
       json::Value det = json::Value::object();
-      det["repo"] = "PekingU/rtdetr_r50vd_coco_o365";
-      det["model"] = "rtdetr_r50vd_coco_o365";
-      det["min_score"] = std::round(static_cast<double>(parsed.pose_min_score) * 1e6) / 1e6;
-      det["max_persons"] = parsed.pose_max_persons;
+      if (given) {
+        det["model"] = "pose_boxes";
+        det["boxes"] = static_cast<long long>(parsed.pose_boxes.size());
+      } else {
+        det["repo"] = "PekingU/rtdetr_r50vd_coco_o365";
+        det["model"] = "rtdetr_r50vd_coco_o365";
+        det["min_score"] = std::round(static_cast<double>(parsed.pose_min_score) * 1e6) / 1e6;
+        det["max_persons"] = parsed.pose_max_persons;
+      }
       used["pose_detector"] = std::move(det);
       if (parsed.pose) {
         json::Value m = json::Value::object();
