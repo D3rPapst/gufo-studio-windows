@@ -1147,6 +1147,36 @@ def running_ids(router, path="/queue"):
     return [item[1] for item in queue["queue_running"]]
 
 
+def check_parallel_same_prefix(router):
+    """Two prompts with the same filename_prefix finish at the same time:
+    each gets its own file (the output counter is reserved atomically) and
+    each history entry shows its own image."""
+    seen = set()
+    for round_ in range(3):
+        sizes = {}
+        ids = []
+        for resolution in (512, 768):
+            graph = qwen_graph(prompt="SLOW same %d" % round_, prefix="film/par/same")
+            graph["5"]["inputs"]["resolution"] = resolution
+            prompt_id = router.submit(graph, client_id="same")
+            ids.append(prompt_id)
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        for prompt_id in ids:
+            entry = router.wait(prompt_id)
+            assert entry["status"]["status_str"] == "success", entry["status"]
+            image = entry["outputs"]["8"]["images"][0]
+            assert image["filename"] not in seen, (image, seen)
+            seen.add(image["filename"])
+            status, data = router.request("GET", "/view?" + urllib.parse.urlencode(image))
+            assert status == 200, image
+            sizes[prompt_id] = png_size(data)
+        # Both files exist and each prompt shows a different picture.
+        assert len(set(sizes.values())) == 2, sizes
+    folder = os.path.join(router.tmp, "comfy", "output", "film", "par")
+    files = sorted(n for n in os.listdir(folder) if n.startswith("same_"))
+    assert files == sorted(seen) and len(files) == 6, files
+
+
 def check_parallel(router):
     """--comfy-parallel 2: two prompts run at the same time, a third waits;
     /queue, /prompt, /filmstudio/progress, /ws, /interrupt and /history keep
@@ -1206,6 +1236,8 @@ def check_parallel(router):
                {"queue_running": [], "queue_pending": []})
     status, body = router.json("GET", "/filmstudio/progress")
     assert body["prompt_id"] is None and body["running"] == [], body
+
+    check_parallel_same_prefix(router)
 
     # Interrupt without a prompt id stops every running prompt.
     first = router.submit(qwen_graph(prompt="SLOW all one", prefix="film/par/all"))

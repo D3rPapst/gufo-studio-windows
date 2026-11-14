@@ -2495,6 +2495,50 @@ int CounterIn(const Destination& destination) {
   return NextCounter(names, destination.base);
 }
 
+/// Serialises counter lookup + reservation of output names. Parallel prompts
+/// (--comfy-parallel > 1) with the same filename_prefix would otherwise both
+/// read the same counter and overwrite each other's file.
+std::mutex& OutputMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+/// Creates `path` only if it does not exist yet (O_EXCL / CREATE_NEW).
+/// Returns false when it exists; throws on any other error.
+bool CreateExclusive(const fs::path& path) {
+#ifdef _WIN32
+  std::FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"wbx") != 0)
+    file = nullptr;
+#else
+  std::FILE* file = std::fopen(path.c_str(), "wbx");
+#endif
+  if (file != nullptr) {
+    std::fclose(file);
+    return true;
+  }
+  std::error_code ec;
+  if (fs::exists(path, ec))
+    return false;
+  throw std::runtime_error("cannot create " + PathU8(path));
+}
+
+/// Reserves the next free output name in `destination` by creating it empty
+/// and exclusively; the caller then fills it.
+std::string ReserveOutput(const Destination& destination, OutputKind kind,
+                          std::string_view extension) {
+  std::lock_guard<std::mutex> lock(OutputMutex());
+  int counter = CounterIn(destination);
+  for (int tries = 0; tries < 10000; ++tries, ++counter) {
+    const std::string filename =
+        OutputFilename(destination.base, counter, kind, extension);
+    if (CreateExclusive(destination.folder / U8Path(filename)))
+      return filename;
+  }
+  throw std::runtime_error("no free output name for '" + destination.base +
+                           "'");
+}
+
 json::Value FileEntry(const Destination& destination,
                       const std::string& filename) {
   json::Value entry = json::Value::object();
@@ -2510,8 +2554,8 @@ json::Value Adapter::SaveBytes(const OutputTarget& target,
                                std::string_view extension,
                                const std::string& bytes) {
   const Destination destination = DestinationFor(options_.root, target);
-  const std::string filename = OutputFilename(
-      destination.base, CounterIn(destination), target.kind, extension);
+  const std::string filename =
+      ReserveOutput(destination, target.kind, extension);
   WriteAll(destination.folder / U8Path(filename), bytes);
   json::Value list = json::Value::array();
   list.push_back(FileEntry(destination, filename));
@@ -2528,8 +2572,8 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
   const bool opus = target.class_type == "SaveAudioOpus";
   const std::string ext = mp3 ? "mp3" : opus ? "opus" : "flac";
   const Destination destination = DestinationFor(options_.root, target);
-  const std::string filename = OutputFilename(
-      destination.base, CounterIn(destination), OutputKind::kAudio, ext);
+  const std::string filename =
+      ReserveOutput(destination, OutputKind::kAudio, ext);
   std::vector<fs::path> codec;
   if (mp3)
     codec = {"-c:a", "libmp3lame", "-q:a", "0"};
@@ -2541,8 +2585,11 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
   args.insert(args.end(), codec.begin(), codec.end());
   args.push_back(destination.folder / U8Path(filename));
   std::string error;
-  if (!RunFfmpeg(args, &error))
+  if (!RunFfmpeg(args, &error)) {
+    std::error_code ec;
+    fs::remove(destination.folder / U8Path(filename), ec);  // the reservation
     throw std::runtime_error("cannot write the audio track: " + error);
+  }
   json::Value list = json::Value::array();
   list.push_back(FileEntry(destination, filename));
   json::Value ui = json::Value::object();
@@ -2553,19 +2600,53 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
 json::Value Adapter::SaveVideoFrames(const OutputTarget& target,
                                      const fs::path& video) {
   const Destination destination = DestinationFor(options_.root, target);
-  const int first = CounterIn(destination);
+  // ffmpeg writes into a private folder first: a parallel prompt saving into
+  // the same output folder must neither get a number inside our range nor
+  // have its frames counted as ours.
+  const fs::path frames = WorkFile("frames");
+  fs::create_directories(frames);
+  struct RemoveFrames {
+    fs::path dir;
+    ~RemoveFrames() {
+      std::error_code ignored;
+      fs::remove_all(dir, ignored);
+    }
+  } cleanup{frames};
   std::string error;
-  if (!RunFfmpeg({"-i", video, "-start_number", std::to_string(first),
-                  destination.folder / U8Path(destination.base + "_%05d_.png")},
+  if (!RunFfmpeg({"-i", video, "-start_number", "1",
+                  frames / U8Path("f_%05d.png")},
                  &error))
     throw std::runtime_error("cannot extract the video frames: " + error);
   json::Value list = json::Value::array();
   std::error_code ec;
-  for (int counter = first;; ++counter) {
-    const std::string filename =
-        OutputFilename(destination.base, counter, OutputKind::kImage, "png");
-    if (!fs::exists(destination.folder / U8Path(filename), ec))
+  std::lock_guard<std::mutex> lock(OutputMutex());
+  int counter = CounterIn(destination);
+  for (int index = 1;; ++index) {
+    char own[32];
+    std::snprintf(own, sizeof(own), "f_%05d.png", index);
+    const fs::path source = frames / own;
+    if (!fs::exists(source, ec))
       break;
+    std::string filename;
+    for (int tries = 0;; ++tries, ++counter) {
+      if (tries >= 10000)
+        throw std::runtime_error("no free output name for '" +
+                                 destination.base + "'");
+      filename = OutputFilename(destination.base, counter, OutputKind::kImage,
+                                "png");
+      if (!fs::exists(destination.folder / U8Path(filename), ec))
+        break;
+    }
+    ++counter;
+    const fs::path target_file = destination.folder / U8Path(filename);
+    fs::rename(source, target_file, ec);
+    if (ec) {  // other volume: copy instead
+      ec.clear();
+      fs::copy_file(source, target_file, ec);
+      if (ec)
+        throw std::runtime_error("cannot store video frame " + filename +
+                                 ": " + ec.message());
+    }
     list.push_back(FileEntry(destination, filename));
   }
   json::Value ui = json::Value::object();
