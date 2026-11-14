@@ -170,6 +170,22 @@ void TestParse() {
   boxes["wd14_tags"] = std::move(wb);
   r = vision::ParseRequest(boxes);
   assert(r.wd14.boxes.size() == 1 && r.wd14.boxes[0][3] == 220.5 && r.tasks.empty());
+  // At most kWd14MaxRegions explicit regions (each is one tagger run).
+  {
+    const auto regions = [](std::size_t n) {
+      json::Value list = json::Value::array();
+      for (std::size_t i = 0; i < n; ++i)
+        list.push_back(json::parse("[0, 0, 1, 1]"));
+      json::Value body = Body("AAAA", {"wd14_tags"});
+      json::Value o = json::Value::object();
+      o["regions"] = std::move(list);
+      body["wd14_tags"] = std::move(o);
+      return body;
+    };
+    assert(vision::ParseRequest(regions(vision::kWd14MaxRegions)).wd14.boxes.size() ==
+           vision::kWd14MaxRegions);
+    assert(Throws([&] { (void)vision::ParseRequest(regions(vision::kWd14MaxRegions + 1)); }));
+  }
   for (const char* bad_options :
        {R"({"regions": [[10, 20, 5, 30]]})", R"({"regions": "face"})",
         R"({"general_threshold": 2})", R"({"colour": 1})", R"({"images": [1]})",

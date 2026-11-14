@@ -39,7 +39,7 @@ the requests instead of letting several processes compete for the cores.
   `{"general_threshold": 0.35, "character_threshold": 0.85, "regions": "person",
   "margin": 0.08, "images": ["data:image/png;base64,..."]}`. `regions` is `"person"`
   (the person boxes of the same request, the `person` task then runs too) or a list
-  of `[x0, y0, x1, y1]` boxes, each grown by `margin` × its longer side. Without
+  of up to 64 `[x0, y0, x1, y1]` boxes, each grown by `margin` × its longer side. Without
   `regions` the whole image is tagged. `images` adds up to 16 pictures, tagged whole.
 
 ## Answer
