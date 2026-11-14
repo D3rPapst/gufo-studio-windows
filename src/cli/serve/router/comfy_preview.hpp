@@ -64,6 +64,44 @@ inline std::string PreviewId(std::string_view prompt_id,
   return id;
 }
 
+/// Whether `id` is a worker preview id as gufo.preview.id takes it:
+/// 1..128 characters [A-Za-z0-9._-].
+inline bool IsPreviewId(std::string_view id) {
+  if (id.empty() || id.size() > 128)
+    return false;
+  for (const char c : id) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+/// The preview id of one image or video task of a prompt (2.1): `base`
+/// (extra_data.gufo_preview_id, else the prompt id) when the prompt has a
+/// single such task, else `base` + "_" + node id, shortened at the base
+/// so the node suffix stays. Characters outside [A-Za-z0-9._-] become '_'.
+inline std::string TaskPreviewId(std::string_view base,
+                                 std::string_view node_id, bool several) {
+  const auto clean = [](std::string_view text, std::size_t limit) {
+    std::string out;
+    for (const char c : text) {
+      if (out.size() == limit)
+        break;
+      const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                      c == '.';
+      out.push_back(ok ? c : '_');
+    }
+    return out;
+  };
+  if (!several)
+    return clean(base, 128);
+  const std::string suffix = "_" + clean(node_id, 63);
+  return clean(base, 128 - suffix.size()) + suffix;
+}
+
 }  // namespace gufo::router::comfy
 
 #endif  // GUFO_CLI_SERVE_ROUTER_COMFY_PREVIEW_HPP_

@@ -29,6 +29,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
@@ -1042,6 +1043,36 @@ public:
     std::chrono::steady_clock::time_point at{};
   };
   std::map<std::string, PoolJobState> pool_jobs_;
+  /// placement = pool (2.1): on which machine the live preview of an image
+  /// request renders, by its preview id (X-Gufo-Preview-Id or the JSON
+  /// gufo.preview.id), recorded when the pool picks a side; state mutex.
+  /// /v1/previews/<id> of a pool model follows it (PlanPreviewLocked).
+  struct PreviewSide {
+    std::string model;
+    bool remote{false};
+    std::chrono::steady_clock::time_point at{};
+  };
+  std::map<std::string, PreviewSide, std::less<>> preview_sides_;
+
+  /// Records the side of `preview_id` (state mutex held); forgets entries
+  /// older than an hour, keeps at most 1024.
+  void NotePreviewSideLocked(const std::string& preview_id,
+                             const std::string& model_id, bool remote) {
+    if (preview_id.empty())
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(preview_sides_, [&](const auto& entry) {
+      return now - entry.second.at > std::chrono::hours(1);
+    });
+    while (preview_sides_.size() >= 1024) {
+      auto oldest = preview_sides_.begin();
+      for (auto it = preview_sides_.begin(); it != preview_sides_.end(); ++it)
+        if (it->second.at < oldest->second.at)
+          oldest = it;
+      preview_sides_.erase(oldest);
+    }
+    preview_sides_[preview_id] = PreviewSide{model_id, remote, now};
+  }
 
   /// {job id: "wait"|"local"|"remote"}; entries older than a day go.
   std::map<std::string, std::string> PoolJobStates() {
@@ -1722,6 +1753,28 @@ public:
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
     const bool from_comfy =
         !forwarded && req.header(router::kOriginHeader) == "comfy";
+    // The live preview id of an image request (2.1): the side picked below
+    // is recorded for /v1/previews/<id> (preview_sides_).
+    std::string preview_id;
+    if (req.path.starts_with("/v1/images/")) {
+      preview_id = req.header(router::kPreviewIdHeader);
+      if (preview_id.empty() && IsJsonBody(req)) {
+        lock.unlock();
+        try {
+          const json::Value body = json::parse(req.body);
+          if (const json::Value* gufo = body.find("gufo");
+              gufo != nullptr && gufo->is_object())
+            if (const json::Value* preview = gufo->find("preview");
+                preview != nullptr && preview->is_object())
+              preview_id = preview->member_str("id");
+        } catch (const std::exception&) {
+          // The worker answers a malformed body itself.
+        }
+        lock.lock();
+      }
+      if (!router::comfy::IsPreviewId(preview_id))
+        preview_id.clear();
+    }
     // The side the request must run on: the job store sets X-Gufo-Pool
     // when only one router can run a job; a direct request's LoRA names
     // are checked here against this preset and the partner's
@@ -1907,6 +1960,7 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "local");
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/false);
         ++pool_[model_id].local_picks;
         // The claim keeps the local worker "taken" for other pool requests
         // until this one's busy count is armed (after a cold load).
@@ -1945,6 +1999,7 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "remote");
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/true);
         ++pool_[model_id].remote_picks;
         pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
         HttpResponse response =
@@ -2503,48 +2558,264 @@ public:
     return router::RemoteUnavailable(model_id, detail);
   }
 
+  /// Where one /v1/previews request goes (PlanPreviewLocked).
+  struct PreviewPlan {
+    enum class Kind { kAnswer, kRemote, kLocal, kWait };
+    Kind kind{Kind::kAnswer};
+    /// The request to send on (its path names the worker's preview id).
+    HttpRequest request;
+    std::string model_id;
+    router::RemoteSpec spec;
+    int port{0};
+    HttpResponse answer;
+    /// The id belongs to a queued or running ComfyUI prompt of this router.
+    bool comfy_known{false};
+  };
+
   /// Live previews (/v1/previews/{id}[/events]) of a running image or video
   /// job: the model comes from `?model=` or, for a video job, its owner.
   /// Only a loaded worker is asked; a preview never starts or keeps one.
-  /// A remote model's preview goes to its router.
+  /// A remote model's preview goes to its router. 2.1: a ComfyUI prompt's
+  /// preview id (prompt id or extra_data.gufo_preview_id) leads to its
+  /// task's preview, and a pool model's preview goes to the machine the
+  /// pool sent the request to (preview_sides_). An /events stream opened
+  /// before that is known waits for it (WaitPreviewStream).
   HttpResponse PreviewLocked(const HttpRequest& req,
                              std::unique_lock<std::mutex>& lock) {
+    const bool events = req.path.ends_with("/events");
+    PreviewPlan plan = PlanPreviewLocked(req);
+    if (plan.kind == PreviewPlan::Kind::kWait) {
+      if (events) {
+        lock.unlock();
+        return WaitPreviewStream(req);
+      }
+      if (!plan.comfy_known)
+        return Err(404, "Not Found",
+                   "no loaded image or video model runs this preview "
+                   "(pass ?model= for images)",
+                   "invalid_request_error", "preview_not_found");
+      // A queued prompt: nothing to show yet, as a worker's unstarted id.
+      return PendingPreview(req);
+    }
+    return RunPreviewPlan(std::move(plan), lock);
+  }
+
+  /// The plain-read answer for a preview that has not started (204, or the
+  /// JSON snapshot for format=json|frame-json), as a worker answers it.
+  static HttpResponse PendingPreview(const HttpRequest& req) {
+    const std::string id =
+        req.path.substr(std::string_view("/v1/previews/").size());
+    const std::string format = req.query_param("format");
+    HttpResponse response;
+    if (format == "json" || format == "frame-json") {
+      json::Value body = json::Value::object();
+      body["id"] = id;
+      body["state"] = "pending";
+      body["seq"] = 0;
+      body["step"] = 0;
+      body["steps"] = 0;
+      json::Value frames = json::Value::array();
+      frames.push_back(0);
+      frames.push_back(0);
+      body["frames"] = std::move(frames);
+      response.body = body.dump();
+      response.headers.emplace_back("Content-Type", "application/json");
+    } else {
+      response.status = 204;
+      response.reason = "No Content";
+    }
+    response.headers.emplace_back("Cache-Control", "no-store");
+    response.headers.emplace_back("X-Gufo-Preview-State", "pending");
+    return response;
+  }
+
+  /// Decides where a /v1/previews request goes (state mutex held).
+  PreviewPlan PlanPreviewLocked(const HttpRequest& req) {
+    PreviewPlan plan;
+    plan.request = req;
+    const bool events = req.path.ends_with("/events");
+    const bool forwarded = !req.header(router::kForwardedHeader).empty();
     std::string model_id = req.query_param("model");
-    std::string_view id(req.path);
-    id.remove_prefix(std::string_view("/v1/previews/").size());
-    if (id.ends_with("/events"))
-      id.remove_suffix(std::string_view("/events").size());
+    std::string id = req.path.substr(std::string_view("/v1/previews/").size());
+    if (events)
+      id.resize(id.size() - std::string_view("/events").size());
+    if (comfy != nullptr && !forwarded) {
+      // A ComfyUI prompt's preview id (2.1): known from /prompt on.
+      if (auto route = comfy->FindPreview(id)) {
+        plan.comfy_known = true;
+        if (route->target.empty()) {
+          plan.kind = PreviewPlan::Kind::kWait;
+          return plan;
+        }
+        if (route->target != id) {
+          id = route->target;
+          plan.request.path =
+              "/v1/previews/" + id + (events ? "/events" : "");
+        }
+        // The adapter knows the task's model; the client need not (a
+        // video's preview follows its job's owner).
+        model_id = route->video ? std::string() : route->model;
+      }
+    }
+    const auto side = preview_sides_.find(id);
+    if (side != preview_sides_.end() && model_id.empty())
+      model_id = side->second.model;
     if (model_id.empty())
       model_id = registry.JobOwner(id);
-    // A recorded job's preview goes where the job runs; anything else
-    // follows the model's current placement.
+    plan.model_id = model_id;
+    // A recorded job's preview goes where the job runs; a pool model's
+    // where the pool sent the request; anything else follows the model's
+    // current placement.
     const bool own_job = !model_id.empty() && registry.JobOwner(id) == model_id;
-    if (const router::PresetModel* preset =
-            model_id.empty() ? nullptr : registry.Find(model_id);
-        preset != nullptr && preset->remote.has_value() &&
-        (own_job ? registry.JobRemote(id) : registry.RoutesRemote(model_id))) {
-      // The remote router finds the job itself: path and query go unchanged
-      // and the SSE stream relays as it arrives.
-      if (auto loop = RefuseRelayedAgain(req, model_id)) {
-        return std::move(*loop);
+    const router::PresetModel* preset =
+        model_id.empty() ? nullptr : registry.Find(model_id);
+    if (preset != nullptr && preset->remote.has_value()) {
+      bool remote =
+          own_job ? registry.JobRemote(id) : registry.RoutesRemote(model_id);
+      if (!own_job && !remote && !forwarded) {
+        if (side != preview_sides_.end() && side->second.model == model_id) {
+          remote = side->second.remote;
+        } else if (plan.comfy_known) {
+          // The adapter's request is on its way to the pool decision.
+          plan.kind = PreviewPlan::Kind::kWait;
+          return plan;
+        }
       }
-      const router::RemoteSpec spec = *preset->remote;
-      lock.unlock();
-      return RelayRemote(model_id, spec, req);
+      if (remote) {
+        // The remote router finds the job itself and the SSE stream relays
+        // as it arrives. The query names the model found here (the client
+        // may have left it out for a ComfyUI prompt's preview).
+        if (auto loop = RefuseRelayedAgain(req, model_id)) {
+          plan.answer = std::move(*loop);
+          return plan;
+        }
+        if (!own_job && req.query_param("model") != model_id) {
+          std::string query = "model=" + model_id;
+          if (const std::string format = req.query_param("format");
+              !format.empty())
+            query += "&format=" + format;
+          plan.request.query = std::move(query);
+        }
+        plan.kind = PreviewPlan::Kind::kRemote;
+        plan.spec = *preset->remote;
+        return plan;
+      }
     }
     const auto worker = model_id.empty() || !LoadedLocked(model_id)
                             ? nullptr
                             : FindWorkerLocked(model_id);
-    if (worker == nullptr)
-      return Err(404, "Not Found",
-                 "no loaded image or video model runs this preview "
-                 "(pass ?model= for images)",
-                 "invalid_request_error", "preview_not_found");
-    router::UpstreamTarget target;
-    target.host = "127.0.0.1";
-    target.port = worker->port();
-    lock.unlock();
-    return router::ProxyToWorker(target, req);
+    if (worker == nullptr) {
+      if (events && preset != nullptr) {
+        // The worker loads for the request this stream waits for.
+        plan.kind = PreviewPlan::Kind::kWait;
+        return plan;
+      }
+      plan.answer = Err(404, "Not Found",
+                        "no loaded image or video model runs this preview "
+                        "(pass ?model= for images)",
+                        "invalid_request_error", "preview_not_found");
+      return plan;
+    }
+    plan.kind = PreviewPlan::Kind::kLocal;
+    plan.port = worker->port();
+    return plan;
+  }
+
+  /// Sends a decided preview request on; releases the state mutex.
+  HttpResponse RunPreviewPlan(PreviewPlan plan,
+                              std::unique_lock<std::mutex>& lock) {
+    switch (plan.kind) {
+      case PreviewPlan::Kind::kRemote:
+        lock.unlock();
+        return RelayRemote(plan.model_id, plan.spec, plan.request);
+      case PreviewPlan::Kind::kLocal: {
+        router::UpstreamTarget target;
+        target.host = "127.0.0.1";
+        target.port = plan.port;
+        lock.unlock();
+        return router::ProxyToWorker(target, plan.request);
+      }
+      default:
+        lock.unlock();
+        return std::move(plan.answer);
+    }
+  }
+
+  /// An /events stream whose preview is not placed yet (a queued ComfyUI
+  /// prompt, a pool request not decided, a worker still loading): keeps the
+  /// client connected with SSE comments and, once placed, relays the
+  /// worker's (or the partner's) stream. Ends with `event: done` and state
+  /// "failed" when the prompt ends without the task, or after 30 minutes.
+  HttpResponse WaitPreviewStream(const HttpRequest& req) {
+    HttpResponse response;
+    response.headers = {{"Content-Type", "text/event-stream"},
+                        {"Cache-Control", "no-cache"},
+                        {"X-Accel-Buffering", "no"}};
+    response.streaming_body = [this, req](
+                                  const HttpResponse::BodyWriter& write) {
+      std::string id =
+          req.path.substr(std::string_view("/v1/previews/").size());
+      id.resize(id.size() - std::string_view("/events").size());
+      const auto failed = [&] {
+        json::Value body = json::Value::object();
+        body["id"] = id;
+        body["state"] = "failed";
+        body["seq"] = 0;
+        body["step"] = 0;
+        body["steps"] = 0;
+        (void)write("event: done\ndata: " + body.dump() + "\n\n");
+      };
+      const auto began = std::chrono::steady_clock::now();
+      auto keepalive = began;
+      bool was_comfy = false;
+      if (!write(": waiting\n\n"))
+        return;
+      for (;;) {
+        if ((req.is_cancelled && req.is_cancelled()) ||
+            stop_requested.load())
+          return;
+        std::optional<HttpResponse> inner;
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          PreviewPlan plan = PlanPreviewLocked(req);
+          if (plan.kind == PreviewPlan::Kind::kWait) {
+            was_comfy = was_comfy || plan.comfy_known;
+          } else if (was_comfy && !plan.comfy_known) {
+            // The prompt ended (or left the queue) before the task ran.
+            lock.unlock();
+            failed();
+            return;
+          } else {
+            inner = RunPreviewPlan(std::move(plan), lock);
+          }
+        }
+        if (inner) {
+          if (inner->status == 200 && inner->streaming_body) {
+            inner->streaming_body(write);
+          } else if (inner->status == 200) {
+            (void)write(inner->body);
+          } else {
+            (void)write("event: error\ndata: " +
+                        (inner->body.empty() ? std::string("{}")
+                                             : inner->body) +
+                        "\n\n");
+          }
+          return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - began > std::chrono::minutes(30)) {
+          failed();
+          return;
+        }
+        if (now - keepalive > std::chrono::seconds(10)) {
+          if (!write(": waiting\n\n"))
+            return;
+          keepalive = now;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      }
+    };
+    return response;
   }
 
   /// Stops every loaded worker that serves no request (ComfyUI /free).

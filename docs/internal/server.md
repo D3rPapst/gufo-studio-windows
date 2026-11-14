@@ -742,6 +742,24 @@ only in the worker's memory, so a read for a job whose worker is no longer
 loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
 /embeddings` goes to the embedding model named in its body.
+ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
+previews under an id known from the answer on: `extra_data.gufo_preview_id`
+(1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with
+`_<node id>` appended when the prompt has more than one image or video
+task. `GET /v1/previews/<id>/events` (SSE: `event: preview` with `mime`,
+`data`, `step`, `steps`, `seq`; `event: done` at the end) may be opened
+right after `/prompt`; `?model=` is not needed. While the prompt waits
+in the queue (or the pool has not placed the request, or the worker
+loads) the router keeps the stream open with `: waiting` comments and
+then relays the worker's stream; a prompt that ends without the task
+(deleted from the queue, failed earlier) ends it with `event: done` and
+`"state": "failed"`; after 30 min of waiting it ends the same way. A
+plain read answers `pending` (204, or JSON for `format=json|frame-json`)
+meanwhile. For a video task the id leads to the video job's preview
+(H3: a WebP loop with a JPEG middle frame for `format=frame`). The worker
+renders previews only while someone watches (an open stream, a read in
+the last 10 s, or the adapter's relay for a `/ws` client), so an idle
+graph costs nothing.
 A ComfyUI graph that loads a video (`LoadVideo` -> `RIFE VFI`) takes
 the RIFE rate from the file's probed frame rate (ffprobe next to
 `--comfy-ffmpeg`; 24 fps assumed when it is missing): x5 of a 12 fps shot
@@ -991,6 +1009,16 @@ log).
 Limits: the pool has exactly one partner; the image preview of a pulled job runs on the requester's
 worker, so the owner shows no live step for it; a job with a multipart
 body states its LoRAs only through a `loras` JSON part.
+
+**Previews (2.1).** When the pool picks a side for an image request, it
+records the request's preview id (`X-Gufo-Preview-Id`, which the ComfyUI
+adapter sets, or a JSON body's `gufo.preview.id`; a direct multipart
+request is not read) for an hour. `GET /v1/previews/<id>[/events]` of a
+pool model then goes to that side, with `?model=` added for the partner
+when the client left it out. Before 2.1 the read went to the local
+worker, so a ComfyUI graph on one router whose image the pool sent to the
+partner never showed a preview (14.11.: Qwen-Image keyframes of the .56
+adapter rendered on the .198 with `preview_published=0`).
 
 ### Pool failures (after 1.4.24)
 

@@ -48,6 +48,12 @@ namespace gufo::router {
 /// busy rule does not hold them back (never honoured on a relayed request).
 inline constexpr const char* kOriginHeader = "X-Gufo-Origin";
 
+/// The live preview id (gufo.preview.id) of an image request, set by the
+/// ComfyUI adapter so the pool need not parse a multipart body: the pool
+/// records on which machine that preview renders, and /v1/previews/<id>
+/// follows it there (2.1). A JSON body's gufo.preview.id counts as well.
+inline constexpr const char* kPreviewIdHeader = "X-Gufo-Preview-Id";
+
 /// One relay at a time per pool model to the remote router (its GPU runs
 /// one request of it at a time).
 inline constexpr int kPoolRemoteCapacity = 1;
