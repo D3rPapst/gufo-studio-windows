@@ -773,11 +773,12 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
                    "wd14_tags.regions[" + std::to_string(i) + "] lies outside the image",
                    "invalid_request");
   }
-  // Enlarged OCR passes stay within kMaxOcrPixels (host RAM).
+  // Every OCR pass, enlarged or not, stays within kMaxOcrPixels (host RAM
+  // of the detector's feature maps; imgutils itself has no limit).
   for (const OcrPass& pass : parsed.ocr) {
     const auto pixels = static_cast<std::int64_t>(image.width) * pass.scale *
                         static_cast<std::int64_t>(image.height) * pass.scale;
-    if (pass.scale > 1 && pixels > kMaxOcrPixels)
+    if (pixels > kMaxOcrPixels)
       return Error(400, "Bad Request",
                    "ocr scale " + std::to_string(pass.scale) + ": " +
                        std::to_string(image.width * pass.scale) + "x" +

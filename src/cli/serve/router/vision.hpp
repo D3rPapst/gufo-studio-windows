@@ -113,7 +113,10 @@ struct OcrPass {
 };
 inline constexpr std::size_t kMaxOcrPasses = 4;
 inline constexpr int kMaxOcrScale = 4;
-/// Largest enlarged OCR input (3x of 1920x1080 is 18.7 megapixels).
+/// Largest OCR input, enlarged or not (3x of 1920x1080 is 18.7 megapixels).
+/// imgutils.ocr has no limit (it pads to a multiple of 32 and runs DBNet on
+/// the whole picture); the detector's float32 feature maps of a larger
+/// input need several GB of host RAM, so gufo answers 400 instead.
 inline constexpr std::int64_t kMaxOcrPixels = 24'000'000;
 /// Encoded bytes of all input pictures of one request together (image and
 /// wd14_tags.images; data URLs, https URLs and Ablage paths alike).
