@@ -80,13 +80,15 @@ default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) and loads each model 
 
 ## Limits and errors
 
-- One request computes at a time; `--vision-threads` (default 8) sets its CPU threads.
-  Up to `--vision-queue` (default 4) more wait; the next one gets `503 busy` with
-  `Retry-After: 5`.
+- One request computes at a time, in one queue with the CCIP figure check;
+  `--vision-threads` (default 8) sets its CPU threads. Up to `--vision-queue`
+  (default 4) more wait; the next one gets `503 busy` with `Retry-After: 5`.
 - `400 invalid_request`: unknown task, bad threshold, unreadable image.
 - `404`: an Ablage path of a job you can't read.
 - `503 vision_unavailable`: a model file is missing; the message names it.
 - The request needs the `bild` area and doesn't count against the daily limit.
-- It runs on the router that receives it; it is not passed to the pool partner.
+- With a pool partner, a request goes there first when this machine is busy or
+  lacks the models; its answer carries `X-Gufo-Ran-On: partner`. `X-Gufo-Pool: local`
+  keeps it here, `X-Gufo-Pool: remote` sends it there.
 
 Details, processing steps and tests: [server reference](../internal/server.md#image-recognition-post-v1visiondetect).

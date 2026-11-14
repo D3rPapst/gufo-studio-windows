@@ -3,7 +3,10 @@
 // 503) and, with GUFO_VISION_DIR (converted detectors) and GUFO_VISION_FRAME
 // (a PNG keyframe), real detections: the frame as a data URL and as an
 // Ablage path through a scripted gate (its 404 is relayed), and two parallel
-// requests that must queue one after the other.
+// requests that must queue one after the other. Pool (cpu_pool.hpp) with a
+// scripted partner: Decide, relay when busy or without models, the Ablage
+// image inlined for the partner, X-Gufo-Pool local/remote, the partner's
+// 503 falling back here, and /v1/figuren "ccip" over the same queue/relay.
 // Written with AI assistance (Claude Code).
 #undef NDEBUG
 #include <algorithm>
@@ -21,11 +24,15 @@
 #include <vector>
 
 #include "ccip/image_ops.hpp"
+#include "src/cli/serve/router/cpu_pool.hpp"
+#include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/vision.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/json.hpp"
 
 namespace json = gufo::json;
+namespace cpu = gufo::router::cpu;
+namespace figuren = gufo::router::figuren;
 namespace vision = gufo::router::vision;
 using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
@@ -186,6 +193,126 @@ void TestErrors() {
   assert(response->body.find("face_detect_v1.4_s.safetensors") != std::string::npos);
 }
 
+HttpResponse JsonAnswer(int status, std::string body) {
+  HttpResponse response;
+  response.status = status;
+  response.body = std::move(body);
+  response.headers = {{"Content-Type", "application/json"}};
+  return response;
+}
+
+void TestPool() {
+  // Decide.
+  HttpRequest plain = Post(Body("AAAA", {"face"}));
+  assert(cpu::Decide(plain, true, false, false) == cpu::Route::kLocal);
+  assert(cpu::Decide(plain, true, true, false) == cpu::Route::kTryPartner);
+  assert(cpu::Decide(plain, true, false, true) == cpu::Route::kTryPartner);
+  assert(cpu::Decide(plain, false, true, true) == cpu::Route::kLocal);
+  HttpRequest pinned = plain;
+  pinned.headers.emplace_back("X-Gufo-Pool", "local");
+  assert(cpu::Decide(pinned, true, true, true) == cpu::Route::kLocal);
+  HttpRequest remote = plain;
+  remote.headers.emplace_back("X-Gufo-Pool", "Remote");
+  assert(cpu::Decide(remote, true, false, false) == cpu::Route::kPartnerOnly);
+  HttpRequest relayed = plain;
+  relayed.headers.emplace_back("X-Gufo-Forwarded", "abc");
+  assert(cpu::Decide(relayed, true, true, true) == cpu::Route::kLocal);
+  relayed.headers.emplace_back(cpu::kIfIdleHeader, "1");
+  assert(cpu::Decide(relayed, true, true, true) == cpu::Route::kLocalIfIdle);
+  // The relayed request: no credentials, If-Idle unless forced.
+  HttpRequest with_token = plain;
+  with_token.headers.emplace_back("Authorization", "Bearer user");
+  const HttpRequest copy = cpu::RelayRequest(with_token, "{}", false);
+  assert(copy.header("Authorization").empty() && copy.header(cpu::kIfIdleHeader) == "1");
+  assert(cpu::RelayRequest(with_token, "{}", true).header(cpu::kIfIdleHeader).empty());
+
+  // No models here: the partner gets it; the Ablage image travels inline.
+  struct Partner {
+    int calls{0};
+    int status{200};
+    std::string last_body;
+    std::string last_if_idle;
+  };
+  auto partner = std::make_shared<Partner>();
+  vision::Options options;
+  options.model_dir = "Z:/does-not-exist/vision";
+  options.serve = [](const HttpRequest& inner) {
+    HttpResponse file;
+    assert(inner.path == "/v1/jobs/j1/files/a.png");
+    file.body = std::string("\x89PNG\r\n\x1a\nrest", 12);
+    return file;
+  };
+  options.relay = [partner](const HttpRequest& request) -> std::optional<HttpResponse> {
+    ++partner->calls;
+    partner->last_body = request.body;
+    partner->last_if_idle = request.header(cpu::kIfIdleHeader);
+    if (partner->status == 0)
+      return std::nullopt;
+    return JsonAnswer(partner->status, R"({"object":"vision.detection","detections":{}})");
+  };
+  auto queue = std::make_shared<cpu::CpuQueue>(4);
+  options.queue = queue;
+  const vision::VisionService service(options);
+  auto response = service.Handle(Post(Body("/v1/jobs/j1/files/a.png", {"face"})));
+  assert(response->status == 200 && partner->calls == 1);
+  bool ran_on_partner = false;
+  for (const auto& [name, value] : response->headers)
+    ran_on_partner = ran_on_partner || (name == cpu::kRanOnHeader && value == "partner");
+  assert(ran_on_partner);
+  const json::Value sent = json::parse(partner->last_body);
+  assert(sent.member_str("image").starts_with("data:image/png;base64,"));
+  assert(sent.find("tasks") != nullptr && partner->last_if_idle == "1");
+  // Partner busy (503) or gone: back here, where the models are missing.
+  partner->status = 503;
+  response = service.Handle(Post(Body("AAAA", {"face"})));
+  assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  partner->status = 0;
+  response = service.Handle(Post(Body("AAAA", {"face"})));
+  assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  // Pinned here: never relayed.
+  const int before = partner->calls;
+  HttpRequest local = Post(Body("AAAA", {"face"}));
+  local.headers.emplace_back("X-Gufo-Pool", "local");
+  response = service.Handle(local);
+  assert(response->status == 503 && partner->calls == before);
+  // X-Gufo-Pool: remote without a partner: 503 remote_unavailable.
+  HttpRequest forced = Post(Body("AAAA", {"face"}));
+  forced.headers.emplace_back("X-Gufo-Pool", "remote");
+  response = service.Handle(forced);
+  assert(response->status == 503 && response->body.find("remote_unavailable") != std::string::npos);
+  assert(partner->last_if_idle.empty());
+
+  // /v1/figuren "ccip" over the same queue and relay: no CCIP models here,
+  // so the partner gets the body unchanged.
+  partner->status = 200;
+  figuren::Options fig;
+  fig.queue = queue;
+  fig.relay = options.relay;
+  const figuren::FigurenService figures(fig);
+  json::Value ref = json::Value::object();
+  ref["name"] = "lars";
+  ref["kopf"] = "AAAA";
+  json::Value refs = json::Value::array();
+  refs.push_back(std::move(ref));
+  json::Value ccip = json::Value::object();
+  ccip["verfahren"] = "ccip";
+  ccip["bild"] = "AAAA";
+  ccip["referenzen"] = std::move(refs);
+  HttpRequest fr;
+  fr.method = "POST";
+  fr.path = "/v1/figuren";
+  fr.body = ccip.dump();
+  const int calls = partner->calls;
+  response = figures.Handle(fr);
+  assert(response->status == 200 && partner->calls == calls + 1);
+  assert(partner->last_body == fr.body);
+  // Busy queue on a relayed request with If-Idle: 503 busy at once.
+  fr.headers.emplace_back("X-Gufo-Forwarded", "abc");
+  fr.headers.emplace_back(cpu::kIfIdleHeader, "1");
+  response = figures.Handle(fr);  // no models here: 503 ccip_unavailable first
+  assert(response->status == 503);
+}
+
 std::string ReadFile(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -235,6 +362,22 @@ void TestReal(const char* dir, const char* frame) {
   response = service.Handle(foreign);
   assert(response->status == 404);
   assert(gate_calls == 2);
+  // Relayed here with If-Idle while the queue is busy: 503 busy at once.
+  {
+    auto queue = std::make_shared<cpu::CpuQueue>(4);
+    vision::Options busy_options = options;
+    busy_options.queue = queue;
+    const vision::VisionService busy_service(busy_options);
+    assert(queue->Enter({}) == cpu::CpuQueue::Result::kOk);
+    HttpRequest relayed = Post(Body(data_url, {"face"}));
+    relayed.headers.emplace_back("X-Gufo-Forwarded", "abc");
+    relayed.headers.emplace_back(cpu::kIfIdleHeader, "1");
+    auto busy = busy_service.Handle(relayed);
+    assert(busy->status == 503 && busy->body.find("busy") != std::string::npos);
+    queue->Leave();
+    busy = busy_service.Handle(relayed);
+    assert(busy->status == 200);
+  }
   // Two at once: one waits for the other.
   auto a = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });
   auto b = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });
@@ -252,6 +395,7 @@ int main() {
   TestParse();
   TestLumaGamma();
   TestErrors();
+  TestPool();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')

@@ -6,9 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <mutex>
 #include <span>
@@ -17,6 +15,7 @@
 #include <utility>
 
 #include "ccip/ccip.hpp"
+#include "src/core/base64.hpp"
 #include "src/core/image.hpp"
 
 namespace gufo::router::vision {
@@ -71,57 +70,29 @@ float Threshold(const json::Value& value, const std::string& what) {
   return static_cast<float>(v);
 }
 
-/// The caller waits here until it is first in line and the CPU is free.
-/// FIFO by ticket; a cancelled caller leaves the line.
-class FifoGate {
-public:
-  enum class Result { kOk, kFull, kCancelled };
+/// The image type of encoded bytes for a data URL (PNG, JPEG, WebP).
+std::string SniffImageType(const std::vector<std::uint8_t>& bytes) {
+  if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+    return "image/jpeg";
+  if (bytes.size() >= 12 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' &&
+      bytes[3] == 'F' && bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P')
+    return "image/webp";
+  return "image/png";
+}
 
-  Result Enter(const std::function<bool()>& cancelled, std::size_t max_waiting) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (busy_ && line_.size() >= max_waiting)
-      return Result::kFull;
-    const std::uint64_t ticket = next_++;
-    line_.push_back(ticket);
-    while (busy_ || line_.front() != ticket) {
-      cv_.wait_for(lock, std::chrono::milliseconds(200));
-      if (cancelled && cancelled()) {
-        line_.erase(std::find(line_.begin(), line_.end(), ticket));
-        cv_.notify_all();
-        return Result::kCancelled;
-      }
-    }
-    line_.pop_front();
-    busy_ = true;
-    return Result::kOk;
+/// The request body for the partner: every member as sent, the image
+/// inline as a data URL (the partner cannot read this machine's Ablage).
+std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& bytes) {
+  json::Value out = json::Value::object();
+  for (const auto& [key, value] : body.members()) {
+    if (key != "image" && key != "bild")
+      out[key] = value;
   }
-
-  void Leave() {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      busy_ = false;
-    }
-    cv_.notify_all();
-  }
-
-  std::size_t Waiting() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return line_.size();
-  }
-
-private:
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  std::deque<std::uint64_t> line_;
-  std::uint64_t next_{0};
-  bool busy_{false};
-};
-
-/// Leaves the gate on every path out of the compute section.
-struct GateTurn {
-  FifoGate& gate;
-  ~GateTurn() { gate.Leave(); }
-};
+  out["image"] = "data:" + SniffImageType(bytes) + ";base64," +
+                 core::EncodeBase64(std::string_view(
+                     reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+  return out.dump();
+}
 
 /// Bytes of an Ablage path, read through the gate with the caller's token.
 /// A refusal of the gate or the job store is returned in *failure.
@@ -288,7 +259,6 @@ Request ParseRequest(const json::Value& body) {
 struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
-  FifoGate gate;
 
   /// The detector of `spec`, loaded on first use; null with *error set.
   const models::ccip::YoloDetector* Get(const Options& options, const TaskSpec& spec,
@@ -322,11 +292,14 @@ struct VisionState {
 };
 
 VisionService::VisionService(Options options)
-    : options_(std::move(options)), state_(std::make_shared<VisionState>()) {}
+    : options_(std::move(options)), state_(std::make_shared<VisionState>()) {
+  if (options_.queue == nullptr)
+    options_.queue = std::make_shared<cpu::CpuQueue>(options_.max_waiting);
+}
 
 VisionService::~VisionService() = default;
 
-std::size_t VisionService::Waiting() const { return state_->gate.Waiting(); }
+std::size_t VisionService::Waiting() const { return options_.queue->Waiting(); }
 
 std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) const {
   if (request.path != "/v1/vision/detect")
@@ -334,20 +307,22 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   if (request.method != "POST")
     return Error(405, "Method Not Allowed", "use POST", "method_not_allowed");
   Request parsed;
+  json::Value body;
   try {
-    parsed = ParseRequest(json::parse(request.body));
+    body = json::parse(request.body);
+    parsed = ParseRequest(body);
   } catch (const std::domain_error& error) {
     return Error(501, "Not Implemented", error.what(), "task_not_available");
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", error.what(), "invalid_request");
   }
-  // Models first: a missing file is 503 before the caller queues.
+  // Models: a missing file is 503 unless the pool partner runs it.
   std::vector<const models::ccip::YoloDetector*> nets;
+  std::string missing;
   for (const TaskSpec& spec : parsed.tasks) {
-    std::string error;
-    const auto* net = state_->Get(options_, spec, &error);
+    const auto* net = state_->Get(options_, spec, &missing);
     if (net == nullptr)
-      return Error(503, "Service Unavailable", error, "vision_unavailable");
+      break;
     nets.push_back(net);
   }
   // Input before the queue: reading an Ablage path goes through the gate
@@ -370,6 +345,28 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", std::string("image: ") + error.what(), "invalid_request");
   }
+  // Pool (cpu_pool.hpp): the partner when this machine is busy or lacks
+  // the models.
+  cpu::CpuQueue& queue = *options_.queue;
+  const cpu::Route route = cpu::Decide(request, static_cast<bool>(options_.relay),
+                                       !queue.Idle(), !missing.empty());
+  if (route == cpu::Route::kTryPartner || route == cpu::Route::kPartnerOnly) {
+    const bool force = route == cpu::Route::kPartnerOnly;
+    std::optional<HttpResponse> answer;
+    if (options_.relay)
+      answer = options_.relay(cpu::RelayRequest(request, RelayBody(body, bytes), force));
+    if (answer.has_value() && (force || cpu::PartnerAnswered(*answer))) {
+      answer->headers.emplace_back(cpu::kRanOnHeader, "partner");
+      return std::move(*answer);
+    }
+    if (force)
+      return Error(503, "Service Unavailable", "no pool partner can run it",
+                   "remote_unavailable");
+  }
+  if (!missing.empty())
+    return Error(503, "Service Unavailable", missing, "vision_unavailable");
+  if (route == cpu::Route::kLocalIfIdle && !queue.Idle())
+    return cpu::Busy("image recognition");
   models::ccip::RgbImage image;
   try {
     // RGB8 with the alpha channel dropped (imgutils puts RGBA on white).
@@ -393,19 +390,15 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const models::ccip::RgbImage& detector_input = brightened ? detect_image : image;
 
   const auto queued = std::chrono::steady_clock::now();
-  switch (state_->gate.Enter(request.is_cancelled, options_.max_waiting)) {
-    case FifoGate::Result::kOk:
+  switch (queue.Enter(request.is_cancelled)) {
+    case cpu::CpuQueue::Result::kOk:
       break;
-    case FifoGate::Result::kFull: {
-      HttpResponse busy = Error(503, "Service Unavailable",
-                                "image recognition queue is full, try again", "busy");
-      busy.headers.emplace_back("Retry-After", "5");
-      return busy;
-    }
-    case FifoGate::Result::kCancelled:
+    case cpu::CpuQueue::Result::kFull:
+      return cpu::Busy("image recognition");
+    case cpu::CpuQueue::Result::kCancelled:
       return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
   }
-  const GateTurn turn{state_->gate};
+  const cpu::CpuQueue::Turn turn(queue);
   const auto started = std::chrono::steady_clock::now();
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();

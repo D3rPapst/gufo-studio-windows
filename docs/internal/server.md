@@ -499,8 +499,8 @@ Router:
   --vision-dir <DIR>            Detectors for POST /v1/vision/detect (person, head, face, hand:
                                 <model>.safetensors + .json; loaded on first use)
   --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
-  --vision-queue <N>            /v1/vision/detect requests that may wait behind the running one
-                                before 503 busy (default: 4)
+  --vision-queue <N>            Requests of the shared CPU queue (/v1/vision/detect, /v1/figuren
+                                ccip) that may wait behind the running one before 503 busy (default: 4)
   --remote-allow <LIST>         Remote routers [remote/<id>] sections may name: IPv4 addresses or
                                 a.b.c.d/n ranges, each with an optional :port. Default: none,
                                 remote sections are refused
@@ -799,7 +799,10 @@ person is `"unbekannt"`. Each person returns `name`, `box` (face),
 `D:\llm-modelle\deepghs\ccip_onnx\gufo` and
 `D:\llm-modelle\deepghs\anime_face_detection\gufo`), loads them on the first
 ccip request (~165 MB host RAM) and answers 503 `ccip_unavailable` when they
-are missing. `--ccip-threads` (default 8) bounds the CPU threads.
+are missing. `--ccip-threads` (default 8) bounds the CPU threads. The CPU part
+waits in the queue shared with `/v1/vision/detect` and follows the same pool
+rule (see [CPU queue and pool](#cpu-queue-and-pool-for-the-router-services)); the
+27B questions run after it, outside the queue.
 
 ### Image recognition (`POST /v1/vision/detect`)
 
@@ -842,18 +845,38 @@ weights 19595/38470/7471) is below 70, the detectors see a copy with
 (class names and `imgsz` from the ONNX metadata); each loads on first use
 and stays (~100 MB host RAM for the m model, ~43 MB per s model); a missing
 file is `503 vision_unavailable` naming it. One request computes at a time in
-FIFO order with `--vision-threads` threads; up to `--vision-queue` more wait
-(their connection stays open; a caller that disconnects leaves the line),
-the next one gets `503 busy` with `Retry-After: 5`. An Ablage path
+FIFO order with `--vision-threads` threads in the CPU queue shared with
+`/v1/figuren` ccip; up to `--vision-queue` more wait (their connection stays
+open; a caller that disconnects leaves the line), the next one gets
+`503 busy` with `Retry-After: 5`. An Ablage path
 `/v1/jobs/{id}/files/{name}` is read through the gate with the caller's own
 `Authorization` (as the MCP tools do; another user's job is the gate's 404,
 relayed), at most 20 MB. RGBA input loses its alpha channel (imgutils puts it
 on white). Area `bild`; the request is not counted against `tageslimit`.
-Not pool-routed yet: it runs on the router that receives it.
+Pool: see below; the relayed body carries the image inline (an Ablage path
+is read here first).
 Tests: `router_vision_test` (parsing and errors; with `GUFO_VISION_DIR` and
 `GUFO_VISION_FRAME` real detections, the Ablage path and the queue) and
 `ccip.vision_oracle` (`vision_oracle_test` against
 `reference/make_vision_oracle.py`, which runs imgutils itself).
+
+### CPU queue and pool for the router services
+
+`/v1/vision/detect` and `/v1/figuren` `"verfahren": "ccip"` compute on the
+router's CPU, not in a worker, so the model pool (`placement = pool`) does not
+cover them; `src/cli/serve/router/cpu_pool.hpp` does. Both share one FIFO
+queue (one request computes, `--vision-queue` wait). A request goes to the
+pool partner first when this machine is busy (something computes or waits)
+or lacks the models, unless it was relayed already (`X-Gufo-Forwarded`) or is
+pinned (`X-Gufo-Pool: local`, also set by the gate for users with
+`pool = false`). It travels with the partner key and `X-Gufo-If-Idle: 1`; a
+partner whose queue is not idle answers `503 busy` at once. A partner that
+is unreachable or answers 404 (older router), 502, 503 or 504 does not count:
+the request queues here. `X-Gufo-Pool: remote` sends it without the idle
+condition (`503 remote_unavailable` without a partner). A partner's answer
+carries `X-Gufo-Ran-On: partner`. Images must be inline in the relayed body:
+`/v1/vision/detect` inlines an Ablage path itself; `/v1/figuren` takes only
+data URLs, base64 and https anyway.
 
 ### Video concat (`POST /v1/videos/concat`)
 

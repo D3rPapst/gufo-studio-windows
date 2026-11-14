@@ -82,6 +82,10 @@
 //   images are cached by SHA-256 of the image string, so only the first
 //   request pays for them (~1.1 s CPU per reference image). CPU work is
 //   serialised over one lock and uses --ccip-threads OpenMP threads.
+//   Queue and pool (cpu_pool.hpp): the CPU part waits in the queue shared
+//   with /v1/vision/detect; when this machine is busy there (or has no
+//   CCIP models) the request goes to the pool partner first, body
+//   unchanged (every image is inline); X-Gufo-Ran-On: partner marks it.
 
 #include <array>
 #include <chrono>
@@ -96,6 +100,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::figuren {
@@ -176,6 +181,11 @@ struct Options {
   std::filesystem::path ccip_model_dir;
   std::filesystem::path ccip_face_dir;
   int ccip_threads = 8;
+  /// "ccip": the CPU queue shared with /v1/vision/detect (cpu_pool.hpp);
+  /// null: an own queue of 4 waiting.
+  std::shared_ptr<cpu::CpuQueue> queue;
+  /// "ccip": the pool partner (cpu_pool.hpp); null: never relayed.
+  cpu::Relay relay;
 };
 
 struct CcipState;
@@ -190,7 +200,7 @@ public:
 
 private:
   std::optional<server::HttpResponse> HandleCcip(
-      const json::Value& body,
+      const server::HttpRequest& request, const json::Value& body,
       std::chrono::steady_clock::time_point started) const;
 
   Options options_;

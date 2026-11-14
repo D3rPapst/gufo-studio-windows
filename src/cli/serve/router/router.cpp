@@ -30,6 +30,7 @@
 #include "src/cli/serve/router/auth.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
+#include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/jobs.hpp"
@@ -4194,8 +4195,9 @@ int RunRouter(std::span<const char* const> args) {
                    "CPU threads for /v1/vision/detect (default: 8)", "Router",
                    &vision_threads);
   parser.AddOption("", "--vision-queue", "N",
-                   "/v1/vision/detect requests that may wait behind the "
-                   "running one before 503 busy (default: 4)",
+                   "Requests of the shared CPU queue (/v1/vision/detect, "
+                   "/v1/figuren ccip) that may wait behind the running one "
+                   "before 503 busy (default: 4)",
                    "Router", &vision_queue);
   parser.AddOption("", "--jobs-parallel", "N",
                    "Jobs running at the same time (default: 1)", "Jobs",
@@ -4675,9 +4677,34 @@ int RunRouter(std::span<const char* const> args) {
       return CollectResponse(router::ProxyToWorker(target, request));
     };
   }
+  // The CPU services (/v1/figuren "ccip", /v1/vision/detect) share one
+  // queue and hand work to the pool partner when this machine is busy
+  // (cpu_pool.hpp). The relay reads partner_spec at call time.
+  auto cpu_queue = std::make_shared<router::cpu::CpuQueue>(vision_queue);
+  router::cpu::Relay cpu_relay =
+      [raw](const HttpRequest& request) -> std::optional<HttpResponse> {
+    if (!raw->partner_spec.has_value())
+      return std::nullopt;
+    router::UpstreamTarget target =
+        router::RemoteTarget(*raw->partner_spec, raw->router_id);
+    target.connect_timeout = std::chrono::seconds(3);
+    router::comfy::FetchResult answer =
+        CollectResponse(router::ProxyToWorker(target, request));
+    if (answer.status == 0)
+      return std::nullopt;
+    HttpResponse out;
+    out.status = answer.status;
+    out.reason = answer.status < 400 ? "OK" : "Partner Error";
+    out.body = std::move(answer.body);
+    if (!answer.content_type.empty())
+      out.headers.emplace_back("Content-Type", answer.content_type);
+    return out;
+  };
   {
     router::figuren::Options figuren_options;
     figuren_options.fetch = self_fetch;
+    figuren_options.queue = cpu_queue;
+    figuren_options.relay = cpu_relay;
     figuren_options.ccip_model_dir = ccip_model_dir;
     figuren_options.ccip_face_dir = ccip_face_dir;
     figuren_options.ccip_threads = static_cast<int>(ccip_threads);
@@ -4871,6 +4898,8 @@ int RunRouter(std::span<const char* const> args) {
     vision_options.model_dir = vision_dir;
     vision_options.threads = static_cast<int>(vision_threads);
     vision_options.max_waiting = vision_queue;
+    vision_options.queue = cpu_queue;
+    vision_options.relay = cpu_relay;
     vision_options.serve = [raw](const HttpRequest& inner) {
       return raw->gate->Serve(inner, [raw](const HttpRequest& checked) {
         return raw->Dispatch(checked);

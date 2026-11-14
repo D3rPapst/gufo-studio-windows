@@ -29,10 +29,12 @@
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
 //   use and kept (person m ~100 MB, the s models ~43 MB each, host RAM);
 //   503 "vision_unavailable" when a file is missing.
-//   Queue: one request computes at a time (FIFO, --vision-threads OpenMP
-//   threads), so parallel callers wait instead of fighting for the cores;
-//   more than --vision-queue waiting requests: 503 "busy" with Retry-After.
-//   A caller that disconnects while waiting leaves the queue.
+//   Queue and pool: cpu_pool.hpp. One request computes at a time in the
+//   CPU queue shared with /v1/figuren "ccip" (FIFO, --vision-threads OpenMP
+//   threads); more than --vision-queue waiting: 503 "busy" with Retry-After.
+//   When this machine is busy or lacks the models, the pool partner gets
+//   the request first (image inline as a data URL); X-Gufo-Ran-On: partner
+//   marks its answer.
 //   An Ablage path is read through the gate with the caller's own
 //   Authorization (another user's job is the gate's 404), at most 20 MB.
 
@@ -46,6 +48,7 @@
 #include <vector>
 
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::vision {
@@ -83,8 +86,14 @@ Request ParseRequest(const json::Value& body);
 struct Options {
   std::filesystem::path model_dir;
   int threads = 8;
-  /// Requests that may wait behind the running one.
-  std::size_t max_waiting = 16;
+  /// Requests that may wait behind the running one (only for the own queue
+  /// made when `queue` is null).
+  std::size_t max_waiting = 4;
+  /// The CPU queue shared with /v1/figuren "ccip" (cpu_pool.hpp); null: an
+  /// own queue.
+  std::shared_ptr<cpu::CpuQueue> queue;
+  /// The pool partner (cpu_pool.hpp); null: never relayed.
+  cpu::Relay relay;
   /// One request through the gate and the router (for Ablage paths), as
   /// mcp::Options::serve. Null: Ablage paths are refused (400).
   std::function<server::HttpResponse(const server::HttpRequest&)> serve;

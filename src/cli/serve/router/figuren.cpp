@@ -1236,12 +1236,16 @@ std::vector<Assignment> Assign(const std::vector<Person>& people,
 }
 
 FigurenService::FigurenService(Options options)
-    : options_(std::move(options)), ccip_(std::make_shared<CcipState>()) {}
+    : options_(std::move(options)), ccip_(std::make_shared<CcipState>()) {
+  if (options_.queue == nullptr)
+    options_.queue = std::make_shared<cpu::CpuQueue>(4);
+}
 
 FigurenService::~FigurenService() = default;
 
 std::optional<HttpResponse> FigurenService::HandleCcip(
-    const json::Value& body, std::chrono::steady_clock::time_point started) const {
+    const HttpRequest& request, const json::Value& body,
+    std::chrono::steady_clock::time_point started) const {
   CcipRequest parsed;
   try {
     parsed = ParseCcipRequest(body, options_.default_model);
@@ -1249,8 +1253,29 @@ std::optional<HttpResponse> FigurenService::HandleCcip(
     return Error(400, "Bad Request", error.what(), "invalid_request");
   }
   std::string unavailable;
-  if (!ccip_->Ensure(options_, &unavailable))
+  const bool ready = ccip_->Ensure(options_, &unavailable);
+  // Pool (cpu_pool.hpp): the partner first when this machine is busy or
+  // has no models; the body goes unchanged (every image is inline).
+  cpu::CpuQueue& queue = *options_.queue;
+  const cpu::Route route =
+      cpu::Decide(request, static_cast<bool>(options_.relay), !queue.Idle(), !ready);
+  if (route == cpu::Route::kTryPartner || route == cpu::Route::kPartnerOnly) {
+    const bool force = route == cpu::Route::kPartnerOnly;
+    std::optional<HttpResponse> answer;
+    if (options_.relay)
+      answer = options_.relay(cpu::RelayRequest(request, request.body, force));
+    if (answer.has_value() && (force || cpu::PartnerAnswered(*answer))) {
+      answer->headers.emplace_back(cpu::kRanOnHeader, "partner");
+      return std::move(*answer);
+    }
+    if (force)
+      return Error(503, "Service Unavailable", "no pool partner can run it",
+                   "remote_unavailable");
+  }
+  if (!ready)
     return Error(503, "Service Unavailable", unavailable, "ccip_unavailable");
+  if (route == cpu::Route::kLocalIfIdle && !queue.Idle())
+    return cpu::Busy("CCIP");
   struct Head {
     ccip::Face face;
     Box kopf{};
@@ -1258,6 +1283,18 @@ std::optional<HttpResponse> FigurenService::HandleCcip(
     std::vector<CcipCandidate> diffs;  // reference order
   };
   std::vector<Head> heads;
+  // The CPU part waits its turn in the shared queue; the 27B questions
+  // below run after it.
+  switch (queue.Enter(request.is_cancelled)) {
+    case cpu::CpuQueue::Result::kOk:
+      break;
+    case cpu::CpuQueue::Result::kFull:
+      return cpu::Busy("CCIP");
+    case cpu::CpuQueue::Result::kCancelled:
+      return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
+  }
+  std::optional<cpu::CpuQueue::Turn> turn;
+  turn.emplace(queue);
   try {
     // CPU work: detection, head embeddings, reference/gallery embeddings.
     std::lock_guard<std::mutex> lock(ccip_->compute_mutex);
@@ -1314,6 +1351,7 @@ std::optional<HttpResponse> FigurenService::HandleCcip(
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", error.what(), "figuren_failed");
   }
+  turn.reset();
   try {
     const Session session(options_.fetch, parsed.model);
     // Figures with a Steckbrief can be checked against read features.
@@ -1416,7 +1454,7 @@ std::optional<HttpResponse> FigurenService::Handle(
       if (const json::Value* method = peek.find("verfahren");
           method != nullptr && !method->is_null()) {
         if (method->is_string() && method->str() == "ccip")
-          return HandleCcip(peek, started);
+          return HandleCcip(request, peek, started);
         if (!method->is_string() || method->str() != "llm")
           return Error(400, "Bad Request",
                        "verfahren must be \"ccip\" or \"llm\"",
