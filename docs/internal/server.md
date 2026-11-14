@@ -955,6 +955,23 @@ pipeline's person cut-outs, 448 input bit-exact, all 10861 probabilities
 within 1e-3, same tags; measured max diff 4.1e-6 on 7 keyframes + 33
 cut-outs).
 
+#### Poses (`pose`, `pose_wholebody`)
+
+Port of the film pipeline's `posen_erkennung.erkenne` (transformers 5.18 with
+torchvision, onnxruntime, OpenCV 5): RT-DETR r50vd COCO+O365 (`RtDetr`, input
+resized to 640 x 640 with torchvision's uint8 antialiased bilinear kernel,
+reproduced bit for bit by `ResizeBilinearTorchAA`; post-processing sigmoid, top 300
+of queries x classes, score > `min_score`) finds the persons (label 0, `max_persons`
+by score). ViTPose base (`VitPose`: UDP warp with scipy `affine_transform`
+semantics, round half up to uint8; DARK refinement with an 11-tap reflect
+gaussian) gives 17 points, DWPose dw-ll_ucoco_384 (`DwPose`: the converted ONNX
+node list run in order; cv2-style warp of the float image, SimCC arg-max / 2) 133.
+Files from `reference/convert_pose.py` and `reference/convert_dwpose.py` in
+`--vision-dir`; host RAM after loading: about 170 + 345 + 135 MB. The film
+pipeline's body-point merge (per point the surer of ViTPose and DWPose) and the
+mouth measurement stay with the caller. Test: `ccip.pose_oracle`
+(`pose_oracle_test` against `reference/make_pose_oracle.py`).
+
 ### CPU queue and pool for the router services
 
 `/v1/vision/detect` and `/v1/figuren` `"verfahren": "ccip"` compute on the

@@ -35,6 +35,10 @@ gufo_extension_target(
     cpu/ocr_net.cpp
     ocr.cpp
     ocr_post.cpp
+    cpu/nn.cpp
+    cpu/rtdetr.cpp
+    cpu/vitpose.cpp
+    cpu/dwpose.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     Threads::Threads
@@ -143,6 +147,27 @@ if(TARGET vision_oracle_test)
     LABELS "ccip;cpu;quality;external-model"
     SKIP_RETURN_CODE 77
     TIMEOUT 1200)
+endif()
+
+# "pose" (RT-DETR + ViTPose) against the transformers reference
+# (reference/make_pose_oracle.py). Needs GUFO_VISION_DIR (converted with
+# reference/convert_pose.py) and GUFO_POSE_ORACLE; skips (77) otherwise.
+gufo_extension_target(
+  NAME pose_oracle_test
+  SOURCES
+    tests/pose_oracle_test.cpp
+  LINK_LIBRARIES
+    gufo_ccip
+    gufo_ext_runtime
+)
+
+if(TARGET pose_oracle_test)
+  ccip_use_openmp(pose_oracle_test)
+  add_test(NAME ccip.pose_oracle COMMAND pose_oracle_test)
+  set_tests_properties(ccip.pose_oracle PROPERTIES
+    LABELS "ccip;cpu;quality;external-model"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 1800)
 endif()
 
 if(TARGET ccip_oracle_test)

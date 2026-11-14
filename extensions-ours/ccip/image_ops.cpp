@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace gufo::models::ccip {
@@ -203,6 +204,119 @@ RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height) {
 
 RgbImage ResizeLanczos(const RgbImage& in, int out_width, int out_height) {
   return Resample(in, out_width, out_height, kLanczos);
+}
+
+namespace {
+
+struct TorchCoeffs {
+  std::vector<int> bounds;          // xmin, size per output
+  std::vector<std::int32_t> w;      // ksize per output (int16 range)
+  int ksize{0};
+  int precision{0};
+};
+
+// torch _compute_index_ranges_int16_weights for the bilinear (triangle) filter.
+TorchCoeffs TorchAAWeights(int in_size, int out_size) {
+  const double scale = static_cast<double>(in_size) / out_size;
+  const double support = scale >= 1.0 ? scale : 1.0;
+  const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
+  TorchCoeffs c;
+  c.ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+  c.bounds.resize(static_cast<std::size_t>(out_size) * 2);
+  std::vector<double> wd(static_cast<std::size_t>(out_size) * c.ksize, 0.0);
+  double max_w = 0.0;
+  for (int i = 0; i < out_size; ++i) {
+    const double center = scale * (i + 0.5);
+    const int xmin = std::max(static_cast<int>(center - support + 0.5), 0);
+    const int xsize = std::min(static_cast<int>(center + support + 0.5), in_size) - xmin;
+    double total = 0.0;
+    double* w = &wd[static_cast<std::size_t>(i) * c.ksize];
+    for (int j = 0; j < xsize; ++j) {
+      const double x = std::fabs((j + xmin - center + 0.5) * invscale);
+      w[j] = x < 1.0 ? 1.0 - x : 0.0;
+      total += w[j];
+    }
+    for (int j = 0; j < xsize; ++j) {
+      if (total != 0.0) w[j] /= total;
+      max_w = std::max(max_w, w[j]);
+    }
+    c.bounds[static_cast<std::size_t>(i) * 2] = xmin;
+    c.bounds[static_cast<std::size_t>(i) * 2 + 1] = xsize;
+  }
+  int precision = 0;
+  for (precision = 0; precision < 22; ++precision) {
+    const int next = static_cast<int>(0.5 + max_w * (1 << (precision + 1)));
+    if (next >= (1 << 15)) break;
+  }
+  c.precision = precision;
+  c.w.resize(wd.size());
+  for (std::size_t i = 0; i < wd.size(); ++i) {
+    const double v = wd[i] * (1 << precision);
+    c.w[i] = v < 0 ? static_cast<std::int32_t>(-0.5 + v) : static_cast<std::int32_t>(0.5 + v);
+  }
+  return c;
+}
+
+inline std::uint8_t ClipShift(std::int32_t v, int precision) {
+  return static_cast<std::uint8_t>(std::clamp(v >> precision, 0, 255));
+}
+
+}  // namespace
+
+RgbImage ResizeBilinearTorchAA(const RgbImage& in, int out_width, int out_height) {
+  if (in.width <= 0 || in.height <= 0 || out_width <= 0 || out_height <= 0) {
+    throw std::invalid_argument("Resize: empty image");
+  }
+  RgbImage cur = in;
+  if (out_width != cur.width) {
+    const TorchCoeffs c = TorchAAWeights(cur.width, out_width);
+    RgbImage next;
+    next.width = out_width;
+    next.height = cur.height;
+    next.rgb.resize(static_cast<std::size_t>(out_width) * cur.height * 3);
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < cur.height; ++y) {
+      const std::uint8_t* row = &cur.rgb[static_cast<std::size_t>(y) * cur.width * 3];
+      std::uint8_t* out = &next.rgb[static_cast<std::size_t>(y) * out_width * 3];
+      for (int x = 0; x < out_width; ++x) {
+        const int xmin = c.bounds[static_cast<std::size_t>(x) * 2];
+        const int n = c.bounds[static_cast<std::size_t>(x) * 2 + 1];
+        const std::int32_t* w = &c.w[static_cast<std::size_t>(x) * c.ksize];
+        std::int32_t s0 = 1 << (c.precision - 1), s1 = s0, s2 = s0;
+        for (int j = 0; j < n; ++j) {
+          const std::uint8_t* p = row + static_cast<std::size_t>(xmin + j) * 3;
+          s0 += p[0] * w[j];
+          s1 += p[1] * w[j];
+          s2 += p[2] * w[j];
+        }
+        out[x * 3] = ClipShift(s0, c.precision);
+        out[x * 3 + 1] = ClipShift(s1, c.precision);
+        out[x * 3 + 2] = ClipShift(s2, c.precision);
+      }
+    }
+    cur = std::move(next);
+  }
+  if (out_height != cur.height) {
+    const TorchCoeffs c = TorchAAWeights(cur.height, out_height);
+    RgbImage next;
+    next.width = cur.width;
+    next.height = out_height;
+    next.rgb.resize(static_cast<std::size_t>(cur.width) * out_height * 3);
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < out_height; ++y) {
+      const int ymin = c.bounds[static_cast<std::size_t>(y) * 2];
+      const int n = c.bounds[static_cast<std::size_t>(y) * 2 + 1];
+      const std::int32_t* w = &c.w[static_cast<std::size_t>(y) * c.ksize];
+      std::uint8_t* out = &next.rgb[static_cast<std::size_t>(y) * cur.width * 3];
+      for (int x = 0; x < cur.width * 3; ++x) {
+        std::int32_t s = 1 << (c.precision - 1);
+        for (int j = 0; j < n; ++j) s += cur.rgb[static_cast<std::size_t>(ymin + j) * cur.width * 3 + x] * w[j];
+        out[x] = ClipShift(s, c.precision);
+      }
+    }
+    cur = std::move(next);
+  }
+  return cur;
 }
 
 double MeanLuma(const RgbImage& image) {

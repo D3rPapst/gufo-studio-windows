@@ -1,9 +1,9 @@
 # Image recognition (imgutils detectors, OCR and tags)
 
 `POST /v1/vision/detect` finds people, heads, faces and hands in an image with the
-anime detectors of dghs-imgutils, reads text in it with imgutils' OCR and tags it
-with its WD14 tagger, on the router's CPU, with the same models, thresholds and
-rounding as `imgutils`.
+anime detectors of dghs-imgutils, reads text in it with imgutils' OCR, tags it
+with its WD14 tagger and finds body poses with RT-DETR, ViTPose and DWPose, on the
+router's CPU with the same models, thresholds and rounding as the Python originals.
 
 Use it when a pipeline today calls `detect_person`, `detect_heads`, `detect_faces`,
 `detect_hands`, `ocr` or `get_wd14_tags` in Python: the answers match, so earlier
@@ -25,8 +25,10 @@ several processes compete for the cores.
 - `image`: a `data:` URL, plain base64, a public `https://` URL or an Ablage path
   `/v1/jobs/{id}/files/{name}` of one of your own jobs. PNG, JPEG or WebP, at most
   20 MB. An alpha channel is dropped.
-- `tasks`: any of `person`, `head`, `face`, `hand`, `ocr`, `wd14_tags`; the four
-  detectors when left out (`ocr` and `wd14_tags` only when asked for).
+- `tasks`: any of `person`, `head`, `face`, `hand`, `ocr`, `wd14_tags`, `pose`,
+  `pose_wholebody`; the four detectors when left out (the others only when asked for).
+- `pose_options`: optional `min_score` (default 0.35) and `max_persons` (default 4) for
+  the person search of the pose tasks.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per detector; for `ocr` `heat` and `box`. Each in (0, 1].
 - `ocr`: optional settings, one object or a list of up to 4 passes:
@@ -74,6 +76,23 @@ several processes compete for the cores.
   (`index` into your regions or the person list, `box` the cut-out) or `images`.
   Ratings are always listed, the other tags only above their threshold.
 
+## Poses
+
+`pose` and `pose_wholebody` find the persons with RT-DETR (label person, score above
+`min_score`, the `max_persons` best) and add a `poses` list in score order:
+
+```json
+{"poses": [{"box": [412.3, 96.1, 705.8, 767.2], "score": 0.93,
+            "keypoints": [[530.1, 140.7, 0.91]],
+            "wholebody": [[531.0, 141.2, 0.88]]}]}
+```
+
+`keypoints` (with `pose`) are the 17 COCO points of ViTPose, `wholebody` (with
+`pose_wholebody`) the 133 COCO-WholeBody points of DWPose: 0-16 body, 17-22 feet,
+23-90 face (68, mouth 48-67 counted from 23), 91-111 left and 112-132 right hand; each
+`[x, y, score]` in image pixels (shortened above). Poses always use the original image,
+also with `brighten_dark`.
+
 ## Models
 
 | Task | Hugging Face model | Network | Defaults | ONNX size | Licence |
@@ -85,11 +104,18 @@ several processes compete for the cores.
 | `ocr` | `deepghs/paddleocr` `ch_PP-OCRv4_det` + `ch_PP-OCRv4_rec` | PP-OCRv4 mobile | heat 0.3 / box 0.7 | 5 + 11 MB | Apache-2.0 |
 | `wd14_tags` | `SmilingWolf/wd-swinv2-tagger-v3` + `selected_tags.csv` | SwinV2-B, 448 px | 0.35 / 0.85 | 467 MB | Apache-2.0 |
 
-These are the defaults of dghs-imgutils 0.19. Convert each model once with the
-scripts in `extensions-ours\ccip\reference` (Python with `onnx`, `numpy` and
-`safetensors`): `convert_weights.py yolo` for the detectors, `convert_ocr.py` for
-both OCR models (the recognizer also with its `dict.txt`) and `convert_wd14.py` for
-the tagger. The router reads them from `--vision-dir` (Windows default
+| `pose` (persons) | `PekingU/rtdetr_r50vd_coco_o365` | RT-DETR R50-vd | 0.35, 4 persons | 172 MB | Apache-2.0 |
+| `pose` | `usyd-community/vitpose-base-simple` | ViTPose-B | - | 344 MB | Apache-2.0 |
+| `pose_wholebody` | `yzd-v/DWPose` `dw-ll_ucoco_384.onnx` | RTMPose-l | - | 134 MB | Apache-2.0 |
+
+The detectors, OCR and tagger are the defaults of dghs-imgutils 0.19; the pose models
+and their processing follow transformers 5.18 and onnxruntime as the film pipeline runs
+them. Convert each model once with the scripts in `extensions-ours\ccip\reference`
+(Python with `onnx`, `numpy` and `safetensors`): `convert_weights.py yolo` for the
+detectors, `convert_ocr.py` for both OCR models (the recognizer also with its
+`dict.txt`), `convert_wd14.py` for the tagger, `convert_pose.py rtdetr|vitpose <hf
+folder> <dir>` and `convert_dwpose.py <onnx> <dir>` for the pose models. The router
+reads them from `--vision-dir` (Windows default
 `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) and loads each on its first use.
 
 The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and

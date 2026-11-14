@@ -39,6 +39,16 @@
 //   by s, unrounded (erkennung_schrift.py). "ocr" as a list of passes
 //   answers one such list per pass (and models.ocr as a list). OCR and tags
 //   always read the original, never the brightened copy.
+//   "pose" / "pose_wholebody" (film pipeline posen_erkennung.erkenne):
+//   RT-DETR r50vd finds the persons (label person, score > min_score 0.35,
+//   at most max_persons 4 by score; "pose_options": {"min_score",
+//   "max_persons"}), on the original image even with brighten_dark;
+//   "pose" adds ViTPose base (17 COCO points), "pose_wholebody" DWPose
+//   dw-ll_ucoco_384 (133 COCO-WholeBody points) per person:
+//     "poses": [{"box": [x0, y0, x1, y1] (float), "score",
+//                "keypoints": [[x, y, score] x 17],      with "pose"
+//                "wholebody": [[x, y, score] x 133]}]    with "pose_wholebody"
+//   in score order; the point names are in "models".
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -114,7 +124,15 @@ struct Request {
   /// texts per pass (else the one pass's list).
   std::vector<OcrPass> ocr;
   bool ocr_list{false};
+  /// "pose" (ViTPose) and/or "pose_wholebody" (DWPose) on RT-DETR persons.
+  bool pose{false};
+  bool pose_wholebody{false};
+  float pose_min_score{0.35f};
+  int pose_max_persons{4};
 };
+
+/// The pose tasks ("pose", "pose_wholebody").
+const std::vector<std::string>& PoseTasks();
 
 /// Parses and checks a request body; throws std::invalid_argument with a
 /// message for the 400 answer. Tasks default to all four detectors (ocr and

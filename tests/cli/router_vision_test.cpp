@@ -173,6 +173,25 @@ void TestParse() {
       bad["wd14_tags"] = json::parse(bad_options);
       (void)vision::ParseRequest(bad);
     }));
+  // Pose tasks: flags, options, no detector tasks.
+  r = vision::ParseRequest(Body("AAAA", {"pose_wholebody"}));
+  assert(r.pose_wholebody && !r.pose && r.tasks.empty());
+  assert(r.pose_min_score == 0.35f && r.pose_max_persons == 4);
+  json::Value po = Body("AAAA", {"pose", "face"});
+  json::Value opt = json::Value::object();
+  opt["min_score"] = 0.5;
+  opt["max_persons"] = 2;
+  po["pose_options"] = std::move(opt);
+  r = vision::ParseRequest(po);
+  assert(r.pose && !r.pose_wholebody && r.tasks.size() == 1 && r.pose_min_score == 0.5f &&
+         r.pose_max_persons == 2);
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"pose"});
+    json::Value o = json::Value::object();
+    o["max_persons"] = 0;
+    bad["pose_options"] = std::move(o);
+    (void)vision::ParseRequest(bad);
+  }));
   }
   assert(Throws([&] {
     json::Value bad = Body("AAAA", {"face"});
@@ -300,6 +319,9 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"ocr"})));
   assert(response->status == 503);
   assert(response->body.find("ch_PP-OCRv4_det.safetensors") != std::string::npos);
+  response = service_missing.Handle(Post(Body("AAAA", {"pose"})));
+  assert(response->status == 503);
+  assert(response->body.find("rtdetr_r50vd_coco_o365.safetensors") != std::string::npos);
 }
 
 HttpResponse JsonAnswer(int status, std::string body) {
@@ -541,6 +563,18 @@ void TestReal(const char* dir, const char* frame) {
   response = service.Handle(foreign);
   assert(response->status == 404);
   assert(gate_calls == 2);
+  // Pose (when converted): persons with 17 and 133 points.
+  if (std::filesystem::exists(std::filesystem::path(dir) / "rtdetr_r50vd_coco_o365.safetensors")) {
+    auto pr = service.Handle(Post(Body(data_url, {"pose", "pose_wholebody"})));
+    assert(pr->status == 200);
+    const json::Value pj = json::parse(pr->body);
+    const json::Value* poses = pj.find("poses");
+    assert(poses != nullptr && poses->is_array() && poses->size() >= 1 && poses->size() <= 4);
+    for (const auto& p : poses->items()) {
+      assert(p.find("keypoints")->size() == 17 && p.find("wholebody")->size() == 133);
+    }
+    std::cout << "pose: " << poses->size() << " persons, " << pj.member_double("seconds") << " s\n";
+  }
   // Relayed here with If-Idle while the queue is busy: 503 busy at once.
   {
     auto queue = std::make_shared<cpu::CpuQueue>(4);
