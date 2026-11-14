@@ -791,7 +791,10 @@ prompts. `GET /queue` lists every running prompt in `queue_running`
 `POST /interrupt` with `{"prompt_id": id}` stops only that prompt, an
 empty body stops every running prompt (ComfyUI's global interrupt);
 waiting prompts are removed with `POST /queue {"delete": [...]}` as
-before. `GET /filmstudio/progress` keeps its top-level fields for the
+before. With users (`[router] auth`), a signed-in user who is no admin
+stops, clears (`{"clear": true}`) and deletes only the own prompts (the
+adapter keeps each prompt's `X-Gufo-User`); the admin, loopback and the
+router itself act on all of them. `GET /filmstudio/progress` keeps its top-level fields for the
 oldest running prompt (or the one `?prompt_id=` names) and adds
 `"running"`: the same fields for each running prompt; `GET
 /filmstudio/preview?prompt_id=` answers that prompt's newest preview
