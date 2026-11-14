@@ -15,6 +15,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/strings.hpp"
+#include "src/core/platform/os_info.hpp"
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -819,15 +820,9 @@ std::string PercentEncode(std::string_view text) {
 std::string IsoUtc(long long seconds) {
   if (seconds <= 0)
     return {};
-  const std::time_t t = static_cast<std::time_t>(seconds);
   std::tm tm{};
-#ifdef _WIN32
-  if (gmtime_s(&tm, &t) != 0)
+  if (!platform::UtcTime(static_cast<std::time_t>(seconds), &tm))
     return {};
-#else
-  if (gmtime_r(&t, &tm) == nullptr)
-    return {};
-#endif
   char buf[32];
   std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
