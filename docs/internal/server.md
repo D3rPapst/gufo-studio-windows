@@ -700,9 +700,9 @@ The preset values then apply until the next load measures a new peak.
 
 | Endpoint | Model source |
 | --- | --- |
-| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template` | JSON `model` field |
+| `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/images/*`, `/v1/audio/speech`, `/v1/audio/music`, `/v1/videos`, `/v1/embeddings` (also `/embeddings`, `/embedding`), `/completion`, `/apply-template`, `/v1/systemone` | JSON `model` field |
 | `/v1/audio/transcriptions` (multipart) | `model` form field |
-| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter |
+| `/v1/realtime`, `/v1/audio/speech/stream` (WebSocket) | `model` query parameter; the router opens the worker WebSocket on the same path and query and forwards `Sec-WebSocket-Protocol` (realtime sessions of `gufo serve asr` require `realtime`) |
 | `GET /v1/audio/voices`, `GET /props`, `GET /sdapi/v1/loras` | `model` query parameter (loads the model) |
 | `/v1/videos/<id>` status/content | router job table |
 | `GET /v1/audio/music/<id>` status/content (`"async": true`) | `model` query parameter, else router job table |
