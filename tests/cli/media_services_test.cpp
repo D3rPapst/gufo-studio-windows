@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
@@ -20,6 +21,7 @@
 #include "src/cli/serve/media/media_serve.hpp"
 #include "src/cli/serve/media/music_api.hpp"
 #include "src/cli/serve/media/omni_service.hpp"
+#include "src/cli/serve/media/png_fast.hpp"
 #include "src/cli/serve/media/upscale_api.hpp"
 #include "src/cli/serve/media/video_postprocess.hpp"
 #include "src/core/image.hpp"
@@ -76,6 +78,29 @@ std::unique_ptr<server::UpscaleEngine> FakeEngine(std::vector<std::string>* call
     return true;
   };
   return engine;
+}
+
+// The one-pass PNG encoder: lossless for odd sizes, one strip and many.
+void TestFastPng() {
+  for (const auto [w, h, threads] :
+       {std::tuple{1, 1, 0}, std::tuple{7, 3, 1}, std::tuple{333, 517, 4},
+        std::tuple{64, 640, 8}, std::tuple{1, 200, 3}}) {
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(w) * h * 3);
+    std::uint32_t state = 12345U + static_cast<std::uint32_t>(w * 31 + h);
+    for (std::size_t i = 0; i < rgb.size(); ++i) {
+      state = state * 1664525U + 1013904223U;
+      // Smooth ramps with noise, so deflate finds matches and literals.
+      rgb[i] = static_cast<std::uint8_t>((i / 3 % 97) + (state >> 28U));
+    }
+    const std::vector<std::uint8_t> png =
+        server::EncodePngRgbFast(rgb.data(), w, h, threads);
+    assert(png.size() > 8 && png[1] == 'P');
+    const gufo::core::Image decoded = gufo::core::DecodeImage(png);
+    assert(static_cast<int>(decoded.width) == w &&
+           static_cast<int>(decoded.height) == h);
+    assert(decoded.pixels == rgb);
+  }
+  assert(server::EncodePngRgbFast(nullptr, 4, 4).empty());
 }
 
 void TestUpscaleService() {
@@ -135,6 +160,43 @@ void TestUpscaleService() {
   assert(Post(service, "/v1/images/upscale", R"({"size":"8x8"})").status ==
          400);
   assert(Post(service, "/v1/images/upscale", "not json").status == 400);
+
+  // images: [...] answers one data item per image, in order.
+  calls.clear();
+  response = Post(service, "/v1/images/upscale",
+                  R"({"images":[")" + image + R"(",{"image":")" + image +
+                      R"("},")" + image + R"(",")" + image +
+                      R"("],"size":"6x2","fit":"stretch"})");
+  assert(response.status == 200);
+  const json::Value batch = json::parse(response.body);
+  assert(batch.find("data")->items().size() == 4);
+  for (const json::Value& item : batch.find("data")->items()) {
+    assert(item.member_double("width") == 6 &&
+           item.member_double("height") == 2 &&
+           item.member_str("input") == "1x1");
+    std::string bytes;
+    assert(server::DecodeAudioBase64(item.member_str("b64_json"), 1 << 20,
+                                     &bytes));
+    const gufo::core::Image one = gufo::core::DecodeImage(std::span(
+        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+    assert(one.width == 6 && one.height == 2);
+  }
+  assert(batch.find("cost")->member_double("images") == 4);
+  assert(calls.size() == 4 && calls.front() == "anime:stretch");
+  assert(Post(service, "/v1/images/upscale", R"({"images":[]})").status ==
+         400);
+  assert(Post(service, "/v1/images/upscale",
+              R"({"images":[")" + image + R"("],"image":")" + image + R"("})")
+             .status == 400);
+  assert(Post(service, "/v1/images/upscale",
+              R"({"images":[")" + image + R"("],"response_format":"png"})")
+             .status == 400);
+  assert(Post(service, "/v1/images/upscale",
+              R"({"images":[")" + image + R"("],"async":true})")
+             .status == 400);
+  assert(Post(service, "/v1/images/upscale",
+              R"({"images":[")" + image + R"(","data:image/png;base64,AAAA"]})")
+             .status == 400);
   int w = 0, h = 0;
   assert(server::ParseUpscaleSize("1920x1080", &w, &h) && w == 1920 &&
          h == 1080);
@@ -366,6 +428,7 @@ int main() {
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);
   std::filesystem::create_directories(root);
+  TestFastPng();
   TestUpscaleService();
   TestMusicAndFoleyStartup(root);
   TestServeOptions(root);

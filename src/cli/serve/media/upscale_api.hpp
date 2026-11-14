@@ -173,6 +173,12 @@ private:
   struct Job;
 
   HttpResponse HandleImage(const HttpRequest& request);
+  /// `images: [...]` (sync, b64_json only): every image runs as its own
+  /// job with the settings of `base`; while one is on the device the next is
+  /// decoded and the previous encoded. Answers `data` in request order.
+  HttpResponse HandleImageBatch(const HttpRequest& request,
+                                const json::Value& body,
+                                const json::Value& images, const Job& base);
   HttpResponse SubmitVideo(const HttpRequest& request);
   HttpResponse JobStatus(const std::string& id, bool content);
   HttpResponse CancelJob(const std::string& id);

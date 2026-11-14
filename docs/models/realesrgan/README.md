@@ -45,13 +45,8 @@ start-up works as with a local conversion.
 hf download D3rPapst/realesrgan-srvgg-gufo --local-dir D:\llm-modelle\gufo\modelle\upscale
 ```
 
-| File | Size | Variant |
-|---|---:|---|
-| `realesr-general-x4v3.safetensors` | 4.9 MB | `general` (32 body convolutions) |
-| `realesr-general-wdn-x4v3.safetensors` | 4.9 MB | `wdn` (32) |
-| `realesr-animevideov3.safetensors` | 2.5 MB | `anime` (16) |
-
-That folder is what the `[external/gufo-upscale]` section under
+The files (`realesr-general-x4v3`, `realesr-general-wdn-x4v3`: 4.9 MB,
+`realesr-animevideov3`: 2.5 MB) are what the `[external/gufo-upscale]` section under
 [Router section](#router-section) loads (`model =` the general file, two `--model` lines
 without `NAME=` the other two; the variant comes from the file name).
 
@@ -116,11 +111,9 @@ Every weight file carries a **variant** read from its file name: `general`
 32, weaker denoising) and `anime` (realesr-animevideov3, 16). Files given
 without `NAME=` share the public model id (`--served-model-name`, else the
 file stem) and are chosen per request with `"variant"`; a variant name alone
-also works as `model` on the worker itself. On the GPU the safetensors header
-is checked on the host at start-up (tensor names and shapes against the
-`__metadata__`), so a wrong file fails with a clear message before anything
-is uploaded; `GET /v1/models` lists the variants with their convolution
-count.
+also works as `model` on the worker itself. On the GPU a wrong safetensors
+file fails at start-up with a clear message; `GET /v1/models` lists the
+variants with their convolution count.
 
 - `--device npu` runs a Real-ESRGAN **body** ONNX (the convolutions before
   the pixel shuffle, int8 QDQ from AMD Quark, fixed input size) on the AMD
@@ -154,6 +147,9 @@ width; the request's frame picks the file.
 ```
 
 - `image`: data URL, raw base64, public https URL or `file:` path.
+- `images`: a list of 1..32 such images (or `{"image": ...}` objects) with
+  the same settings, answered in order as `data[i]` with `width`, `height`
+  and `input`; sync and `b64_json` only.
 - `scale`: 4 (native) or 2 (the x4 picture resized to half: Lanczos-3 on
   the GPU, OpenCV-exact `INTER_AREA` on the NPU / CPU). `size: "WxH"` or
   `width` + `height` (at most 8192 on a side) replace the scale and use
@@ -168,8 +164,9 @@ width; the request's frame picks the file.
 The sync answer is `{created, model, variant, device, model_file, width,
 height, input, scale, fit, format, data: [{b64_json}], cost: {seconds,
 queue_seconds, body_seconds, post_seconds, encode_seconds}}` with a
-`Server-Timing` header. Requests run one at a time; more than 8 waiting give
-429.
+`Server-Timing` header. The device runs one image at a time (in an `images`
+list the next image decodes and the previous one encodes meanwhile); more
+than 8 waiting requests give 429.
 
 ### `POST /v1/videos/upscale`
 
@@ -192,6 +189,22 @@ cost, error}` (202 + `Location`); `GET /v1/videos/{id}` reads it,
 `DELETE /v1/videos/{id}` cancels a running job or drops a finished result.
 Up to 8 jobs queue; finished results stay for an hour (at most 8). Uploads
 are limited to 512 MiB.
+
+### Speed
+
+Seconds per 832x512 frame (anime) at the worker, Strix Halo (gfx1151, XDNA 2):
+
+| Path | GPU | NPU |
+|---|---:|---:|
+| image, x4 PNG (3328x2048) | 0.16 | 0.34 |
+| image, `size` 1920x1080 PNG | 0.10 | 0.27 |
+| image, `size` 1920x1080 JPEG 95 | 0.07 | 0.21 |
+| `images` list of 10, 1920x1080 PNG | 0.06 | 0.22 |
+| `/v1/videos/upscale`, 240 frames, 1920x1080 | 0.040 | 0.19 |
+
+The network takes 37 ms on the GPU (145 ms on the NPU). For film segments
+send the whole MP4 with the delivery size (`"video": ..., "variant": "anime",
+"size": "1920x1080", "fit": "crop", "async": false`); a job adds about 0.4 s.
 
 ### Router section
 
@@ -218,15 +231,8 @@ router-gpu-gb = 1
 router-host-gb = 1
 ```
 
-The NPU variant stays as before:
-
-```ini
-[external/realesr-npu]
-command = D:\path\to\gufo.exe
-args = serve upscale --device npu
-model = D:\path\to\body896q_h288_h3.onnx
-served-model-name = realesr-npu
-```
+An NPU section has `args = serve upscale --device npu` and the body ONNX as
+`model =` (Take One's `body512q_h280_h3.onnx` for 832x512 frames).
 
 `npu-upscale-probe` (built with `GUFO_ENABLE_ONNXRUNTIME`) runs one image
 and compares it with a reference: `npu-upscale-probe --device cpu --model
@@ -238,4 +244,6 @@ body896q_h288_h3.onnx --input in.png --size 1920x1080 --compare ref.png`.
 3x3 kernel of the RIFE port (FP16 WMMA, FP32 accumulation, 64x64 tiles) with
 the per-channel PReLU in its epilogue; the last convolution writes FP32. The
 pixel shuffle, the nearest-neighbour base, the clamp and the two separable
-resize passes are FP32 kernels; the result is downloaded as RGB24.
+resize passes are FP32 kernels; the result is downloaded as RGB24. PNG
+results are written in one pass (Sub filter, zlib level 1, row strips
+deflated on up to 8 threads into one stream).
