@@ -86,34 +86,166 @@ struct Node {
 
 std::size_t Sz(std::int64_t v) { return static_cast<std::size_t>(v); }
 
+// A run of consecutive elementwise nodes whose operands are run slots of one
+// common shape or scalar constants, evaluated tile by tile in one pass: every
+// element goes through the same float operations in the same order as node
+// by node, only the intermediate tensors stay in small per-thread tiles.
+struct FusedArg {
+  int reg{-1};        // >= 0: tile register; < 0: the constant `value`
+  float value{0.0f};
+};
+struct FusedOp {
+  Op op{};
+  FusedArg a, b;      // b: second operand of binary ops
+  float p0{0.0f}, p1{0.0f};  // Clip lo/hi, HardSigmoid alpha/beta
+};
+struct FusedRun {
+  std::size_t first{0}, last{0};  // node range [first, last]
+  std::vector<int> ext;           // run slot of register r < ext.size()
+  std::vector<FusedOp> ops;       // node first + i writes register ext.size() + i
+  std::vector<std::pair<int, int>> outputs;  // (register, run slot) kept in memory
+  std::vector<int> release;       // run slots whose last use is inside the run
+};
+
 Shape Strides(const Shape& s) {
   Shape st(s.size(), 1);
   for (int d = static_cast<int>(s.size()) - 2; d >= 0; --d) st[Sz(d)] = st[Sz(d) + 1] * s[Sz(d) + 1];
   return st;
 }
 
+// Buffers of released run slots, handed out again by FloatTensor during the
+// same Run: large tensors are not freed and faulted in again for every node.
+// Holds at most kMaxFree buffers; the smallest goes first when it is full.
+class BufferPool {
+public:
+  std::vector<float> Take(std::size_t n) {
+    std::size_t best = free_.size();
+    for (std::size_t k = 0; k < free_.size(); ++k)
+      if (free_[k].capacity() >= n &&
+          (best == free_.size() || free_[k].capacity() < free_[best].capacity()))
+        best = k;
+    if (best == free_.size()) return std::vector<float>(n);
+    std::vector<float> v = std::move(free_[best]);
+    free_.erase(free_.begin() + static_cast<std::ptrdiff_t>(best));
+    v.resize(n);  // only grows (and zero fills) when size < n <= capacity
+    return v;
+  }
+  void Give(std::vector<float>&& v) {
+    if (v.capacity() < kMinFloats || v.capacity() > kMaxFloats) return;
+    free_.push_back(std::move(v));
+    std::size_t total = 0;
+    for (const auto& f : free_) total += f.capacity();
+    while (free_.size() > kMaxFree || (free_.size() > 1 && total > kMaxTotalFloats)) {
+      auto smallest = std::min_element(free_.begin(), free_.end(), [](const auto& a, const auto& b) {
+        return a.capacity() < b.capacity();
+      });
+      total -= smallest->capacity();
+      free_.erase(smallest);
+    }
+  }
+
+private:
+  // Measured on a 1920x1080 frame, 3x pass: without the pool 2.35 s and
+  // 1.1 GiB peak, unbounded 1.8 s and 2.8 GiB, these limits 2.0 s and 1.5 GiB.
+  static constexpr std::size_t kMaxFree = 8;
+  static constexpr std::size_t kMinFloats = 4096;
+  static constexpr std::size_t kMaxFloats = std::size_t{32} << 20;       // 128 MiB
+  static constexpr std::size_t kMaxTotalFloats = std::size_t{128} << 20;  // 512 MiB
+  std::vector<std::vector<float>> free_;
+};
+
+thread_local BufferPool* tls_pool = nullptr;
+
+// Puts a run slot's buffer back into the pool (or frees it).
+void Recycle(NetTensor& t) {
+  if (tls_pool != nullptr && !t.is_int) tls_pool->Give(std::move(t.f));
+  t = NetTensor{};
+}
+
 NetTensor FloatTensor(Shape shape) {
   NetTensor t;
   t.shape = std::move(shape);
-  t.f.resize(Sz(t.numel()));
+  if (tls_pool != nullptr) {
+    t.f = tls_pool->Take(Sz(t.numel()));
+  } else {
+    t.f.resize(Sz(t.numel()));
+  }
   return t;
 }
 
 // ------------------------------------------------------------------ elementwise
 enum class Bin { kAdd, kSub, kMul, kDiv, kPow };
 
-inline float Apply(Bin op, float a, float b) {
-  switch (op) {
-    case Bin::kAdd: return a + b;
-    case Bin::kSub: return a - b;
-    case Bin::kMul: return a * b;
-    case Bin::kDiv: return a / b;
-    case Bin::kPow: return b == 2.0f ? a * a : std::pow(a, b);
-  }
+// Elements per parallel work item of the elementwise loops.
+constexpr std::int64_t kChunk = 16384;
+
+template <Bin op>
+inline float ApplyT(float a, float b) {
+  if constexpr (op == Bin::kAdd) return a + b;
+  if constexpr (op == Bin::kSub) return a - b;
+  if constexpr (op == Bin::kMul) return a * b;
+  if constexpr (op == Bin::kDiv) return a / b;
+  if constexpr (op == Bin::kPow) return b == 2.0f ? a * a : std::pow(a, b);
   return 0.0f;
 }
 
-NetTensor Binary(Bin op, const NetTensor& a, const NetTensor& b) {
+// One broadcast loop: out[o * inner + j] = op(a[oa(o) + j * ia], b[ob(o) + j * ib]).
+// Work is split into (outer row, chunk of the row) items so that one long row
+// (scalar broadcasts) runs on all threads as well. `out` may alias an input
+// that has the output shape (each element is read before it is written).
+template <Bin op>
+void BinaryLoop(const float* pa, const float* pb, float* po, const Shape& dims, const Shape& st_a,
+                const Shape& st_b, std::int64_t total) {
+  const std::int64_t inner = dims.back();
+  const std::int64_t ia = st_a.back(), ib = st_b.back();
+  const std::int64_t outer = total / inner;
+  const std::int64_t pieces = (inner + kChunk - 1) / kChunk;
+  const std::int64_t items = outer * pieces;
+  const int nd = static_cast<int>(dims.size()) - 1;
+#pragma omp parallel for schedule(static) if (items > 1 && total > 32768)
+  for (std::int64_t it = 0; it < items; ++it) {
+    const std::int64_t o = it / pieces;
+    const std::int64_t j0 = (it % pieces) * kChunk;
+    const std::int64_t j1 = std::min(inner, j0 + kChunk);
+    std::int64_t rem = o, oa = 0, ob = 0;
+    for (int d = nd - 1; d >= 0; --d) {
+      const std::int64_t idx = rem % dims[Sz(d)];
+      rem /= dims[Sz(d)];
+      oa += idx * st_a[Sz(d)];
+      ob += idx * st_b[Sz(d)];
+    }
+    const float* xa = pa + oa;
+    const float* xb = pb + ob;
+    float* y = po + o * inner;
+    if (ia == 1 && ib == 1) {
+      for (std::int64_t j = j0; j < j1; ++j) y[j] = ApplyT<op>(xa[j], xb[j]);
+    } else if (ia == 1 && ib == 0) {
+      const float v = xb[0];
+      for (std::int64_t j = j0; j < j1; ++j) y[j] = ApplyT<op>(xa[j], v);
+    } else if (ia == 0 && ib == 1) {
+      const float v = xa[0];
+      for (std::int64_t j = j0; j < j1; ++j) y[j] = ApplyT<op>(v, xb[j]);
+    } else {
+      for (std::int64_t j = j0; j < j1; ++j) y[j] = ApplyT<op>(xa[j * ia], xb[j * ib]);
+    }
+  }
+}
+
+// y[q] = op(a, b) over one tile; a null pointer means the scalar value.
+template <Bin op>
+void FusedBinary(const float* xa, float va, const float* xb, float vb, float* y, std::int64_t len) {
+  if (xa != nullptr && xb != nullptr) {
+    for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(xa[q], xb[q]);
+  } else if (xa != nullptr) {
+    for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(xa[q], vb);
+  } else {
+    for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(va, xb[q]);
+  }
+}
+
+// `reuse_a` / `reuse_b`: the input's run slot may be overwritten (last use).
+NetTensor Binary(Bin op, const NetTensor& a, const NetTensor& b, NetTensor* reuse_a,
+                 NetTensor* reuse_b) {
   if (a.is_int || b.is_int) Fail("elementwise ops on int tensors are not implemented");
   const std::size_t rank = std::max(a.shape.size(), b.shape.size());
   Shape sa(rank, 1), sb(rank, 1), so(rank, 1);
@@ -123,7 +255,17 @@ NetTensor Binary(Bin op, const NetTensor& a, const NetTensor& b) {
     if (sa[d] != sb[d] && sa[d] != 1 && sb[d] != 1) Fail("broadcast mismatch");
     so[d] = (sa[d] == 0 || sb[d] == 0) ? 0 : std::max(sa[d], sb[d]);
   }
-  NetTensor out = FloatTensor(so);
+  const float* pa = a.f.data();
+  const float* pb = b.f.data();
+  NetTensor out;
+  if (reuse_a != nullptr && sa == so) {
+    out = std::move(*reuse_a);
+  } else if (reuse_b != nullptr && sb == so) {
+    out = std::move(*reuse_b);
+  } else {
+    out = FloatTensor(so);
+  }
+  out.shape = so;
   if (out.f.empty()) return out;
   // Element strides (0 on broadcast dims); merge dims that stay contiguous for
   // both inputs so the inner loop is long.
@@ -146,52 +288,39 @@ NetTensor Binary(Bin op, const NetTensor& a, const NetTensor& b) {
     }
   }
   if (dims.empty()) {
-    out.f[0] = Apply(op, a.f[0], b.f[0]);
-    return out;
+    dims = {1};
+    st_a = {0};
+    st_b = {0};
   }
-  const std::int64_t inner = dims.back();
-  const std::int64_t ia = st_a.back(), ib = st_b.back();
-  const std::int64_t outer = out.numel() / inner;
-  const int nd = static_cast<int>(dims.size()) - 1;
-  const float* pa = a.f.data();
-  const float* pb = b.f.data();
+  const std::int64_t total = static_cast<std::int64_t>(out.f.size());
   float* po = out.f.data();
-#pragma omp parallel for schedule(static) if (outer > 16 && outer * inner > 32768)
-  for (std::int64_t o = 0; o < outer; ++o) {
-    std::int64_t rem = o, oa = 0, ob = 0;
-    for (int d = nd - 1; d >= 0; --d) {
-      const std::int64_t idx = rem % dims[Sz(d)];
-      rem /= dims[Sz(d)];
-      oa += idx * st_a[Sz(d)];
-      ob += idx * st_b[Sz(d)];
-    }
-    const float* xa = pa + oa;
-    const float* xb = pb + ob;
-    float* y = po + o * inner;
-    if (ia == 1 && ib == 1) {
-      for (std::int64_t j = 0; j < inner; ++j) y[j] = Apply(op, xa[j], xb[j]);
-    } else if (ia == 1 && ib == 0) {
-      const float v = xb[0];
-      for (std::int64_t j = 0; j < inner; ++j) y[j] = Apply(op, xa[j], v);
-    } else if (ia == 0 && ib == 1) {
-      const float v = xa[0];
-      for (std::int64_t j = 0; j < inner; ++j) y[j] = Apply(op, v, xb[j]);
-    } else {
-      for (std::int64_t j = 0; j < inner; ++j) y[j] = Apply(op, xa[j * ia], xb[j * ib]);
-    }
+  switch (op) {
+    case Bin::kAdd: BinaryLoop<Bin::kAdd>(pa, pb, po, dims, st_a, st_b, total); break;
+    case Bin::kSub: BinaryLoop<Bin::kSub>(pa, pb, po, dims, st_a, st_b, total); break;
+    case Bin::kMul: BinaryLoop<Bin::kMul>(pa, pb, po, dims, st_a, st_b, total); break;
+    case Bin::kDiv: BinaryLoop<Bin::kDiv>(pa, pb, po, dims, st_a, st_b, total); break;
+    case Bin::kPow: BinaryLoop<Bin::kPow>(pa, pb, po, dims, st_a, st_b, total); break;
   }
   return out;
 }
 
 template <typename F>
-NetTensor Unary(const NetTensor& x, F fn) {
+NetTensor Unary(const NetTensor& x, F fn, NetTensor* reuse) {
   if (x.is_int) Fail("unary op on an int tensor");
-  NetTensor out = FloatTensor(x.shape);
-  const std::int64_t n = x.numel();
   const float* px = x.f.data();
+  NetTensor out;
+  if (reuse != nullptr) {
+    out = std::move(*reuse);
+  } else {
+    out = FloatTensor(x.shape);
+  }
+  const std::int64_t n = static_cast<std::int64_t>(out.f.size());
   float* po = out.f.data();
 #pragma omp parallel for schedule(static) if (n > 65536)
-  for (std::int64_t k = 0; k < n; ++k) po[k] = fn(px[k]);
+  for (std::int64_t c = 0; c < n; c += kChunk) {
+    const std::int64_t e = std::min(n, c + kChunk);
+    for (std::int64_t k = c; k < e; ++k) po[k] = fn(px[k]);
+  }
   return out;
 }
 
@@ -239,37 +368,17 @@ NetTensor Conv(const NetTensor& x, const NetTensor& w, const NetTensor* b, const
   const int mg = m / p.group;
   if (cg == 1 && mg == 1) {
     // Depthwise: one output plane per input channel.
-    for (int bn = 0; bn < n; ++bn) {
-#pragma omp parallel for schedule(static)
-      for (int ch = 0; ch < m; ++ch) {
-        const float* xp = x.f.data() + (Sz(bn) * Sz(c) + Sz(ch)) * Sz(h) * Sz(wd);
-        const float* wp = w.f.data() + Sz(ch) * Sz(p.kh) * Sz(p.kw);
-        float* yp = out.f.data() + (Sz(bn) * Sz(m) + Sz(ch)) * ohw;
-        const float bv = bias != nullptr ? bias[ch] : 0.0f;
-        for (int oy = 0; oy < oh; ++oy) {
-          float* yrow = yp + Sz(oy) * Sz(ow);
-          for (int ox = 0; ox < ow; ++ox) yrow[ox] = bv;
-          for (int ky = 0; ky < p.kh; ++ky) {
-            const int iy = oy * p.sh - p.pt + ky;
-            if (iy < 0 || iy >= h) continue;
-            const float* xrow = xp + Sz(iy) * Sz(wd);
-            for (int kx = 0; kx < p.kw; ++kx) {
-              const float wv = wp[ky * p.kw + kx];
-              const int x0 = kx - p.pl;
-              // ox with 0 <= ox * sw + x0 < wd
-              const int lo = x0 >= 0 ? 0 : (-x0 + p.sw - 1) / p.sw;
-              int hi = (wd - 1 - x0) >= 0 ? (wd - 1 - x0) / p.sw + 1 : 0;
-              hi = std::min(hi, ow);
-              if (p.sw == 1) {
-                for (int ox = lo; ox < hi; ++ox) yrow[ox] += wv * xrow[ox + x0];
-              } else {
-                for (int ox = lo; ox < hi; ++ox) yrow[ox] += wv * xrow[ox * p.sw + x0];
-              }
-            }
-          }
-        }
-      }
-    }
+    for (int bn = 0; bn < n; ++bn)
+      DepthwiseNchwFast(x.f.data() + Sz(bn) * Sz(c) * Sz(h) * Sz(wd), m, h, wd, w.f.data(), bias,
+                        p.kh, p.kw, p.sh, p.sw, p.pt, p.pl, oh, ow,
+                        out.f.data() + Sz(bn) * Sz(m) * ohw);
+    return out;
+  }
+  if (p.group == 1) {
+    for (int bn = 0; bn < n; ++bn)
+      ConvNchwFast(x.f.data() + Sz(bn) * Sz(c) * Sz(h) * Sz(wd), c, h, wd, w.f.data(), bias, m,
+                   p.kh, p.kw, p.sh, p.sw, p.pt, p.pl, oh, ow,
+                   out.f.data() + Sz(bn) * Sz(m) * ohw);
     return out;
   }
   const int kk = cg * p.kh * p.kw;
@@ -339,27 +448,31 @@ NetTensor ConvTranspose(const NetTensor& x, const NetTensor& w, const NetTensor*
   for (int i = 0; i < ci; ++i)
     for (int r = 0; r < rows; ++r) wt[Sz(r) * Sz(ci) + Sz(i)] = w.f[Sz(i) * Sz(rows) + Sz(r)];
   const std::size_t hw = Sz(h) * Sz(wd);
-  std::vector<float> col(Sz(rows) * hw);
+  NetTensor col_t = FloatTensor({rows, static_cast<std::int64_t>(hw)});
+  std::vector<float>& col = col_t.f;
   for (int bn = 0; bn < n; ++bn) {
-    Gemm(wt.data(), x.f.data() + Sz(bn) * Sz(ci) * hw, nullptr, col.data(), rows,
-         static_cast<int>(hw), ci);
+    GemmFast(wt.data(), x.f.data() + Sz(bn) * Sz(ci) * hw, nullptr, col.data(), rows,
+             static_cast<int>(hw), ci);
     float* y = out.f.data() + Sz(bn) * Sz(co) * Sz(oh) * Sz(ow);
 #pragma omp parallel for schedule(static)
-    for (int o = 0; o < co; ++o) {
-      float* yo = y + Sz(o) * Sz(oh) * Sz(ow);
+    for (std::int64_t task = 0; task < static_cast<std::int64_t>(co) * oh; ++task) {
+      const int o = static_cast<int>(task / oh);
+      const int yy = static_cast<int>(task % oh);
+      float* yr = y + (Sz(o) * Sz(oh) + Sz(yy)) * Sz(ow);
       const float bv = b != nullptr ? b->f[Sz(o)] : 0.0f;
-      std::fill(yo, yo + Sz(oh) * Sz(ow), bv);
+      std::fill(yr, yr + ow, bv);
       for (int ky = 0; ky < p.kh; ++ky) {
+        const int t = yy + p.pt - ky;  // = iy * sh
+        if (t < 0 || t % p.sh != 0) continue;
+        const int iy = t / p.sh;
+        if (iy >= h) continue;
         for (int kx = 0; kx < p.kw; ++kx) {
-          const float* cr = col.data() + (Sz(o) * Sz(p.kh) * Sz(p.kw) + Sz(ky * p.kw + kx)) * hw;
-          for (int iy = 0; iy < h; ++iy) {
-            const int yy = iy * p.sh - p.pt + ky;
-            if (yy < 0 || yy >= oh) continue;
-            for (int ix = 0; ix < wd; ++ix) {
-              const int xx = ix * p.sw - p.pl + kx;
-              if (xx < 0 || xx >= ow) continue;
-              yo[Sz(yy) * Sz(ow) + Sz(xx)] += cr[Sz(iy) * Sz(wd) + Sz(ix)];
-            }
+          const float* cr = col.data() + (Sz(o) * Sz(p.kh) * Sz(p.kw) + Sz(ky * p.kw + kx)) * hw +
+                            Sz(iy) * Sz(wd);
+          for (int ix = 0; ix < wd; ++ix) {
+            const int xx = ix * p.sw - p.pl + kx;
+            if (xx < 0 || xx >= ow) continue;
+            yr[xx] += cr[ix];
           }
         }
       }
@@ -369,22 +482,27 @@ NetTensor ConvTranspose(const NetTensor& x, const NetTensor& w, const NetTensor*
 }
 
 NetTensor BatchNorm(const NetTensor& x, const NetTensor& scale, const NetTensor& bias,
-                    const NetTensor& mean, const NetTensor& var, double eps) {
+                    const NetTensor& mean, const NetTensor& var, double eps, NetTensor* reuse) {
   const std::int64_t n = x.shape[0], c = x.shape[1];
   const std::int64_t inner = x.numel() / (n * c);
-  NetTensor out = FloatTensor(x.shape);
+  const float* px = x.f.data();
+  NetTensor out = reuse != nullptr ? std::move(*reuse) : FloatTensor(x.shape);
   std::vector<float> s(Sz(c)), t(Sz(c));
   for (std::int64_t ch = 0; ch < c; ++ch) {
     const float inv = 1.0f / std::sqrt(var.f[Sz(ch)] + static_cast<float>(eps));
     s[Sz(ch)] = scale.f[Sz(ch)] * inv;
     t[Sz(ch)] = bias.f[Sz(ch)] - mean.f[Sz(ch)] * s[Sz(ch)];
   }
+  const std::int64_t pieces = (inner + kChunk - 1) / kChunk;
 #pragma omp parallel for schedule(static)
-  for (std::int64_t r = 0; r < n * c; ++r) {
+  for (std::int64_t it = 0; it < n * c * pieces; ++it) {
+    const std::int64_t r = it / pieces;
+    const std::int64_t j0 = (it % pieces) * kChunk;
+    const std::int64_t j1 = std::min(inner, j0 + kChunk);
     const float sv = s[Sz(r % c)], tv = t[Sz(r % c)];
-    const float* xp = x.f.data() + Sz(r) * Sz(inner);
+    const float* xp = px + Sz(r) * Sz(inner);
     float* yp = out.f.data() + Sz(r) * Sz(inner);
-    for (std::int64_t j = 0; j < inner; ++j) yp[j] = xp[j] * sv + tv;
+    for (std::int64_t j = j0; j < j1; ++j) yp[j] = xp[j] * sv + tv;
   }
   return out;
 }
@@ -456,14 +574,11 @@ NetTensor Resize(const NetTensor& x, const NetTensor* scales, const NetTensor* s
         w - 1, static_cast<std::int64_t>(std::floor(static_cast<double>(xx) / sc[3])));
   const std::int64_t planes = os[0] * os[1];
 #pragma omp parallel for schedule(static)
-  for (std::int64_t r = 0; r < planes; ++r) {
-    const float* xp = x.f.data() + Sz(r) * Sz(h) * Sz(w);
-    float* yp = out.f.data() + Sz(r) * Sz(oh) * Sz(ow);
-    for (std::int64_t y = 0; y < oh; ++y) {
-      const float* xrow = xp + Sz(ys[Sz(y)]) * Sz(w);
-      float* yrow = yp + Sz(y) * Sz(ow);
-      for (std::int64_t xx = 0; xx < ow; ++xx) yrow[xx] = xrow[xs[Sz(xx)]];
-    }
+  for (std::int64_t task = 0; task < planes * oh; ++task) {
+    const std::int64_t r = task / oh, y = task % oh;
+    const float* xrow = x.f.data() + Sz(r) * Sz(h) * Sz(w) + Sz(ys[Sz(y)]) * Sz(w);
+    float* yrow = out.f.data() + (Sz(r) * Sz(oh) + Sz(y)) * Sz(ow);
+    for (std::int64_t xx = 0; xx < ow; ++xx) yrow[xx] = xrow[xs[Sz(xx)]];
   }
   return out;
 }
@@ -498,11 +613,18 @@ NetTensor Concat(const std::vector<const NetTensor*>& xs, std::int64_t axis_attr
   const std::int64_t row = out.shape[Sz(axis)] * inner;
   for (const NetTensor* t : xs) {
     const std::int64_t chunk = t->shape[Sz(axis)] * inner;
-    for (std::int64_t o = 0; o < outer; ++o) {
-      if (out.is_int)
+    if (out.is_int) {
+      for (std::int64_t o = 0; o < outer; ++o)
         std::copy_n(t->i.data() + o * chunk, chunk, out.i.data() + o * row + offset);
-      else
-        std::copy_n(t->f.data() + o * chunk, chunk, out.f.data() + o * row + offset);
+    } else {
+      const std::int64_t pieces = (chunk + kChunk - 1) / kChunk;
+#pragma omp parallel for schedule(static) if (outer * chunk > 65536)
+      for (std::int64_t it = 0; it < outer * pieces; ++it) {
+        const std::int64_t o = it / pieces;
+        const std::int64_t j0 = (it % pieces) * kChunk;
+        const std::int64_t len = std::min(kChunk, chunk - j0);
+        std::copy_n(t->f.data() + o * chunk + j0, len, out.f.data() + o * row + offset + j0);
+      }
     }
     offset += chunk;
   }
@@ -637,8 +759,8 @@ NetTensor MatMul(const NetTensor& a, const NetTensor& b) {
   NetTensor out = FloatTensor(os);
   if (b.shape.size() == 2) {
     const std::int64_t rows = a.numel() / k;
-    Gemm(a.f.data(), b.f.data(), nullptr, out.f.data(), static_cast<int>(rows),
-         static_cast<int>(n), static_cast<int>(k));
+    GemmFast(a.f.data(), b.f.data(), nullptr, out.f.data(), static_cast<int>(rows),
+             static_cast<int>(n), static_cast<int>(k));
     return out;
   }
   if (a.shape.size() != b.shape.size() ||
@@ -646,8 +768,8 @@ NetTensor MatMul(const NetTensor& a, const NetTensor& b) {
     Fail("MatMul batch broadcast is not implemented");
   const std::int64_t batches = a.numel() / (m * k);
   for (std::int64_t bt = 0; bt < batches; ++bt)
-    Gemm(a.f.data() + bt * m * k, b.f.data() + bt * k * n, nullptr, out.f.data() + bt * m * n,
-         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
+    GemmFast(a.f.data() + bt * m * k, b.f.data() + bt * k * n, nullptr, out.f.data() + bt * m * n,
+             static_cast<int>(m), static_cast<int>(n), static_cast<int>(k));
   return out;
 }
 
@@ -797,6 +919,7 @@ public:
           if (s >= 0) last[Sz(s)] = static_cast<int>(k);
       for (int s = 0; s < slots_; ++s)
         if (last[Sz(s)] >= 0 && s != output_) nodes_[Sz(last[Sz(s)])].release.push_back(s);
+      FindFusedRuns(last);
     } catch (const std::exception& e) {
       if (error) *error = "ocr model " + stem + ": " + e.what();
       return false;
@@ -805,9 +928,24 @@ public:
   }
 
   NetTensor Run(NetTensor input) const override {
+    BufferPool pool;
+    BufferPool* const outer_pool = tls_pool;
+    tls_pool = &pool;
+    struct Restore {
+      BufferPool* p;
+      ~Restore() { tls_pool = p; }
+    } restore{outer_pool};
     std::vector<NetTensor> slots(Sz(slots_));
     slots[Sz(input_)] = std::move(input);
-    for (const Node& n : nodes_) {
+    std::size_t next_run = 0;
+    for (std::size_t ni = 0; ni < nodes_.size(); ++ni) {
+      while (next_run < runs_.size() && runs_[next_run].first < ni) ++next_run;
+      if (next_run < runs_.size() && runs_[next_run].first == ni &&
+          ExecFused(runs_[next_run], slots)) {
+        ni = runs_[next_run].last;
+        continue;
+      }
+      const Node& n = nodes_[ni];
       NetTensor y;
       try {
         y = Eval(n, slots);
@@ -815,12 +953,195 @@ public:
         Fail(std::string(e.what()) + " (node " + n.name + ")");
       }
       slots[Sz(n.out[0])] = std::move(y);
-      for (int s : n.release) slots[Sz(s)] = NetTensor{};
+      for (int s : n.release) Recycle(slots[Sz(s)]);
     }
     return std::move(slots[Sz(output_)]);
   }
 
 private:
+  // Scalar float constant (one element) behind input id, or nullptr.
+  const NetTensor* ScalarConst(int id) const {
+    if (id >= 0 || id == kNone) return nullptr;
+    const NetTensor& t = consts_[Sz(-id - 1)];
+    return (!t.is_int && t.f.size() == 1) ? &t : nullptr;
+  }
+
+  bool Fusable(const Node& n) const {
+    auto operand = [&](std::size_t k) {
+      return k < n.in.size() && (n.in[k] >= 0 || ScalarConst(n.in[k]) != nullptr);
+    };
+    switch (n.op) {
+      case Op::kAdd: case Op::kSub: case Op::kMul: case Op::kDiv:
+        return n.in.size() == 2 && operand(0) && operand(1) && (n.in[0] >= 0 || n.in[1] >= 0);
+      case Op::kPow:
+        return n.in.size() == 2 && n.in[0] >= 0 && ScalarConst(n.in[1]) != nullptr;
+      case Op::kRelu: case Op::kSigmoid: case Op::kSqrt: case Op::kHardSigmoid:
+        return n.in.size() == 1 && n.in[0] >= 0;
+      case Op::kClip:
+        if (n.in.empty() || n.in[0] < 0) return false;
+        for (std::size_t k = 1; k < n.in.size(); ++k)
+          if (n.in[k] != kNone && ScalarConst(n.in[k]) == nullptr) return false;
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  void FindFusedRuns(const std::vector<int>& last) {
+    for (std::size_t k = 0; k < nodes_.size(); ++k) {
+      if (!Fusable(nodes_[k])) continue;
+      std::size_t j = k;
+      while (j + 1 < nodes_.size() && Fusable(nodes_[j + 1])) ++j;
+      if (j > k) {
+        FusedRun run;
+        run.first = k;
+        run.last = j;
+        std::unordered_map<int, int> reg;  // run slot -> register
+        // Externals first (registers 0..), then one register per node.
+        for (std::size_t i = k; i <= j; ++i)
+          for (int id : nodes_[i].in) {
+            if (id < 0 || reg.count(id) != 0) continue;
+            bool produced = false;
+            for (std::size_t q = k; q < i; ++q) produced = produced || nodes_[q].out[0] == id;
+            if (!produced) {
+              reg[id] = static_cast<int>(run.ext.size());
+              run.ext.push_back(id);
+            }
+          }
+        const int base = static_cast<int>(run.ext.size());
+        for (std::size_t i = k; i <= j; ++i) {
+          const Node& n = nodes_[i];
+          auto arg = [&](std::size_t q) {
+            FusedArg a;
+            if (q >= n.in.size() || n.in[q] == kNone) return a;
+            if (n.in[q] >= 0) {
+              a.reg = reg.at(n.in[q]);
+            } else {
+              a.value = ScalarConst(n.in[q])->f[0];
+            }
+            return a;
+          };
+          FusedOp op;
+          op.op = n.op;
+          op.a = arg(0);
+          if (n.op == Op::kClip) {
+            op.p0 = -std::numeric_limits<float>::infinity();
+            op.p1 = std::numeric_limits<float>::infinity();
+            if (n.in.size() > 1 && n.in[1] != kNone) op.p0 = ScalarConst(n.in[1])->f[0];
+            else op.p0 = static_cast<float>(n.attrs.Float("min", op.p0));
+            if (n.in.size() > 2 && n.in[2] != kNone) op.p1 = ScalarConst(n.in[2])->f[0];
+            else op.p1 = static_cast<float>(n.attrs.Float("max", op.p1));
+          } else if (n.op == Op::kHardSigmoid) {
+            op.p0 = static_cast<float>(n.attrs.Float("alpha", 0.2));
+            op.p1 = static_cast<float>(n.attrs.Float("beta", 0.5));
+          } else if (n.in.size() == 2) {
+            op.b = arg(1);
+          }
+          run.ops.push_back(op);
+          const int out = n.out[0];
+          reg[out] = base + static_cast<int>(i - k);
+          if (out == output_ || last[Sz(out)] > static_cast<int>(j))
+            run.outputs.push_back({reg[out], out});
+          for (int r : n.release) run.release.push_back(r);
+        }
+        if (!run.outputs.empty()) runs_.push_back(std::move(run));
+      }
+      k = j;
+    }
+  }
+
+  // Runs a fused run; false (nothing changed) when the slot inputs differ in
+  // shape, then the nodes run one by one.
+  bool ExecFused(const FusedRun& run, std::vector<NetTensor>& s) const {
+    const NetTensor& first = s[Sz(run.ext[0])];
+    for (int id : run.ext) {
+      const NetTensor& t = s[Sz(id)];
+      if (t.is_int || t.shape != first.shape || t.f.size() != first.f.size()) return false;
+    }
+    const Shape shape = first.shape;
+    const std::int64_t n = static_cast<std::int64_t>(first.f.size());
+    std::vector<const float*> src;
+    for (int id : run.ext) src.push_back(s[Sz(id)].f.data());
+    // Output buffers: reuse an external whose last use is inside the run.
+    std::vector<NetTensor> outs(run.outputs.size());
+    std::vector<bool> taken(run.ext.size(), false);
+    for (std::size_t o = 0; o < run.outputs.size(); ++o) {
+      for (std::size_t e = 0; e < run.ext.size(); ++e) {
+        if (taken[e]) continue;
+        if (std::find(run.release.begin(), run.release.end(), run.ext[e]) == run.release.end())
+          continue;
+        taken[e] = true;
+        outs[o] = std::move(s[Sz(run.ext[e])]);
+        break;
+      }
+      if (outs[o].f.size() != Sz(n)) outs[o] = FloatTensor(shape);
+      outs[o].shape = shape;
+    }
+    std::vector<float*> dst;
+    for (auto& t : outs) dst.push_back(t.f.data());
+    constexpr std::int64_t kTile = 1024;
+    const std::int64_t tiles = (n + kTile - 1) / kTile;
+    const int ext_regs = static_cast<int>(run.ext.size());
+    const std::size_t op_regs = run.ops.size();
+#pragma omp parallel if (n > 32768)
+    {
+      std::vector<float> buf(op_regs * Sz(kTile));
+      std::vector<const float*> regs(Sz(ext_regs) + op_regs);
+#pragma omp for schedule(static)
+      for (std::int64_t t = 0; t < tiles; ++t) {
+        const std::int64_t off = t * kTile;
+        const std::int64_t len = std::min(kTile, n - off);
+        for (int e = 0; e < ext_regs; ++e) regs[Sz(e)] = src[Sz(e)] + off;
+        for (std::size_t i = 0; i < op_regs; ++i) {
+          const FusedOp& op = run.ops[i];
+          float* y = buf.data() + i * Sz(kTile);
+          regs[Sz(ext_regs) + i] = y;
+          const float* xa = op.a.reg >= 0 ? regs[Sz(op.a.reg)] : nullptr;
+          const float* xb = op.b.reg >= 0 ? regs[Sz(op.b.reg)] : nullptr;
+          switch (op.op) {
+            case Op::kAdd: FusedBinary<Bin::kAdd>(xa, op.a.value, xb, op.b.value, y, len); break;
+            case Op::kSub: FusedBinary<Bin::kSub>(xa, op.a.value, xb, op.b.value, y, len); break;
+            case Op::kMul: FusedBinary<Bin::kMul>(xa, op.a.value, xb, op.b.value, y, len); break;
+            case Op::kDiv: FusedBinary<Bin::kDiv>(xa, op.a.value, xb, op.b.value, y, len); break;
+            case Op::kPow: FusedBinary<Bin::kPow>(xa, op.a.value, xb, op.b.value, y, len); break;
+            case Op::kRelu:
+              for (std::int64_t q = 0; q < len; ++q) y[q] = xa[q] > 0.0f ? xa[q] : 0.0f;
+              break;
+            case Op::kSigmoid:
+              for (std::int64_t q = 0; q < len; ++q) y[q] = 1.0f / (1.0f + std::exp(-xa[q]));
+              break;
+            case Op::kSqrt:
+              for (std::int64_t q = 0; q < len; ++q) y[q] = std::sqrt(xa[q]);
+              break;
+            case Op::kHardSigmoid: {
+              const float alpha = op.p0, beta = op.p1;
+              for (std::int64_t q = 0; q < len; ++q)
+                y[q] = std::max(0.0f, std::min(1.0f, alpha * xa[q] + beta));
+              break;
+            }
+            case Op::kClip: {
+              const float lo = op.p0, hi = op.p1;
+              for (std::int64_t q = 0; q < len; ++q) y[q] = std::min(hi, std::max(lo, xa[q]));
+              break;
+            }
+            default:
+              break;
+          }
+        }
+        for (std::size_t o = 0; o < run.outputs.size(); ++o)
+          std::memcpy(dst[o] + off, regs[Sz(run.outputs[o].first)], sizeof(float) * Sz(len));
+      }
+    }
+    for (std::size_t o = 0; o < run.outputs.size(); ++o)
+      s[Sz(run.outputs[o].second)] = std::move(outs[o]);
+    for (int r : run.release) {
+      bool kept = false;
+      for (const auto& o : run.outputs) kept = kept || o.second == r;
+      if (!kept) Recycle(s[Sz(r)]);
+    }
+    return true;
+  }
+
   const NetTensor& Get(const std::vector<NetTensor>& slots, int id) const {
     if (id >= 0) return slots[Sz(id)];
     if (id == kNone) Fail("missing input");
@@ -831,24 +1152,37 @@ private:
     return &Get(slots, n.in[k]);
   }
 
-  NetTensor Eval(const Node& n, const std::vector<NetTensor>& s) const {
+  // Run slot of input k when this node is its last use (it may be
+  // overwritten), else nullptr.
+  NetTensor* Reusable(const Node& n, std::vector<NetTensor>& s, std::size_t k) const {
+    if (k >= n.in.size() || n.in[k] < 0) return nullptr;
+    const int id = n.in[k];
+    if (std::find(n.release.begin(), n.release.end(), id) == n.release.end()) return nullptr;
+    NetTensor& t = s[Sz(id)];
+    return t.is_int ? nullptr : &t;
+  }
+
+  NetTensor Eval(const Node& n, std::vector<NetTensor>& s) const {
     const NetTensor& x = Get(s, n.in[0]);
     auto in = [&](std::size_t k) -> const NetTensor& { return Get(s, n.in.at(k)); };
+    NetTensor* r0 = Reusable(n, s, 0);
+    auto bin = [&](Bin op) { return Binary(op, x, in(1), r0, Reusable(n, s, 1)); };
     switch (n.op) {
-      case Op::kAdd: return Binary(Bin::kAdd, x, in(1));
-      case Op::kSub: return Binary(Bin::kSub, x, in(1));
-      case Op::kMul: return Binary(Bin::kMul, x, in(1));
-      case Op::kDiv: return Binary(Bin::kDiv, x, in(1));
-      case Op::kPow: return Binary(Bin::kPow, x, in(1));
-      case Op::kRelu: return Unary(x, [](float v) { return v > 0.0f ? v : 0.0f; });
-      case Op::kSigmoid: return Unary(x, [](float v) { return 1.0f / (1.0f + std::exp(-v)); });
-      case Op::kSqrt: return Unary(x, [](float v) { return std::sqrt(v); });
+      case Op::kAdd: return bin(Bin::kAdd);
+      case Op::kSub: return bin(Bin::kSub);
+      case Op::kMul: return bin(Bin::kMul);
+      case Op::kDiv: return bin(Bin::kDiv);
+      case Op::kPow: return bin(Bin::kPow);
+      case Op::kRelu: return Unary(x, [](float v) { return v > 0.0f ? v : 0.0f; }, r0);
+      case Op::kSigmoid:
+        return Unary(x, [](float v) { return 1.0f / (1.0f + std::exp(-v)); }, r0);
+      case Op::kSqrt: return Unary(x, [](float v) { return std::sqrt(v); }, r0);
       case Op::kHardSigmoid: {
         const float alpha = static_cast<float>(n.attrs.Float("alpha", 0.2));
         const float beta = static_cast<float>(n.attrs.Float("beta", 0.5));
         return Unary(x, [alpha, beta](float v) {
           return std::max(0.0f, std::min(1.0f, alpha * v + beta));
-        });
+        }, r0);
       }
       case Op::kClip: {
         float lo = -std::numeric_limits<float>::infinity();
@@ -857,12 +1191,12 @@ private:
         else lo = static_cast<float>(n.attrs.Float("min", lo));
         if (const NetTensor* t = Opt(s, n, 2)) hi = t->f.at(0);
         else hi = static_cast<float>(n.attrs.Float("max", hi));
-        return Unary(x, [lo, hi](float v) { return std::min(hi, std::max(lo, v)); });
+        return Unary(x, [lo, hi](float v) { return std::min(hi, std::max(lo, v)); }, r0);
       }
       case Op::kConv: return Conv(x, in(1), Opt(s, n, 2), n.attrs);
       case Op::kConvTranspose: return ConvTranspose(x, in(1), Opt(s, n, 2), n.attrs);
       case Op::kBatchNorm:
-        return BatchNorm(x, in(1), in(2), in(3), in(4), n.attrs.Float("epsilon", 1e-5));
+        return BatchNorm(x, in(1), in(2), in(3), in(4), n.attrs.Float("epsilon", 1e-5), r0);
       case Op::kGlobalAveragePool: return GlobalAveragePool(x);
       case Op::kAveragePool: return AveragePool(x, n.attrs);
       case Op::kResize: return Resize(x, Opt(s, n, 2), Opt(s, n, 3));
@@ -910,6 +1244,7 @@ private:
 
   std::vector<NetTensor> consts_;
   std::vector<Node> nodes_;
+  std::vector<FusedRun> runs_;
   int slots_{0};
   int input_{0};
   int output_{0};
