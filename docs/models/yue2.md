@@ -68,4 +68,14 @@ router-idle-seconds = 300
 
 ## Measured
 
-MEASURED
+Strix Halo, 64 GB, 14 Nov 2026: a 47 s English ballad in 48 s (score 9 s, codes 24 s,
+flow matching 14 s, decoder 1.5 s), a 44 s German one in 44 s. The worker holds 8.5 GB
+of GPU memory after such a song (7.3 GB weights, the rest KV cache and buffers; a 6-minute
+song needs about 3 GB more) and 0.3 GB host RAM. AR decoding runs at 43 (score) to 52
+(codes) tokens/s.
+
+Against the FP32 reference of `yue2_infer` 0.1.6 (CPU): token ids and prompts identical,
+prefix logits cosine 0.99999 or better, 64 greedy score and 64 greedy code tokens
+identical, flow velocity within 0.8 % (relative L2), 32-step latents cosine 0.99999,
+decoder 43 dB SNR. A seed gives a different song than the reference, because gufo draws
+its own noise and samples with its own generator.

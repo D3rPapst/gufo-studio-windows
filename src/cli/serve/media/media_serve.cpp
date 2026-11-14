@@ -21,8 +21,8 @@ bool IsMediaServeCommand(std::string_view subcommand) {
 }
 
 std::string MediaServeCommandsHelp() {
-  return "  music     Serve ACE-Step 1.5 XL turbo / sft / base music "
-         "(/v1/audio/music)\n"
+  return "  music     Serve ACE-Step 1.5 XL turbo / sft / base or YuE2-3B "
+         "music (/v1/audio/music)\n"
          "  foley     Serve MMAudio large_44k_v2 video/text-to-audio "
          "(/v1/audio/foley)\n"
          "  upscale   Serve Real-ESRGAN image and video upscaling on the "
@@ -34,7 +34,8 @@ std::string MediaServeCommandsHelp() {
 std::string MediaServeDescription(std::string_view subcommand) {
   if (subcommand == "music")
     return "Serve ACE-Step 1.5 XL (turbo / sft / base) music: text2music, "
-           "repaint, cover, extract, lego, complete.";
+           "repaint, cover, extract, lego, complete. With --yue2-vae (or a "
+           "YuE2-3B --model): YuE2-3B songs with vocals.";
   if (subcommand == "foley")
     return "Serve MMAudio large_44k_v2 video/text-to-audio.";
   if (subcommand == "omni")
