@@ -497,7 +497,8 @@ Router:
   --ccip-face-dir <DIR>         Anime face detector for "verfahren": "ccip"
   --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
   --vision-dir <DIR>            Detectors for POST /v1/vision/detect (person, head, face, hand:
-                                <model>.safetensors + .json; loaded on first use)
+                                <model>.safetensors + .json; loaded on first use) and the
+                                wd14_tags tagger (wd-swinv2-tagger-v3.safetensors + .json)
   --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
   --vision-queue <N>            Requests of the shared CPU queue (/v1/vision/detect, /v1/figuren
                                 ccip) that may wait behind the running one before 503 busy (default: 4)
@@ -837,8 +838,37 @@ weights 19595/38470/7471) is below 70, the detectors see a copy with
 `kopf`, `gesicht`, `hand` = `detections.person|head|face|hand` as
 `box + [round(score, 2)]`.
 
-`ocr` and `wd14_tags` are accepted task names that answer
-`501 task_not_available` until their models are ported. The detectors live in
+`wd14_tags` is `imgutils.tagging.get_wd14_tags` with its default
+`SwinV2_v3` (`deepghs/wd14_tagger_with_embeddings`
+`SmilingWolf/wd-swinv2-tagger-v3/model.onnx`, tags from
+`SmilingWolf/wd-swinv2-tagger-v3/selected_tags.csv`), natively on the CPU
+(`gufo_ccip` `Wd14Tagger`, `extensions-ours/ccip/wd14.hpp`,
+`cpu/swinv2.cpp`): the RGB picture centred on a white `max(w, h)` square
+(offsets floored), Pillow BICUBIC to 448 unless already 448, float 0..255 in
+BGR order; SwinV2-B (window 14, stages 2/2/18/2, 128..1024 channels, cosine
+attention with the export's constant-folded relative position bias and logit
+scale, shift 7 with the -100 mask in odd blocks of stages 0-2, post-norm,
+GELU-tanh), final LayerNorm, mean pool, linear + sigmoid. Linear layers use a
+packed AVX2/FMA GEMM (B in 16-column panels, 6x16 tiles), attention runs per
+(window, head) with OpenMP. Tags in csv order: rating (category 9) always,
+general (0) `> general_threshold`, character (4) `> character_threshold`,
+compared in double. Regions follow `erkennung.py`: the box plus
+`margin * max(w, h)` per side, clipped, then Pillow `crop`'s `round()` (half
+to even, `MarginCropBox`); `regions: "person"` uses this request's person
+boxes (detected on the brightened copy when `brighten_dark` applies) and adds
+the `person` task; the tagger always reads the original pixels. Further
+pictures (`wd14_tags.images`, at most 16) are read like `image` (Ablage path
+through the gate) and inlined as data URLs when the request goes to the pool
+partner. Code: `src/cli/serve/router/vision_wd14.{hpp,cpp}`. Weights:
+`--vision-dir/wd-swinv2-tagger-v3.{safetensors,json}` from
+`extensions-ours/ccip/reference/convert_wd14.py <model.onnx>
+<selected_tags.csv> <dir>` (every value read off the ONNX graph by node
+name; tag names and categories in the JSON), ~462 MB, loaded on first use.
+Measured on the EVO-X2 (8 threads): ~0.58 s per picture or cut-out
+(imgutils with onnxruntime: ~1.2 s).
+
+`ocr` is an accepted task name that answers `501 task_not_available` until its
+models are ported. The detectors live in
 `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) as
 `<model>.safetensors` + `.json` from
 `extensions-ours/ccip/reference/convert_weights.py yolo <model.onnx> <dir> <model>`
@@ -856,9 +886,15 @@ on white). Area `bild`; the request is not counted against `tageslimit`.
 Pool: see below; the relayed body carries the image inline (an Ablage path
 is read here first).
 Tests: `router_vision_test` (parsing and errors; with `GUFO_VISION_DIR` and
-`GUFO_VISION_FRAME` real detections, the Ablage path and the queue) and
-`ccip.vision_oracle` (`vision_oracle_test` against
-`reference/make_vision_oracle.py`, which runs imgutils itself).
+`GUFO_VISION_FRAME` real detections, the Ablage path, the queue and
+`wd14_tags` on the whole frame, the person cut-outs, a region and a further
+picture), `ccip.vision_oracle` (`vision_oracle_test` against
+`reference/make_vision_oracle.py`, which runs imgutils itself) and
+`ccip.wd14_oracle` (`wd14_oracle_test` with `GUFO_VISION_DIR` and
+`GUFO_WD14_ORACLE` against `reference/make_wd14_oracle.py`: keyframes and the
+pipeline's person cut-outs, 448 input bit-exact, all 10861 probabilities
+within 1e-3, same tags; measured max diff 4.1e-6 on 7 keyframes + 33
+cut-outs).
 
 ### CPU queue and pool for the router services
 

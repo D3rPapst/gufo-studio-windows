@@ -1,11 +1,11 @@
-# Image recognition (imgutils detectors)
+# Image recognition (imgutils detectors and tags)
 
 `POST /v1/vision/detect` finds people, heads, faces and hands in an image with the
-anime detectors of dghs-imgutils, on the router's CPU, with the same models,
-thresholds and box rounding as `imgutils.detect`.
+anime detectors of dghs-imgutils and tags images with its WD14 tagger, on the
+router's CPU, with the same models, thresholds and rounding as `imgutils`.
 
-Use it when a pipeline today calls `detect_person`, `detect_heads`, `detect_faces` or
-`detect_hands` in Python: the answers match, so earlier measurements stay comparable,
+Use it when a pipeline today calls `detect_person`, `detect_heads`, `detect_faces`,
+`detect_hands` or `get_wd14_tags` in Python: the answers match, so earlier measurements stay comparable,
 and the router queues the requests instead of letting several processes compete for
 the cores.
 
@@ -22,14 +22,22 @@ the cores.
 - `image`: a `data:` URL, plain base64, a public `https://` URL or an Ablage path
   `/v1/jobs/{id}/files/{name}` of one of your own jobs. PNG, JPEG or WebP, at most
   20 MB. An alpha channel is dropped.
-- `tasks`: any of `person`, `head`, `face`, `hand`; all four when left out. `ocr` and
-  `wd14_tags` are reserved names and answer `501 task_not_available`.
+- `tasks`: any of `person`, `head`, `face`, `hand`, `wd14_tags`; the four detectors
+  when left out. `ocr` is a reserved name and answers `501 task_not_available`.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per task, each in (0, 1].
 - `brighten_dark`: optional. `true` runs the detectors on a brightened copy
   (each channel `round(255 * (v / 255) ** 0.5)`) when the image's mean brightness
   (Pillow's `L` channel) is below 70; `{"below": 50, "gamma": 0.7}` changes both
-  values. The boxes still refer to your image. Off by default.
+  values. The boxes still refer to your image. Off by default. Tags always see the
+  original image.
+- `wd14_tags`: optional settings for the tags, all optional:
+  `{"general_threshold": 0.35, "character_threshold": 0.85, "regions": "person",
+  "margin": 0.08, "images": ["data:image/png;base64,..."]}`. `regions` is `"person"`
+  (the person boxes of the same request, the `person` task then runs too; also as
+  `"use_detections": "person"`) or a list of `[x0, y0, x1, y1]` boxes; each box gets
+  `margin` × its longer side on every side, clipped to the image. Without `regions`
+  the whole image is tagged. `images` adds up to 16 further pictures, each tagged whole.
 
 ## Answer
 
@@ -58,6 +66,18 @@ An answer for two tasks (example values):
 `box` is `[x0, y0, x1, y1]` in whole pixels of your image, each list is sorted by
 score, and `score` is the unrounded value imgutils returns. `seconds` is the compute time, `queue_seconds` the wait for the CPU.
 
+`detections.wd14_tags` holds one entry per tagged picture, like `get_wd14_tags`:
+
+```json
+{"source": "person", "index": 0, "box": [389, 72, 728, 768], "width": 339, "height": 696,
+ "rating": {"general": 0.91, "sensitive": 0.08, "questionable": 0.001, "explicit": 0.0002},
+ "general": {"1boy": 0.97, "necktie": 0.88, "shirt": 0.71}, "character": {}}
+```
+
+`source` is `image` (whole image), `region` or `person` (`index` into your regions or
+the person list, `box` the cut-out) or `images` (`index` into `wd14_tags.images`).
+Ratings are always listed, the other tags only above their threshold, in model order.
+
 ## Models
 
 | Task | Hugging Face model | Network | Default conf / iou | ONNX size | Licence |
@@ -66,6 +86,7 @@ score, and `score` is the unrounded value imgutils returns. `seconds` is the com
 | `head` | `deepghs/anime_head_detection` `head_detect_v2.0_s` | YOLOv8s | 0.4 / 0.7 | 45 MB | MIT |
 | `face` | `deepghs/anime_face_detection` `face_detect_v1.4_s` | YOLOv8s | 0.25 / 0.7 | 45 MB | MIT |
 | `hand` | `deepghs/anime_hand_detection` `hand_detect_v1.0_s` | YOLOv8s | 0.35 / 0.7 | 45 MB | OpenRAIL |
+| `wd14_tags` | `deepghs/wd14_tagger_with_embeddings` `SmilingWolf/wd-swinv2-tagger-v3` + `selected_tags.csv` | SwinV2-B, 448 px, 10861 tags | 0.35 / 0.85 (general / character) | 467 MB | Apache-2.0 |
 
 These are the defaults of dghs-imgutils 0.19. Convert each `model.onnx` once (Python
 with `onnx`, `numpy` and `safetensors`):
@@ -73,6 +94,8 @@ with `onnx`, `numpy` and `safetensors`):
 ```powershell
 python -I extensions-ours\ccip\reference\convert_weights.py yolo `
   <hf-cache>\person_detect_v1.1_m\model.onnx D:\llm-modelle\gufo\modelle\deepghs\vision\gufo person_detect_v1.1_m
+python -I extensions-ours\ccip\reference\convert_wd14.py `
+  <model.onnx> <selected_tags.csv> D:\llm-modelle\gufo\modelle\deepghs\vision\gufo
 ```
 
 The router reads `<model>.safetensors` and `<model>.json` from `--vision-dir` (Windows
@@ -83,7 +106,9 @@ default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) and loads each model 
 - One request computes at a time, in one queue with the CCIP figure check;
   `--vision-threads` (default 8) sets its CPU threads. Up to `--vision-queue`
   (default 4) more wait; the next one gets `503 busy` with `Retry-After: 5`.
-- `400 invalid_request`: unknown task, bad threshold, unreadable image.
+- Tags take about 0.6 s per picture or cut-out (8 threads); the tagger keeps ~470 MB RAM.
+- `400 invalid_request`: unknown task, bad threshold, unreadable image, a region
+  outside the image.
 - `404`: an Ablage path of a job you can't read.
 - `503 vision_unavailable`: a model file is missing; the message names it.
 - The request needs the `bild` area and doesn't count against the daily limit.
