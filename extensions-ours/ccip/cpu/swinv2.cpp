@@ -557,7 +557,11 @@ std::array<int, 4> MarginCropBox(const std::array<double, 4>& box, double margin
                                  int height) {
   const double rand = margin * std::max(box[2] - box[0], box[3] - box[1]);
   // Python round(): half to even (nearbyint in the default rounding mode).
-  const auto r = [](double v) { return static_cast<int>(std::nearbyint(v)); };
+  // Clamped first: a value outside int would be undefined behaviour (the
+  // router limits boxes to +-1e6, this keeps other callers safe too).
+  const auto r = [](double v) {
+    return static_cast<int>(std::nearbyint(std::clamp(v, -1e9, 1e9)));
+  };
   return {r(std::max(0.0, box[0] - rand)), r(std::max(0.0, box[1] - rand)),
           r(std::min(static_cast<double>(width), box[2] + rand)),
           r(std::min(static_cast<double>(height), box[3] + rand))};

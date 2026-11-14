@@ -42,8 +42,8 @@ void ParseRegions(const json::Value& value, Wd14Request* request, const std::str
       throw std::invalid_argument(what + ": every box is [x0, y0, x1, y1]");
     std::array<double, 4> b{};
     for (std::size_t i = 0; i < 4; ++i) {
-      if (!box.items()[i].is_number())
-        throw std::invalid_argument(what + ": box values must be numbers");
+      if (!box.items()[i].is_number() || !(std::fabs(box.items()[i].as_double()) <= 1e6))
+        throw std::invalid_argument(what + ": box values must be numbers within +-1e6");
       b[i] = box.items()[i].as_double();
     }
     if (!(b[2] > b[0] && b[3] > b[1]))
