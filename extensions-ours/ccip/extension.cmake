@@ -31,6 +31,7 @@ gufo_extension_target(
     cpu/kernels.cpp
     cpu/caformer.cpp
     cpu/yolo.cpp
+    cpu/swinv2.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
     Threads::Threads
@@ -41,15 +42,16 @@ if(TARGET gufo_ccip)
     "$<BUILD_INTERFACE:${_ccip_include_root}>"
   )
   ccip_use_openmp(gufo_ccip)
-  set(_ccip_simd "${GUFO_EXTENSION_BUILD_ROOT}/cpu/kernels.cpp")
+  # kernels.cpp and the WD14 tagger's packed GEMM (cpu/swinv2.cpp) use AVX2/FMA.
+  set(_ccip_simd "${GUFO_EXTENSION_BUILD_ROOT}/cpu/kernels.cpp" "${GUFO_EXTENSION_BUILD_ROOT}/cpu/swinv2.cpp")
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-      set_source_files_properties("${_ccip_simd}" PROPERTIES COMPILE_OPTIONS "/clang:-mavx2;/clang:-mfma")
+      set_source_files_properties(${_ccip_simd} PROPERTIES COMPILE_OPTIONS "/clang:-mavx2;/clang:-mfma")
     else()
-      set_source_files_properties("${_ccip_simd}" PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+      set_source_files_properties(${_ccip_simd} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
     endif()
   elseif(MSVC)
-    set_source_files_properties("${_ccip_simd}" PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(${_ccip_simd} PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   endif()
 endif()
 
@@ -76,6 +78,27 @@ gufo_extension_target(
     gufo_ccip
     gufo_ext_runtime
 )
+
+# /v1/vision/detect "wd14_tags" against dghs-imgutils (reference/make_wd14_oracle.py).
+# Needs GUFO_VISION_DIR (wd-swinv2-tagger-v3.* from reference/convert_wd14.py)
+# and GUFO_WD14_ORACLE (manifest.json + wd14_*.safetensors); skips (77) otherwise.
+gufo_extension_target(
+  NAME wd14_oracle_test
+  SOURCES
+    tests/wd14_oracle_test.cpp
+  LINK_LIBRARIES
+    gufo_ccip
+    gufo_ext_runtime
+)
+
+if(TARGET wd14_oracle_test)
+  ccip_use_openmp(wd14_oracle_test)
+  add_test(NAME ccip.wd14_oracle COMMAND wd14_oracle_test)
+  set_tests_properties(ccip.wd14_oracle PROPERTIES
+    LABELS "ccip;cpu;quality;external-model"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 1200)
+endif()
 
 if(TARGET vision_oracle_test)
   ccip_use_openmp(vision_oracle_test)

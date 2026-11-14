@@ -49,6 +49,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/cpu_pool.hpp"
+#include "src/cli/serve/router/vision_wd14.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::vision {
@@ -76,6 +77,8 @@ struct Request {
   bool brighten_dark{false};
   double dark_below{70.0};
   double dark_gamma{0.5};  // models::ccip::MeanLuma / ApplyGamma
+  /// "wd14_tags" and its options (vision_wd14.hpp).
+  Wd14Request wd14;
 };
 
 /// Parses and checks a request body; throws std::invalid_argument with a

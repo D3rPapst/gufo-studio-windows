@@ -1,7 +1,9 @@
 // POST /v1/vision/detect through VisionService: request parsing (tasks,
 // aliases, thresholds), the error answers without models (405, 400, 501,
-// 503) and, with GUFO_VISION_DIR (converted detectors) and GUFO_VISION_FRAME
-// (a PNG keyframe), real detections: the frame as a data URL and as an
+// 503), the wd14_tags options and, with GUFO_VISION_DIR (converted
+// detectors and tagger) and GUFO_VISION_FRAME (a PNG keyframe), real
+// detections and tags (whole frame, person cut-outs, explicit regions,
+// further pictures): the frame as a data URL and as an
 // Ablage path through a scripted gate (its 404 is relayed), and two parallel
 // requests that must queue one after the other. Pool (cpu_pool.hpp) with a
 // scripted partner: Decide, relay when busy or without models, the Ablage
@@ -24,6 +26,7 @@
 #include <vector>
 
 #include "ccip/image_ops.hpp"
+#include "ccip/wd14.hpp"
 #include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/vision.hpp"
@@ -135,6 +138,44 @@ void TestParse() {
     bad["brighten_dark"] = "ja";
     (void)vision::ParseRequest(bad);
   }));
+  // wd14_tags: defaults, options, regions "person" adds the person task.
+  r = vision::ParseRequest(Body("AAAA", {"wd14_tags"}));
+  assert(r.tasks.empty() && r.wd14.enabled && r.wd14.general_threshold == 0.35 &&
+         r.wd14.character_threshold == 0.85 && !r.wd14.persons && r.wd14.boxes.empty());
+  json::Value tags = Body("AAAA", {"wd14_tags", "face"});
+  json::Value wd = json::Value::object();
+  wd["general_threshold"] = 0.5;
+  wd["use_detections"] = "person";
+  wd["margin"] = 0.1;
+  json::Value pics = json::Value::array();
+  pics.push_back("BBBB");
+  wd["images"] = std::move(pics);
+  tags["wd14_tags"] = std::move(wd);
+  r = vision::ParseRequest(tags);
+  assert(r.wd14.persons && r.wd14.general_threshold == 0.5 && r.wd14.margin == 0.1);
+  assert(r.wd14.images.size() == 1 && r.wd14.images[0] == "BBBB");
+  assert(r.tasks.size() == 2 && r.tasks[0].task == "person" && r.tasks[1].task == "face");
+  json::Value boxes = Body("AAAA", {"wd14_tags"});
+  json::Value wb = json::Value::object();
+  wb["regions"] = json::parse("[[10, 20, 110, 220.5]]");
+  boxes["wd14_tags"] = std::move(wb);
+  r = vision::ParseRequest(boxes);
+  assert(r.wd14.boxes.size() == 1 && r.wd14.boxes[0][3] == 220.5 && r.tasks.empty());
+  for (const char* bad_options :
+       {R"({"regions": [[10, 20, 5, 30]]})", R"({"regions": "face"})",
+        R"({"general_threshold": 2})", R"({"colour": 1})", R"({"images": [1]})",
+        R"({"regions": "person", "use_detections": "person"})"}) {
+    assert(Throws([&] {
+      json::Value bad = Body("AAAA", {"wd14_tags"});
+      bad["wd14_tags"] = json::parse(bad_options);
+      (void)vision::ParseRequest(bad);
+    }));
+  }
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"face"});
+    bad["wd14_tags"] = json::Value::object();
+    (void)vision::ParseRequest(bad);
+  }));
   bool planned = false;
   try {
     (void)vision::ParseRequest(Body("AAAA", {"face", "ocr"}));
@@ -179,7 +220,7 @@ void TestErrors() {
   broken.path = "/v1/vision/detect";
   broken.body = "{";
   assert(service.Handle(broken)->status == 400);
-  auto response = service.Handle(Post(Body("AAAA", {"wd14_tags"})));
+  auto response = service.Handle(Post(Body("AAAA", {"ocr"})));
   assert(response->status == 501);
   assert(response->body.find("task_not_available") != std::string::npos);
   response = service.Handle(Post(Body("AAAA", {"person"})));
@@ -191,6 +232,9 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"face"})));
   assert(response->status == 503);
   assert(response->body.find("face_detect_v1.4_s.safetensors") != std::string::npos);
+  response = service_missing.Handle(Post(Body("AAAA", {"wd14_tags"})));
+  assert(response->status == 503);
+  assert(response->body.find("wd-swinv2-tagger-v3.safetensors") != std::string::npos);
 }
 
 HttpResponse JsonAnswer(int status, std::string body) {
@@ -262,6 +306,20 @@ void TestPool() {
   const json::Value sent = json::parse(partner->last_body);
   assert(sent.member_str("image").starts_with("data:image/png;base64,"));
   assert(sent.find("tasks") != nullptr && partner->last_if_idle == "1");
+  // Further wd14_tags pictures from the Ablage travel inline as well.
+  json::Value with_refs = Body("AAAA", {"wd14_tags"});
+  json::Value refs_opt = json::Value::object();
+  json::Value ref_list = json::Value::array();
+  ref_list.push_back("/v1/jobs/j1/files/a.png");
+  refs_opt["images"] = std::move(ref_list);
+  refs_opt["general_threshold"] = 0.4;
+  with_refs["wd14_tags"] = std::move(refs_opt);
+  response = service.Handle(Post(with_refs));
+  assert(response->status == 200);
+  const json::Value sent_refs = json::parse(partner->last_body);
+  const json::Value* sent_opt = sent_refs.find("wd14_tags");
+  assert(sent_opt != nullptr && sent_opt->member_double("general_threshold") == 0.4);
+  assert(sent_opt->find("images")->items()[0].str().starts_with("data:image/png;base64,"));
   // Partner busy (503) or gone: back here, where the models are missing.
   partner->status = 503;
   response = service.Handle(Post(Body("AAAA", {"face"})));
@@ -377,6 +435,64 @@ void TestReal(const char* dir, const char* frame) {
     queue->Leave();
     busy = busy_service.Handle(relayed);
     assert(busy->status == 200);
+  }
+  // wd14_tags: whole frame, the person cut-outs (8 % margin), an explicit
+  // region and a further picture (the frame again, so the same tags).
+  {
+    json::Value whole = Body(data_url, {"wd14_tags"});
+    response = service.Handle(Post(whole));
+    assert(response->status == 200);
+    const json::Value jw = json::parse(response->body);
+    const json::Value& w0 = jw.find("detections")->find("wd14_tags")->items().at(0);
+    assert(w0.member_str("source") == "image" && w0.find("rating")->size() == 4);
+    assert(!w0.find("general")->empty());
+    assert(jw.find("models")->find("wd14_tags")->member_str("model") ==
+           "SmilingWolf/wd-swinv2-tagger-v3");
+    std::cout << "wd14 whole frame: " << w0.find("general")->size() << " general tags, "
+              << jw.member_double("seconds") << " s\n";
+    json::Value cut = Body(data_url, {"wd14_tags"});
+    json::Value opt = json::Value::object();
+    opt["regions"] = "person";
+    json::Value more = json::Value::array();
+    more.push_back(data_url);
+    opt["images"] = std::move(more);
+    cut["wd14_tags"] = std::move(opt);
+    response = service.Handle(Post(cut));
+    assert(response->status == 200);
+    const json::Value jc = json::parse(response->body);
+    const auto& entries = jc.find("detections")->find("wd14_tags")->items();
+    const auto& people = jc.find("detections")->find("person")->items();
+    assert(people.size() == persons && entries.size() == persons + 1);
+    for (std::size_t i = 0; i < persons; ++i) {
+      assert(entries[i].member_str("source") == "person");
+      const auto& pb = people[i].find("box")->items();
+      const auto want = gufo::models::ccip::MarginCropBox(
+          {pb[0].as_double(), pb[1].as_double(), pb[2].as_double(), pb[3].as_double()}, 0.08,
+          static_cast<int>(jc.find("width")->as_double()), static_cast<int>(jc.find("height")->as_double()));
+      for (std::size_t c = 0; c < 4; ++c)
+        assert(static_cast<int>(entries[i].find("box")->items()[c].as_double()) == want[c]);
+    }
+    const json::Value& extra = entries.back();
+    assert(extra.member_str("source") == "images" && extra.find("index")->as_double() == 0);
+    assert(extra.find("general")->dump() == w0.find("general")->dump());
+    std::cout << "wd14 " << persons << " person cut-outs + 1 picture: "
+              << jc.member_double("seconds") << " s (with person detection)\n";
+    json::Value region = Body(data_url, {"wd14_tags"});
+    json::Value ro = json::Value::object();
+    ro["regions"] = json::parse("[[100, 100, 400, 500]]");
+    ro["margin"] = 0;
+    region["wd14_tags"] = std::move(ro);
+    response = service.Handle(Post(region));
+    assert(response->status == 200);
+    const json::Value jr = json::parse(response->body);
+    const json::Value& r0 = jr.find("detections")->find("wd14_tags")->items().at(0);
+    assert(r0.member_str("source") == "region" && r0.find("width")->as_double() == 300 &&
+           r0.find("height")->as_double() == 400);
+    json::Value outside = Body(data_url, {"wd14_tags"});
+    json::Value oo = json::Value::object();
+    oo["regions"] = json::parse("[[5000, 5000, 6000, 6000]]");
+    outside["wd14_tags"] = std::move(oo);
+    assert(service.Handle(Post(outside))->status == 400);
   }
   // Two at once: one waits for the other.
   auto a = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });

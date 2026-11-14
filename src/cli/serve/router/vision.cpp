@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "ccip/ccip.hpp"
+#include "ccip/wd14.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/image.hpp"
 
@@ -80,17 +81,37 @@ std::string SniffImageType(const std::vector<std::uint8_t>& bytes) {
   return "image/png";
 }
 
-/// The request body for the partner: every member as sent, the image
-/// inline as a data URL (the partner cannot read this machine's Ablage).
-std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& bytes) {
+std::string DataUrl(const std::vector<std::uint8_t>& bytes) {
+  return "data:" + SniffImageType(bytes) + ";base64," +
+         core::EncodeBase64(
+             std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+}
+
+/// The request body for the partner: every member as sent, the image (and
+/// the further wd14_tags pictures) inline as data URLs (the partner cannot
+/// read this machine's Ablage).
+std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& bytes,
+                      const std::vector<std::vector<std::uint8_t>>& wd14_images) {
   json::Value out = json::Value::object();
   for (const auto& [key, value] : body.members()) {
-    if (key != "image" && key != "bild")
-      out[key] = value;
+    if (key == "image" || key == "bild")
+      continue;
+    if (key == kWd14Task && value.is_object() && !wd14_images.empty()) {
+      json::Value options = json::Value::object();
+      for (const auto& [name, option] : value.members()) {
+        if (name != "images")
+          options[name] = option;
+      }
+      json::Value images = json::Value::array();
+      for (const auto& picture : wd14_images)
+        images.push_back(DataUrl(picture));
+      options["images"] = std::move(images);
+      out[key] = std::move(options);
+      continue;
+    }
+    out[key] = value;
   }
-  out["image"] = "data:" + SniffImageType(bytes) + ";base64," +
-                 core::EncodeBase64(std::string_view(
-                     reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+  out["image"] = DataUrl(bytes);
   return out.dump();
 }
 
@@ -145,6 +166,32 @@ std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& 
   return std::vector<std::uint8_t>(body.begin(), body.end());
 }
 
+/// Bytes of one input picture: an Ablage path through the gate, else a
+/// data URL, https URL or bare base64. A refusal of the gate is returned in
+/// *failure; anything else unreadable throws.
+std::vector<std::uint8_t> ReadInput(const Options& options, const HttpRequest& outer,
+                                    const std::string& source,
+                                    std::optional<HttpResponse>* failure) {
+  if (IsAblagePath(source))
+    return ReadAblage(options, outer, source, failure);
+  const std::string url = source.starts_with("data:") || source.starts_with("https://")
+                              ? source
+                              : "data:image/png;base64," + source;
+  core::ImageReadBudget budget;
+  return core::ReadImageUrl(url, budget);
+}
+
+/// RGB8 pixels of encoded bytes, the alpha channel dropped (the pipeline
+/// opens its pictures with .convert("RGB")).
+models::ccip::RgbImage DecodeRgb(const std::vector<std::uint8_t>& bytes) {
+  core::Image rgb = core::DecodeImage(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+  models::ccip::RgbImage image;
+  image.width = static_cast<int>(rgb.width);
+  image.height = static_cast<int>(rgb.height);
+  image.rgb = std::move(rgb.pixels);
+  return image;
+}
+
 }  // namespace
 
 const std::vector<TaskSpec>& DetectorTasks() {
@@ -158,7 +205,7 @@ const std::vector<TaskSpec>& DetectorTasks() {
 }
 
 const std::vector<std::string>& PlannedTasks() {
-  static const std::vector<std::string> tasks = {"ocr", "wd14_tags"};
+  static const std::vector<std::string> tasks = {"ocr"};
   return tasks;
 }
 
@@ -195,7 +242,8 @@ Request ParseRequest(const json::Value& body) {
   for (const std::string& name : names) {
     const auto& known = DetectorTasks();
     const auto& planned = PlannedTasks();
-    if (std::none_of(known.begin(), known.end(),
+    if (name != kWd14Task &&
+        std::none_of(known.begin(), known.end(),
                      [&](const TaskSpec& spec) { return spec.task == name; }) &&
         std::find(planned.begin(), planned.end(), name) == planned.end())
       throw std::invalid_argument("unknown task " + name +
@@ -206,6 +254,11 @@ Request ParseRequest(const json::Value& body) {
     if (std::find(planned.begin(), planned.end(), name) != planned.end())
       throw std::domain_error("task " + name + " is not available in this build");
   }
+  // wd14_tags options; regions "person" run the person detector too.
+  request.wd14 =
+      ParseWd14(body, std::find(names.begin(), names.end(), kWd14Task) != names.end());
+  if (request.wd14.persons && std::find(names.begin(), names.end(), "person") == names.end())
+    names.push_back("person");
   // Answer order: the table order, whatever order the caller used.
   for (const TaskSpec& spec : DetectorTasks()) {
     if (std::find(names.begin(), names.end(), spec.task) != names.end())
@@ -259,6 +312,7 @@ Request ParseRequest(const json::Value& body) {
 struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
+  std::unique_ptr<models::ccip::Wd14Tagger> wd14;
 
   /// The detector of `spec`, loaded on first use; null with *error set.
   const models::ccip::YoloDetector* Get(const Options& options, const TaskSpec& spec,
@@ -288,6 +342,37 @@ struct VisionState {
     const auto* loaded = net.get();
     detectors.emplace(spec.model, std::move(net));
     return loaded;
+  }
+
+  /// The WD14 tagger (~460 MB host RAM), loaded on first use; null with
+  /// *error set.
+  const models::ccip::Wd14Tagger* GetWd14(const Options& options, std::string* error) {
+    std::lock_guard<std::mutex> lock(load_mutex);
+    if (wd14 != nullptr)
+      return wd14.get();
+    if (options.model_dir.empty()) {
+      *error = "image recognition is not configured: start the router with --vision-dir";
+      return nullptr;
+    }
+    const std::string stem = models::ccip::kWd14Stem;
+    for (const char* ext : {".safetensors", ".json"}) {
+      const std::filesystem::path path = options.model_dir / (stem + ext);
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) {
+        *error = "model file missing: " + path.string() + " (convert " + kWd14Repo + " " +
+                 kWd14Model + "/model.onnx and its selected_tags.csv with "
+                 "extensions-ours/ccip/reference/convert_wd14.py)";
+        return nullptr;
+      }
+    }
+    std::string load_error;
+    auto net = models::ccip::Wd14Tagger::Load(options.model_dir, stem, &load_error);
+    if (net == nullptr) {
+      *error = "wd14_tags: " + load_error;
+      return nullptr;
+    }
+    wd14 = std::move(net);
+    return wd14.get();
   }
 };
 
@@ -325,25 +410,32 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       break;
     nets.push_back(net);
   }
+  const models::ccip::Wd14Tagger* tagger = nullptr;
+  if (parsed.wd14.enabled && missing.empty())
+    tagger = state_->GetWd14(options_, &missing);
   // Input before the queue: reading an Ablage path goes through the gate
   // and must not hold the CPU turn.
   std::vector<std::uint8_t> bytes;
+  std::vector<std::vector<std::uint8_t>> wd14_bytes;
   try {
-    if (IsAblagePath(parsed.image)) {
-      std::optional<HttpResponse> failure;
-      bytes = ReadAblage(options_, request, parsed.image, &failure);
-      if (failure.has_value())
-        return std::move(*failure);
-    } else {
-      const std::string url =
-          parsed.image.starts_with("data:") || parsed.image.starts_with("https://")
-              ? parsed.image
-              : "data:image/png;base64," + parsed.image;
-      core::ImageReadBudget budget;
-      bytes = core::ReadImageUrl(url, budget);
-    }
+    std::optional<HttpResponse> failure;
+    bytes = ReadInput(options_, request, parsed.image, &failure);
+    if (failure.has_value())
+      return std::move(*failure);
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", std::string("image: ") + error.what(), "invalid_request");
+  }
+  for (std::size_t i = 0; i < parsed.wd14.images.size(); ++i) {
+    try {
+      std::optional<HttpResponse> failure;
+      wd14_bytes.push_back(ReadInput(options_, request, parsed.wd14.images[i], &failure));
+      if (failure.has_value())
+        return std::move(*failure);
+    } catch (const std::exception& error) {
+      return Error(400, "Bad Request",
+                   "wd14_tags.images[" + std::to_string(i) + "]: " + error.what(),
+                   "invalid_request");
+    }
   }
   // Pool (cpu_pool.hpp): the partner when this machine is busy or lacks
   // the models.
@@ -354,7 +446,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     const bool force = route == cpu::Route::kPartnerOnly;
     std::optional<HttpResponse> answer;
     if (options_.relay)
-      answer = options_.relay(cpu::RelayRequest(request, RelayBody(body, bytes), force));
+      answer = options_.relay(
+          cpu::RelayRequest(request, RelayBody(body, bytes, wd14_bytes), force));
     if (answer.has_value() && (force || cpu::PartnerAnswered(*answer))) {
       answer->headers.emplace_back(cpu::kRanOnHeader, "partner");
       return std::move(*answer);
@@ -368,18 +461,34 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   if (route == cpu::Route::kLocalIfIdle && !queue.Idle())
     return cpu::Busy("image recognition");
   models::ccip::RgbImage image;
+  std::vector<models::ccip::RgbImage> wd14_images;
   try {
     // RGB8 with the alpha channel dropped (imgutils puts RGBA on white).
-    core::Image rgb =
-        core::DecodeImage(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
-    image.width = static_cast<int>(rgb.width);
-    image.height = static_cast<int>(rgb.height);
-    image.rgb = std::move(rgb.pixels);
+    image = DecodeRgb(bytes);
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", std::string("image: ") + error.what(), "invalid_request");
   }
+  for (std::size_t i = 0; i < wd14_bytes.size(); ++i) {
+    try {
+      wd14_images.push_back(DecodeRgb(wd14_bytes[i]));
+    } catch (const std::exception& error) {
+      return Error(400, "Bad Request",
+                   "wd14_tags.images[" + std::to_string(i) + "]: " + error.what(),
+                   "invalid_request");
+    }
+  }
   bytes.clear();
   bytes.shrink_to_fit();
+  wd14_bytes.clear();
+  // Explicit wd14 regions must leave a cut-out inside the image.
+  for (std::size_t i = 0; i < parsed.wd14.boxes.size(); ++i) {
+    const auto cut = models::ccip::MarginCropBox(parsed.wd14.boxes[i], parsed.wd14.margin,
+                                                 image.width, image.height);
+    if (cut[2] <= cut[0] || cut[3] <= cut[1])
+      return Error(400, "Bad Request",
+                   "wd14_tags.regions[" + std::to_string(i) + "] lies outside the image",
+                   "invalid_request");
+  }
   const double mean_luma = models::ccip::MeanLuma(image);
   const bool brightened = parsed.brighten_dark && mean_luma < parsed.dark_below;
   // The detectors see the brightened copy; later tasks (OCR, tags) keep
@@ -402,6 +511,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const auto started = std::chrono::steady_clock::now();
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();
+  std::vector<std::array<int, 4>> persons;  // for wd14_tags regions "person"
   try {
     models::ccip::SetCpuThreads(options_.threads);
     for (std::size_t i = 0; i < parsed.tasks.size(); ++i) {
@@ -417,6 +527,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         entry["label"] = labels[static_cast<std::size_t>(d.label)];
         entry["score"] = static_cast<double>(d.score);
         list.push_back(std::move(entry));
+        if (spec.task == "person")
+          persons.push_back(d.box);
       }
       detections[spec.task] = std::move(list);
       json::Value model = json::Value::object();
@@ -425,6 +537,12 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       model["conf"] = std::round(static_cast<double>(spec.conf) * 1e6) / 1e6;
       model["iou"] = std::round(static_cast<double>(spec.iou) * 1e6) / 1e6;
       used[spec.task] = std::move(model);
+    }
+    // Tags on the original pixels (never the brightened copy), like the
+    // pipeline's erkennung.py.
+    if (tagger != nullptr) {
+      detections[kWd14Task] = RunWd14(*tagger, image, parsed.wd14, persons, wd14_images);
+      used[kWd14Task] = Wd14ModelInfo(parsed.wd14);
     }
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),
