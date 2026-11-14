@@ -32,6 +32,30 @@ void ConvToNhwc(const float* x, bool chw_input, int h, int w, int cin, const flo
                 const float* bias, int cout, int kernel, int stride, int pad, float* y,
                 int* out_h, int* out_w);
 
+// Register-blocked AVX2/FMA versions for the OCR graph runtime (ocr_net.cpp).
+// Every output element is summed in the same order as Gemm (k ascending, one
+// FMA per step, starting from 0 or the column bias), so the results are bit
+// for bit those of Gemm; only the blocking and the threading differ.
+//
+// C[M,N] = A[M,K] * B[K,N] (+ col_bias[N] as the start value); row-major.
+void GemmFast(const float* a, const float* b, const float* col_bias, float* c, int m, int n,
+              int k);
+
+// Dense NCHW convolution (one group) as an implicit GEMM: im2col happens in
+// small per-thread panels, never for the whole image. weight [cout, cin, kh,
+// kw]; y [cout, oh, ow] = sum (k ascending as (ci, ky, kx)), then + bias[cout]
+// as a separate add (same rounding as Gemm followed by a bias pass).
+void ConvNchwFast(const float* x, int cin, int h, int w, const float* weight, const float* bias,
+                  int cout, int kh, int kw, int sh, int sw, int pt, int pl, int oh, int ow,
+                  float* y);
+
+// Depthwise NCHW convolution (one input and one output channel per group).
+// Per output: start at bias (or 0), then for ky, kx ascending over the taps
+// inside the image: y = y + w * x as a separate multiply and add (no FMA).
+void DepthwiseNchwFast(const float* x, int c, int h, int w, const float* weight,
+                       const float* bias, int kh, int kw, int sh, int sw, int pt, int pl, int oh,
+                       int ow, float* y);
+
 }  // namespace gufo::models::ccip::cpu
 
 #endif  // GUFO_MODELS_CCIP_CPU_KERNELS_HPP_
