@@ -240,7 +240,8 @@ std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& 
   return out.dump();
 }
 
-/// Bytes of an Ablage path, read through the gate with the caller's token.
+/// Bytes of an Ablage path, read through the gate with the caller's token
+/// or browser session (Authorization, Cookie).
 /// A refusal of the gate or the job store is returned in *failure.
 std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& outer,
                                      const std::string& path,
@@ -254,7 +255,7 @@ std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& 
   inner.is_cancelled = outer.is_cancelled;
   inner.request_id = outer.request_id;
   for (const auto& [name, value] : outer.headers) {
-    if (EqualsIgnoreCase(name, "Authorization"))
+    if (EqualsIgnoreCase(name, "Authorization") || EqualsIgnoreCase(name, "Cookie"))
       inner.headers.emplace_back(name, value);
   }
   inner.headers.emplace_back("Accept", "*/*");

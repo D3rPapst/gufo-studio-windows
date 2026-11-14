@@ -67,7 +67,8 @@
 //   the request first (image inline as a data URL); X-Gufo-Ran-On: partner
 //   marks its answer.
 //   An Ablage path is read through the gate with the caller's own
-//   Authorization (another user's job is the gate's 404), at most 20 MB.
+//   Authorization or session cookie (another user's job is the gate's
+//   404), at most 20 MB.
 //   Limits per request (400 beyond): kMaxRequestBytes encoded over all
 //   input pictures, kMaxRequestPixels decoded over all of them (decoded
 //   only once the request has its CPU turn).

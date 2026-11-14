@@ -943,7 +943,7 @@ FIFO order with `--vision-threads` threads in the CPU queue shared with
 open; a caller that disconnects leaves the line), the next one gets
 `503 busy` with `Retry-After: 5`. An Ablage path
 `/v1/jobs/{id}/files/{name}` is read through the gate with the caller's own
-`Authorization` (as the MCP tools do; another user's job is the gate's 404,
+`Authorization` or session cookie (as the MCP tools do; another user's job is the gate's 404,
 relayed), at most 20 MB. RGBA input loses its alpha channel (imgutils puts it
 on white). Area `bild`; the request is not counted against `tageslimit`.
 Pool: see below; the relayed body carries the image and the further
