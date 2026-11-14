@@ -664,8 +664,10 @@ router-host-gb = 1
   `served-model-name` values into alias ids; put the id in the section
   explicitly, as above. The router still injects `GUFO_HOST`/`GUFO_PORT`
   for the worker's bind address.
-- `GET /v1/models` reports such a model with `"modality": "external"`,
-  not the modality the program serves.
+- `GET /v1/models` reports such a model with the modality its leading
+  `args = serve <modality>` names, `llm` for a `llama-server` command
+  without such `args`, and `"external"` only when the command line does
+  not say (the `modality` paragraph under the front's endpoints below).
 
 Router hints `router-*` are read by the router itself in every local
 section (`ParseHint`) and never reach the worker. They tune
