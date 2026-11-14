@@ -31,6 +31,7 @@
 #include "src/cli/serve/router/comfy_graph.hpp"
 #include "src/cli/serve/router/mcp.hpp"
 #include "src/cli/serve/router/preset.hpp"
+#include "src/cli/serve/router/strings.hpp"
 #include "src/core/json.hpp"
 
 namespace {
@@ -1743,6 +1744,62 @@ void TestMediaJobs() {
     }
     return std::nullopt;
   };
+
+  // Ultra review #16, finding 3: a cut inside a UTF-8 character (title at
+  // 60 bytes, metadata prompt at 4000) left its lead byte, the strict JSON
+  // parser of the job API refused the submit. Umlaut and emoji right at
+  // the cut: the whole character goes, the submit stays valid JSON.
+  {
+    const std::string ue = "\xC3\xBC";                // ü, 2 bytes
+    const std::string smile = "\xF0\x9F\x98\x80";   // U+1F600, 4 bytes
+    struct Cut {
+      std::string prompt;
+      std::string titel;   // expected title
+      std::string kept;    // expected metadata prompt
+    };
+    const std::string turbo = "qwen-image-2.1-turbo \xC2\xB7 ";  // " · "
+    const std::vector<Cut> cuts = {
+        {std::string(59, 'a') + ue + "bc",
+         turbo + std::string(59, 'a') + "\xE2\x80\xA6",
+         std::string(59, 'a') + ue + "bc"},
+        {std::string(58, 'a') + smile + "x",
+         turbo + std::string(58, 'a') + "\xE2\x80\xA6",
+         std::string(58, 'a') + smile + "x"},
+        {std::string(57, 'a') + smile + "x",
+         turbo + std::string(57, 'a') + "\xE2\x80\xA6",
+         std::string(57, 'a') + smile + "x"},
+        {std::string(3998, 'b') + smile + "y",
+         turbo + std::string(60, 'b') + "\xE2\x80\xA6",
+         std::string(3998, 'b') + "\xE2\x80\xA6"},
+        {std::string(3999, 'b') + ue,
+         turbo + std::string(60, 'b') + "\xE2\x80\xA6",
+         std::string(3999, 'b') + "\xE2\x80\xA6"},
+    };
+    for (const Cut& cut : cuts) {
+      json::Value args = json::Value::object();
+      args["prompt"] = cut.prompt;
+      const HttpResponse cr =
+          f.Call("bild_erzeugen", args.dump(), kLan, Fixture::Bearer(mia));
+      CheckAccepted(cr, "qwen-image-2.1-turbo");
+      const json::Value submit = LastSubmit(f);  // null if not valid JSON
+      const json::Value* metadata = submit.find("metadata");
+      CHECK(metadata != nullptr);
+      if (metadata != nullptr) {
+        CHECK_EQ(metadata->member_str("titel"), cut.titel);
+        CHECK_EQ(metadata->member_str("prompt"), cut.kept);
+      }
+    }
+    // The helper itself, at every byte of a 2- and a 4-byte character.
+    using gufo::router::Utf8Prefix;
+    CHECK_EQ(std::string(Utf8Prefix("a" + ue, 1)), std::string("a"));
+    CHECK_EQ(std::string(Utf8Prefix("a" + ue, 2)), std::string("a"));
+    CHECK_EQ(std::string(Utf8Prefix("a" + ue, 3)), "a" + ue);
+    for (std::size_t n = 1; n <= 4; ++n)
+      CHECK_EQ(std::string(Utf8Prefix("a" + smile + "b", n)), std::string("a"));
+    CHECK_EQ(std::string(Utf8Prefix("a" + smile + "b", 5)), "a" + smile);
+    CHECK_EQ(std::string(Utf8Prefix(smile, 0)), std::string());
+    CHECK_EQ(std::string(Utf8Prefix("abc", 10)), std::string("abc"));
+  }
 
   // bild_erzeugen: the page's body, the priority header, the metadata.
   HttpResponse r = f.Call(

@@ -1967,7 +1967,9 @@ matching page uses, with the body that page sends (pages/bild, video,
 stimme, musik, objekt, hochskalieren), so a job made through MCP is a
 job of that page in the Ablage: `metadata {quelle: "mcp", seite, titel,
 modell, prompt?, seed?, ...}`; `titel` is the caller's or built from the
-model and the prompt. `vorrang` (0-9) goes as `X-Gufo-Priority` on the
+model and the prompt (its first 60 bytes; `metadata.prompt` keeps at most
+4000; a cut ends with `…` and never splits a UTF-8 character, whose lone
+lead byte the job API's JSON parser would refuse as `400 invalid_json`). `vorrang` (0-9) goes as `X-Gufo-Priority` on the
 submit (and as its `priority` member), replacing a priority header of the
 `/mcp` request. `model` defaults to the preset's first model of the
 modality (the schema's `default`; the preset's models are named in the

@@ -44,6 +44,24 @@ namespace gufo::router {
   return text;
 }
 
+/// The longest prefix of `text` with at most `max_bytes` bytes that does
+/// not end inside a UTF-8 sequence: a character the cut would split goes
+/// as a whole, its lead byte included (a lone lead byte is invalid UTF-8,
+/// which strict JSON parsers refuse).
+[[nodiscard]] inline std::string_view Utf8Prefix(std::string_view text,
+                                                 std::size_t max_bytes) {
+  if (text.size() <= max_bytes)
+    return text;
+  std::size_t end = max_bytes;
+  // text[end] is the first byte cut off; step back over at most three
+  // continuation bytes to the start of its character.
+  for (int i = 0; i < 3 && end > 0 &&
+                  (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80;
+       ++i)
+    --end;
+  return text.substr(0, end);
+}
+
 /// Trimmed, non-empty parts between `sep`.
 [[nodiscard]] inline std::vector<std::string> Split(std::string_view text,
                                                     char sep) {

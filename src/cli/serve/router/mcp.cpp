@@ -906,7 +906,8 @@ json::Value HttpFailure(const McpService::InnerAnswer& answer) {
   if (code.empty())
     code = "http_" + std::to_string(answer.status);
   if (message.empty())
-    message = answer.body.empty() ? "no details" : answer.body.substr(0, 200);
+    message = answer.body.empty() ? "no details"
+                                  : std::string(Utf8Prefix(answer.body, 200));
   return ToolFailure(answer.status, std::move(code), std::move(message),
                      answer.retry_after);
 }
@@ -915,7 +916,7 @@ json::Value HttpFailure(const McpService::InnerAnswer& answer) {
 json::Value UnexpectedAnswer(const McpService::InnerAnswer& answer) {
   return ToolFailure(answer.status, "unexpected_answer",
                      "unerwartete Antwort (unexpected answer): " +
-                         answer.body.substr(0, 200));
+                         std::string(Utf8Prefix(answer.body, 200)));
 }
 
 /// Parses a 2xx JSON answer; nullopt when it is none.
@@ -1163,17 +1164,13 @@ std::string ArgEnum(const json::Value& args, const std::string& key,
   return value;
 }
 
-/// The first `n` characters of a prompt for the job title.
+/// At most the first `n` bytes of a prompt (job title, metadata), cut
+/// before a character, never inside one (Utf8Prefix), with "…" when cut.
 std::string Short(std::string_view text, std::size_t n) {
-  std::string out(Trim(text));
-  if (out.size() > n) {
-    out.resize(n);
-    // Do not cut a UTF-8 sequence.
-    while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80)
-      out.pop_back();
-    out += "…";
-  }
-  return out;
+  const std::string_view trimmed = Trim(text);
+  if (trimmed.size() <= n)
+    return std::string(trimmed);
+  return std::string(Utf8Prefix(trimmed, n)) + "…";
 }
 
 json::Value MetadataFor(const std::string& seite, const json::Value& args,
