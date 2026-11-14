@@ -1869,7 +1869,7 @@ list:
 | `objekt_3d` | 3d | job around `/v1/3d/generations` | job |
 | `hochskalieren` | bild or video (by file type) | job around `/v1/images/upscale` or `/v1/videos/upscale` | job |
 | `auftrag_status` | ablage | `GET /v1/jobs/{id}` | the job view (`status`, `fortschritt`, `dateien`, ...) |
-| `auftrag_liste` | ablage | `GET /v1/jobs?limit=&status=&kind=&q=` | `{auftraege: [...]}` |
+| `auftrag_liste` | ablage | `GET /v1/jobs?limit=1000&status=&kind=&q=` | `{auftraege: [...]}` |
 | `auftrag_abbrechen` | ablage | `GET` then `DELETE /v1/jobs/{id}` | `{auftrag_id, status, geloescht}` |
 | `ablage_lesen` | ablage | `GET /v1/jobs/{id}` (+ `/files/{name}` when embedding) | `{auftrag_id, name, url, content_type, bytes, eingebettet}` + link or image/audio block |
 
@@ -1936,9 +1936,12 @@ The tools of 2.1 (`modelle`, `chat`, `auftrag_status`, `auftrag_liste`,
   content_type, bytes}], fehler?, vorschau_url?, erstellt, fertig?, url}`
   with ISO 8601 UTC times.
 - `auftrag_liste` `{status?, art?, limit? (1-50, default 20), suche?}`:
-  `GET /v1/jobs?limit=&status=&kind=&q=` (the gate keeps the caller's
-  own jobs) as `{auftraege: [{auftrag_id, status, art, model?, titel?,
-  fortschritt, erstellt, url}]}`.
+  `GET /v1/jobs?limit=1000&status=&kind=&q=` (the gate keeps the
+  caller's own jobs; `limit` is applied after that filter, so other
+  users' newer jobs do not push the caller's out of a short list; only
+  the store's 1000 newest matching jobs are looked at) as `{auftraege:
+  [{auftrag_id, status, art, model?, titel?, fortschritt, erstellt,
+  url}]}`.
 - `auftrag_abbrechen` `{auftrag_id, loeschen? = false}`: reads the job
   first; a finished one (completed, failed, cancelled) is `isError 409
   job_finished` unless `loeschen` is true, then (or for a queued or

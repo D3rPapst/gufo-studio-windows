@@ -1311,11 +1311,18 @@ void TestJobs() {
     const std::string& p = req.path;
     if (req.method == "GET") {
       if (p == "/v1/jobs") {
+        // Newest first, cut at `limit` before the gate's owner filter,
+        // as JobQueue::List does: bob's job jx is the newest.
+        const std::size_t limit = static_cast<std::size_t>(
+            std::stoll(req.query_param("limit").empty()
+                           ? std::string("100")
+                           : req.query_param("limit")));
         json::Value body = json::Value::object();
         json::Value data = json::Value::array();
-        data.push_back(j1);
-        data.push_back(j2);
-        data.push_back(jx);
+        for (const json::Value* job :
+             std::initializer_list<const json::Value*>{&jx, &j1, &j2})
+          if (data.size() < limit)
+            data.push_back(*job);
         body["object"] = "list";
         body["data"] = std::move(data);
         return JsonAnswer(200, body);
@@ -1428,14 +1435,37 @@ void TestJobs() {
       CHECK(list->items()[0].find("dateien") == nullptr);  // the short view
       CHECK_EQ(list->items()[1].member_str("auftrag_id"), std::string("j2"));
     }
-    CHECK_EQ(f.Requests("/v1/jobs").back().query, std::string("limit=20"));
+    // The store's maximum; the tool cuts to its limit after the gate.
+    CHECK_EQ(f.Requests("/v1/jobs").back().query, std::string("limit=1000"));
+  }
+  // Ultra review #16, finding 2: bob's newer job must not push tim's out
+  // of a short list; the limit counts the caller's own jobs.
+  r = f.Call("auftrag_liste", "{\"limit\":1}", kLan, Fixture::Bearer(tim));
+  CheckShape(r, false);
+  {
+    const json::Value s = Structured(r);
+    const json::Value* list = s.find("auftraege");
+    CHECK(list != nullptr && list->size() == 1);
+    if (list != nullptr && list->size() == 1)
+      CHECK_EQ(list->items()[0].member_str("auftrag_id"), std::string("j1"));
+  }
+  r = f.Call("auftrag_liste", "{\"limit\":2}");  // loopback admin
+  CheckShape(r, false);
+  {
+    const json::Value s = Structured(r);
+    const json::Value* list = s.find("auftraege");
+    CHECK(list != nullptr && list->size() == 2);
+    if (list != nullptr && list->size() == 2) {
+      CHECK_EQ(list->items()[0].member_str("auftrag_id"), std::string("jx"));
+      CHECK_EQ(list->items()[1].member_str("auftrag_id"), std::string("j1"));
+    }
   }
   r = f.Call("auftrag_liste",
              "{\"status\":\"completed\",\"art\":\"image\",\"limit\":5,\"suche\":\"Haus am See\"}",
              kLan, Fixture::Bearer(tim));
   CheckShape(r, false);
   CHECK_EQ(f.Requests("/v1/jobs").back().query,
-           std::string("limit=5&status=completed&kind=image&q=Haus%20am%20See"));
+           std::string("limit=1000&status=completed&kind=image&q=Haus%20am%20See"));
   CHECK_EQ(f.Requests("/v1/jobs").back().query_param("q"), std::string("Haus am See"));
   r = f.Call("auftrag_liste", "{}");  // loopback admin: every job
   CheckShape(r, false);

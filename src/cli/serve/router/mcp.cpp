@@ -1046,6 +1046,11 @@ bool Finished(std::string_view status) {
   return status == "completed" || status == "failed" || status == "cancelled";
 }
 
+/// The jobs auftrag_liste asks the job store for (its own maximum,
+/// JobQueue::List); the tool's `limit` applies after the gate's owner
+/// filter.
+constexpr int kJobListFetch = 1000;
+
 /// Paths a tool may send inward (never /mcp itself).
 bool InnerPathAllowed(std::string_view path) {
   return path == "/v1/models" || path == "/v1/chat/completions" ||
@@ -1624,7 +1629,11 @@ json::Value McpService::RunAuftragListe(const json::Value& args,
                           std::end(kKinds))
     throw InvalidParams(
         "arguments.art must be one of image, music, speech, video, other");
-  std::string query = "limit=" + std::to_string(limit);
+  // The gate keeps a non-admin's own jobs only after the job store cut
+  // its list: ask for the store's most (1000) and cut to `limit` here, so
+  // other users' newer jobs do not push the caller's out (ultra review
+  // #16, finding 2).
+  std::string query = "limit=" + std::to_string(kJobListFetch);
   if (!status.empty())
     query += "&status=" + status;
   if (!art.empty())
@@ -1639,8 +1648,11 @@ json::Value McpService::RunAuftragListe(const json::Value& args,
   if (data == nullptr || !data->is_array())
     return UnexpectedAnswer(answer);
   json::Value list = json::Value::array();
-  for (const json::Value& job : data->items())
+  for (const json::Value& job : data->items()) {
+    if (list.size() >= static_cast<std::size_t>(limit))
+      break;
     list.push_back(MapJob(job, false));
+  }
   json::Value structured = json::Value::object();
   structured["auftraege"] = std::move(list);
   return ToolResult(std::move(structured));
