@@ -491,7 +491,10 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // Decision models (gufo serve decision, LFM3 d1); JSON in, scores out.
       "/v1/systemone",
       // TripoSG image-to-3D jobs (gufo serve objekt), async via /v1/jobs.
-      "/v1/3d/generations"};
+      "/v1/3d/generations",
+      // Depth / open-vocabulary boxes / masks (gufo serve vision); the
+      // router's own /v1/vision/detect is answered before routing.
+      "/v1/vision/depth", "/v1/vision/find", "/v1/vision/segment"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }

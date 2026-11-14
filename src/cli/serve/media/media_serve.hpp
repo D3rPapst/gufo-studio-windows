@@ -18,10 +18,11 @@
 #include "src/cli/serve/media/media_service.hpp"
 #include "src/cli/serve/media/upscale_api.hpp"
 #include "src/cli/serve/media/video_postprocess.hpp"
+#include "src/cli/serve/media/vision_api.hpp"
 
 namespace gufo::server {
 
-/// "music", "foley", "upscale" or "omni".
+/// "music", "foley", "upscale", "omni" or "vision".
 [[nodiscard]] bool IsMediaServeCommand(std::string_view subcommand);
 /// Help lines for `gufo serve --help` (one per command, newline-terminated).
 [[nodiscard]] std::string MediaServeCommandsHelp();
@@ -34,6 +35,7 @@ struct MediaServeArgs {
   // music: --dit FILE|turbo|sft|base, --lm FILE|none|0.6b|1.7b|4b, --variant.
   std::string music_dit, music_lm, music_variant;
   UpscaleServeOptions upscale;  // upscale
+  VisionServeOptions vision;    // vision (depth / find / segment)
   // omni (Qwen3-Omni-30B-A3B-Captioner): projector GGUF and limits.
   std::filesystem::path mmproj;
   std::size_t context{8192};
