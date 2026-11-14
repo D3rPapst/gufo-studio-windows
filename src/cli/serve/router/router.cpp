@@ -1060,19 +1060,26 @@ public:
     std::string model;
     bool remote{false};
     std::chrono::steady_clock::time_point at{};
+    /// The request's user (comfy::RestrictedUser; "" for an admin, the
+    /// router, loopback): another user neither overwrites nor reads it.
+    std::string user;
   };
   std::map<std::string, PreviewSide, std::less<>> preview_sides_;
 
   /// Records the side of `preview_id` (state mutex held); forgets entries
   /// older than an hour, keeps at most 1024.
   void NotePreviewSideLocked(const std::string& preview_id,
-                             const std::string& model_id, bool remote) {
+                             const std::string& model_id, bool remote,
+                             const std::string& user) {
     if (preview_id.empty())
       return;
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(preview_sides_, [&](const auto& entry) {
       return now - entry.second.at > std::chrono::hours(1);
     });
+    if (const auto taken = preview_sides_.find(preview_id);
+        taken != preview_sides_.end() && taken->second.user != user)
+      return;  // another user's id: its preview stays where it is
     while (preview_sides_.size() >= 1024) {
       auto oldest = preview_sides_.begin();
       for (auto it = preview_sides_.begin(); it != preview_sides_.end(); ++it)
@@ -1080,7 +1087,7 @@ public:
           oldest = it;
       preview_sides_.erase(oldest);
     }
-    preview_sides_[preview_id] = PreviewSide{model_id, remote, now};
+    preview_sides_[preview_id] = PreviewSide{model_id, remote, now, user};
   }
 
   /// {job id: "wait"|"local"|"remote"}; entries older than a day go.
@@ -1973,7 +1980,8 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "local");
-        NotePreviewSideLocked(preview_id, model_id, /*remote=*/false);
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/false,
+                              router::comfy::RestrictedUser(req));
         ++pool_[model_id].local_picks;
         // The claim keeps the local worker "taken" for other pool requests
         // until this one's busy count is armed (after a cold load).
@@ -2012,7 +2020,8 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "remote");
-        NotePreviewSideLocked(preview_id, model_id, /*remote=*/true);
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/true,
+                              router::comfy::RestrictedUser(req));
         ++pool_[model_id].remote_picks;
         pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
         HttpResponse response =
@@ -2672,7 +2681,7 @@ public:
     }
     if (comfy != nullptr && !forwarded) {
       // A ComfyUI prompt's preview id (2.1): known from /prompt on.
-      if (auto route = comfy->FindPreview(id)) {
+      if (auto route = comfy->FindPreview(id, router::comfy::RestrictedUser(req))) {
         plan.comfy_known = true;
         if (route->target.empty()) {
           plan.kind = PreviewPlan::Kind::kWait;
@@ -2688,7 +2697,13 @@ public:
         model_id = route->video ? std::string() : route->model;
       }
     }
-    const auto side = preview_sides_.find(id);
+    auto side = preview_sides_.find(id);
+    if (side != preview_sides_.end() && !plan.comfy_known) {
+      // Another user's pool request: not this reader's preview.
+      const std::string reader = router::comfy::RestrictedUser(req);
+      if (!reader.empty() && !side->second.user.empty() && side->second.user != reader)
+        side = preview_sides_.end();
+    }
     if (side != preview_sides_.end() && model_id.empty())
       model_id = side->second.model;
     if (model_id.empty())

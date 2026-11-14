@@ -1338,6 +1338,23 @@ def check_owners(binary, tmp):
         assert queue["queue_pending"] == [], queue
         assert router.wait(tim)["status"]["status_str"] == "success"
         assert router.wait(ina)["status"]["status_str"] == "success"
+
+        # Preview ids per user: ina can neither take tim's live
+        # gufo_preview_id nor read its preview; tim reads it.
+        status, payload = call("tim", "POST", "/prompt", {
+            "prompt": qwen_graph(prompt="SLOW tim preview", prefix="film/own/tim"),
+            "extra_data": {"gufo_preview_id": "szene-1"}})
+        assert status == 200, payload
+        tim = json.loads(payload)["prompt_id"]
+        status, payload = call("ina", "POST", "/prompt", {
+            "prompt": qwen_graph(prompt="SLOW ina preview", prefix="film/own/ina"),
+            "extra_data": {"gufo_preview_id": "szene-1"}})
+        assert status == 400 and b"gufo_preview_id" in payload, (status, payload)
+        status, payload = call("ina", "GET", "/v1/previews/szene-1?format=json")
+        assert status == 404, (status, payload)
+        status, payload = call("tim", "GET", "/v1/previews/szene-1?format=json")
+        assert status == 200, (status, payload)
+        assert router.wait(tim)["status"]["status_str"] == "success"
     except BaseException:
         print(router.tail())
         raise

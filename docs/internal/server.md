@@ -765,7 +765,14 @@ then relays the worker's stream; a prompt that ends without the task
 an id this router knows waits (a ComfyUI prompt's, a pool request's, an
 open job's); any other id is `404` at once even with `?model=` of a model
 that is not loaded (a page connects again), and at most 4 such streams
-wait at the same time (`kMaxWaitingPreviews`; the next one: `503 busy`). A
+wait at the same time (`kMaxWaitingPreviews`; the next one: `503 busy`).
+With users, a preview id belongs to the user whose prompt (or pool image
+request) registered it: another signed-in user who is no admin can neither
+take it while that prompt lives (`/prompt` answers `400`, a pool request's
+side is not overwritten) nor reach that preview through the id (`404`);
+the router's own and loopback's prompts stay readable for everyone. A
+worker's preview read directly with `?model=` has no owner check (as
+before 2.1). A
 plain read answers `pending` (204, or JSON for `format=json|frame-json`)
 meanwhile. For a video task the id leads to the video job's preview
 (H3: a WebP loop with a JPEG middle frame for `format=frame`). The worker
