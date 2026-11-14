@@ -681,8 +681,9 @@ std::string ReportedModality(const PresetModel& preset) {
   // `args`, as the production preset runs its GGUF chat models) is a
   // chat model.
   std::string command = preset.command;
-  std::transform(command.begin(), command.end(), command.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(
+      command.begin(), command.end(), command.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   if (command.find("llama-server") != std::string::npos)
     return "llm";
   return "external";

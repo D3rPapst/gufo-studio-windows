@@ -207,8 +207,7 @@ private:
   [[nodiscard]] json::Value ServerInfo() const;
   [[nodiscard]] const Tool* FindTool(std::string_view name,
                                      const auth::Identity& who) const;
-  [[nodiscard]] bool Visible(const Tool& tool,
-                             const auth::Identity& who) const;
+  [[nodiscard]] bool Visible(const Tool& tool, const auth::Identity& who) const;
   /// One inner request through Options::serve: `outer`'s token, address
   /// and cancellation, a JSON body when `body` is set, `extra` headers
   /// (an X-Gufo-Priority there replaces the outer one). `path` must be
@@ -221,14 +220,14 @@ private:
       std::size_t max_body = kInnerBodyLimit) const;
   /// The cap of an inner answer without a tighter one of its own (job
   /// views, lists, chat replies).
-  static constexpr std::size_t kInnerBodyLimit =
-      static_cast<std::size_t>(64) << 20;
+  static constexpr std::size_t kInnerBodyLimit = static_cast<std::size_t>(64)
+                                                 << 20;
   /// The documented default of a tool's `model` field.
   [[nodiscard]] std::string DefaultModel(std::string_view tool) const;
 
   /// A single input file of any media tool (the video anchors' limit).
-  static constexpr std::size_t kMediaBytesLimit =
-      static_cast<std::size_t>(20) << 20;
+  static constexpr std::size_t kMediaBytesLimit = static_cast<std::size_t>(20)
+                                                  << 20;
   /// An Ablage path (through the gate) or a base64 data URL, at most
   /// `limit` bytes (checked before the bytes are read or decoded) and not
   /// empty; `too_large` replaces the "larger than 20 MB" message.
@@ -241,14 +240,11 @@ private:
   /// `content_type` (base64 in the submit), `vorrang` as X-Gufo-Priority,
   /// `metadata` (quelle mcp is added): the uniform job tool result, whose
   /// `modell` is the store's `request.model` or `model`.
-  [[nodiscard]] json::Value SubmitJob(const server::HttpRequest& outer,
-                                      const std::string& path,
-                                      const json::Value& body,
-                                      const std::string& raw_body,
-                                      const std::string& content_type,
-                                      const std::string& model,
-                                      std::optional<long long> vorrang,
-                                      json::Value metadata) const;
+  [[nodiscard]] json::Value SubmitJob(
+      const server::HttpRequest& outer, const std::string& path,
+      const json::Value& body, const std::string& raw_body,
+      const std::string& content_type, const std::string& model,
+      std::optional<long long> vorrang, json::Value metadata) const;
 
   // The builders (Commit 2). Each returns a tool result (`content`,
   // `structuredContent`, maybe `isError`); bad arguments throw

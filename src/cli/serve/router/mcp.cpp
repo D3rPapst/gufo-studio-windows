@@ -47,10 +47,10 @@ HttpResponse JsonResponse(
 
 /// The router's error shape for the HTTP-level refusals of the endpoint
 /// itself (wrong method, wrong content type, endpoint off).
-HttpResponse HttpError(int status, std::string_view reason,
-                       std::string_view message, std::string_view code,
-                       std::vector<std::pair<std::string, std::string>> headers =
-                           {}) {
+HttpResponse HttpError(
+    int status, std::string_view reason, std::string_view message,
+    std::string_view code,
+    std::vector<std::pair<std::string, std::string>> headers = {}) {
   json::Value detail = json::Value::object();
   detail["message"] = std::string(message);
   detail["type"] = "invalid_request_error";
@@ -245,13 +245,17 @@ const char* kTitelSchema =
     R"json({"type": "string", "maxLength": 200,
             "description": "Titel in der Ablage (job title)"})json";
 
-json::Value Titel() { return json::parse(kTitelSchema); }
+json::Value Titel() {
+  return json::parse(kTitelSchema);
+}
 
 const char* kVorrangSchema =
     R"json({"type": "integer", "minimum": 0, "maximum": 9, "default": 0,
             "description": "Vorrang 0-9, 9 zuerst (priority, 9 runs first)"})json";
 
-json::Value Vorrang() { return json::parse(kVorrangSchema); }
+json::Value Vorrang() {
+  return json::parse(kVorrangSchema);
+}
 
 std::vector<Tool> BuildTools(const Options& options) {
   std::vector<Tool> tools;
@@ -263,7 +267,8 @@ std::vector<Tool> BuildTools(const Options& options) {
   const std::vector<std::string> music =
       ModelIds(options.models, {"music", "moss-music"});
   const std::vector<std::string> objekt = ModelIds(options.models, {"objekt"});
-  const std::vector<std::string> upscale = ModelIds(options.models, {"upscale"});
+  const std::vector<std::string> upscale =
+      ModelIds(options.models, {"upscale"});
 
   // modelle ----------------------------------------------------------------
   {
@@ -782,8 +787,8 @@ std::optional<double> ArgNumber(const json::Value& args, const std::string& key,
   if (v == nullptr)
     return std::nullopt;
   if (!v->is_number() || v->as_double() < min)
-    throw InvalidParams("arguments." + key + " must be a number >= " +
-                        std::to_string(min));
+    throw InvalidParams("arguments." + key +
+                        " must be a number >= " + std::to_string(min));
   return v->as_double();
 }
 
@@ -1158,8 +1163,9 @@ std::string SizeArg(const json::Value& args, int step, long long max_pixels) {
   if (!breite.has_value())
     return {};
   if (step > 1 && (*breite % step != 0 || *hoehe % step != 0))
-    throw InvalidParams("arguments.breite and arguments.hoehe must be multiples of " +
-                        std::to_string(step));
+    throw InvalidParams(
+        "arguments.breite and arguments.hoehe must be multiples of " +
+        std::to_string(step));
   if (max_pixels > 0 && *breite * *hoehe > max_pixels)
     throw InvalidParams("arguments.breite x arguments.hoehe must be at most " +
                         std::to_string(max_pixels) + " pixels");
@@ -1197,7 +1203,8 @@ json::Value MetadataFor(const std::string& seite, const json::Value& args,
   metadata["seite"] = seite;
   metadata["titel"] = titel;
   metadata["modell"] = model;
-  if (const json::Value* seed = Arg(args, "seed"); seed != nullptr && seed->is_number())
+  if (const json::Value* seed = Arg(args, "seed");
+      seed != nullptr && seed->is_number())
     metadata["seed"] = *seed;
   return metadata;
 }
@@ -1500,7 +1507,8 @@ json::Value McpService::RunChat(const json::Value& args,
         throw InvalidParams("arguments.verlauf[] must be {rolle, text}");
       const std::string rolle = turn.member_str("rolle");
       if (rolle != "user" && rolle != "assistant")
-        throw InvalidParams("arguments.verlauf[].rolle must be user or assistant");
+        throw InvalidParams(
+            "arguments.verlauf[].rolle must be user or assistant");
       const json::Value* text = turn.find("text");
       if (text == nullptr || !text->is_string())
         throw InvalidParams("arguments.verlauf[].text must be a string");
@@ -1530,7 +1538,8 @@ json::Value McpService::RunChat(const json::Value& args,
                            "(send smaller or fewer images)");
     };
     for (const json::Value& bild : bilder->items()) {
-      const std::string where = "arguments.bilder[" + std::to_string(index++) + "]";
+      const std::string where =
+          "arguments.bilder[" + std::to_string(index++) + "]";
       if (!bild.is_string())
         throw InvalidParams(where + " must be a string");
       std::string url = bild.str();
@@ -1550,8 +1559,8 @@ json::Value McpService::RunChat(const json::Value& args,
         if (total > kChatImagesLimit)
           throw too_large(where);
       } else {
-        throw InvalidParams(where +
-                            " must be /v1/jobs/<id>/files/<name> or a data: URL");
+        throw InvalidParams(
+            where + " must be /v1/jobs/<id>/files/<name> or a data: URL");
       }
       json::Value image = json::Value::object();
       json::Value ref = json::Value::object();
@@ -1587,7 +1596,8 @@ json::Value McpService::RunChat(const json::Value& args,
   if (answer.status >= 400)
     return HttpFailure(answer);
   const std::optional<json::Value> reply = JsonOf(answer);
-  const json::Value* choices = reply.has_value() ? reply->find("choices") : nullptr;
+  const json::Value* choices =
+      reply.has_value() ? reply->find("choices") : nullptr;
   if (choices == nullptr || !choices->is_array() || choices->size() == 0)
     return UnexpectedAnswer(answer);
   const json::Value& choice = choices->items()[0];
@@ -1617,11 +1627,11 @@ json::Value McpService::RunChat(const json::Value& args,
   structured["text"] = text;
   if (!gedanken.empty())
     structured["gedanken"] = gedanken;
-  structured["model"] = reply->member_str("model").empty()
-                            ? model
-                            : reply->member_str("model");
+  structured["model"] =
+      reply->member_str("model").empty() ? model : reply->member_str("model");
   json::Value usage = json::Value::object();
-  if (const json::Value* u = reply->find("usage"); u != nullptr && u->is_object()) {
+  if (const json::Value* u = reply->find("usage");
+      u != nullptr && u->is_object()) {
     usage["prompt_tokens"] = NumberOf(*u, "prompt_tokens");
     usage["completion_tokens"] = NumberOf(*u, "completion_tokens");
   }
@@ -1653,12 +1663,13 @@ json::Value McpService::RunAuftragListe(const json::Value& args,
       "queued", "in_progress", "completed", "failed", "cancelled"};
   if (!status.empty() && std::find(std::begin(kStatus), std::end(kStatus),
                                    status) == std::end(kStatus))
-    throw InvalidParams("arguments.status must be one of queued, in_progress, "
-                        "completed, failed, cancelled");
+    throw InvalidParams(
+        "arguments.status must be one of queued, in_progress, "
+        "completed, failed, cancelled");
   static constexpr std::string_view kKinds[] = {"image", "music", "speech",
                                                 "video", "other"};
-  if (!art.empty() && std::find(std::begin(kKinds), std::end(kKinds), art) ==
-                          std::end(kKinds))
+  if (!art.empty() &&
+      std::find(std::begin(kKinds), std::end(kKinds), art) == std::end(kKinds))
     throw InvalidParams(
         "arguments.art must be one of image, music, speech, video, other");
   // The gate keeps a non-admin's own jobs only after the job store cut
@@ -1782,8 +1793,10 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
     extra["auftrag_id"] = id;
     extra["status"] = view->member_str("status");
     return ToolFailure(404, "file_not_found",
-                       "Auftrag " + id + " hat keine Bild-, Ton- oder "
-                           "Videodatei (status " + view->member_str("status") +
+                       "Auftrag " + id +
+                           " hat keine Bild-, Ton- oder "
+                           "Videodatei (status " +
+                           view->member_str("status") +
                            "; job has no media file yet)",
                        0, std::move(extra));
   }
@@ -1794,7 +1807,8 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
   // Fetch when the content is wanted and may fit, or when the list did
   // not know the file (then its answer gives type and size).
   const bool fetch =
-      (inhalt && inline_kind && (bytes < 0 || static_cast<std::size_t>(bytes) <= limit)) ||
+      (inhalt && inline_kind &&
+       (bytes < 0 || static_cast<std::size_t>(bytes) <= limit)) ||
       bytes < 0;
   std::string data;
   bool embedded = false;
@@ -1808,8 +1822,7 @@ json::Value McpService::RunAblageLesen(const json::Value& args,
       content_type = file.content_type;
     bytes = file.truncated ? -1 : static_cast<long long>(file.body.size());
     if (inhalt && !file.truncated && !media_kind(content_type).empty() &&
-        media_kind(content_type) != "video" &&
-        file.body.size() <= limit) {
+        media_kind(content_type) != "video" && file.body.size() <= limit) {
       data = comfy::Base64Encode(file.body);
       embedded = true;
     }
@@ -1867,9 +1880,10 @@ McpService::Media McpService::ReadMedia(const HttpRequest& outer,
     if (file.truncated)
       throw refuse();
     media.bytes = std::move(file.body);
-    media.content_type = file.content_type.empty()
-                             ? std::string("application/octet-stream")
-                             : file.content_type.substr(0, file.content_type.find(';'));
+    media.content_type =
+        file.content_type.empty()
+            ? std::string("application/octet-stream")
+            : file.content_type.substr(0, file.content_type.find(';'));
     media.name = value.substr(value.rfind('/') + 1);
   } else {
     // A data URL's size from its base64 text (3 bytes per 4 characters,
@@ -1893,14 +1907,11 @@ McpService::Media McpService::ReadMedia(const HttpRequest& outer,
   return media;
 }
 
-json::Value McpService::SubmitJob(const HttpRequest& outer,
-                                  const std::string& path,
-                                  const json::Value& body,
-                                  const std::string& raw_body,
-                                  const std::string& content_type,
-                                  const std::string& model,
-                                  std::optional<long long> vorrang,
-                                  json::Value metadata) const {
+json::Value McpService::SubmitJob(
+    const HttpRequest& outer, const std::string& path, const json::Value& body,
+    const std::string& raw_body, const std::string& content_type,
+    const std::string& model, std::optional<long long> vorrang,
+    json::Value metadata) const {
   json::Value request = json::Value::object();
   request["method"] = "POST";
   request["path"] = path;
@@ -2009,8 +2020,8 @@ json::Value McpService::RunBildErzeugen(const json::Value& args,
     gufo["negative_prompt"] = negativ;
     body["gufo"] = std::move(gufo);
   }
-  json::Value metadata =
-      MetadataFor("bild", args, TitelArg(args, model + " · " + Short(prompt, 60)), model);
+  json::Value metadata = MetadataFor(
+      "bild", args, TitelArg(args, model + " · " + Short(prompt, 60)), model);
   metadata["prompt"] = Short(prompt, 4000);
   if (!size.empty())
     metadata["groesse"] = size;
@@ -2032,7 +2043,8 @@ json::Value McpService::RunBildBearbeiten(const json::Value& args,
     model = DefaultModel("bild_bearbeiten");
   const json::Value* bilder = Arg(args, "bilder");
   if (bilder == nullptr || !bilder->is_array() || bilder->size() == 0)
-    throw InvalidParams("arguments.bilder must be a non-empty array of strings");
+    throw InvalidParams(
+        "arguments.bilder must be a non-empty array of strings");
   if (bilder->size() > 10)
     throw InvalidParams("arguments.bilder takes at most 10 images");
   const std::string maske = ArgString(args, "maske", false);
@@ -2049,7 +2061,8 @@ json::Value McpService::RunBildBearbeiten(const json::Value& args,
   std::size_t total = 0;
   std::size_t index = 0;
   for (const json::Value& bild : bilder->items()) {
-    const std::string where = "arguments.bilder[" + std::to_string(index++) + "]";
+    const std::string where =
+        "arguments.bilder[" + std::to_string(index++) + "]";
     if (!bild.is_string())
       throw InvalidParams(where + " must be a string");
     Media media = ReadMedia(outer, bild.str(), where);
@@ -2120,8 +2133,8 @@ json::Value McpService::RunBildBearbeiten(const json::Value& args,
   if (mask.has_value())
     metadata["maske"] = true;
   return SubmitJob(outer, "/v1/images/edits", json::Value(), raw,
-                   "multipart/form-data; boundary=" + boundary, model,
-                   vorrang, std::move(metadata));
+                   "multipart/form-data; boundary=" + boundary, model, vorrang,
+                   std::move(metadata));
 }
 
 json::Value McpService::RunVideoErzeugen(const json::Value& args,
@@ -2156,7 +2169,8 @@ json::Value McpService::RunVideoErzeugen(const json::Value& args,
   const auto vorrang = ArgInt(args, "vorrang", 0, 9);
   // The limits the pages state (de.ini [faehigkeiten]).
   if (!endbild.empty() && !h3)
-    throw InvalidParams("arguments.endbild: only minimax-h3 takes an end frame");
+    throw InvalidParams(
+        "arguments.endbild: only minimax-h3 takes an end frame");
   if (!ton.empty() && (wan || cam))
     throw InvalidParams("arguments.ton: " + model + " takes no audio");
   if ((cam || talk) && startbild.empty())
@@ -2261,9 +2275,11 @@ json::Value McpService::RunStimme(const json::Value& args,
   const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
   const auto vorrang = ArgInt(args, "vorrang", 0, 9);
   if (model == "fish-drama-3" && !probe.empty() && Trim(wortlaut).empty())
-    throw InvalidParams("arguments.wortlaut is required with a probe for fish-drama-3");
+    throw InvalidParams(
+        "arguments.wortlaut is required with a probe for fish-drama-3");
   if (model == "qwen3-tts-voicedesign" && Trim(beschreibung).empty())
-    throw InvalidParams("arguments.beschreibung is required for qwen3-tts-voicedesign");
+    throw InvalidParams(
+        "arguments.beschreibung is required for qwen3-tts-voicedesign");
   json::Value body = json::Value::object();
   body["model"] = model;
   body["input"] = text;
@@ -2333,8 +2349,9 @@ json::Value McpService::RunMusik(const json::Value& args,
     body["bitrate_kbps"] = 192;
   json::Value metadata = MetadataFor(
       "musik", args,
-      TitelArg(args, std::to_string(static_cast<long long>(sekunden.value_or(30.0))) +
-                         " s · " + Short(stil, 60)),
+      TitelArg(args,
+               std::to_string(static_cast<long long>(sekunden.value_or(30.0))) +
+                   " s · " + Short(stil, 60)),
       model);
   metadata["prompt"] = Short(stil, 4000);
   metadata["liedtext"] = Short(liedtext, 4000);
@@ -2396,7 +2413,7 @@ json::Value McpService::RunObjekt3d(const json::Value& args,
 }
 
 json::Value McpService::RunHochskalieren(const json::Value& args,
-                                        const HttpRequest& outer) const {
+                                         const HttpRequest& outer) const {
   // pages/hochskalieren/index.html: image -> POST /v1/images/upscale
   // {model, variant general|wdn|anime, image (data URL), scale, output,
   // response_format b64_json, quality 92 for jpg}; video -> POST
@@ -2409,8 +2426,8 @@ json::Value McpService::RunHochskalieren(const json::Value& args,
   const long long faktor = ArgInt(args, "faktor", 2, 4).value_or(2);
   if (faktor != 2 && faktor != 4)
     throw InvalidParams("arguments.faktor must be 2 or 4");
-  const std::string variante =
-      ArgEnum(args, "variante", {"allgemein", "entrauscht", "anime"}, "allgemein");
+  const std::string variante = ArgEnum(
+      args, "variante", {"allgemein", "entrauscht", "anime"}, "allgemein");
   const std::string ausgabe = ArgEnum(args, "ausgabe", {"png", "jpg"}, "png");
   const auto vorrang = ArgInt(args, "vorrang", 0, 9);
   Media media = ReadMedia(outer, datei, "arguments.datei");
@@ -2434,7 +2451,8 @@ json::Value McpService::RunHochskalieren(const json::Value& args,
     if (ausgabe == "jpg")
       body["quality"] = 92;
   }
-  const std::string name = media.name.empty() ? (video ? "video" : "bild") : media.name;
+  const std::string name =
+      media.name.empty() ? (video ? "video" : "bild") : media.name;
   json::Value metadata = MetadataFor(
       "hochskalieren", args,
       TitelArg(args, name + " · " + std::to_string(faktor) + "× · " + variante),
@@ -2454,8 +2472,8 @@ json::Value McpService::Call(std::string_view name, const json::Value& args,
     if (options_.gate != nullptr)
       options_.gate->Log(outer, who, "mcp:" + std::string(name) + ":unbekannt");
     json::Value out = json::Value::object();
-    out["error"] = RpcError(kInvalidParams,
-                            "Unknown tool: " + std::string(name));
+    out["error"] =
+        RpcError(kInvalidParams, "Unknown tool: " + std::string(name));
     return out;
   }
   // The model for the log line: the call's or the tool's default.
@@ -2467,8 +2485,8 @@ json::Value McpService::Call(std::string_view name, const json::Value& args,
     model = DefaultModel(tool->name);
   const auto log = [&](std::string_view result) {
     if (options_.gate != nullptr)
-      options_.gate->Log(outer, who, "mcp:" + tool->name + ":" + std::string(result),
-                         model);
+      options_.gate->Log(
+          outer, who, "mcp:" + tool->name + ":" + std::string(result), model);
   };
   json::Value result;
   try {
@@ -2636,10 +2654,9 @@ HttpResponse McpService::Rpc(const HttpRequest& req,
   }
   // The era-selecting calls, once per client start.
   if (name == "server/discover" || name == "initialize")
-    Logger::Info("router",
-                 "event=mcp_client method=" + name +
-                     " era=" + (modern ? "modern" : "legacy") +
-                     " client=\"" + client + "\" user=" + who.name);
+    Logger::Info("router", "event=mcp_client method=" + name +
+                               " era=" + (modern ? "modern" : "legacy") +
+                               " client=\"" + client + "\" user=" + who.name);
 
   // Base Protocol -> Result Responses (2026-07-28): "The result MUST
   // include a resultType field"; _meta -> Per-response protocol fields:
@@ -2695,11 +2712,12 @@ HttpResponse McpService::Rpc(const HttpRequest& req,
     // server does not implement the requested RPC method, it MUST respond
     // with 404 Not Found and a JSON-RPC error with code -32601"; legacy
     // requests get the 200 of the older transports.
-    return ErrorResponse(modern ? 404 : 200, id,
-                         RpcError(kMethodNotFound, "Method not found: " + name));
+    return ErrorResponse(
+        modern ? 404 : 200, id,
+        RpcError(kMethodNotFound, "Method not found: " + name));
   } catch (const std::exception& error) {
-    Logger::Warn("router", "event=mcp_error method=" + name +
-                               " detail=\"" + error.what() + "\"");
+    Logger::Warn("router", "event=mcp_error method=" + name + " detail=\"" +
+                               error.what() + "\"");
     return ErrorResponse(200, id, RpcError(kInternalError, "Internal error"));
   }
 }
