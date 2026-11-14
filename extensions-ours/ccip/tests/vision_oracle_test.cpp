@@ -110,16 +110,14 @@ int main() {
     if (differ != 0 || x.size() != ref_x.size()) ok = false;
     const double luma = ccip::MeanLuma(img);
     const double want_luma = item.member_double("mean_luma");
-    std::printf("  mean luma %.6f (Pillow %.6f)
-", luma, want_luma);
+    std::printf("  mean luma %.6f (Pillow %.6f)\n", luma, want_luma);
     if (std::fabs(luma - want_luma) > 1e-9) ok = false;
     const ccip::RgbImage bright = ccip::ApplyGamma(img, 0.5);
     for (const char* variant : {"detections", "detections_gamma05"}) {
     const ccip::RgbImage& input = std::string(variant) == "detections" ? img : bright;
     const gufo::json::Value* want_all = item.find(variant);
     if (want_all == nullptr) continue;
-    std::printf("  [%s]
-", variant);
+    std::printf("  [%s]\n", variant);
     for (std::size_t k = 0; k < std::size(kTasks); ++k) {
       const Task& task = kTasks[k];
       const auto a = std::chrono::steady_clock::now();
