@@ -20,11 +20,31 @@ to run the model and what speed to expect.
 <!-- END GENERATED MODEL TABLE -->
 
 Fork pages outside the generated table: [Qwen3-Omni captioner](qwen3-omni-captioner.md),
-[RIFE](rife/README.md), [Real-ESRGAN](realesrgan/README.md).
+[ACE-Step 1.5](ace-step-1.5.md), [MOSS-Music](moss-music.md), [TripoSG](triposg.md),
+[TRELLIS.2](trellis2.md), [RIFE](rife/README.md), [Real-ESRGAN](realesrgan/README.md).
 
 Gufo doesn't ship weights; download them from Hugging Face as each page shows.
 Every speed on these pages was measured on Strix Halo with 128 GB of memory,
-on the date given next to it.
+on the date given next to it, unless the page names the 64 GB machine.
 
 Community extensions add other models and variants; see
 [extensions](../extensions.md).
+
+### Converted weights
+
+Six models run in a file layout of this fork (merged BF16 safetensors or GGUF). Those files
+are published ready to use under [huggingface.co/D3rPapst](https://huggingface.co/D3rPapst);
+each page has a "Converted weights" section with the download command and the preset:
+
+| Model | Repository | Size | Licence of the weights |
+|---|---|---:|---|
+| [ACE-Step 1.5](ace-step-1.5.md) XL (turbo / sft / base, planners 0.6B / 1.7B / 4B, text encoder, VAE) | [D3rPapst/ace-step-1.5-gufo](https://huggingface.co/D3rPapst/ace-step-1.5-gufo) | 44.9 GB | MIT; Qwen3-Embedding part Apache-2.0 |
+| [MOSS-Music](moss-music.md)-8B-Instruct (audio encoder BF16 + LLM Q8_0 GGUF) | [D3rPapst/moss-music-8b-gufo](https://huggingface.co/D3rPapst/moss-music-8b-gufo) | 10.4 GB | Apache-2.0 |
+| [TRELLIS.2](trellis2.md)-4B (512 path, six parts; DINOv3 encoder not included) | [D3rPapst/trellis2-gufo](https://huggingface.co/D3rPapst/trellis2-gufo) | 9.8 GB | MIT; DINOv3 under Meta's DINOv3 License, convert it yourself |
+| [TripoSG](triposg.md) (one file) | [D3rPapst/triposg-gufo](https://huggingface.co/D3rPapst/triposg-gufo) | 3.92 GB | MIT |
+| [Real-ESRGAN](realesrgan/README.md) compact x4 (general, wdn, anime) | [D3rPapst/realesrgan-srvgg-gufo](https://huggingface.co/D3rPapst/realesrgan-srvgg-gufo) | 12 MB | BSD-3-Clause |
+| [RIFE](rife/README.md) 4.7 / 4.9 IFNet | [D3rPapst/rife-ifnet-gufo](https://huggingface.co/D3rPapst/rife-ifnet-gufo) | 43 MB | MIT |
+
+The cards record the source revision, the converter commit, every file with its size and the
+router section. The layouts are read by this fork's workers only (upstream Gufo does not load
+them). Unchanged originals are not mirrored; the other pages link to the publishers' repositories.
