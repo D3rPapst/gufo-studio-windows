@@ -1,14 +1,17 @@
 // POST /v1/vision/detect through VisionService: request parsing (tasks,
-// aliases, thresholds), the error answers without models (405, 400, 501,
-// 503), the wd14_tags options and, with GUFO_VISION_DIR (converted
-// detectors and tagger) and GUFO_VISION_FRAME (a PNG keyframe), real
-// detections and tags (whole frame, person cut-outs, explicit regions,
+// aliases, thresholds), the error answers without models (405, 400, 503),
+// the ocr passes (thresholds, box_threshold, scale, lists) and wd14_tags
+// options and, with GUFO_VISION_DIR (converted detectors, PP-OCRv4 and
+// tagger) and GUFO_VISION_FRAME (a PNG keyframe), real detections, texts
+// (one plain and one 3x LANCZOS pass, the original pixels under
+// brighten_dark) and tags (whole frame, person cut-outs, explicit regions,
 // further pictures): the frame as a data URL and as an
 // Ablage path through a scripted gate (its 404 is relayed), and two parallel
 // requests that must queue one after the other. Pool (cpu_pool.hpp) with a
 // scripted partner: Decide, relay when busy or without models, the Ablage
-// image inlined for the partner, X-Gufo-Pool local/remote, the partner's
-// 503 falling back here, and /v1/figuren "ccip" over the same queue/relay.
+// image inlined for the partner (with the ocr options and thresholds), the
+// ocr models missing here, X-Gufo-Pool local/remote, the partner's 503
+// falling back here, and /v1/figuren "ccip" over the same queue/relay.
 // Written with AI assistance (Claude Code).
 #undef NDEBUG
 #include <algorithm>
@@ -176,13 +179,68 @@ void TestParse() {
     bad["wd14_tags"] = json::Value::object();
     (void)vision::ParseRequest(bad);
   }));
-  bool planned = false;
-  try {
-    (void)vision::ParseRequest(Body("AAAA", {"face", "ocr"}));
-  } catch (const std::domain_error&) {
-    planned = true;
+  // Every task of the API runs: detectors, ocr and wd14_tags together.
+  r = vision::ParseRequest(Body("AAAA", {"face", "wd14_tags", "ocr"}));
+  assert(r.tasks.size() == 1 && r.wd14.enabled && r.ocr.size() == 1);
+  // ocr: opt-in, one pass with imgutils defaults, kept as double.
+  r = vision::ParseRequest(Body("AAAA", {"ocr"}));
+  assert(r.ocr.size() == 1 && !r.ocr_list && r.tasks.empty());
+  assert(r.ocr[0].heat_threshold == 0.3 && r.ocr[0].box_threshold == 0.7 &&
+         r.ocr[0].unclip_ratio == 2.0 && r.ocr[0].scale == 1);
+  r = vision::ParseRequest(Body("AAAA", {}));
+  assert(r.ocr.empty());
+  json::Value ocr_body = Body("AAAA", {"ocr", "face"});
+  json::Value ocr_th = json::Value::object();
+  json::Value ocr_values = json::Value::object();
+  ocr_values["heat"] = 0.4;
+  ocr_values["box"] = 0.6;
+  ocr_th["ocr"] = std::move(ocr_values);
+  ocr_body["thresholds"] = std::move(ocr_th);
+  r = vision::ParseRequest(ocr_body);
+  assert(r.ocr.size() == 1 && r.tasks.size() == 1 && r.ocr[0].heat_threshold == 0.4 &&
+         r.ocr[0].box_threshold == 0.6);
+  // "ocr" options: one object, or a list of passes (erkennung_schrift.py:
+  // box_threshold 0.5 on the frame and on a 3x enlargement); thresholds.ocr
+  // is the default of every pass.
+  ocr_body["ocr"] = json::parse(R"({"box_threshold": 0.5, "unclip_ratio": 1.5})");
+  r = vision::ParseRequest(ocr_body);
+  assert(r.ocr.size() == 1 && !r.ocr_list && r.ocr[0].box_threshold == 0.5 &&
+         r.ocr[0].heat_threshold == 0.4 && r.ocr[0].unclip_ratio == 1.5 && r.ocr[0].scale == 1);
+  ocr_body["ocr"] = json::parse(R"([{"box_threshold": 0.5}, {"box_threshold": 0.5, "scale": 3}])");
+  r = vision::ParseRequest(ocr_body);
+  assert(r.ocr.size() == 2 && r.ocr_list && r.ocr[0].scale == 1 && r.ocr[1].scale == 3 &&
+         r.ocr[1].box_threshold == 0.5 && r.ocr[1].heat_threshold == 0.4);
+  for (const char* bad_options :
+       {R"({"scale": 0})", R"({"scale": 2.5})", R"({"scale": 5})", R"({"box_threshold": 0})",
+        R"({"heat_threshold": "x"})", R"({"unclip_ratio": -1})", R"({"box": 0.5})", R"([])",
+        R"([{}, {}, {}, {}, {}])", R"([1])", R"("fast")"}) {
+    assert(Throws([&] {
+      json::Value bad = Body("AAAA", {"ocr"});
+      bad["ocr"] = json::parse(bad_options);
+      (void)vision::ParseRequest(bad);
+    }));
   }
-  assert(planned);
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"face"});
+    bad["ocr"] = json::Value::object();
+    (void)vision::ParseRequest(bad);
+  }));
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"ocr"});
+    json::Value t = json::Value::object();
+    json::Value o = json::Value::object();
+    o["iou"] = 0.5;
+    t["ocr"] = std::move(o);
+    bad["thresholds"] = std::move(t);
+    (void)vision::ParseRequest(bad);
+  }));
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"face"});
+    json::Value t = json::Value::object();
+    t["ocr"] = json::Value::object();
+    bad["thresholds"] = std::move(t);
+    (void)vision::ParseRequest(bad);
+  }));
 }
 
 // Pillow values: (255,0,0) -> L 76, (10,200,30) -> L 124, mean 100.0;
@@ -220,12 +278,16 @@ void TestErrors() {
   broken.path = "/v1/vision/detect";
   broken.body = "{";
   assert(service.Handle(broken)->status == 400);
-  auto response = service.Handle(Post(Body("AAAA", {"ocr"})));
-  assert(response->status == 501);
-  assert(response->body.find("task_not_available") != std::string::npos);
-  response = service.Handle(Post(Body("AAAA", {"person"})));
-  assert(response->status == 503);
-  assert(response->body.find("vision_unavailable") != std::string::npos);
+  // Unknown task: 400 naming every task; no --vision-dir: 503 for each task.
+  auto response = service.Handle(Post(Body("AAAA", {"cat"})));
+  assert(response->status == 400);
+  assert(response->body.find("person, head, face, hand, ocr, wd14_tags") != std::string::npos);
+  for (const char* task : {"person", "ocr", "wd14_tags"}) {
+    response = service.Handle(Post(Body("AAAA", {task})));
+    assert(response->status == 503);
+    assert(response->body.find("vision_unavailable") != std::string::npos);
+    assert(response->body.find("--vision-dir") != std::string::npos);
+  }
   vision::Options missing;
   missing.model_dir = "Z:/does-not-exist/vision";
   const vision::VisionService service_missing(missing);
@@ -235,6 +297,9 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"wd14_tags"})));
   assert(response->status == 503);
   assert(response->body.find("wd-swinv2-tagger-v3.safetensors") != std::string::npos);
+  response = service_missing.Handle(Post(Body("AAAA", {"ocr"})));
+  assert(response->status == 503);
+  assert(response->body.find("ch_PP-OCRv4_det.safetensors") != std::string::npos);
 }
 
 HttpResponse JsonAnswer(int status, std::string body) {
@@ -320,6 +385,18 @@ void TestPool() {
   const json::Value* sent_opt = sent_refs.find("wd14_tags");
   assert(sent_opt != nullptr && sent_opt->member_double("general_threshold") == 0.4);
   assert(sent_opt->find("images")->items()[0].str().starts_with("data:image/png;base64,"));
+  // ocr (models missing here too): the passes and thresholds.ocr travel as
+  // sent.
+  json::Value with_ocr = Body("/v1/jobs/j1/files/a.png", {"ocr", "face"});
+  with_ocr["ocr"] = json::parse(R"([{"box_threshold": 0.5}, {"box_threshold": 0.5, "scale": 3}])");
+  with_ocr["thresholds"] = json::parse(R"({"ocr": {"heat": 0.35}, "face": {"conf": 0.4}})");
+  response = service.Handle(Post(with_ocr));
+  assert(response->status == 200);
+  const json::Value sent_ocr = json::parse(partner->last_body);
+  assert(sent_ocr.member_str("image").starts_with("data:image/png;base64,"));
+  assert(sent_ocr.find("ocr")->dump() == with_ocr.find("ocr")->dump());
+  assert(sent_ocr.find("thresholds")->dump() == with_ocr.find("thresholds")->dump());
+  assert(sent_ocr.find("tasks")->dump() == with_ocr.find("tasks")->dump());
   // Partner busy (503) or gone: back here, where the models are missing.
   partner->status = 503;
   response = service.Handle(Post(Body("AAAA", {"face"})));
@@ -409,6 +486,50 @@ void TestReal(const char* dir, const char* frame) {
     assert(answer.find("detections")->find(task) != nullptr);
   assert(answer.find("brightened") != nullptr && !answer.find("brightened")->as_bool());
   const std::size_t persons = answer.find("detections")->find("person")->size();
+  assert(answer.find("detections")->find("ocr") == nullptr);
+  // ocr when the converted PP-OCRv4 files are in the same directory.
+  if (std::filesystem::exists(std::filesystem::path(dir) / "ch_PP-OCRv4_rec.dict.txt")) {
+    response = service.Handle(Post(Body(data_url, {"ocr"})));
+    std::cout << response->body.substr(0, 600) << '\n';
+    assert(response->status == 200);
+    const json::Value texts = json::parse(response->body);
+    const json::Value* list = texts.find("detections")->find("ocr");
+    assert(list != nullptr && list->is_array());
+    for (const json::Value& t : list->items()) {
+      assert(t.find("text")->is_string());
+      assert(t.find("points")->size() == 4 && t.find("box")->size() == 4);
+    }
+    assert(texts.find("models")->find("ocr")->member_str("rec_model") == "ch_PP-OCRv4_rec");
+    // OCR reads the original even when the detectors see the brightened
+    // copy (below 256: always brightened).
+    json::Value dark = Body(data_url, {"ocr"});
+    dark["brighten_dark"] = json::parse(R"({"below": 256})");
+    response = service.Handle(Post(dark));
+    assert(response->status == 200);
+    const json::Value dark_texts = json::parse(response->body);
+    assert(dark_texts.find("brightened")->as_bool());
+    assert(dark_texts.find("detections")->find("ocr")->dump() == list->dump());
+    // erkennung_schrift.py in one request: box_threshold 0.5 on the frame
+    // and on a 3x LANCZOS enlargement, its boxes divided back by 3.
+    json::Value passes = Body(data_url, {"ocr"});
+    passes["ocr"] = json::parse(R"([{"box_threshold": 0.5}, {"box_threshold": 0.5, "scale": 3}])");
+    response = service.Handle(Post(passes));
+    assert(response->status == 200);
+    const json::Value jp = json::parse(response->body);
+    const auto& per_pass = jp.find("detections")->find("ocr")->items();
+    const auto& infos = jp.find("models")->find("ocr")->items();
+    assert(per_pass.size() == 2 && infos.size() == 2);
+    assert(infos[1].find("scale")->as_double() == 3 && infos[1].member_double("box") == 0.5);
+    const double width = jp.find("width")->as_double();
+    const double height = jp.find("height")->as_double();
+    for (const json::Value& t : per_pass[1].items()) {
+      const auto& b = t.find("box")->items();
+      assert(b[0].as_double() >= 0 && b[2].as_double() <= width);
+      assert(b[1].as_double() >= 0 && b[3].as_double() <= height);
+    }
+    std::cout << "ocr passes: " << per_pass[0].size() << " texts plain, " << per_pass[1].size()
+              << " texts 3x, " << jp.member_double("seconds") << " s\n";
+  }
   // Ablage path through the scripted gate: same answer.
   HttpRequest ablage = Post(Body("/v1/jobs/abc/files/frame.png", {"person"}));
   ablage.headers.emplace_back("Authorization", "Bearer test");

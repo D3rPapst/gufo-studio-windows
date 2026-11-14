@@ -30,6 +30,12 @@
       "requires": [
         "testing"
       ]
+    },
+    "ocr_oracle_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
     }
   },
   "production_paths": {

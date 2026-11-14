@@ -27,12 +27,26 @@ double BicubicFilter(double x) {
   return 0.0;
 }
 
+// Pillow sinc_filter / lanczos_filter (a = 3), support 3.
+double SincFilter(double x) {
+  if (x == 0.0) return 1.0;
+  x = x * 3.14159265358979323846;  // M_PI
+  return std::sin(x) / x;
+}
+
+double LanczosFilter(double x) {
+  // Truncated sinc; -3 <= x < 3.
+  if (-3.0 <= x && x < 3.0) return SincFilter(x) * SincFilter(x / 3);
+  return 0.0;
+}
+
 struct Filter {
   double (*fn)(double);
   double support;
 };
 constexpr Filter kBilinear{&BilinearFilter, 1.0};
 constexpr Filter kBicubic{&BicubicFilter, 2.0};
+constexpr Filter kLanczos{&LanczosFilter, 3.0};
 
 struct Coeffs {
   int ksize{0};
@@ -185,6 +199,10 @@ RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height) {
 
 RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height) {
   return Resample(in, out_width, out_height, kBicubic);
+}
+
+RgbImage ResizeLanczos(const RgbImage& in, int out_width, int out_height) {
+  return Resample(in, out_width, out_height, kLanczos);
 }
 
 double MeanLuma(const RgbImage& image) {

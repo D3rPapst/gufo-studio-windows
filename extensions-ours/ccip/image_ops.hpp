@@ -29,6 +29,10 @@ struct RgbImage {
 // Pillow Image.resize(..., BICUBIC) (a = -0.5, support 2; the Pillow >= 7
 // default of Image.resize), same fixed-point path as ResizeBilinear.
 [[nodiscard]] RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height);
+// Pillow Image.resize(..., LANCZOS) (sinc windowed by sinc, a = 3, support
+// 3), same fixed-point path: the film pipeline's 3x enlargement before OCR
+// (erkennung_schrift.py).
+[[nodiscard]] RgbImage ResizeLanczos(const RgbImage& in, int out_width, int out_height);
 
 // Pillow ImageStat.Stat(image.convert("L")).mean[0]: L = (R*19595 +
 // G*38470 + B*7471 + 0x8000) >> 16 per pixel, averaged.

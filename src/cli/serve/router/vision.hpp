@@ -3,13 +3,20 @@
 
 // Image recognition for the film pipeline (`POST /v1/vision/detect`): the
 // detectors of dghs-imgutils (detect_person, detect_heads, detect_faces,
-// detect_hands) with the same default models and thresholds, natively on the
-// CPU (gufo_ccip YoloDetector, OpenMP), without Python or ONNX at run time.
+// detect_hands), its text recognition (imgutils.ocr.ocr) and its WD14
+// tagger (get_wd14_tags) with the same default models and thresholds,
+// natively on the CPU (gufo_ccip YoloDetector, TextOcr and Wd14Tagger,
+// OpenMP), without Python or ONNX at run time.
 //
 //   POST /v1/vision/detect
 //     {"image": "<data URL | base64 | https URL | /v1/jobs/<id>/files/<name>>",
-//      "tasks": ["person", "head", "face", "hand"],
-//      "thresholds": {"person": {"conf": 0.3, "iou": 0.5}}}   optional
+//      "tasks": ["person", "head", "face", "hand", "ocr", "wd14_tags"],
+//      "thresholds": {"person": {"conf": 0.3, "iou": 0.5},
+//                     "ocr": {"heat": 0.3, "box": 0.7}},       optional
+//      "ocr": {"box_threshold": 0.5, "heat_threshold": 0.3,
+//              "unclip_ratio": 2.0, "scale": 3}                 optional
+//             or a list of up to 4 such passes,
+//      "wd14_tags": {...}}                         optional, vision_wd14.hpp
 //     ("bild" and "aufgaben" are accepted for image and tasks.)
 //     "brighten_dark": true | {"below": 70, "gamma": 0.5}   optional: when
 //     the mean luma (Pillow "L") is below `below`, the detectors run on a
@@ -22,12 +29,22 @@
 //       (score: the float32 value as imgutils returns it, unrounded)
 //       "models": {"person": {"repo", "model", "conf", "iou"}, ...},
 //       "seconds": compute time, "queue_seconds": wait before it}
-//   Boxes are integer pixels of the input image, sorted by score (imgutils
-//   order). "ocr" and "wd14_tags" are known tasks that this build does not
-//   run yet: 501 "task_not_available". Unknown task or bad threshold: 400.
+//   "ocr" (not in the default task list) answers
+//     [{"box": [x0, y0, x1, y1], "points": [[x, y] x 4], "text": "...",
+//       "score": det * text, "det_score", "text_score"}, ...]
+//   with models.ocr = {"repo", "model", "rec_model", "heat", "box",
+//   "unclip_ratio", "scale"}, sorted by score (imgutils order). Boxes are
+//   integer pixels of the input image; a pass with scale s > 1 reads a
+//   Pillow-LANCZOS enlargement to s*W x s*H and answers its boxes divided
+//   by s, unrounded (erkennung_schrift.py). "ocr" as a list of passes
+//   answers one such list per pass (and models.ocr as a list). OCR and tags
+//   always read the original, never the brightened copy.
+//   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
 //   use and kept (person m ~100 MB, the s models ~43 MB each, host RAM);
+//   ocr: ch_PP-OCRv4_det.*, ch_PP-OCRv4_rec.* and ch_PP-OCRv4_rec.dict.txt
+//   from extensions-ours/ccip/reference/convert_ocr.py (~16 MB);
 //   503 "vision_unavailable" when a file is missing.
 //   Queue and pool: cpu_pool.hpp. One request computes at a time in the
 //   CPU queue shared with /v1/figuren "ccip" (FIFO, --vision-threads OpenMP
@@ -39,6 +56,7 @@
 //   Authorization (another user's job is the gate's 404), at most 20 MB.
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -65,8 +83,20 @@ struct TaskSpec {
 
 /// The four detector tasks in answer order.
 const std::vector<TaskSpec>& DetectorTasks();
-/// Tasks that are part of the API but not built yet (501).
-const std::vector<std::string>& PlannedTasks();
+
+/// One "ocr" pass: imgutils.ocr.ocr keyword arguments (its defaults) and an
+/// enlargement before it (erkennung_schrift.py: 3x Pillow LANCZOS, boxes
+/// divided back by 3).
+struct OcrPass {
+  double heat_threshold{0.3};
+  double box_threshold{0.7};
+  double unclip_ratio{2.0};
+  int scale{1};
+};
+inline constexpr std::size_t kMaxOcrPasses = 4;
+inline constexpr int kMaxOcrScale = 4;
+/// Largest enlarged OCR input (3x of 1920x1080 is 18.7 megapixels).
+inline constexpr std::int64_t kMaxOcrPixels = 24'000'000;
 
 struct Request {
   std::string image;
@@ -79,11 +109,16 @@ struct Request {
   double dark_gamma{0.5};  // models::ccip::MeanLuma / ApplyGamma
   /// "wd14_tags" and its options (vision_wd14.hpp).
   Wd14Request wd14;
+  /// "ocr" passes (imgutils.ocr.ocr), empty when not requested. `ocr_list`:
+  /// the caller sent "ocr" as a list of passes, the answer has one list of
+  /// texts per pass (else the one pass's list).
+  std::vector<OcrPass> ocr;
+  bool ocr_list{false};
 };
 
 /// Parses and checks a request body; throws std::invalid_argument with a
-/// message for the 400 answer, and std::domain_error naming a planned task
-/// (501). Tasks default to all four detectors; duplicates are dropped.
+/// message for the 400 answer. Tasks default to all four detectors (ocr and
+/// wd14_tags only on request); duplicates are dropped.
 Request ParseRequest(const json::Value& body);
 
 struct Options {

@@ -496,9 +496,9 @@ Router:
   --ccip-model-dir <DIR>        CCIP character fingerprints for POST /v1/figuren "verfahren": "ccip"
   --ccip-face-dir <DIR>         Anime face detector for "verfahren": "ccip"
   --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
-  --vision-dir <DIR>            Detectors for POST /v1/vision/detect (person, head, face, hand:
-                                <model>.safetensors + .json; loaded on first use) and the
-                                wd14_tags tagger (wd-swinv2-tagger-v3.safetensors + .json)
+  --vision-dir <DIR>            Models for POST /v1/vision/detect (tasks person, head, face, hand,
+                                ocr, wd14_tags: <model>.safetensors + .json, ocr also
+                                ch_PP-OCRv4_rec.dict.txt; each loaded on first use)
   --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
   --vision-queue <N>            Requests of the shared CPU queue (/v1/vision/detect, /v1/figuren
                                 ccip) that may wait behind the running one before 503 busy (default: 4)
@@ -809,10 +809,13 @@ rule (see [CPU queue and pool](#cpu-queue-and-pool-for-the-router-services)); th
 
 The front answers `POST /v1/vision/detect` itself with the detectors of
 dghs-imgutils 0.19 (`detect_person`, `detect_heads`, `detect_faces`,
-`detect_hands`): same models, same default thresholds and the same pre- and
-post-processing, natively on the CPU (`gufo_ccip` `YoloDetector`, OpenMP),
-without Python or ONNX at run time. Public page with request and answer:
-[docs/models/vision-detect.md](../models/vision-detect.md).
+`detect_hands`), its OCR (`imgutils.ocr.ocr`, task `ocr`, see
+[Text recognition](#text-recognition-task-ocr)) and its WD14 tagger
+(`get_wd14_tags`, task `wd14_tags`): same models, same default thresholds and
+the same pre- and post-processing, natively on the CPU (`gufo_ccip`
+`YoloDetector`, `TextOcr`, `Wd14Tagger`, OpenMP), without Python or ONNX at
+run time. Every task of the API runs; an unknown name is `400`. Public page
+with request and answer: [docs/models/vision-detect.md](../models/vision-detect.md).
 
 | task | model (Hugging Face) | conf | iou |
 |---|---|---:|---:|
@@ -867,8 +870,7 @@ name; tag names and categories in the JSON), ~462 MB, loaded on first use.
 Measured on the EVO-X2 (8 threads): ~0.58 s per picture or cut-out
 (imgutils with onnxruntime: ~1.2 s).
 
-`ocr` is an accepted task name that answers `501 task_not_available` until its
-models are ported. The detectors live in
+The detectors live in
 `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) as
 `<model>.safetensors` + `.json` from
 `extensions-ours/ccip/reference/convert_weights.py yolo <model.onnx> <dir> <model>`
@@ -883,12 +885,18 @@ open; a caller that disconnects leaves the line), the next one gets
 `Authorization` (as the MCP tools do; another user's job is the gate's 404,
 relayed), at most 20 MB. RGBA input loses its alpha channel (imgutils puts it
 on white). Area `bild`; the request is not counted against `tageslimit`.
-Pool: see below; the relayed body carries the image inline (an Ablage path
-is read here first).
-Tests: `router_vision_test` (parsing and errors; with `GUFO_VISION_DIR` and
-`GUFO_VISION_FRAME` real detections, the Ablage path, the queue and
-`wd14_tags` on the whole frame, the person cut-outs, a region and a further
-picture), `ccip.vision_oracle` (`vision_oracle_test` against
+Pool: see below; the relayed body carries the image and the further
+`wd14_tags.images` inline (an Ablage path is read here first) and every other
+member as sent (`thresholds`, `ocr` passes, `wd14_tags` options). A missing
+OCR or tagger file counts as missing models, so the partner gets the request.
+All tasks share one input reader (`ReadInput` for every picture before the
+queue, `DecodeRgb` to RGB8 in it); detectors may see the brightened copy, OCR
+and tags always the original pixels.
+Tests: `router_vision_test` (parsing and errors, ocr passes, the relayed ocr
+options; with `GUFO_VISION_DIR` and `GUFO_VISION_FRAME` real detections, the
+Ablage path, the queue, `ocr` plain, under `brighten_dark` (same texts) and
+as two passes with `scale` 3, and `wd14_tags` on the whole frame, the person
+cut-outs, a region and a further picture), `ccip.vision_oracle` (`vision_oracle_test` against
 `reference/make_vision_oracle.py`, which runs imgutils itself) and
 `ccip.wd14_oracle` (`wd14_oracle_test` with `GUFO_VISION_DIR` and
 `GUFO_WD14_ORACLE` against `reference/make_wd14_oracle.py`: keyframes and the
@@ -913,6 +921,68 @@ condition (`503 remote_unavailable` without a partner). A partner's answer
 carries `X-Gufo-Ran-On: partner`. Images must be inline in the relayed body:
 `/v1/vision/detect` inlines an Ablage path itself; `/v1/figuren` takes only
 data URLs, base64 and https anyway.
+
+#### Text recognition (task `ocr`)
+
+`ocr` is `imgutils.ocr.ocr` with its defaults: PaddleOCR PP-OCRv4 mobile from
+`deepghs/paddleocr` (`det/ch_PP-OCRv4_det`, DBNet with a PP-LCNetV3 backbone,
+4.7 MB; `rec/ch_PP-OCRv4_rec`, SVTR-LCNet with CTC over `<blank>` + 6623
+`dict.txt` symbols + space, 10.8 MB; PaddleOCR Apache-2.0). It is not part of
+the default task list. `thresholds.ocr` takes `heat` (0.3) and `box` (0.7)
+as the defaults of every pass; the member `"ocr"` is one pass's options or a
+list of up to 4 passes (`Request::ocr`, `OcrPass`): `heat_threshold`,
+`box_threshold`, `unclip_ratio` (2.0, the growth factor of step 2) and
+`scale` (1-4). A pass with `scale` s reads `ResizeLanczos(image, s*W, s*H)`
+(Pillow `Image.resize(..., LANCZOS)` bit for bit: sinc windowed by sinc,
+support 3, Pillow's fixed-point passes like BICUBIC/BILINEAR in
+`image_ops.cpp`) and answers its boxes and corners divided by s as decimals;
+one enlargement per scale is made per request, at most 24 megapixels
+(`kMaxOcrPixels`, else 400). This is `erkennung_schrift.py`
+(`ocr(im, box_threshold=0.5)` and the same on a 3x LANCZOS copy, boxes / 3)
+in one request; with a list, `detections.ocr` and `models.ocr` are lists per
+pass. OCR always reads the original pixels, never the `brighten_dark` copy.
+Steps (`gufo_ccip` `TextOcr`, `extensions-ours/ccip/ocr.hpp`):
+
+1. Detector input at full resolution, padded right/bottom with zeros to
+   multiples of 64, `x/255`, then normalised with the CLIP mean/std (an
+   imgutils choice, computed in float64 like numpy).
+2. Heat map cropped to the image; `heat >= 0.3` gives the bitmap; contours as
+   OpenCV `findContours(RETR_LIST, CHAIN_APPROX_SIMPLE)`; per contour (at most
+   1000) `minAreaRect` (short side >= 3), score = mean heat inside the box
+   (`fillPoly` mask), dropped below 0.7; the box grows by
+   `area * 2.0 / perimeter` with a Clipper round offset, `minAreaRect` again
+   (short side >= 5), corners rounded half to even and clipped to the image.
+3. Per box the axis-aligned rectangle is cropped, turned by Pillow's
+   `rotate(90)` without expand when its height is >= 1.5 x its width (the
+   picture keeps its size, so tall boxes mostly read as empty text, as in
+   imgutils), resized to height 48 with BICUBIC, `(x/255 - 0.5)/0.5`; CTC
+   greedy decoding drops blanks and keeps repeats (imgutils'
+   `is_remove_duplicate=False`); text score = mean of the step maxima.
+4. `score = box score x text score`, sorted descending.
+
+The networks run on a small graph runtime (`cpu/ocr_net.cpp`, NCHW fp32,
+OpenMP) over the node list that `reference/convert_ocr.py` writes from the
+paddle2onnx export (float constants to `<stem>.safetensors`, int64 constants
+and nodes to `<stem>.json`; ops the runtime lacks are refused at conversion).
+The geometry of step 2 is ported line by line from OpenCV 4.11 (contours,
+convex hull, rotating calipers, `boxPoints`, `fillPoly`) and Clipper 6.4.2
+(round offset), so on the same heat map the boxes equal imgutils'. Files in
+`--vision-dir`: `ch_PP-OCRv4_det.{safetensors,json}`,
+`ch_PP-OCRv4_rec.{safetensors,json}`, `ch_PP-OCRv4_rec.dict.txt` (~16 MB,
+loaded on the first ocr request; missing: `503 vision_unavailable`). An
+empty rectangle gives empty text with score 0 (imgutils would raise).
+Test: `ccip.ocr_oracle` (`ocr_oracle_test`, env `GUFO_OCR_DIR`,
+`GUFO_OCR_ORACLE`) against `reference/make_ocr_oracle.py`, which runs
+imgutils itself (`--render` draws German and English name plates, signs and
+screens): detector input and recognizer crops bit-exact, boxes on the
+onnxruntime heat map identical, end to end same texts, rectangles within
+2 px, scores within 1e-3; per image also the `erkennung_schrift.py` pass
+(manifest `scaled`: the 3x LANCZOS pixels by hash, then `box_threshold` 0.5
+on them, rectangles within 2 px x 3) and six small LANCZOS resizes (up, down,
+mixed; `lanczos.safetensors`) bit for bit.
+Measured on the six rendered images (640x480 to 1344x768, 8 threads, Ryzen AI
+Max+ 395): 0.56-1.76 s per image, mean 1.06 s; imgutils with onnxruntime
+0.63 s. Rectangles were identical, scores within 5e-6.
 
 ### Video concat (`POST /v1/videos/concat`)
 

@@ -1,4 +1,5 @@
-// POST /v1/vision/detect: imgutils detectors natively (see vision.hpp).
+// POST /v1/vision/detect: imgutils detectors, OCR and WD14 tags natively
+// (see vision.hpp).
 // Written with AI assistance (Claude Code).
 #include "src/cli/serve/router/vision.hpp"
 
@@ -8,13 +9,16 @@
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
 #include "ccip/ccip.hpp"
+#include "ccip/ocr.hpp"
 #include "ccip/wd14.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/image.hpp"
@@ -26,6 +30,12 @@ using server::HttpRequest;
 using server::HttpResponse;
 
 constexpr std::size_t kAblageBytesLimit = static_cast<std::size_t>(20) << 20;
+
+// imgutils.ocr defaults (ocr/entry.py): PP-OCRv4 mobile from deepghs/paddleocr.
+constexpr const char* kOcrTask = "ocr";
+constexpr const char* kOcrRepo = "deepghs/paddleocr";
+constexpr const char* kOcrDet = "ch_PP-OCRv4_det";
+constexpr const char* kOcrRec = "ch_PP-OCRv4_rec";
 
 HttpResponse JsonResponse(int status, std::string reason, std::string body) {
   HttpResponse response;
@@ -69,6 +79,120 @@ float Threshold(const json::Value& value, const std::string& what) {
   if (!(v > 0.0 && v <= 1.0))
     throw std::invalid_argument(what + " must be in (0, 1]");
   return static_cast<float>(v);
+}
+
+/// The same check for the ocr thresholds, kept as double (imgutils compares
+/// the box score against the Python float).
+double OcrThreshold(const json::Value& value, const std::string& what) {
+  if (!value.is_number())
+    throw std::invalid_argument(what + " must be a number");
+  const double v = value.as_double();
+  if (!(v > 0.0 && v <= 1.0))
+    throw std::invalid_argument(what + " must be in (0, 1]");
+  return v;
+}
+
+/// The "ocr" member: one object of options or a list of passes (at most
+/// kMaxOcrPasses). Without it one pass with `base`. Options without the
+/// task requested are refused like wd14_tags'.
+std::vector<OcrPass> ParseOcr(const json::Value& body, bool requested, const OcrPass& base,
+                              bool* list) {
+  *list = false;
+  const json::Value* options = body.find(kOcrTask);
+  const bool given = options != nullptr && !options->is_null();
+  if (!requested) {
+    if (given)
+      throw std::invalid_argument("ocr options given, but the task is not requested");
+    return {};
+  }
+  if (!given)
+    return {base};
+  std::vector<OcrPass> passes;
+  const auto parse_one = [&](const json::Value& value, const std::string& where) {
+    if (!value.is_object())
+      throw std::invalid_argument(where + " must be an object of options");
+    OcrPass pass = base;
+    for (const auto& [key, option] : value.members()) {
+      const std::string what = where + "." + key;
+      if (key == "heat_threshold") {
+        pass.heat_threshold = OcrThreshold(option, what);
+      } else if (key == "box_threshold") {
+        pass.box_threshold = OcrThreshold(option, what);
+      } else if (key == "unclip_ratio") {
+        if (!option.is_number() || !(option.as_double() > 0.0 && option.as_double() <= 10.0))
+          throw std::invalid_argument(what + " must be a number in (0, 10]");
+        pass.unclip_ratio = option.as_double();
+      } else if (key == "scale") {
+        const double s = option.is_number() ? option.as_double() : 0.0;
+        if (!(s >= 1.0 && s <= kMaxOcrScale) || s != std::floor(s))
+          throw std::invalid_argument(what + " must be a whole number from 1 to " +
+                                      std::to_string(kMaxOcrScale));
+        pass.scale = static_cast<int>(s);
+      } else {
+        throw std::invalid_argument(what +
+                                    ": use heat_threshold, box_threshold, unclip_ratio or scale");
+      }
+    }
+    passes.push_back(pass);
+  };
+  if (options->is_array()) {
+    if (options->empty() || options->size() > kMaxOcrPasses)
+      throw std::invalid_argument("ocr must list 1 to " + std::to_string(kMaxOcrPasses) +
+                                  " passes");
+    *list = true;
+    for (std::size_t i = 0; i < options->size(); ++i)
+      parse_one(options->items()[i], "ocr[" + std::to_string(i) + "]");
+  } else {
+    parse_one(*options, "ocr");
+  }
+  return passes;
+}
+
+/// The answer list of one ocr pass. At scale 1 integer pixels as imgutils
+/// returns them; an enlarged pass divides its boxes and corners back by
+/// the scale without rounding (erkennung_schrift.py).
+json::Value OcrEntries(const std::vector<models::ccip::OcrText>& texts, int scale) {
+  const auto coord = [scale](int v) -> json::Value {
+    if (scale == 1)
+      return json::Value(v);
+    return json::Value(static_cast<double>(v) / scale);
+  };
+  json::Value list = json::Value::array();
+  for (const models::ccip::OcrText& t : texts) {
+    json::Value box = json::Value::array();
+    for (int v : t.box)
+      box.push_back(coord(v));
+    json::Value points = json::Value::array();
+    for (const auto& p : t.points) {
+      json::Value xy = json::Value::array();
+      xy.push_back(coord(p[0]));
+      xy.push_back(coord(p[1]));
+      points.push_back(std::move(xy));
+    }
+    json::Value entry = json::Value::object();
+    entry["box"] = std::move(box);
+    entry["points"] = std::move(points);
+    entry["text"] = t.text;
+    entry["score"] = t.score;
+    entry["det_score"] = t.det_score;
+    entry["text_score"] = t.text_score;
+    list.push_back(std::move(entry));
+  }
+  return list;
+}
+
+/// models.ocr of one pass.
+json::Value OcrModelInfo(const OcrPass& pass) {
+  const auto round6 = [](double v) { return std::round(v * 1e6) / 1e6; };
+  json::Value model = json::Value::object();
+  model["repo"] = kOcrRepo;
+  model["model"] = kOcrDet;
+  model["rec_model"] = kOcrRec;
+  model["heat"] = round6(pass.heat_threshold);
+  model["box"] = round6(pass.box_threshold);
+  model["unclip_ratio"] = round6(pass.unclip_ratio);
+  model["scale"] = pass.scale;
+  return model;
 }
 
 /// The image type of encoded bytes for a data URL (PNG, JPEG, WebP).
@@ -204,11 +328,6 @@ const std::vector<TaskSpec>& DetectorTasks() {
   return tasks;
 }
 
-const std::vector<std::string>& PlannedTasks() {
-  static const std::vector<std::string> tasks = {"ocr"};
-  return tasks;
-}
-
 Request ParseRequest(const json::Value& body) {
   if (!body.is_object())
     throw std::invalid_argument("body must be a JSON object");
@@ -238,21 +357,13 @@ Request ParseRequest(const json::Value& body) {
         names.push_back(item.str());
     }
   }
-  // Unknown names first (400), then planned ones (501).
   for (const std::string& name : names) {
     const auto& known = DetectorTasks();
-    const auto& planned = PlannedTasks();
-    if (name != kWd14Task &&
+    if (name != kWd14Task && name != kOcrTask &&
         std::none_of(known.begin(), known.end(),
-                     [&](const TaskSpec& spec) { return spec.task == name; }) &&
-        std::find(planned.begin(), planned.end(), name) == planned.end())
+                     [&](const TaskSpec& spec) { return spec.task == name; }))
       throw std::invalid_argument("unknown task " + name +
                                   " (person, head, face, hand, ocr, wd14_tags)");
-  }
-  for (const std::string& name : names) {
-    const auto& planned = PlannedTasks();
-    if (std::find(planned.begin(), planned.end(), name) != planned.end())
-      throw std::domain_error("task " + name + " is not available in this build");
   }
   // wd14_tags options; regions "person" run the person detector too.
   request.wd14 =
@@ -283,12 +394,29 @@ Request ParseRequest(const json::Value& body) {
       throw std::invalid_argument("brighten_dark must be true, false or {below, gamma}");
     }
   }
+  const bool ocr_requested = std::find(names.begin(), names.end(), kOcrTask) != names.end();
+  OcrPass ocr_base;  // thresholds.ocr: the defaults of every pass
   if (const json::Value* thresholds = body.find("thresholds");
       thresholds != nullptr && !thresholds->is_null()) {
     if (!thresholds->is_object())
       throw std::invalid_argument("thresholds must be an object by task");
     for (const auto& [key_task, values] : thresholds->members()) {
       const std::string& task = key_task;
+      if (task == kOcrTask) {
+        if (!ocr_requested)
+          throw std::invalid_argument("thresholds.ocr: task not requested");
+        if (!values.is_object())
+          throw std::invalid_argument("thresholds.ocr must be an object");
+        for (const auto& [key, value] : values.members()) {
+          if (key == "heat")
+            ocr_base.heat_threshold = OcrThreshold(value, "thresholds.ocr.heat");
+          else if (key == "box")
+            ocr_base.box_threshold = OcrThreshold(value, "thresholds.ocr.box");
+          else
+            throw std::invalid_argument("thresholds.ocr." + key + ": use heat or box");
+        }
+        continue;
+      }
       auto spec = std::find_if(request.tasks.begin(), request.tasks.end(),
                                [&task](const TaskSpec& s) { return s.task == task; });
       if (spec == request.tasks.end())
@@ -305,6 +433,7 @@ Request ParseRequest(const json::Value& body) {
       }
     }
   }
+  request.ocr = ParseOcr(body, ocr_requested, ocr_base, &request.ocr_list);
   return request;
 }
 
@@ -313,6 +442,7 @@ struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
   std::unique_ptr<models::ccip::Wd14Tagger> wd14;
+  std::unique_ptr<models::ccip::TextOcr> ocr;
 
   /// The detector of `spec`, loaded on first use; null with *error set.
   const models::ccip::YoloDetector* Get(const Options& options, const TaskSpec& spec,
@@ -374,6 +504,38 @@ struct VisionState {
     wd14 = std::move(net);
     return wd14.get();
   }
+
+  /// The text recognizer (detector + recognizer + dictionary), loaded on
+  /// first use; null with *error set.
+  const models::ccip::TextOcr* GetOcr(const Options& options, std::string* error) {
+    std::lock_guard<std::mutex> lock(load_mutex);
+    if (ocr != nullptr)
+      return ocr.get();
+    if (options.model_dir.empty()) {
+      *error = "image recognition is not configured: start the router with --vision-dir";
+      return nullptr;
+    }
+    const std::string det = kOcrDet, rec = kOcrRec;
+    for (const std::string& name : {det + ".safetensors", det + ".json", rec + ".safetensors",
+                                    rec + ".json", rec + ".dict.txt"}) {
+      const std::filesystem::path path = options.model_dir / name;
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) {
+        *error = "model file missing: " + path.string() + " (convert " + kOcrRepo +
+                 " det/" + det + " and rec/" + rec +
+                 " with extensions-ours/ccip/reference/convert_ocr.py)";
+        return nullptr;
+      }
+    }
+    std::string load_error;
+    auto loaded = models::ccip::TextOcr::Load(options.model_dir, det, rec, &load_error);
+    if (loaded == nullptr) {
+      *error = "ocr: " + load_error;
+      return nullptr;
+    }
+    ocr = std::move(loaded);
+    return ocr.get();
+  }
 };
 
 VisionService::VisionService(Options options)
@@ -396,8 +558,6 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   try {
     body = json::parse(request.body);
     parsed = ParseRequest(body);
-  } catch (const std::domain_error& error) {
-    return Error(501, "Not Implemented", error.what(), "task_not_available");
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", error.what(), "invalid_request");
   }
@@ -413,6 +573,9 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const models::ccip::Wd14Tagger* tagger = nullptr;
   if (parsed.wd14.enabled && missing.empty())
     tagger = state_->GetWd14(options_, &missing);
+  const models::ccip::TextOcr* ocr = nullptr;
+  if (!parsed.ocr.empty() && missing.empty())
+    ocr = state_->GetOcr(options_, &missing);
   // Input before the queue: reading an Ablage path goes through the gate
   // and must not hold the CPU turn.
   std::vector<std::uint8_t> bytes;
@@ -489,6 +652,18 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
                    "wd14_tags.regions[" + std::to_string(i) + "] lies outside the image",
                    "invalid_request");
   }
+  // Enlarged OCR passes stay within kMaxOcrPixels (host RAM).
+  for (const OcrPass& pass : parsed.ocr) {
+    const auto pixels = static_cast<std::int64_t>(image.width) * pass.scale *
+                        static_cast<std::int64_t>(image.height) * pass.scale;
+    if (pass.scale > 1 && pixels > kMaxOcrPixels)
+      return Error(400, "Bad Request",
+                   "ocr scale " + std::to_string(pass.scale) + ": " +
+                       std::to_string(image.width * pass.scale) + "x" +
+                       std::to_string(image.height * pass.scale) + " is more than " +
+                       std::to_string(kMaxOcrPixels / 1000000) + " megapixels",
+                   "invalid_request");
+  }
   const double mean_luma = models::ccip::MeanLuma(image);
   const bool brightened = parsed.brighten_dark && mean_luma < parsed.dark_below;
   // The detectors see the brightened copy; later tasks (OCR, tags) keep
@@ -543,6 +718,39 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     if (tagger != nullptr) {
       detections[kWd14Task] = RunWd14(*tagger, image, parsed.wd14, persons, wd14_images);
       used[kWd14Task] = Wd14ModelInfo(parsed.wd14);
+    }
+    // OCR on the original pixels too (erkennung.py / erkennung_schrift.py),
+    // each pass on its own Pillow-LANCZOS enlargement when scale > 1.
+    if (ocr != nullptr) {
+      std::map<int, models::ccip::RgbImage> enlarged;
+      json::Value lists = json::Value::array();
+      json::Value infos = json::Value::array();
+      for (const OcrPass& pass : parsed.ocr) {
+        const models::ccip::RgbImage* input = &image;
+        if (pass.scale > 1) {
+          auto it = enlarged.find(pass.scale);
+          if (it == enlarged.end())
+            it = enlarged
+                     .emplace(pass.scale,
+                              models::ccip::ResizeLanczos(image, image.width * pass.scale,
+                                                          image.height * pass.scale))
+                     .first;
+          input = &it->second;
+        }
+        models::ccip::OcrOptions ocr_options;
+        ocr_options.heat_threshold = pass.heat_threshold;
+        ocr_options.box_threshold = pass.box_threshold;
+        ocr_options.unclip_ratio = pass.unclip_ratio;
+        lists.push_back(OcrEntries(ocr->Run(*input, ocr_options), pass.scale));
+        infos.push_back(OcrModelInfo(pass));
+      }
+      if (parsed.ocr_list) {
+        detections[kOcrTask] = std::move(lists);
+        used[kOcrTask] = std::move(infos);
+      } else {
+        detections[kOcrTask] = lists.items().front();
+        used[kOcrTask] = infos.items().front();
+      }
     }
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),
