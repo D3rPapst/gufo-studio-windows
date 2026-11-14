@@ -52,8 +52,8 @@ hf download D3rPapst/realesrgan-srvgg-gufo --local-dir D:\llm-modelle\gufo\model
 | `realesr-animevideov3.safetensors` | 2.5 MB | `anime` (16) |
 
 That folder is what the `[external/gufo-upscale]` section under
-[Router section](#router-section) loads (`model =` the general file, `--model wdn=...` and
-`--model anime=...` the other two).
+[Router section](#router-section) loads (`model =` the general file, two `--model` lines
+without `NAME=` the other two; the variant comes from the file name).
 
 ## CLI
 
@@ -201,13 +201,16 @@ body's `model` (the section id) and records the job id of a
 and cancel reads reach the same worker; async image jobs are tracked like
 music jobs (`/v1/images/upscale/{id}`). Every `model =` / `--model` file
 without `NAME=` takes the served name, so the three variants sit behind one
-id. The production section of 2.0.4 (`gufo-router-combo7.ini`) names the
-two extra files `wdn` and `anime` so a request can pick them with `model`:
+id and a request picks one with `"variant"` (`general`, `wdn`, `anime`).
+Do not write `--model wdn=...` or `--model anime=...`: `NAME=` is a model
+name, not a variant, so the worker then serves extra models `wdn` and
+`anime`, while `gufo-upscale` knows only `general` and a request for another
+variant gets 404. The production section (`gufo-router-combo7.ini`, 2.1):
 
 ```ini
 [external/gufo-upscale]
-command = D:\llm-modelle\gufo\app\gufo-2.0.4-2026-11-13\gufo.exe
-args = serve upscale --device gpu --model wdn=D:\llm-modelle\gufo\modelle\upscale\realesr-general-wdn-x4v3.safetensors --model anime=D:\llm-modelle\gufo\modelle\upscale\realesr-animevideov3.safetensors
+command = D:\llm-modelle\gufo\app\gufo-2.1.0-2026-11-14\gufo.exe
+args = serve upscale --device gpu --model D:\llm-modelle\gufo\modelle\upscale\realesr-general-wdn-x4v3.safetensors --model D:\llm-modelle\gufo\modelle\upscale\realesr-animevideov3.safetensors
 model = D:\llm-modelle\gufo\modelle\upscale\realesr-general-x4v3.safetensors
 served-model-name = gufo-upscale
 max-request-bytes = 134217728
