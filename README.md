@@ -323,9 +323,6 @@ without thinking:
 - Output at temperature 0 is identical with and without speculative decoding.
 - One request at a time; concurrent requests were not measured.
 
-Every configuration tried (gufo and llama.cpp), what worked and what did not,
-and the repeat runs: [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md).
-
 ## What you need
 
 | What | Version used here | Where to get it |
@@ -478,8 +475,8 @@ Port 8090, the script's default, may be taken by other software.
 
 ## Known limitations
 
-Measured on the test machine; see [docs/WINDOWS-REBASE.md](docs/WINDOWS-REBASE.md)
-for the numbers.
+Measured on the test machine; the numbers are in
+[What was tested](#what-was-tested).
 
 - **Short answers without thinking decode slower than llama.cpp:** about
   19 tok/s against 20-23 tok/s. gufo's lead comes from prefill (about 2x)
@@ -502,21 +499,18 @@ for the numbers.
 ## Not tested here
 
 - On this `main` branch: anything but Qwen3.8-27B. The other models in
-  [What runs here now](#what-runs-here-now-143-november-2026) were tested on their
+  [What runs here now](#what-runs-here-now-148-november-2026) were tested on their
   branches and in the release packages. DeepSeek V4 Flash was never run here.
 - The launchers `start.cmd` and `tools\windows\start.ps1` (only
   `start.ps1 -List` was run) and the prebuilt package script.
 - Concurrent requests; the EVO-X2's high-performance mode and Windows power mode "Best performance".
 
-[docs/WINDOWS.md](docs/WINDOWS.md) describes how the port works inside; its
-measurements come from the pixmaate fork and were not re-checked here.
-
 ## Build from source
 
 On Windows, follow [Step by step](#step-by-step) above; `tools\windows\build.ps1`
 builds `build\release\gufo.exe`, and `-Preset gpu-test` adds the tests.
-[docs/WINDOWS.md](docs/WINDOWS.md) explains the toolchain and how the port
-works. The Linux build (Nix or system packages) is unchanged from upstream and
+[BUILD-WINDOWS.md](BUILD-WINDOWS.md) explains the toolchain and the
+Windows build steps. The Linux build (Nix or system packages) is unchanged from upstream and
 was not tested here; its prerequisites are in
 [upstream's README](https://github.com/gufo-org/gufo#build-from-source).
 

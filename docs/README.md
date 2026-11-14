@@ -16,6 +16,10 @@ pages explain how to install it, run models, and extend it with your own.
 
 - [Cache](cache.md): how Gufo reuses work across requests, and how to size it.
 - [Troubleshooting](troubleshooting.md): diagnostics, logs and common failures.
+- [Windows GPU timeouts](WINDOWS-TDR.md): the Windows driver watchdog (TDR)
+  and how to keep long GPU work from tripping it.
+- [Two machines](TWO-MACHINES.md): two EVO-X2 machines sharing the work behind
+  one port each.
 - [Benchmarks](benchmarks.md): how the published speeds are measured.
 - [Versions](versions.md): what a release promises and where it's published.
 
