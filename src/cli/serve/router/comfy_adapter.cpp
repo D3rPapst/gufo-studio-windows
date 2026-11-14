@@ -56,6 +56,9 @@ struct Adapter::Job {
   json::Value prompt;
   json::Value extra_data = json::Value::object();
   std::string client_id;
+  /// The signed-in user who sent the prompt (X-Gufo-User from the gate);
+  /// empty for the router itself, loopback or auth = off.
+  std::string user;
   std::vector<std::string> outputs;
   Plan plan;
   std::atomic<bool> cancel{false};
@@ -75,6 +78,19 @@ struct Interrupted : std::runtime_error {
 };
 
 constexpr std::string_view kWorkDir = ".gufo-work";
+
+/// The caller the gate names (auth.hpp kUserHeader/kRightsHeader): empty
+/// when it is no user (router, loopback, auth = off) or an admin; such a
+/// caller may stop or remove any prompt, a user only its own.
+std::string RestrictedUser(const HttpRequest& request) {
+  const std::string user = request.header("X-Gufo-User");
+  if (user.empty())
+    return {};
+  const std::string rights = request.header("X-Gufo-Rights");
+  if (rights == "rolle=admin" || rights.starts_with("rolle=admin;"))
+    return {};
+  return user;
+}
 
 fs::path U8Path(std::string_view text) {
   return fs::path(std::u8string(text.begin(), text.end()));
@@ -618,6 +634,7 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
   auto job = std::make_shared<Job>();
   job->prompt = *prompt;
   job->client_id = body.member_str("client_id");
+  job->user = request.header("X-Gufo-User");
   job->id = body.member_str("prompt_id");
   if (job->id.empty())
     job->id = NewUuid();
@@ -785,14 +802,20 @@ HttpResponse Adapter::QueuePost(const HttpRequest& request) {
   json::Value body = json::Value::object();
   if (!request.body.empty())
     body = json::parse(request.body);
+  // A signed-in user clears or deletes only its own waiting prompts.
+  const std::string user = RestrictedUser(request);
+  const auto mine = [&](const std::shared_ptr<Job>& job) {
+    return user.empty() || job->user == user;
+  };
   const std::lock_guard<std::mutex> lock(mutex_);
   if (body.find("clear") != nullptr && body.find("clear")->as_bool())
-    pending_.clear();
+    std::erase_if(pending_, mine);
   if (const json::Value* remove = body.find("delete");
       remove != nullptr && remove->is_array()) {
     for (const json::Value& id : remove->items())
-      std::erase_if(pending_,
-                    [&](const auto& job) { return job->id == id.str(); });
+      std::erase_if(pending_, [&](const auto& job) {
+        return id.is_string() && job->id == id.str() && mine(job);
+      });
   }
   EmitStatusLocked();
   return EmptyOk();
@@ -848,10 +871,14 @@ HttpResponse Adapter::Interrupt(const HttpRequest& request) {
     }
   }
   // Without a prompt id every running prompt stops (ComfyUI's global
-  // interrupt); with one only that prompt.
+  // interrupt); with one only that prompt. A signed-in user who is no
+  // admin stops only its own prompts either way.
+  const std::string user = RestrictedUser(request);
   const std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& job : running_) {
     if (!wanted.empty() && wanted != job->id)
+      continue;
+    if (!user.empty() && job->user != user)
       continue;
     job->cancel.store(true);
     Logger::Info("comfy", "event=interrupt prompt_id=" + job->id);

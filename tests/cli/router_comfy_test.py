@@ -1275,6 +1275,71 @@ def check_parallel(router):
         assert "execution_interrupted" in kinds, kinds
 
 
+def check_owners(binary, tmp):
+    """With users (auth = lan): /interrupt and POST /queue clear/delete of a
+    user who is no admin touch only that user's prompts; loopback (admin)
+    still stops every prompt (check_parallel)."""
+    own_tmp = os.path.join(tmp, "owners")
+    os.makedirs(own_tmp, exist_ok=True)
+    router = Router(binary, own_tmp, os.path.join(own_tmp, "comfy"),
+                    extra_args=["--comfy-parallel", "2"],
+                    extra_preset="[router]\nauth = lan\n")
+    try:
+        tokens = {}
+        for name in ("tim", "ina"):
+            status, body = router.json("POST", "/router/users", {
+                "name": name, "rolle": "nutzer", "passwort": name + "-passwort-1",
+                "rechte": {"bereiche": ["bild"]}})
+            assert status in (200, 201), (status, body)
+            status, body = router.json("POST", "/router/users/%s/tokens" % name,
+                                       {"name": "test", "tage": 1})
+            assert status == 201, (status, body)
+            tokens[name] = {"Authorization": "Bearer " + body["token"]}
+
+        def call(user, method, path, body=None):
+            data = json.dumps(body).encode() if body is not None else b""
+            headers = dict(tokens[user], **{"Content-Type": "application/json"})
+            return router.request(method, path, data, headers)
+
+        def submit(user, prompt, prefix):
+            status, payload = call(user, "POST", "/prompt", {
+                "prompt": qwen_graph(prompt=prompt, prefix=prefix), "client_id": user})
+            assert status == 200, payload
+            return json.loads(payload)["prompt_id"]
+
+        # A user's interrupt without prompt_id stops only its own prompt.
+        tim = submit("tim", "SLOW tim one", "film/own/tim")
+        ina = submit("ina", "SLOW ina one", "film/own/ina")
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        status, _ = call("ina", "POST", "/interrupt", None)
+        assert status == 200
+        assert router.wait(tim)["status"]["status_str"] == "success"
+        assert router.wait(ina)["status"]["status_str"] == "error"
+
+        # Another user's prompt id, clear and delete leave tim's prompts alone.
+        ina = submit("ina", "SLOW ina two", "film/own/ina")
+        tim = submit("tim", "SLOW tim two", "film/own/tim")
+        waiting = submit("tim", "SLOW tim three", "film/own/tim")
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        status, queue = router.json("GET", "/queue")
+        assert [item[1] for item in queue["queue_pending"]] == [waiting], queue
+        assert call("ina", "POST", "/interrupt", {"prompt_id": tim})[0] == 200
+        assert call("ina", "POST", "/queue", {"clear": True})[0] == 200
+        assert call("ina", "POST", "/queue", {"delete": [waiting]})[0] == 200
+        status, queue = router.json("GET", "/queue")
+        assert [item[1] for item in queue["queue_pending"]] == [waiting], queue
+        assert call("tim", "POST", "/queue", {"delete": [waiting]})[0] == 200
+        status, queue = router.json("GET", "/queue")
+        assert queue["queue_pending"] == [], queue
+        assert router.wait(tim)["status"]["status_str"] == "success"
+        assert router.wait(ina)["status"]["status_str"] == "success"
+    except BaseException:
+        print(router.tail())
+        raise
+    finally:
+        router.stop()
+
+
 def check_pool_view(binary, tmp, partner):
     """GET /queue?pool=1 adds the partner router's ComfyUI queue (each item
     names its router in extra_data.gufo_router); /prompt?pool=1 counts it."""
@@ -1490,6 +1555,7 @@ def main():
     finally:
         if router.proc.poll() is None:
             router.stop()
+    check_owners(binary, tmp)
     if not os.environ.get("COMFY_SKIP_AUTOLOAD"):
         check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
