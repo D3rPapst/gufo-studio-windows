@@ -2595,7 +2595,8 @@ public:
   /// before that is known waits for it (WaitPreviewStream).
   HttpResponse PreviewLocked(const HttpRequest& req,
                              std::unique_lock<std::mutex>& lock) {
-    const bool events = req.path.ends_with("/events");
+    bool events = false;
+    (void)PreviewIdOf(req.path, &events);
     PreviewPlan plan = PlanPreviewLocked(req);
     if (plan.kind == PreviewPlan::Kind::kWait) {
       if (events) {
@@ -2646,16 +2647,29 @@ public:
     return response;
   }
 
+  /// The id of /v1/previews/<id>[/events]; *events only with an id before
+  /// "/events" (/v1/previews/events is the id "events", a plain 404).
+  static std::string PreviewIdOf(const std::string& path, bool* events) {
+    std::string id = path.substr(std::string_view("/v1/previews/").size());
+    *events = id.size() > std::string_view("/events").size() && id.ends_with("/events");
+    if (*events)
+      id.resize(id.size() - std::string_view("/events").size());
+    return id;
+  }
+
   /// Decides where a /v1/previews request goes (state mutex held).
   PreviewPlan PlanPreviewLocked(const HttpRequest& req) {
     PreviewPlan plan;
     plan.request = req;
-    const bool events = req.path.ends_with("/events");
+    bool events = false;
+    std::string id = PreviewIdOf(req.path, &events);
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
     std::string model_id = req.query_param("model");
-    std::string id = req.path.substr(std::string_view("/v1/previews/").size());
-    if (events)
-      id.resize(id.size() - std::string_view("/events").size());
+    if (id.empty()) {
+      plan.answer = Err(404, "Not Found", "no preview id", "invalid_request_error",
+                        "preview_not_found");
+      return plan;
+    }
     if (comfy != nullptr && !forwarded) {
       // A ComfyUI prompt's preview id (2.1): known from /prompt on.
       if (auto route = comfy->FindPreview(id)) {
@@ -2779,9 +2793,8 @@ public:
                                   [this](void*) { --waiting_previews_; });
     response.streaming_body = [this, req, waiting](
                                   const HttpResponse::BodyWriter& write) {
-      std::string id =
-          req.path.substr(std::string_view("/v1/previews/").size());
-      id.resize(id.size() - std::string_view("/events").size());
+      bool events = false;
+      const std::string id = PreviewIdOf(req.path, &events);
       const auto failed = [&] {
         json::Value body = json::Value::object();
         body["id"] = id;
