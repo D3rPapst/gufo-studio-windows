@@ -47,8 +47,10 @@ add_library(gufo_media STATIC
   src/cli/serve/media/vision_backends.cpp
   src/cli/serve/media/video_rife.cpp
   src/cli/serve/media/video_upscale.cpp
+  src/cli/serve/media/zip_store.cpp
 )
-# png_fast.cpp deflates Real-ESRGAN results with zlib directly.
+# png_fast.cpp deflates Real-ESRGAN results with zlib directly; zip_store.cpp
+# takes its CRC-32 from zlib.
 find_package(ZLIB REQUIRED)
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
   gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG ZLIB::ZLIB)

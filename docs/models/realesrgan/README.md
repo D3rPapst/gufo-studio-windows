@@ -3,7 +3,7 @@
 gufo runs Real-ESRGAN's compact video models (`SRVGGNetCompact` from
 [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), BSD 3-Clause) natively
 on HIP to bring finished videos and images to a delivery size such as
-1920x1200 or 1920x1080.
+1920x1080, the film format.
 
 Supported checkpoints (Real-ESRGAN release v0.2.5.0, published in the
 BSD-3-Clause repository without a separate model license):
@@ -54,11 +54,11 @@ without `NAME=` the other two; the variant comes from the file name).
 
 ```sh
 gufo video-upscale --model realesr-animevideov3.safetensors \
-  --input in.mp4 --output out.mp4 --size 1920x1200
+  --input in.mp4 --output out.mp4 --size 1920x1080
 ```
 
 `--fit pad` (default) keeps the aspect ratio and the whole picture with black
-bars (832x480 -> picture 1920x1108 at y 46 in 1920x1200); `--fit crop` keeps
+bars (832x480 -> picture 1872x1080 at x 24 in 1920x1080); `--fit crop` keeps
 the aspect ratio and fills the frame (centre crop); `--fit stretch` scales each
 axis on its own. Picture sizes and offsets are even, so 4:2:0 chroma stays
 aligned. The output keeps the input frame rate and copies the audio
@@ -84,11 +84,11 @@ accepts
 
 ```json
 {"gufo": {"interpolate": {"fps": 60},
-          "upscale": {"width": 1920, "height": 1200, "fit": "pad",
+          "upscale": {"width": 1920, "height": 1080, "fit": "crop",
                       "model": "realesr-animevideov3"}}}
 ```
 
-on `POST /v1/videos` (H3 and Wan 2.2). `"upscale": "1920x1200"` is short for
+on `POST /v1/videos` (H3 and Wan 2.2). `"upscale": "1920x1080"` is short for
 the default model with `pad`. Width and height must be even (at most
 7680x4320). The upscale runs after any interpolation (RIFE at the generated
 size, then every output frame upscaled) and reports progress phase `upscale`.
@@ -134,7 +134,8 @@ two row passes (rows 0..T-1 keep the top half, rows h-T..h-1 the bottom half),
 DepthToSpace(4) plus the nearest-neighbour input, clip, `uint8(v*255+0.5)`,
 then OpenCV `INTER_AREA` (bit-exact port) and a centre crop: 896x512 ->
 rows 16..2031 of the x4 picture -> 1920x1080; 832x512 -> 1950x1200 ->
-columns 15..1934 -> 1920x1200 (`fit: "crop"`). `pad` and `stretch` use the
+columns 15..1934 -> 1920x1200 (`fit: "crop"`; this is Take One's NPU path,
+the film itself uses 1920x1080). `pad` and `stretch` use the
 same area filter. One model name may have several files, one per frame
 width; the request's frame picks the file.
 
@@ -172,8 +173,8 @@ than 8 waiting requests give 429.
 
 ```json
 {"model": "gufo-upscale", "variant": "anime",
- "video": "data:video/mp4;base64,...", "scale": 2,
- "fit": "pad", "crf": 18, "keep_audio": true}
+ "video": "data:video/mp4;base64,...", "size": "1920x1080",
+ "fit": "crop", "crf": 18, "keep_audio": true}
 ```
 
 An async job (`"async": false` waits and returns the MP4): FFmpeg decodes
@@ -185,10 +186,20 @@ answer is a video-job object `{id, object: "video", status: queued |
 in_progress | completed | failed | cancelled, progress (0..100), model,
 variant, size, input, upscale: {frames, frames_done, fps, audio, crf},
 cost, error}` (202 + `Location`); `GET /v1/videos/{id}` reads it,
-`GET /v1/videos/{id}/content` returns the MP4 (409 while running) and
+`GET /v1/videos/{id}/content` returns the result (409 while running) and
 `DELETE /v1/videos/{id}` cancels a running job or drops a finished result.
 Up to 8 jobs queue; finished results stay for an hour (at most 8). Uploads
 are limited to 512 MiB.
+
+`"output_format": "png_zip"` returns the frames losslessly instead of an
+MP4: every upscaled frame as an 8-bit RGB PNG (the one-pass encoder below)
+in a ZIP without compression (stored entries, CRC-32), named `f_00001.png`,
+`f_00002.png`, ... in frame order, `Content-Type: application/zip`. There is
+no audio and no `crf`; the job object says `"output_format": "png_zip"`.
+Use it when the pipeline encodes the delivery itself, so the frames are not
+compressed twice. The archive is held in memory like the MP4 and is limited
+to 4 GiB and 65535 frames (no ZIP64): a 1920x1080 frame is about 2-4 MB as
+PNG, so send film segments, not whole films.
 
 ### Speed
 
@@ -205,6 +216,13 @@ Seconds per 832x512 frame (anime) at the worker, Strix Halo (gfx1151, XDNA 2):
 The network takes 37 ms on the GPU (145 ms on the NPU). For film segments
 send the whole MP4 with the delivery size (`"video": ..., "variant": "anime",
 "size": "1920x1080", "fit": "crop", "async": false`); a job adds about 0.4 s.
+For lossless frames that the pipeline encodes itself:
+
+```json
+{"model": "gufo-upscale", "variant": "anime",
+ "video": "data:video/mp4;base64,...", "size": "1920x1080",
+ "fit": "crop", "output_format": "png_zip", "async": false}
+```
 
 ### Router section
 

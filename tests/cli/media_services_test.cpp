@@ -1,10 +1,13 @@
 // gufo-studio-windows media services without a model (src/cli/serve/media):
 // /v1/images/upscale request handling and PNG output through a stand-in
-// engine, music / foley start-up errors, the `gufo serve` media commands and
+// engine, /v1/videos/upscale png_zip frames (with FFmpeg), music / foley start-up errors, the `gufo serve` media commands and
 // the video post-step options, and the post-step request parser.
 // Written with AI assistance (Claude Code).
+#include <zlib.h>
+
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -13,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
@@ -24,8 +28,10 @@
 #include "src/cli/serve/media/png_fast.hpp"
 #include "src/cli/serve/media/upscale_api.hpp"
 #include "src/cli/serve/media/video_postprocess.hpp"
+#include "src/core/base64.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
+#include "src/models/rife/video_io.hpp"
 
 namespace server = gufo::server;
 namespace json = gufo::json;
@@ -201,6 +207,134 @@ void TestUpscaleService() {
   assert(server::ParseUpscaleSize("1920x1080", &w, &h) && w == 1920 &&
          h == 1080);
   assert(!server::ParseUpscaleSize("x1080", &w, &h));
+}
+
+std::uint32_t Le32(const std::string& b, std::size_t at) {
+  return static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at])) |
+         static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at + 1])) << 8U |
+         static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at + 2])) << 16U |
+         static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at + 3])) << 24U;
+}
+
+std::uint32_t Le16(const std::string& b, std::size_t at) {
+  return static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at])) |
+         static_cast<std::uint32_t>(static_cast<std::uint8_t>(b[at + 1])) << 8U;
+}
+
+// Reads a store-only ZIP: entries in order (name, bytes), CRC-32 checked,
+// central directory count checked.
+std::vector<std::pair<std::string, std::string>> ReadStoredZip(
+    const std::string& zip) {
+  std::vector<std::pair<std::string, std::string>> entries;
+  std::size_t at = 0;
+  while (at + 30 <= zip.size() && Le32(zip, at) == 0x04034b50U) {
+    assert(Le16(zip, at + 8) == 0);  // stored
+    const std::uint32_t crc = Le32(zip, at + 14);
+    const std::uint32_t size = Le32(zip, at + 18);
+    assert(Le32(zip, at + 22) == size);
+    const std::uint32_t name_len = Le16(zip, at + 26);
+    const std::uint32_t extra = Le16(zip, at + 28);
+    std::string name = zip.substr(at + 30, name_len);
+    std::string data = zip.substr(at + 30 + name_len + extra, size);
+    assert(data.size() == size);
+    assert(crc32(crc32(0L, Z_NULL, 0),
+                 reinterpret_cast<const Bytef*>(data.data()),
+                 static_cast<uInt>(data.size())) == crc);
+    entries.emplace_back(std::move(name), std::move(data));
+    at += 30 + name_len + extra + size;
+  }
+  assert(zip.size() >= 22);
+  const std::size_t end = zip.size() - 22;
+  assert(Le32(zip, end) == 0x06054b50U);
+  assert(Le16(zip, end + 10) == entries.size());
+  assert(Le32(zip, end + 16) == at);  // central directory follows the data
+  return entries;
+}
+
+gufo::core::Image DecodePng(const std::string& bytes) {
+  return gufo::core::DecodeImage(std::span(
+      reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+}
+
+// /v1/videos/upscale "output_format": "png_zip": one lossless PNG per frame
+// in a stored ZIP, pixels equal to /v1/images/upscale of the same decoded
+// frame. Needs FFmpeg for the test MP4 (skipped without it).
+void TestVideoPngZip(const std::filesystem::path& root) {
+  namespace io = gufo::models::rife;
+  constexpr int kW = 16, kH = 12, kFrames = 3;
+  const std::filesystem::path mp4 = root / "png-zip-in.mp4";
+  io::FrameWriter writer;
+  std::string error;
+  if (!writer.Open(mp4, kW, kH, 24, 1, {}, &error)) {
+    std::cout << "png_zip video test skipped (no FFmpeg): " << error << '\n';
+    return;
+  }
+  std::vector<std::uint8_t> rgb(static_cast<std::size_t>(kW) * kH * 3);
+  for (int f = 0; f < kFrames; ++f) {
+    for (std::size_t i = 0; i < rgb.size(); ++i)
+      rgb[i] = static_cast<std::uint8_t>((i * 7 + static_cast<std::size_t>(f) * 60) % 256);
+    assert(writer.Write(rgb.data(), &error));
+  }
+  assert(writer.Finish(&error));
+
+  // The frames as the worker's decoder sees them.
+  std::vector<std::vector<std::uint8_t>> frames;
+  {
+    io::FrameReader reader;
+    assert(reader.Open(mp4, kW, kH, &error));
+    std::vector<std::uint8_t> frame(rgb.size());
+    bool end = false;
+    while (reader.Read(frame.data(), &end, &error))
+      frames.push_back(frame);
+    assert(end);
+    reader.Close();
+  }
+  assert(static_cast<int>(frames.size()) == kFrames);
+
+  std::ifstream in(mp4, std::ios::binary);
+  const std::string video((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+  in.close();
+  const std::string video_url =
+      "data:video/mp4;base64," + gufo::core::EncodeBase64(video);
+
+  std::vector<std::string> calls;
+  server::UpscaleService service(FakeEngine(&calls));
+  const auto response = Post(
+      service, "/v1/videos/upscale",
+      R"({"video":")" + video_url +
+          R"(","size":"40x24","fit":"crop","output_format":"png_zip","async":false})");
+  assert(response.status == 200);
+  bool zip_type = false;
+  for (const auto& [name, value] : response.headers)
+    zip_type = zip_type || (name == "Content-Type" && value == "application/zip");
+  assert(zip_type);
+  const auto entries = ReadStoredZip(response.body);
+  assert(static_cast<int>(entries.size()) == kFrames);
+  for (int f = 0; f < kFrames; ++f) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "f_%05d.png", f + 1);
+    assert(entries[f].first == name);
+    const gufo::core::Image zipped = DecodePng(entries[f].second);
+    assert(zipped.width == 40 && zipped.height == 24);
+    // The same decoded frame through /v1/images/upscale.
+    const std::vector<std::uint8_t> png =
+        server::EncodePngRgbFast(frames[f].data(), kW, kH, 1);
+    const std::string image_url =
+        "data:image/png;base64," +
+        gufo::core::EncodeBase64(std::string_view(
+            reinterpret_cast<const char*>(png.data()), png.size()));
+    const auto single = Post(service, "/v1/images/upscale",
+                             R"({"image":")" + image_url +
+                                 R"(","size":"40x24","fit":"crop","response_format":"png"})");
+    assert(single.status == 200);
+    assert(DecodePng(single.body).pixels == zipped.pixels);
+  }
+  assert(Post(service, "/v1/videos/upscale",
+              R"({"video":")" + video_url + R"(","output_format":"webm"})")
+             .status == 400);
+  std::error_code ignored;
+  std::filesystem::remove(mp4, ignored);
 }
 
 void TestMusicAndFoleyStartup(const std::filesystem::path& root) {
@@ -430,6 +564,7 @@ int main() {
   std::filesystem::create_directories(root);
   TestFastPng();
   TestUpscaleService();
+  TestVideoPngZip(root);
   TestMusicAndFoleyStartup(root);
   TestServeOptions(root);
   TestOmni();

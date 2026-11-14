@@ -312,6 +312,8 @@ std::string ExtensionFor(std::string_view content_type) {
     return "opus";
   if (type == "video/mp4")
     return "mp4";
+  if (type == "application/zip")
+    return "zip";
   if (type == "text/vtt")
     return "vtt";
   if (type == "application/x-subrip")
@@ -351,6 +353,8 @@ std::string ContentTypeFor(std::string_view name) {
     return "model/gltf-binary";
   if (ext == "mp4")
     return "video/mp4";
+  if (ext == "zip")
+    return "application/zip";
   if (ext == "vtt")
     return "text/vtt; charset=utf-8";
   if (ext == "srt")
