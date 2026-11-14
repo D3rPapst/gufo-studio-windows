@@ -233,13 +233,48 @@ void BinaryLoop(const float* pa, const float* pb, float* po, const Shape& dims, 
 
 // y[q] = op(a, b) over one tile; a null pointer means the scalar value.
 template <Bin op>
-void FusedBinary(const float* xa, float va, const float* xb, float vb, float* y, std::int64_t len) {
+inline void FusedBinary(const float* xa, float va, const float* xb, float vb, float* y, std::int64_t len) {
   if (xa != nullptr && xb != nullptr) {
     for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(xa[q], xb[q]);
   } else if (xa != nullptr) {
     for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(xa[q], vb);
   } else {
     for (std::int64_t q = 0; q < len; ++q) y[q] = ApplyT<op>(va, xb[q]);
+  }
+}
+
+// One fused op over one tile (a null operand pointer means its scalar).
+// Built for AVX2 (no FMA, so every multiply and add rounds as node by node).
+__attribute__((target("avx2"))) void FusedOpTile(const FusedOp& op, const float* xa,
+                                                 const float* xb, float* y, std::int64_t len) {
+  switch (op.op) {
+    case Op::kAdd: FusedBinary<Bin::kAdd>(xa, op.a.value, xb, op.b.value, y, len); break;
+    case Op::kSub: FusedBinary<Bin::kSub>(xa, op.a.value, xb, op.b.value, y, len); break;
+    case Op::kMul: FusedBinary<Bin::kMul>(xa, op.a.value, xb, op.b.value, y, len); break;
+    case Op::kDiv: FusedBinary<Bin::kDiv>(xa, op.a.value, xb, op.b.value, y, len); break;
+    case Op::kPow: FusedBinary<Bin::kPow>(xa, op.a.value, xb, op.b.value, y, len); break;
+    case Op::kRelu:
+      for (std::int64_t q = 0; q < len; ++q) y[q] = xa[q] > 0.0f ? xa[q] : 0.0f;
+      break;
+    case Op::kSigmoid:
+      for (std::int64_t q = 0; q < len; ++q) y[q] = 1.0f / (1.0f + std::exp(-xa[q]));
+      break;
+    case Op::kSqrt:
+      for (std::int64_t q = 0; q < len; ++q) y[q] = std::sqrt(xa[q]);
+      break;
+    case Op::kHardSigmoid: {
+      const float alpha = op.p0, beta = op.p1;
+      for (std::int64_t q = 0; q < len; ++q)
+        y[q] = std::max(0.0f, std::min(1.0f, alpha * xa[q] + beta));
+      break;
+    }
+    case Op::kClip: {
+      const float lo = op.p0, hi = op.p1;
+      for (std::int64_t q = 0; q < len; ++q) y[q] = std::min(hi, std::max(lo, xa[q]));
+      break;
+    }
+    default:
+      break;
   }
 }
 
@@ -674,6 +709,21 @@ NetTensor Slice(const NetTensor& x, const NetTensor& starts, const NetTensor* en
   if (out.is_int) out.i.resize(Sz(n));
   else out.f.resize(Sz(n));
   const Shape xs = Strides(x.shape);
+  if (!out.is_int && rank > 0 && step[rank - 1] == 1 && n > 0) {
+    // Last axis unit step: copy whole rows.
+    const std::int64_t inner = os[rank - 1];
+    const std::int64_t rows = n / inner;
+    for (std::int64_t r = 0; r < rows; ++r) {
+      std::int64_t rem = r, src = b[rank - 1];
+      for (int d = static_cast<int>(rank) - 2; d >= 0; --d) {
+        const std::int64_t v = rem % os[Sz(d)];
+        rem /= os[Sz(d)];
+        src += (b[Sz(d)] + v * step[Sz(d)]) * xs[Sz(d)];
+      }
+      std::copy_n(x.f.data() + src, inner, out.f.data() + r * inner);
+    }
+    return out;
+  }
   for (std::int64_t idx = 0; idx < n; ++idx) {
     std::int64_t rem = idx, src = 0;
     for (int d = static_cast<int>(rank) - 1; d >= 0; --d) {
@@ -780,7 +830,7 @@ NetTensor Softmax(const NetTensor& x, std::int64_t axis_attr) {
   for (std::size_t d = Sz(axis); d < x.shape.size(); ++d) inner *= x.shape[d];
   const std::int64_t rows = x.numel() / inner;
   NetTensor out = FloatTensor(x.shape);
-#pragma omp parallel for schedule(static) if (rows > 64)
+#pragma omp parallel for schedule(static) if (rows > 1 && rows * inner > 32768)
   for (std::int64_t r = 0; r < rows; ++r) {
     const float* xp = x.f.data() + r * inner;
     float* yp = out.f.data() + r * inner;
@@ -1085,8 +1135,10 @@ private:
     const std::size_t op_regs = run.ops.size();
 #pragma omp parallel if (n > 32768)
     {
-      std::vector<float> buf(op_regs * Sz(kTile));
-      std::vector<const float*> regs(Sz(ext_regs) + op_regs);
+      thread_local std::vector<float> buf;
+      thread_local std::vector<const float*> regs;
+      if (buf.size() < op_regs * Sz(kTile)) buf.resize(op_regs * Sz(kTile));
+      regs.resize(Sz(ext_regs) + op_regs);
 #pragma omp for schedule(static)
       for (std::int64_t t = 0; t < tiles; ++t) {
         const std::int64_t off = t * kTile;
@@ -1098,35 +1150,7 @@ private:
           regs[Sz(ext_regs) + i] = y;
           const float* xa = op.a.reg >= 0 ? regs[Sz(op.a.reg)] : nullptr;
           const float* xb = op.b.reg >= 0 ? regs[Sz(op.b.reg)] : nullptr;
-          switch (op.op) {
-            case Op::kAdd: FusedBinary<Bin::kAdd>(xa, op.a.value, xb, op.b.value, y, len); break;
-            case Op::kSub: FusedBinary<Bin::kSub>(xa, op.a.value, xb, op.b.value, y, len); break;
-            case Op::kMul: FusedBinary<Bin::kMul>(xa, op.a.value, xb, op.b.value, y, len); break;
-            case Op::kDiv: FusedBinary<Bin::kDiv>(xa, op.a.value, xb, op.b.value, y, len); break;
-            case Op::kPow: FusedBinary<Bin::kPow>(xa, op.a.value, xb, op.b.value, y, len); break;
-            case Op::kRelu:
-              for (std::int64_t q = 0; q < len; ++q) y[q] = xa[q] > 0.0f ? xa[q] : 0.0f;
-              break;
-            case Op::kSigmoid:
-              for (std::int64_t q = 0; q < len; ++q) y[q] = 1.0f / (1.0f + std::exp(-xa[q]));
-              break;
-            case Op::kSqrt:
-              for (std::int64_t q = 0; q < len; ++q) y[q] = std::sqrt(xa[q]);
-              break;
-            case Op::kHardSigmoid: {
-              const float alpha = op.p0, beta = op.p1;
-              for (std::int64_t q = 0; q < len; ++q)
-                y[q] = std::max(0.0f, std::min(1.0f, alpha * xa[q] + beta));
-              break;
-            }
-            case Op::kClip: {
-              const float lo = op.p0, hi = op.p1;
-              for (std::int64_t q = 0; q < len; ++q) y[q] = std::min(hi, std::max(lo, xa[q]));
-              break;
-            }
-            default:
-              break;
-          }
+          FusedOpTile(op, xa, xb, y, len);
         }
         for (std::size_t o = 0; o < run.outputs.size(); ++o)
           std::memcpy(dst[o] + off, regs[Sz(run.outputs[o].first)], sizeof(float) * Sz(len));
