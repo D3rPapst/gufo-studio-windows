@@ -761,7 +761,11 @@ in the queue (or the pool has not placed the request, or the worker
 loads) the router keeps the stream open with `: waiting` comments and
 then relays the worker's stream; a prompt that ends without the task
 (deleted from the queue, failed earlier) ends it with `event: done` and
-`"state": "failed"`; after 30 min of waiting it ends the same way. A
+`"state": "failed"`; after 30 min of waiting it ends the same way. Only
+an id this router knows waits (a ComfyUI prompt's, a pool request's, an
+open job's); any other id is `404` at once even with `?model=` of a model
+that is not loaded (a page connects again), and at most 4 such streams
+wait at the same time (`kMaxWaitingPreviews`; the next one: `503 busy`). A
 plain read answers `pending` (204, or JSON for `format=json|frame-json`)
 meanwhile. For a video task the id leads to the video job's preview
 (H3: a WebP loop with a JPEG middle frame for `format=frame`). The worker
