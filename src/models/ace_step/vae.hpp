@@ -13,6 +13,33 @@ namespace gufo::models::ace_step {
 constexpr int kSampleRate = 48000;
 constexpr int kSamplesPerFrame = 1920;
 
+/// Shape and tensor names of an Oobleck decoder file. ACE-Step 1.5 has five
+/// upsampling blocks with Diffusers names (`decoder.block.N.conv_t1`);
+/// YuE2-Vae has six blocks with stable-audio-tools names
+/// (`decoder.layers.N.layers.M`). The product of the strides is the hop
+/// (1920 = 25 frames/s at 48 kHz) for both.
+struct OobleckLayout {
+  std::vector<int> strides;  // decoder upsampling order
+  bool stable_audio_names{false};
+
+  [[nodiscard]] static OobleckLayout AceStep() {
+    return {{10, 6, 4, 4, 2}, false};
+  }
+  [[nodiscard]] static OobleckLayout YuE2() {
+    return {{6, 5, 4, 4, 2, 2}, true};
+  }
+  /// Output samples of a single-pass decode of `frames` latents: each
+  /// transposed convolution (kernel 2s, stride s, padding ceil(s / 2)) maps
+  /// L to L * s + s - 2 * ceil(s / 2), so an odd stride loses one sample
+  /// (ACE-Step: frames * 1920; YuE2-Vae: frames * 1920 - 64).
+  [[nodiscard]] std::size_t OutputSamples(std::size_t frames) const {
+    std::size_t length = frames;
+    for (const int s : strides)
+      length = length * s + s - 2 * ((s + 1) / 2);
+    return length;
+  }
+};
+
 /// Decoder of the ACE-Step 1.5 AutoencoderOobleck (Diffusers `vae/` or the
 /// ComfyUI `ace_1.5_vae` file): 64 latent channels at 25 frames/s to 48 kHz
 /// stereo. Weight norm is folded at load; convolutions run as BF16 GEMMs
@@ -23,11 +50,17 @@ class VaeDecoder {
 public:
   [[nodiscard]] static std::unique_ptr<VaeDecoder> Load(
       const std::filesystem::path& safetensors, std::string* error);
+  /// Any Oobleck decoder with 64 latent channels, stereo output and the
+  /// given layout (OobleckLayout::YuE2() for YuE2-Vae `model.safetensors`).
+  [[nodiscard]] static std::unique_ptr<VaeDecoder> Load(
+      const std::filesystem::path& safetensors, const OobleckLayout& layout,
+      std::string* error);
   ~VaeDecoder();
   VaeDecoder(const VaeDecoder&) = delete;
   VaeDecoder& operator=(const VaeDecoder&) = delete;
 
-  /// latents [frames, 64] -> planar audio [2][frames * 1920].
+  /// latents [frames, 64] -> planar audio [2][layout.OutputSamples(frames)]
+  /// (frames * 1920 for ACE-Step).
   bool Decode(std::span<const float> latents, int frames,
               std::vector<float>* audio, std::string* error);
 

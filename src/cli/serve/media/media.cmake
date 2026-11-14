@@ -28,6 +28,8 @@ option(GUFO_ENABLE_ONNXRUNTIME
 
 add_subdirectory(src/models/rife)
 add_subdirectory(src/models/ace_step)
+# YuE2-3B songs (`gufo serve music --yue2`), on the ACE-Step stack.
+add_subdirectory(src/models/yue2)
 add_subdirectory(src/models/mmaudio)
 add_subdirectory(src/models/realesrgan)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
@@ -36,6 +38,7 @@ add_subdirectory(src/models/qwen3_omni)
 add_library(gufo_media STATIC
   src/cli/serve/media/media_serve.cpp
   src/cli/serve/media/music_api.cpp
+  src/cli/serve/media/yue2_api.cpp
   src/cli/serve/music_encode.cpp
   src/cli/serve/media/foley_api.cpp
   src/cli/serve/media/omni_api.cpp
@@ -44,6 +47,7 @@ add_library(gufo_media STATIC
   src/cli/serve/media/video_upscale.cpp
 )
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
+  gufo_yue2
   gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG)
 # mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
 target_compile_definitions(gufo_media PRIVATE

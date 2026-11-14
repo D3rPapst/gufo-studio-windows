@@ -1,8 +1,11 @@
-// Oobleck VAE of ACE-Step 1.5 (Diffusers AutoencoderOobleck).
+// Oobleck VAE of ACE-Step 1.5 (Diffusers AutoencoderOobleck) and the
+// decoder of YuE2-Vae (stable-audio-tools names; OobleckLayout, vae.hpp).
 // Decoder:
-//   conv1 (64 -> 2048, k7) -> 5 x [Snake, ConvTranspose (k 2s, stride s,
-//   pad s/2), 3 residual units (Snake, conv k7 dilation 1/3/9, Snake, conv
-//   k1)] -> Snake -> conv2 (128 -> 2, k7, no bias).
+//   conv1 (64 -> 2048, k7) -> N x [Snake, ConvTranspose (k 2s, stride s,
+//   pad ceil(s/2)), 3 residual units (Snake, conv k7 dilation 1/3/9, Snake,
+//   conv k1)] -> Snake -> conv2 (-> 2, k7, no bias). ACE-Step: N = 5,
+//   strides 10 6 4 4 2; YuE2-Vae: N = 6, strides 6 5 4 4 2 2. An odd stride
+//   drops the last sample of its block.
 // Encoder (the mirror image):
 //   conv1 (2 -> 128, k7) -> 5 x [3 residual units, Snake, conv (k 2s,
 //   stride s, pad ceil(s/2))] -> Snake -> conv2 (2048 -> 128, k3) giving
@@ -27,8 +30,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kBlocks = 5;
-// Decoder upsampling order; the encoder downsamples with the reverse.
-constexpr int kStrides[kBlocks] = {10, 6, 4, 4, 2};
+// The ACE-Step encoder downsamples with the reverse of the decoder strides.
 constexpr int kEncoderStrides[kBlocks] = {2, 4, 4, 6, 10};
 constexpr int kChunkFrames = 128;
 // Receptive field of either half is below 10 latent frames on either side.
@@ -280,16 +282,26 @@ bool LoadSnake(SafetensorsFile& file, const std::string& p, Snake& snake,
          UploadF32(snake.inv_beta, beta, error);
 }
 
+// Diffusers names (`p.res_unitU.snake1 / conv1 / snake2 / conv2`) or the
+// stable-audio-tools names of a decoder block (`p.layers.{U + 1}.layers.{0,
+// 1, 2, 3}` for the units U = 1..3).
 bool LoadResidualUnits(SafetensorsFile& file, const std::string& p,
-                       ResidualUnit* units, std::string* error) {
+                       ResidualUnit* units, std::string* error,
+                       bool stable_audio_names = false) {
   const int dilations[3] = {1, 3, 9};
+  static const char* const kNames[4] = {"snake1", "conv1", "snake2", "conv2"};
+  static const char* const kNumbers[4] = {"0", "1", "2", "3"};
+  const char* const* n = stable_audio_names ? kNumbers : kNames;
   for (int u = 0; u < 3; ++u) {
-    const std::string q = p + ".res_unit" + std::to_string(u + 1);
+    const std::string q =
+        stable_audio_names
+            ? p + ".layers." + std::to_string(u + 2) + ".layers."
+            : p + ".res_unit" + std::to_string(u + 1) + ".";
     ResidualUnit& unit = units[u];
-    if (!LoadSnake(file, q + ".snake1", unit.snake1, error) ||
-        !LoadConv(file, q + ".conv1", dilations[u], true, unit.conv1, error) ||
-        !LoadSnake(file, q + ".snake2", unit.snake2, error) ||
-        !LoadConv(file, q + ".conv2", 1, true, unit.conv2, error))
+    if (!LoadSnake(file, q + n[0], unit.snake1, error) ||
+        !LoadConv(file, q + n[1], dilations[u], true, unit.conv1, error) ||
+        !LoadSnake(file, q + n[2], unit.snake2, error) ||
+        !LoadConv(file, q + n[3], 1, true, unit.conv2, error))
       return false;
   }
   return true;
@@ -376,29 +388,32 @@ struct VaeCore {
 // ------------------------------------------------------------- decoder
 
 struct VaeDecoder::Impl : VaeCore {
+  OobleckLayout layout;
   Conv conv1, conv2;
-  Block blocks[kBlocks];
+  std::vector<Block> blocks;
   Snake snake;
 
   // Decodes latent frames [frames, 64] (BF16, on the device in `act`)
-  // into t [frames * 1920, 2].
+  // into t [layout.OutputSamples(frames), 2].
   bool Run(int frames, std::string* error) {
     int length = frames;
     if (!Convolve(conv1, length, x.f32(), nullptr, error))
       return false;
     int channels = conv1.out;
-    for (int b = 0; b < kBlocks; ++b) {
-      Block& block = blocks[b];
+    for (Block& block : blocks) {
       ApplySnake(block.snake, x.f32(), length, channels);
       const int s = block.up.stride;
       if (!gemm.Run(block.up.weight.bf16(), nullptr, act.bf16(), z.bf16(),
                     length, 2 * s * block.up.out, channels, error))
         return false;
-      const std::size_t count = std::size_t(length) * s * block.up.out;
+      // Natural output length L * s + s - 2 * ceil(s / 2) (L * s for an
+      // even stride).
+      const int next = length * s + s - 2 * ((s + 1) / 2);
+      const std::size_t count = std::size_t(next) * block.up.out;
       TransposeScatterKernel<<<Blocks(count), kThreads, 0, stream>>>(
           z.bf16(), length, s, block.up.out, (s + 1) / 2, block.up.bias.f32(),
           count, x.f32());
-      length *= s;
+      length = next;
       channels = block.up.out;
       if (!ResidualUnits(block.units, length, channels, error))
         return false;
@@ -413,27 +428,52 @@ VaeDecoder::~VaeDecoder() = default;
 
 std::unique_ptr<VaeDecoder> VaeDecoder::Load(
     const std::filesystem::path& safetensors, std::string* error) {
+  return Load(safetensors, OobleckLayout::AceStep(), error);
+}
+
+std::unique_ptr<VaeDecoder> VaeDecoder::Load(
+    const std::filesystem::path& safetensors, const OobleckLayout& layout,
+    std::string* error) {
   auto impl = std::make_unique<Impl>();
   Impl& m = *impl;
+  if (layout.strides.empty()) {
+    Fail(error, "Oobleck layout without blocks");
+    return nullptr;
+  }
+  m.layout = layout;
+  m.blocks.resize(layout.strides.size());
   if (!m.Init(error))
     return nullptr;
   SafetensorsFile file;
   if (!file.Open(safetensors, m.stream, error))
     return nullptr;
-  bool ok = LoadConv(file, "decoder.conv1", 1, true, m.conv1, error);
-  for (int b = 0; ok && b < kBlocks; ++b) {
-    const std::string p = "decoder.block." + std::to_string(b);
+  // stable-audio-tools: decoder.layers.0 = conv1, layers.1..N = blocks
+  // (layers.0 Snake, layers.1 ConvTranspose, layers.2..4 residual units),
+  // layers.N+1 = Snake, layers.N+2 = conv2.
+  const bool sa = layout.stable_audio_names;
+  const int count = static_cast<int>(layout.strides.size());
+  const auto top = [](int i) { return "decoder.layers." + std::to_string(i); };
+  bool ok = LoadConv(file, sa ? top(0) : std::string("decoder.conv1"), 1, true,
+                     m.conv1, error);
+  for (int b = 0; ok && b < count; ++b) {
+    const std::string p =
+        sa ? top(b + 1) : "decoder.block." + std::to_string(b);
     Block& block = m.blocks[b];
-    ok = LoadSnake(file, p + ".snake1", block.snake, error) &&
-         LoadTransposed(file, p + ".conv_t1", kStrides[b], block.up, error) &&
-         LoadResidualUnits(file, p, block.units, error);
+    ok = LoadSnake(file, p + (sa ? ".layers.0" : ".snake1"), block.snake,
+                   error) &&
+         LoadTransposed(file, p + (sa ? ".layers.1" : ".conv_t1"),
+                        layout.strides[b], block.up, error) &&
+         LoadResidualUnits(file, p, block.units, error, sa);
   }
-  ok = ok && LoadSnake(file, "decoder.snake1", m.snake, error) &&
-       LoadConv(file, "decoder.conv2", 1, false, m.conv2, error);
+  ok = ok &&
+       LoadSnake(file, sa ? top(count + 1) : std::string("decoder.snake1"),
+                 m.snake, error) &&
+       LoadConv(file, sa ? top(count + 2) : std::string("decoder.conv2"), 1,
+                false, m.conv2, error);
   if (!ok)
     return nullptr;
   if (m.conv1.in != kLatentChannels || m.conv2.out != 2) {
-    Fail(error, "unexpected ACE-Step VAE layout");
+    Fail(error, "unexpected Oobleck VAE layout");
     return nullptr;
   }
   return std::unique_ptr<VaeDecoder>(new VaeDecoder(std::move(impl)));
@@ -461,7 +501,7 @@ bool VaeDecoder::Decode(std::span<const float> latents, int frames,
       !m.cols.Reserve(kIm2colBytes + (1U << 20U), error) ||
       !m.z.Reserve(most_z * 2, error) || !m.gemm_out.Reserve(most * 2, error))
     return false;
-  const std::size_t samples = std::size_t(frames) * kSamplesPerFrame;
+  const std::size_t samples = m.layout.OutputSamples(frames);
   audio->assign(2 * samples, 0.0F);
   std::vector<float> chunk;
   for (int first = 0; first < frames; first += kChunkFrames) {
@@ -478,14 +518,18 @@ bool VaeDecoder::Decode(std::span<const float> latents, int frames,
                "VAE upload", error) ||
         !m.Run(count, error))
       return false;
-    chunk.resize(std::size_t(count) * kSamplesPerFrame * 2);
+    chunk.resize(m.layout.OutputSamples(count) * 2);
     if (!Check(hipMemcpyAsync(chunk.data(), m.t.get(), chunk.size() * 4,
                               hipMemcpyDeviceToHost, m.stream),
                "VAE download", error) ||
         !Check(hipStreamSynchronize(m.stream), "VAE decode", error))
       return false;
+    // The overlap covers the receptive field, so the kept core equals the
+    // single-pass decode; only the last chunk may end before the hop grid.
     const std::size_t skip = std::size_t(first - begin) * kSamplesPerFrame;
-    const std::size_t keep = std::size_t(last - first) * kSamplesPerFrame;
+    const std::size_t keep =
+        std::min(std::size_t(last - first) * kSamplesPerFrame,
+                 samples - std::size_t(first) * kSamplesPerFrame);
     for (std::size_t i = 0; i < keep; ++i)
       for (int ch = 0; ch < 2; ++ch)
         (*audio)[ch * samples + std::size_t(first) * kSamplesPerFrame + i] =

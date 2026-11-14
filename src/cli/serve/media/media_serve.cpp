@@ -8,6 +8,7 @@
 
 #include "src/cli/serve/media/foley_api.hpp"
 #include "src/cli/serve/media/music_api.hpp"
+#include "src/cli/serve/media/yue2_api.hpp"
 #include "src/cli/serve/media/omni_service.hpp"
 #include "src/cli/serve/media/video_rife.hpp"
 #include "src/cli/serve/media/video_upscale.hpp"
@@ -71,8 +72,15 @@ void AddMediaServeOptions(std::string_view subcommand, cli::ArgParser& parser,
                      "gufo.variant / model_version metadata and its name "
                      "does not tell",
                      "Model", &args->music_variant);
+    parser.AddOption("", "--yue2-vae", "DIR",
+                     "YuE2-Vae directory; serves YuE2-3B songs from --model "
+                     "(the YuE2-3B directory with qwen.tiktoken) instead of "
+                     "ACE-Step. A YuE2-3B --model alone uses "
+                     "<model>/../YuE2-Vae",
+                     "Model", &args->yue2_vae);
     parser.AddOption("", "--served-model-name", "NAME",
-                     "Public API model ID (default ace-step-1.5-xl-<variant>)",
+                     "Public API model ID (default ace-step-1.5-xl-<variant>, "
+                     "yue2-3b for YuE2)",
                      "Model", &args->name);
     return;
   }
@@ -220,6 +228,19 @@ std::shared_ptr<MediaService> LoadMediaService(std::string_view subcommand,
                                                const MediaServeArgs& args,
                                                std::string* details,
                                                std::string* error) {
+  if (subcommand == "music" &&
+      (!args.yue2_vae.empty() || IsYue2ModelDir(args.model))) {
+    const std::filesystem::path vae =
+        args.yue2_vae.empty() ? args.model.parent_path() / "YuE2-Vae"
+                              : args.yue2_vae;
+    auto music = std::make_shared<Yue2MusicService>(args.model, vae, args.name);
+    if (!music->ready()) {
+      *error = "Error loading YuE2: " + music->initialization_error();
+      return nullptr;
+    }
+    *details = "model=" + music->model_id() + " vae=" + vae.string();
+    return music;
+  }
   if (subcommand == "music") {
     MusicServiceOptions options;
     options.model_root = args.model;

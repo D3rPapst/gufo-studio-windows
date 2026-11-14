@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "name": "yue2",
+  "target": "gufo_yue2",
+  "kind": "static",
+  "purpose": "YuE2-3B songs with vocals (gufo-studio-windows): qwen.tiktoken tokenizer, prompts, phase sampler, AR / NAR model and the song pipeline with the YuE2-Vae decoder.",
+  "consumers": [
+    "gufo_media"
+  ],
+  "checks": [
+    "yue2_protocol_test"
+  ]
+}

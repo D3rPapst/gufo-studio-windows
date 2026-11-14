@@ -33,6 +33,8 @@ struct MediaServeArgs {
   std::string name;             // --served-model-name
   // music: --dit FILE|turbo|sft|base, --lm FILE|none|0.6b|1.7b|4b, --variant.
   std::string music_dit, music_lm, music_variant;
+  // music: --yue2-vae DIR (YuE2-3B in --model; default <model>/../YuE2-Vae).
+  std::filesystem::path yue2_vae;
   UpscaleServeOptions upscale;  // upscale
   // omni (Qwen3-Omni-30B-A3B-Captioner): projector GGUF and limits.
   std::filesystem::path mmproj;

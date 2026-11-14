@@ -20,7 +20,7 @@ to run the model and what speed to expect.
 <!-- END GENERATED MODEL TABLE -->
 
 Fork pages outside the generated table: [Qwen3-Omni captioner](qwen3-omni-captioner.md),
-[ACE-Step 1.5](ace-step-1.5.md), [MOSS-Music](moss-music.md), [TripoSG](triposg.md),
+[ACE-Step 1.5](ace-step-1.5.md), [YuE2](yue2.md), [MOSS-Music](moss-music.md), [TripoSG](triposg.md),
 [TRELLIS.2](trellis2.md), [RIFE](rife/README.md), [Real-ESRGAN](realesrgan/README.md),
 [image recognition (imgutils detectors)](vision-detect.md).
 
