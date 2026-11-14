@@ -549,6 +549,25 @@ std::string UniformPng(int width, int height) {
 
 /// All pictures of one request share kMaxRequestBytes (encoded): four
 /// Ablage pictures of 20 MB each are refused before anything is decoded.
+/// A page user (session cookie) reads an Ablage path with its own session.
+void TestAblageCookie() {
+  vision::Options options;
+  std::string cookie;
+  options.serve = [&cookie](const HttpRequest& inner) {
+    cookie = inner.header("Cookie");
+    HttpResponse response;
+    response.status = 404;
+    response.reason = "Not Found";
+    response.body = R"({"error":{"code":"not_found","message":"no such job"}})";
+    return response;
+  };
+  const vision::VisionService service(options);
+  HttpRequest request = Post(Body("/v1/jobs/abc/files/a.png", {"face"}));
+  request.headers.emplace_back("Cookie", "gufo_sitzung=s-1");
+  assert(service.Handle(request)->status == 404);
+  assert(cookie == "gufo_sitzung=s-1");
+}
+
 void TestRequestBytes() {
   vision::Options options;
   options.serve = [](const HttpRequest&) {
@@ -841,6 +860,7 @@ int main() {
   TestErrors();
   TestPool();
   TestRequestBytes();
+  TestAblageCookie();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')
