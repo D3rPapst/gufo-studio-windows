@@ -13,10 +13,10 @@ _Written with AI assistance (Claude Code) from our configuration and test logs. 
 
 Each machine runs one `gufo router`. The router owns the API surface and starts one `gufo serve` worker
 process per model when a request needs it. A `[remote/<id>]` preset section makes a model on the other
-machine look local (see [SERVER.md on release/1.4](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#remote-models)).
+machine look local (see [SERVER.md on release/1.4](https://github.com/D3rPapst/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#remote-models)).
 Since 1.4, a local section and a `[remote/<id>]` section with the same id make a model switchable:
 `POST /router/placement` moves it between the machines without a restart
-([details](https://github.com/D3rPapts/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#switching-a-model-between-local-and-remote)).
+([details](https://github.com/D3rPapst/gufo-studio-windows/blob/release/1.4/docs/SERVER.md#switching-a-model-between-local-and-remote)).
 
 | Machine | Memory | Role |
 |---|---|---|

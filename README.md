@@ -7,20 +7,56 @@ music and 3D run behind one OpenAI-compatible port; a second machine joins as a 
 (`/pool/`), and every job lands in one shared result store (`/ablage/`). Built on
 [gufo-org/gufo](https://github.com/gufo-org/gufo), measured on a 64 GB and a 128 GB GMKtec EVO-X2.
 
-> **[Download 2.0.5](https://github.com/D3rPapts/gufo-studio-windows/releases/tag/v2.0.5)** · unzip, edit `examples\router.ini`, run `start-router.cmd`.
+> **[Download 2.0.5](https://github.com/D3rPapst/gufo-studio-windows/releases/tag/v2.0.5)** · unzip, edit `examples\router.ini`, run `start-router.cmd`.
 > ROCm runtime included; FFmpeg via `winget install Gyan.FFmpeg`. Models load on the first request.
 
-| What | Models | 64 GB EVO-X2, Windows 11, ROCm 10.0 |
-|---|---|---|
-| Chat | Qwen3.8-27B, Qwen3.8 Flash-Next (Q3/Q4), Qwen3.6-35B-A3B | 27B 14.7 tok/s, Flash-Next Q3 28.7 tok/s |
-| Images | Qwen-Image 2.1 + Turbo, LoRA, ControlNet, MOSS-Image | 1024² in ~20 s; 22 GB between jobs |
-| Video | Wan 2.2 5B, Wan 2.1 camera/VACE/InfiniteTalk, MiniMax H3 (128 GB) | Wan 2.2 640x352, 1 s: 45 s |
-| Voice | Qwen3-TTS (3 variants), Fish Drama-3, IndexTTS, VoxCPM2, Ming, ASR | RTF 0.4–0.8 |
-| Music | ACE-Step 1.5 (turbo/sft/base, all tasks), MOSS-Music captions | live preview while rendering |
-| 3D | TripoSG, TRELLIS.2 (textured GLB) | 136 s / 121 s |
-| Tools | Real-ESRGAN upscale, RIFE, Omni captioner, memory, job store | |
-| Two machines | job pool with priorities, capabilities, never-stuck fallback, `/pool/` page | partner down → local in 3 s |
-| Users | optional login, roles, per-user areas and models, word filter (images, video, chat), daily limits, tokens, own password change (`/verwaltung/`, off by default) | |
+| What | Models | 64 GB EVO-X2, Windows 11, ROCm 10.0 | Weights |
+|---|---|---|---|
+| Chat | Qwen3.8-27B, Qwen3.8 Flash-Next (Q3/Q4), Qwen3.6-35B-A3B | 27B 14.7 tok/s, Flash-Next Q3 28.7 tok/s | HF original (GGUF, see model pages) |
+| Images | Qwen-Image 2.1 + Turbo, LoRA, ControlNet, MOSS-Image | 1024² in ~20 s; 22 GB between jobs | HF original |
+| Video | Wan 2.2 5B, Wan 2.1 camera/VACE/InfiniteTalk, MiniMax H3 (128 GB) | Wan 2.2 640x352, 1 s: 45 s | HF original |
+| Voice | Qwen3-TTS (3 variants), Fish Drama-3, IndexTTS, VoxCPM2, Ming, ASR | RTF 0.4–0.8 | HF original |
+| Music | ACE-Step 1.5 (turbo/sft/base, all tasks), MOSS-Music captions | live preview while rendering | [ace-step-1.5-gufo](https://huggingface.co/D3rPapst/ace-step-1.5-gufo) · [moss-music-8b-gufo](https://huggingface.co/D3rPapst/moss-music-8b-gufo) |
+| 3D | TripoSG, TRELLIS.2 (textured GLB) | 136 s / 121 s | [triposg-gufo](https://huggingface.co/D3rPapst/triposg-gufo) · [trellis2-gufo](https://huggingface.co/D3rPapst/trellis2-gufo) (DINOv3 not included, see below) |
+| Tools | Real-ESRGAN upscale, RIFE, Omni captioner, memory, job store | | [realesrgan-srvgg-gufo](https://huggingface.co/D3rPapst/realesrgan-srvgg-gufo) · [rife-ifnet-gufo](https://huggingface.co/D3rPapst/rife-ifnet-gufo); captioner HF original |
+| Two machines | job pool with priorities, capabilities, never-stuck fallback, `/pool/` page | partner down → local in 3 s | |
+| Users | optional login, roles, per-user areas and models, word filter (images, video, chat), daily limits, tokens, own password change (`/verwaltung/`, off by default) | | |
+
+### Converted weights on Hugging Face
+
+The models that this fork runs in its own file layout are published ready to use under
+[huggingface.co/D3rPapst](https://huggingface.co/D3rPapst), so you skip the sharded original
+downloads and the conversion step:
+
+| Repository | Content | Size | Licence |
+|---|---|---:|---|
+| [ace-step-1.5-gufo](https://huggingface.co/D3rPapst/ace-step-1.5-gufo) | ACE-Step 1.5 XL turbo / sft / base DiTs, 5 Hz planners 0.6B / 1.7B / 4B, text encoder, VAE, tokenizer, silence latent (BF16 safetensors) | 44.9 GB | MIT (ACE-Step), Apache-2.0 (Qwen3-Embedding part) |
+| [moss-music-8b-gufo](https://huggingface.co/D3rPapst/moss-music-8b-gufo) | MOSS-Music-8B-Instruct: audio encoder BF16 + Qwen3-8B LLM Q8_0 (two GGUF files) | 10.4 GB | Apache-2.0 |
+| [trellis2-gufo](https://huggingface.co/D3rPapst/trellis2-gufo) | TRELLIS.2-4B flow DiTs and sparse decoders, 512 path (six safetensors) | 9.8 GB | MIT; DINOv3 encoder **not included** |
+| [triposg-gufo](https://huggingface.co/D3rPapst/triposg-gufo) | TripoSG (DINOv2-L + DiT + shape VAE decoder) in one BF16/F32 file | 3.92 GB | MIT |
+| [realesrgan-srvgg-gufo](https://huggingface.co/D3rPapst/realesrgan-srvgg-gufo) | Real-ESRGAN compact x4: general, wdn, anime (FP32 safetensors) | 12 MB | BSD-3-Clause |
+| [rife-ifnet-gufo](https://huggingface.co/D3rPapst/rife-ifnet-gufo) | RIFE 4.7 / 4.9 IFNet (FP32 safetensors) | 43 MB | MIT |
+
+The files were converted with the scripts in `tools/` (`tools/ace_step`, `tools/rife` and
+`tools/upscale` on `main`; `tools/moss_music`, `tools/triposg` and `tools/trellis2` on the
+feature branches below). Safetensors and JSON are parsed directly, PyTorch pickles are read
+with a restricted unpickler; no checkpoint code runs. Every card names the source repository
+and revision, the converter commit, the files with sizes and the router preset section that
+loads them; the licence text travels with the weights. Download one with
+`hf download D3rPapst/<repo> --local-dir <folder>`.
+
+Two things to know: **these layouts need the workers of this fork** (`gufo serve music`,
+`serve upscale` and `--rife-model` on `main`; `serve moss-music` and `serve objekt` on the
+branches `feat/moss-music`, `feat/triposg` and `feat/trellis2`, see the cards); upstream Gufo
+does not read them. And **TRELLIS.2 needs one more file**: its image encoder, DINOv3 ViT-L/16,
+is gated under Meta's DINOv3 License and is not in the repository. Accept the terms at
+[facebook/dinov3-vitl16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m),
+download the snapshot and run
+`python -P -E tools/trellis2/convert_hf_to_gufo.py --dinov3 <snapshot> --out <trellis2 folder> --parts dinov3`;
+that writes `trellis2-dinov3.safetensors` (1.21 GB) next to the six parts ("Built with DINOv3").
+
+Unchanged originals (the Qwen, Wan, MiniMax, OpenMOSS, Fish, VoxCPM, Ming and LoRA weights)
+are not mirrored; the model pages link to their Hugging Face repositories.
 
 All numbers are from the release notes; nothing here is estimated.
 Previous releases: 2.0.3, 2.0.2, 2.0.1, 2.0.0, 1.4.21, 1.4.8 … 1.0.0 (see Releases). The repository was called `gufo_windows` until 31 October 2026.
@@ -227,7 +263,7 @@ large for 64 GB; not tried yet).
 
 ### Want something from this?
 
-**Open an [issue](https://github.com/D3rPapts/gufo-studio-windows/issues) in this
+**Open an [issue](https://github.com/D3rPapst/gufo-studio-windows/issues) in this
 repository** and say what you'd like to use: a model, a fix, a feature from
 one of the branches. We'll help. That can mean rebasing it onto your fork or
 branch, building it for you, or testing on our hardware (a 64 GB and a 128 GB
@@ -340,7 +376,7 @@ C:\vcpkg\vcpkg.exe install icu curl openssl libpng libjpeg-turbo --triplet x64-w
 ### 3. Get the code and build
 
 ```powershell
-git clone https://github.com/D3rPapts/gufo-studio-windows
+git clone https://github.com/D3rPapst/gufo-studio-windows
 cd gufo-studio-windows
 powershell -ExecutionPolicy Bypass -File tools\windows\check.ps1   # lists anything missing and how to fix it
 powershell -ExecutionPolicy Bypass -File tools\windows\build.ps1   # -> build\release\gufo.exe
@@ -461,7 +497,7 @@ for the numbers.
 - **After installing CMake or Ninja with winget, open a new terminal**, or
   `check.ps1` and `build.ps1` report them missing.
 - Plans and open questions are tracked in the
-  [issues](https://github.com/D3rPapts/gufo-studio-windows/issues).
+  [issues](https://github.com/D3rPapst/gufo-studio-windows/issues).
 
 ## Not tested here
 
