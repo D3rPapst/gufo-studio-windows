@@ -1231,6 +1231,11 @@ void TestChat() {
         "{\"nachricht\":\"x\",\"verlauf\":[{\"rolle\":\"system\",\"text\":\"a\"}]}",
         "{\"nachricht\":\"x\",\"verlauf\":\"a\"}",
         "{\"nachricht\":\"x\",\"bilder\":[\"http://x/y.png\"]}",
+        // A single path instead of an array (finding 4), also an empty
+        // string and an object: never silently "no images".
+        "{\"nachricht\":\"x\",\"bilder\":\"/v1/jobs/j1/files/a.png\"}",
+        "{\"nachricht\":\"x\",\"bilder\":\"\"}",
+        "{\"nachricht\":\"x\",\"bilder\":{}}",
         "{\"nachricht\":\"x\",\"max_tokens\":0}",
         "{\"nachricht\":\"x\",\"temperature\":-1}",
         "{\"nachricht\":\"x\",\"denken\":\"ja\"}"}) {

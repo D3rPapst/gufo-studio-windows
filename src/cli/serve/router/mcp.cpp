@@ -1472,10 +1472,12 @@ json::Value McpService::RunChat(const json::Value& args,
   // An Ablage path is read through the gate (own files only) and sent as
   // a data URL; the worker cannot fetch router paths itself.
   json::Value user_content;
-  if (const json::Value* bilder = Arg(args, "bilder");
-      bilder != nullptr && bilder->size() > 0) {
-    if (!bilder->is_array())
-      throw InvalidParams("arguments.bilder must be an array of strings");
+  const json::Value* bilder = Arg(args, "bilder");
+  // The type first: size() is 0 for a string, which must not pass as "no
+  // images" (ultra review #16, finding 4).
+  if (bilder != nullptr && !bilder->is_array())
+    throw InvalidParams("arguments.bilder must be an array of strings");
+  if (bilder != nullptr && bilder->size() > 0) {
     json::Value parts = json::Value::array();
     json::Value text_part = json::Value::object();
     text_part["type"] = "text";
