@@ -826,7 +826,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     // Tags on the original pixels (never the brightened copy), like the
     // pipeline's erkennung.py.
     if (tagger != nullptr) {
-      detections[kWd14Task] = RunWd14(*tagger, image, parsed.wd14, persons, wd14_images);
+      detections[kWd14Task] =
+          RunWd14(*tagger, image, parsed.wd14, persons, wd14_images, request.is_cancelled);
       used[kWd14Task] = Wd14ModelInfo(parsed.wd14);
     }
     // OCR on the original pixels too (erkennung.py / erkennung_schrift.py),
@@ -940,6 +941,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         used["pose_wholebody"] = std::move(m);
       }
     }
+  } catch (const Wd14Cancelled&) {
+    return Error(499, "Client Closed Request", "cancelled", "cancelled");
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),
                  "vision_failed");

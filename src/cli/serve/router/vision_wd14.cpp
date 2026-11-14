@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace gufo::router::vision {
@@ -34,6 +35,8 @@ void ParseRegions(const json::Value& value, Wd14Request* request, const std::str
   }
   if (!value.is_array())
     throw std::invalid_argument(what + ": \"person\" or a list of [x0, y0, x1, y1] boxes");
+  if (value.size() > kWd14MaxRegions)
+    throw std::invalid_argument(what + ": at most " + std::to_string(kWd14MaxRegions) + " boxes");
   for (const json::Value& box : value.items()) {
     if (!box.is_array() || box.size() != 4)
       throw std::invalid_argument(what + ": every box is [x0, y0, x1, y1]");
@@ -135,9 +138,15 @@ json::Value Wd14ModelInfo(const Wd14Request& request) {
 json::Value RunWd14(const models::ccip::Wd14Tagger& net, const models::ccip::RgbImage& image,
                     const Wd14Request& request,
                     const std::vector<std::array<int, 4>>& persons,
-                    const std::vector<models::ccip::RgbImage>& extra) {
+                    const std::vector<models::ccip::RgbImage>& extra,
+                    const std::function<bool()>& cancelled) {
   json::Value list = json::Value::array();
+  const auto check = [&] {
+    if (cancelled && cancelled())
+      throw Wd14Cancelled{};
+  };
   const auto tag_region = [&](const std::array<double, 4>& region, const char* source, int index) {
+    check();
     const std::array<int, 4> cut =
         models::ccip::MarginCropBox(region, request.margin, image.width, image.height);
     if (cut[2] <= cut[0] || cut[3] <= cut[1])
@@ -165,6 +174,7 @@ json::Value RunWd14(const models::ccip::Wd14Tagger& net, const models::ccip::Rgb
                              "image", 0, nullptr, image.width, image.height));
   }
   for (std::size_t i = 0; i < extra.size(); ++i) {
+    check();
     list.push_back(Wd14Entry(net.Tag(extra[i], request.general_threshold,
                                      request.character_threshold),
                              "images", static_cast<int>(i), nullptr, extra[i].width,

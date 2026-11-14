@@ -914,7 +914,10 @@ compared in double. Regions follow `erkennung.py`: the box plus
 `margin * max(w, h)` per side, clipped, then Pillow `crop`'s `round()` (half
 to even, `MarginCropBox`); `regions: "person"` uses this request's person
 boxes (detected on the brightened copy when `brighten_dark` applies) and adds
-the `person` task; the tagger always reads the original pixels. Further
+the `person` task; the tagger always reads the original pixels. Explicit
+`regions` are at most `kWd14MaxRegions` = 64 boxes (each is one SwinV2 run
+on the shared CPU queue; more: 400), and a caller that disconnects stops
+the tagging between two pictures (499). Further
 pictures (`wd14_tags.images`, at most 16) are read like `image` (Ablage path
 through the gate) and inlined as data URLs when the request goes to the pool
 partner. Code: `src/cli/serve/router/vision_wd14.{hpp,cpp}`. Weights:

@@ -10,7 +10,8 @@
 //            of the whole image, or "person" (also use_detections:
 //            "person"): the person boxes of the same request (detect_person,
 //            on the brightened copy with brighten_dark); the person task is
-//            then run and answered even when not listed
+//            then run and answered even when not listed; at most
+//            kMaxWd14Regions boxes (each is one SwinV2 run), more: 400
 //   margin  (0.08)  added on every side of a region: margin * max(w, h),
 //           clipped to the image, Pillow's rounding (the film pipeline's
 //           erkennung.py cut-outs); the pixels come from the original
@@ -25,6 +26,8 @@
 // Written with AI assistance (Claude Code).
 
 #include <array>
+#include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,6 +39,8 @@ namespace gufo::router::vision {
 inline constexpr const char* kWd14Task = "wd14_tags";
 inline constexpr const char* kWd14Repo = "deepghs/wd14_tagger_with_embeddings";
 inline constexpr const char* kWd14Model = "SmilingWolf/wd-swinv2-tagger-v3";
+/// Explicit regions per request (each is one tagger run on the CPU queue).
+inline constexpr std::size_t kWd14MaxRegions = 64;
 
 struct Wd14Request {
   bool enabled{false};
@@ -61,11 +66,14 @@ json::Value Wd14ModelInfo(const Wd14Request& request);
 
 /// Tags `image` as the request asks (whole, explicit regions or the
 /// `persons` boxes) and every picture of `extra`; the entries in order.
-/// Throws std::invalid_argument when a region lies outside the image.
+/// Throws std::invalid_argument when a region lies outside the image and
+/// Wd14Cancelled when `cancelled` says so between two pictures.
+struct Wd14Cancelled {};
 json::Value RunWd14(const models::ccip::Wd14Tagger& net, const models::ccip::RgbImage& image,
                     const Wd14Request& request,
                     const std::vector<std::array<int, 4>>& persons,
-                    const std::vector<models::ccip::RgbImage>& extra);
+                    const std::vector<models::ccip::RgbImage>& extra,
+                    const std::function<bool()>& cancelled = {});
 
 }  // namespace gufo::router::vision
 
