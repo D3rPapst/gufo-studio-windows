@@ -198,7 +198,7 @@ in a ZIP without compression (stored entries, CRC-32), named `f_00001.png`,
 no audio and no `crf`; the job object says `"output_format": "png_zip"`.
 Use it when the pipeline encodes the delivery itself, so the frames are not
 compressed twice. The archive is held in memory like the MP4 and is limited
-to 4 GiB and 65535 frames (no ZIP64): a 1920x1080 frame is about 2-4 MB as
+to 4 GiB and 65535 frames (no ZIP64): a 1920x1080 frame is about 3-5 MB as
 PNG, so send film segments, not whole films.
 
 ### Speed
