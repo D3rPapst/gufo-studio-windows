@@ -188,6 +188,7 @@ void TestParse() {
   }
   for (const char* bad_options :
        {R"({"regions": [[10, 20, 5, 30]]})", R"({"regions": "face"})",
+        R"({"regions": [[0, 0, 1e12, 10]]})", R"({"regions": [[-2e6, 0, 10, 10]]})",
         R"({"general_threshold": 2})", R"({"colour": 1})", R"({"images": [1]})",
         R"({"regions": "person", "use_detections": "person"})"}) {
     assert(Throws([&] {
