@@ -240,6 +240,25 @@ Request ParseRequest(const json::Value& body) {
     if (std::find(names.begin(), names.end(), spec.task) != names.end())
       request.tasks.push_back(spec);
   }
+  if (const json::Value* dark = body.find("brighten_dark"); dark != nullptr && !dark->is_null()) {
+    if (dark->is_bool()) {
+      request.brighten_dark = dark->as_bool();
+    } else if (dark->is_object()) {
+      request.brighten_dark = true;
+      for (const auto& [key, value] : dark->members()) {
+        if (!value.is_number())
+          throw std::invalid_argument("brighten_dark." + key + " must be a number");
+        if (key == "below" && value.as_double() >= 0.0 && value.as_double() <= 256.0)
+          request.dark_below = value.as_double();
+        else if (key == "gamma" && value.as_double() > 0.0 && value.as_double() <= 4.0)
+          request.dark_gamma = value.as_double();
+        else
+          throw std::invalid_argument("brighten_dark: below in [0, 256], gamma in (0, 4]");
+      }
+    } else {
+      throw std::invalid_argument("brighten_dark must be true, false or {below, gamma}");
+    }
+  }
   if (const json::Value* thresholds = body.find("thresholds");
       thresholds != nullptr && !thresholds->is_null()) {
     if (!thresholds->is_object())
@@ -364,6 +383,14 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   }
   bytes.clear();
   bytes.shrink_to_fit();
+  const double mean_luma = models::ccip::MeanLuma(image);
+  const bool brightened = parsed.brighten_dark && mean_luma < parsed.dark_below;
+  // The detectors see the brightened copy; later tasks (OCR, tags) keep
+  // the original, as in the pipeline's erkennung.py.
+  models::ccip::RgbImage detect_image;
+  if (brightened)
+    detect_image = models::ccip::ApplyGamma(image, parsed.dark_gamma);
+  const models::ccip::RgbImage& detector_input = brightened ? detect_image : image;
 
   const auto queued = std::chrono::steady_clock::now();
   switch (state_->gate.Enter(request.is_cancelled, options_.max_waiting)) {
@@ -388,14 +415,14 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       const TaskSpec& spec = parsed.tasks[i];
       const auto& labels = nets[i]->Labels();
       json::Value list = json::Value::array();
-      for (const models::ccip::Detection& d : nets[i]->Detect(image, spec.conf, spec.iou)) {
+      for (const models::ccip::Detection& d : nets[i]->Detect(detector_input, spec.conf, spec.iou)) {
         json::Value box = json::Value::array();
         for (int v : d.box)
           box.push_back(v);
         json::Value entry = json::Value::object();
         entry["box"] = std::move(box);
         entry["label"] = labels[static_cast<std::size_t>(d.label)];
-        entry["score"] = std::round(static_cast<double>(d.score) * 1e6) / 1e6;
+        entry["score"] = static_cast<double>(d.score);
         list.push_back(std::move(entry));
       }
       detections[spec.task] = std::move(list);
@@ -419,6 +446,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   out["object"] = "vision.detection";
   out["width"] = image.width;
   out["height"] = image.height;
+  out["mean_luma"] = std::round(mean_luma * 1000.0) / 1000.0;
+  out["brightened"] = brightened;
   out["detections"] = std::move(detections);
   out["models"] = std::move(used);
   out["seconds"] = seconds(started, done);

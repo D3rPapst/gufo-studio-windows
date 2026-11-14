@@ -2,8 +2,10 @@
 // Env: GUFO_VISION_DIR (dir with <model>.safetensors/.json for the four default
 // detectors), GUFO_VISION_ORACLE (dir with manifest.json), optional
 // GUFO_CCIP_THREADS. Exit 77 (skip) without them.
-// Pass: the stretched 640x640 input bit-exact, per task the same number of
-// boxes, every box within 1 px and every score within 1e-3 of imgutils.
+// Pass: the stretched 640x640 input bit-exact, MeanLuma equal to Pillow's,
+// per task the same number of boxes, every box within 1 px and every score
+// within 1e-3 of imgutils, on the image and on its gamma-0.5 copy (the film
+// pipeline's dark-keyframe path).
 // Written with AI assistance (Claude Code).
 #include <algorithm>
 #include <chrono>
@@ -106,11 +108,22 @@ int main() {
     std::printf("\n%s (%dx%d): input %zu of %zu values differ\n",
                 item.member_str("source").c_str(), img.width, img.height, differ, ref_x.size());
     if (differ != 0 || x.size() != ref_x.size()) ok = false;
-    const gufo::json::Value* want_all = item.find("detections");
+    const double luma = ccip::MeanLuma(img);
+    const double want_luma = item.member_double("mean_luma");
+    std::printf("  mean luma %.6f (Pillow %.6f)
+", luma, want_luma);
+    if (std::fabs(luma - want_luma) > 1e-9) ok = false;
+    const ccip::RgbImage bright = ccip::ApplyGamma(img, 0.5);
+    for (const char* variant : {"detections", "detections_gamma05"}) {
+    const ccip::RgbImage& input = std::string(variant) == "detections" ? img : bright;
+    const gufo::json::Value* want_all = item.find(variant);
+    if (want_all == nullptr) continue;
+    std::printf("  [%s]
+", variant);
     for (std::size_t k = 0; k < std::size(kTasks); ++k) {
       const Task& task = kTasks[k];
       const auto a = std::chrono::steady_clock::now();
-      const std::vector<ccip::Detection> got = nets[k]->Detect(img, task.conf, task.iou);
+      const std::vector<ccip::Detection> got = nets[k]->Detect(input, task.conf, task.iou);
       const auto b = std::chrono::steady_clock::now();
       const auto& want = want_all->find(task.name)->items();
       double max_px = 0;
@@ -130,6 +143,7 @@ int main() {
                   task.name, got.size(), want.size(), max_px, max_score,
                   std::chrono::duration<double, std::milli>(b - a).count(), pass ? "ok" : "FAIL");
       ok = ok && pass;
+    }
     }
   }
   std::printf("\n%s\n", ok ? "PASS" : "FAIL");

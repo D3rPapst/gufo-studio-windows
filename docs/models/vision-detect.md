@@ -26,6 +26,10 @@ the cores.
   `wd14_tags` are reserved names and answer `501 task_not_available`.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per task, each in (0, 1].
+- `brighten_dark`: optional. `true` runs the detectors on a brightened copy
+  (each channel `round(255 * (v / 255) ** 0.5)`) when the image's mean brightness
+  (Pillow's `L` channel) is below 70; `{"below": 50, "gamma": 0.7}` changes both
+  values. The boxes still refer to your image. Off by default.
 
 ## Answer
 
@@ -36,6 +40,8 @@ An answer for two tasks (example values):
   "object": "vision.detection",
   "width": 1344,
   "height": 768,
+  "mean_luma": 44.083,
+  "brightened": true,
   "detections": {
     "person": [{"box": [412, 96, 705, 768], "label": "person", "score": 0.912345}],
     "face": [{"box": [520, 140, 598, 222], "label": "face", "score": 0.874512}]
@@ -50,7 +56,7 @@ An answer for two tasks (example values):
 ```
 
 `box` is `[x0, y0, x1, y1]` in whole pixels of your image, each list is sorted by
-score. `seconds` is the compute time, `queue_seconds` the wait for the CPU.
+score, and `score` is the unrounded value imgutils returns. `seconds` is the compute time, `queue_seconds` the wait for the CPU.
 
 ## Models
 

@@ -11,9 +11,15 @@
 //      "tasks": ["person", "head", "face", "hand"],
 //      "thresholds": {"person": {"conf": 0.3, "iou": 0.5}}}   optional
 //     ("bild" and "aufgaben" are accepted for image and tasks.)
+//     "brighten_dark": true | {"below": 70, "gamma": 0.5}   optional: when
+//     the mean luma (Pillow "L") is below `below`, the detectors run on a
+//     copy brightened with v -> round(255 * (v/255)^gamma), as the film
+//     pipeline does for dark keyframes; "brightened" in the answer says so.
 //   -> {"object": "vision.detection", "width": W, "height": H,
+//       "mean_luma": L, "brightened": bool,
 //       "detections": {"person": [{"box": [x0, y0, x1, y1], "label":
 //          "person", "score": 0.93}], ...},          one list per task
+//       (score: the float32 value as imgutils returns it, unrounded)
 //       "models": {"person": {"repo", "model", "conf", "iou"}, ...},
 //       "seconds": compute time, "queue_seconds": wait before it}
 //   Boxes are integer pixels of the input image, sorted by score (imgutils
@@ -61,6 +67,12 @@ const std::vector<std::string>& PlannedTasks();
 struct Request {
   std::string image;
   std::vector<TaskSpec> tasks;  // with the request's thresholds applied
+  /// "brighten_dark": detectors look at a gamma-brightened copy when the
+  /// image's mean luma is below `dark_below` (film pipeline erkennung.py:
+  /// 70 and gamma 0.5). Off by default (plain imgutils).
+  bool brighten_dark{false};
+  double dark_below{70.0};
+  double dark_gamma{0.5};  // models::ccip::MeanLuma / ApplyGamma
 };
 
 /// Parses and checks a request body; throws std::invalid_argument with a

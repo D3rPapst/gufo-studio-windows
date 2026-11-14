@@ -14,7 +14,7 @@ import json
 import os
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageStat
 from safetensors.numpy import save_file
 
 import imgutils
@@ -69,13 +69,18 @@ def main():
         x = rgb_encode(stretched)
         name = f"vision_{i}.safetensors"
         save_file({"rgb": rgb, "input640": np.ascontiguousarray(x)}, os.path.join(args.out_dir, name))
+        # The film pipeline (erkennung.py) runs the detectors on a gamma-0.5 copy when the mean luma is < 70;
+        # both variants are recorded, whatever the luma.
+        bright = img.point(lambda v: round(255 * (v / 255) ** 0.5))
         entry = {"source": os.path.basename(path), "file": name, "width": img.width, "height": img.height,
-                 "detections": {}}
+                 "mean_luma": ImageStat.Stat(img.convert("L")).mean[0], "detections": {},
+                 "detections_gamma05": {}}
         for task, fn in TASKS.items():
-            entry["detections"][task] = [
-                {"box": [int(v) for v in box], "label": label, "score": float(score)}
-                for box, label, score in fn(img)
-            ]
+            for key, im in (("detections", img), ("detections_gamma05", bright)):
+                entry[key][task] = [
+                    {"box": [int(v) for v in box], "label": label, "score": float(score)}
+                    for box, label, score in fn(im)
+                ]
         manifest["images"].append(entry)
         print(path, {t: len(d) for t, d in entry["detections"].items()})
     with open(os.path.join(args.out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:

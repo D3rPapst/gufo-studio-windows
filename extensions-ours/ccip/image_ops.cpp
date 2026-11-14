@@ -187,6 +187,30 @@ RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height) {
   return Resample(in, out_width, out_height, kBicubic);
 }
 
+double MeanLuma(const RgbImage& image) {
+  const std::size_t pixels = static_cast<std::size_t>(image.width) * image.height;
+  if (pixels == 0) return 0.0;
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < pixels; ++i) {
+    sum += (static_cast<std::uint32_t>(image.rgb[i * 3]) * 19595u +
+            static_cast<std::uint32_t>(image.rgb[i * 3 + 1]) * 38470u +
+            static_cast<std::uint32_t>(image.rgb[i * 3 + 2]) * 7471u + 0x8000u) >>
+           16;
+  }
+  return static_cast<double>(sum) / static_cast<double>(pixels);
+}
+
+RgbImage ApplyGamma(const RgbImage& image, double gamma) {
+  std::uint8_t lut[256];
+  for (int v = 0; v < 256; ++v) {
+    const double y = std::nearbyint(255.0 * std::pow(v / 255.0, gamma));
+    lut[v] = static_cast<std::uint8_t>(std::clamp(y, 0.0, 255.0));
+  }
+  RgbImage out = image;
+  for (std::uint8_t& c : out.rgb) c = lut[c];
+  return out;
+}
+
 std::vector<float> StretchInput(const RgbImage& image, int width, int height) {
   const RgbImage r = ResizeBicubic(image, width, height);
   const std::size_t plane = static_cast<std::size_t>(width) * height;

@@ -8,6 +8,7 @@
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include "ccip/image_ops.hpp"
 #include "src/cli/serve/router/vision.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/json.hpp"
@@ -109,6 +111,23 @@ void TestParse() {
     bad["thresholds"] = std::move(t);
     (void)vision::ParseRequest(bad);
   }));
+  // brighten_dark: off by default, true = 70 / 0.5, object overrides.
+  assert(!vision::ParseRequest(Body("AAAA", {})).brighten_dark);
+  json::Value dark = Body("AAAA", {"head"});
+  dark["brighten_dark"] = true;
+  r = vision::ParseRequest(dark);
+  assert(r.brighten_dark && r.dark_below == 70.0 && r.dark_gamma == 0.5);
+  json::Value custom = json::Value::object();
+  custom["below"] = 50;
+  custom["gamma"] = 0.7;
+  dark["brighten_dark"] = std::move(custom);
+  r = vision::ParseRequest(dark);
+  assert(r.brighten_dark && r.dark_below == 50.0 && r.dark_gamma == 0.7);
+  assert(Throws([&] {
+    json::Value bad = Body("AAAA", {"head"});
+    bad["brighten_dark"] = "ja";
+    (void)vision::ParseRequest(bad);
+  }));
   bool planned = false;
   try {
     (void)vision::ParseRequest(Body("AAAA", {"face", "ocr"}));
@@ -116,6 +135,26 @@ void TestParse() {
     planned = true;
   }
   assert(planned);
+}
+
+// Pillow values: (255,0,0) -> L 76, (10,200,30) -> L 124, mean 100.0;
+// round(255 * (v/255) ** 0.5) for 0, 1, 2, 64, 128, 254, 255.
+void TestLumaGamma() {
+  gufo::models::ccip::RgbImage two;
+  two.width = 2;
+  two.height = 1;
+  two.rgb = {255, 0, 0, 10, 200, 30};
+  assert(gufo::models::ccip::MeanLuma(two) == 100.0);
+  gufo::models::ccip::RgbImage ramp;
+  ramp.width = 7;
+  ramp.height = 1;
+  for (int v : {0, 1, 2, 64, 128, 254, 255})
+    for (int c = 0; c < 3; ++c)
+      ramp.rgb.push_back(static_cast<std::uint8_t>(v));
+  const auto bright = gufo::models::ccip::ApplyGamma(ramp, 0.5);
+  const int want[] = {0, 16, 23, 128, 181, 254, 255};
+  for (int i = 0; i < 7; ++i)
+    assert(bright.rgb[static_cast<std::size_t>(i) * 3] == want[i]);
 }
 
 void TestErrors() {
@@ -183,6 +222,7 @@ void TestReal(const char* dir, const char* frame) {
   const json::Value answer = json::parse(response->body);
   for (const char* task : {"person", "head", "face", "hand"})
     assert(answer.find("detections")->find(task) != nullptr);
+  assert(answer.find("brightened") != nullptr && !answer.find("brightened")->as_bool());
   const std::size_t persons = answer.find("detections")->find("person")->size();
   // Ablage path through the scripted gate: same answer.
   HttpRequest ablage = Post(Body("/v1/jobs/abc/files/frame.png", {"person"}));
@@ -210,6 +250,7 @@ void TestReal(const char* dir, const char* frame) {
 
 int main() {
   TestParse();
+  TestLumaGamma();
   TestErrors();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");

@@ -826,6 +826,14 @@ boxes with IoU `> iou`, and the corners are scaled back, clipped and rounded
 half to even. The `/v1/figuren` face detector differs on purpose (letterbox,
 BILINEAR, `face_detect_v1.4_n`, from `ccip_ref.py`).
 
+`"brighten_dark": true` (or `{"below", "gamma"}`) reproduces the film
+pipeline's `erkennung.py`: when Pillow's mean `L` (`MeanLuma`, fixed-point
+weights 19595/38470/7471) is below 70, the detectors see a copy with
+`round(255 * (v/255) ** 0.5)` per channel (`ApplyGamma`); the answer carries
+`mean_luma` and `brightened`. Mapping to `erkennung.py`'s keys: `person`,
+`kopf`, `gesicht`, `hand` = `detections.person|head|face|hand` as
+`box + [round(score, 2)]`.
+
 `ocr` and `wd14_tags` are accepted task names that answer
 `501 task_not_available` until their models are ported. The detectors live in
 `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`) as
