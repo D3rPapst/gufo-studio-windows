@@ -39,12 +39,15 @@ add_library(gufo_media STATIC
   src/cli/serve/music_encode.cpp
   src/cli/serve/media/foley_api.cpp
   src/cli/serve/media/omni_api.cpp
+  src/cli/serve/media/png_fast.cpp
   src/cli/serve/media/upscale_api.cpp
   src/cli/serve/media/video_rife.cpp
   src/cli/serve/media/video_upscale.cpp
 )
+# png_fast.cpp deflates Real-ESRGAN results with zlib directly.
+find_package(ZLIB REQUIRED)
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
-  gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG)
+  gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG ZLIB::ZLIB)
 # mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
 target_compile_definitions(gufo_media PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
