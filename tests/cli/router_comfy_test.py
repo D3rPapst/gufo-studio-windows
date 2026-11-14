@@ -999,6 +999,30 @@ def check_preview_ids(router):
     status, body = router.json("GET", "/v1/previews/%s?format=json" % victim)
     assert status == 404, (status, body)
 
+    # An id nobody knows waits for no model: 404 at once, even when the
+    # named model is not loaded (2.1.1 held such a stream up to 30 min).
+    started = time.monotonic()
+    status, _ = router.request("GET", "/v1/previews/made-up-id/events?model=minimax-h3")
+    assert status == 404 and time.monotonic() - started < 5, status
+
+    # At most 4 streams wait at once; the next one is 503 busy.
+    first = router.submit(qwen_graph(prompt="SLOW ahead limit", prefix="film/stil/ahead"))
+    queued = router.submit(qwen_graph(prompt="SLOW queued limit", prefix="film/stil/queued"))
+    streams = [{} for _ in range(4)]
+    readers = [threading.Thread(target=read_events,
+                                args=(router, "/v1/previews/%s/events" % queued, s))
+               for s in streams]
+    for reader in readers:
+        reader.start()
+    time.sleep(0.5)
+    status, payload = router.request("GET", "/v1/previews/%s/events" % queued)
+    assert status == 503 and b"busy" in payload, (status, payload)
+    router.wait(first)
+    router.wait(queued)
+    for reader in readers:
+        reader.join(30)
+    assert all(s.get("status") == 200 for s in streams), streams
+
 
 def check_filmstudio(router):
     """/filmstudio/progress and /filmstudio/preview answer like the film

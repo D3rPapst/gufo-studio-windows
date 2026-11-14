@@ -1016,6 +1016,10 @@ public:
   }
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
+  /// /v1/previews/<id>/events streams waiting for their preview to be
+  /// placed (WaitPreviewStream); more than kMaxWaitingPreviews: 503.
+  static constexpr int kMaxWaitingPreviews = 4;
+  std::atomic<int> waiting_previews_{0};
   /// Reachability and model states of the remote routers; null without
   /// [remote/<id>] sections.
   std::unique_ptr<router::RemoteHub> remotes;
@@ -2595,6 +2599,10 @@ public:
     PreviewPlan plan = PlanPreviewLocked(req);
     if (plan.kind == PreviewPlan::Kind::kWait) {
       if (events) {
+        if (waiting_previews_.load() >= kMaxWaitingPreviews)
+          return Err(503, "Service Unavailable",
+                     "too many preview streams are waiting; try again",
+                     "server_error", "busy");
         lock.unlock();
         return WaitPreviewStream(req);
       }
@@ -2714,8 +2722,13 @@ public:
                             ? nullptr
                             : FindWorkerLocked(model_id);
     if (worker == nullptr) {
-      if (events && preset != nullptr) {
-        // The worker loads for the request this stream waits for.
+      // The worker loads for the request this stream waits for. Only an id
+      // this router knows (a ComfyUI prompt's, a pool request's, a job's)
+      // waits; any other id is 404 at once (a page connects again), so a
+      // made-up id with ?model=<unloaded model> holds no connection.
+      const bool known_id = plan.comfy_known || side != preview_sides_.end() ||
+                            registry.JobOpen(id);
+      if (events && preset != nullptr && known_id) {
         plan.kind = PreviewPlan::Kind::kWait;
         return plan;
       }
@@ -2760,7 +2773,11 @@ public:
     response.headers = {{"Content-Type", "text/event-stream"},
                         {"Cache-Control", "no-cache"},
                         {"X-Accel-Buffering", "no"}};
-    response.streaming_body = [this, req](
+    // Counted from here until the stream (or the unsent response) ends.
+    ++waiting_previews_;
+    std::shared_ptr<void> waiting(nullptr,
+                                  [this](void*) { --waiting_previews_; });
+    response.streaming_body = [this, req, waiting](
                                   const HttpResponse::BodyWriter& write) {
       std::string id =
           req.path.substr(std::string_view("/v1/previews/").size());
