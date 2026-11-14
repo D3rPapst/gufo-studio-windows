@@ -1223,6 +1223,8 @@ Route Classify(const HttpRequest& req) {
       {"/v1/slots", "text", 0, false},
       {"/slots", "text", 0, false},
       {"/sdapi/v1/loras", "bild", 0, false},
+      // Image recognition (imgutils detectors, CPU): not a generation.
+      {"/v1/vision/", "bild", 0, false},
       {"/v1/images/", "bild", 1, true},
       {"/v1/images", "bild", 1, true},
       {"/v1/previews/", "bild|video", 0, false},

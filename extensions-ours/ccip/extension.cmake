@@ -65,6 +65,27 @@ gufo_extension_target(
     gufo_ext_runtime
 )
 
+# /v1/vision/detect detectors against dghs-imgutils (reference/make_vision_oracle.py).
+# Needs GUFO_VISION_DIR (the four converted default detectors) and
+# GUFO_VISION_ORACLE (manifest.json + vision_*.safetensors); skips (77) otherwise.
+gufo_extension_target(
+  NAME vision_oracle_test
+  SOURCES
+    tests/vision_oracle_test.cpp
+  LINK_LIBRARIES
+    gufo_ccip
+    gufo_ext_runtime
+)
+
+if(TARGET vision_oracle_test)
+  ccip_use_openmp(vision_oracle_test)
+  add_test(NAME ccip.vision_oracle COMMAND vision_oracle_test)
+  set_tests_properties(ccip.vision_oracle PROPERTIES
+    LABELS "ccip;cpu;quality;external-model"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 1200)
+endif()
+
 if(TARGET ccip_oracle_test)
   ccip_use_openmp(ccip_oracle_test)
   add_test(NAME ccip.oracle COMMAND ccip_oracle_test)

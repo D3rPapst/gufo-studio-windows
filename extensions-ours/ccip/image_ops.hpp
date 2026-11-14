@@ -26,6 +26,14 @@ struct RgbImage {
 };
 
 [[nodiscard]] RgbImage ResizeBilinear(const RgbImage& in, int out_width, int out_height);
+// Pillow Image.resize(..., BICUBIC) (a = -0.5, support 2; the Pillow >= 7
+// default of Image.resize), same fixed-point path as ResizeBilinear.
+[[nodiscard]] RgbImage ResizeBicubic(const RgbImage& in, int out_width, int out_height);
+
+// imgutils generic YOLO input (allow_dynamic=False): stretched to
+// width x height with ResizeBicubic (no letterbox), (x / 255.0) as float32,
+// 3 x height x width.
+[[nodiscard]] std::vector<float> StretchInput(const RgbImage& image, int width, int height);
 
 // Pillow Image.crop for a box inside the image (x1/y1 exclusive); parts
 // outside the image are black like Pillow's.

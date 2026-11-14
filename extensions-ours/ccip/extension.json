@@ -18,6 +18,12 @@
       "requires": [
         "testing"
       ]
+    },
+    "vision_oracle_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
     }
   },
   "production_paths": {

@@ -496,6 +496,11 @@ Router:
   --ccip-model-dir <DIR>        CCIP character fingerprints for POST /v1/figuren "verfahren": "ccip"
   --ccip-face-dir <DIR>         Anime face detector for "verfahren": "ccip"
   --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
+  --vision-dir <DIR>            Detectors for POST /v1/vision/detect (person, head, face, hand:
+                                <model>.safetensors + .json; loaded on first use)
+  --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
+  --vision-queue <N>            /v1/vision/detect requests that may wait behind the running one
+                                before 503 busy (default: 4)
   --remote-allow <LIST>         Remote routers [remote/<id>] sections may name: IPv4 addresses or
                                 a.b.c.d/n ranges, each with an optional :port. Default: none,
                                 remote sections are refused
@@ -795,6 +800,52 @@ person is `"unbekannt"`. Each person returns `name`, `box` (face),
 `D:\llm-modelle\deepghs\anime_face_detection\gufo`), loads them on the first
 ccip request (~165 MB host RAM) and answers 503 `ccip_unavailable` when they
 are missing. `--ccip-threads` (default 8) bounds the CPU threads.
+
+### Image recognition (`POST /v1/vision/detect`)
+
+The front answers `POST /v1/vision/detect` itself with the detectors of
+dghs-imgutils 0.19 (`detect_person`, `detect_heads`, `detect_faces`,
+`detect_hands`): same models, same default thresholds and the same pre- and
+post-processing, natively on the CPU (`gufo_ccip` `YoloDetector`, OpenMP),
+without Python or ONNX at run time. Public page with request and answer:
+[docs/models/vision-detect.md](../models/vision-detect.md).
+
+| task | model (Hugging Face) | conf | iou |
+|---|---|---:|---:|
+| `person` | `deepghs/anime_person_detection` `person_detect_v1.1_m` (YOLOv8m) | 0.3 | 0.5 |
+| `head` | `deepghs/anime_head_detection` `head_detect_v2.0_s` (YOLOv8s) | 0.4 | 0.7 |
+| `face` | `deepghs/anime_face_detection` `face_detect_v1.4_s` (YOLOv8s) | 0.25 | 0.7 |
+| `hand` | `deepghs/anime_hand_detection` `hand_detect_v1.0_s` (YOLOv8s) | 0.35 | 0.7 |
+
+Processing as `imgutils.generic.yolo.YOLOModel.predict` with
+`allow_dynamic=False`: the image is stretched to the export's `imgsz`
+(640 x 640, no letterbox) with Pillow's BICUBIC filter (`ResizeBicubic`,
+bit-exact fixed point), divided by 255; anchors whose best class score is
+`> conf` are kept, class-agnostic NMS with imgutils' `+1` pixel areas drops
+boxes with IoU `> iou`, and the corners are scaled back, clipped and rounded
+half to even. The `/v1/figuren` face detector differs on purpose (letterbox,
+BILINEAR, `face_detect_v1.4_n`, from `ccip_ref.py`).
+
+`ocr` and `wd14_tags` are accepted task names that answer
+`501 task_not_available` until their models are ported. The detectors live in
+`--vision-dir` (Windows default `D:\llm-modelle\deepghsision\gufo`) as
+`<model>.safetensors` + `.json` from
+`extensions-ours/ccip/reference/convert_weights.py yolo <model.onnx> <dir> <model>`
+(class names and `imgsz` from the ONNX metadata); each loads on first use
+and stays (~100 MB host RAM for the m model, ~43 MB per s model); a missing
+file is `503 vision_unavailable` naming it. One request computes at a time in
+FIFO order with `--vision-threads` threads; up to `--vision-queue` more wait
+(their connection stays open; a caller that disconnects leaves the line),
+the next one gets `503 busy` with `Retry-After: 5`. An Ablage path
+`/v1/jobs/{id}/files/{name}` is read through the gate with the caller's own
+`Authorization` (as the MCP tools do; another user's job is the gate's 404,
+relayed), at most 20 MB. RGBA input loses its alpha channel (imgutils puts it
+on white). Area `bild`; the request is not counted against `tageslimit`.
+Not pool-routed yet: it runs on the router that receives it.
+Tests: `router_vision_test` (parsing and errors; with `GUFO_VISION_DIR` and
+`GUFO_VISION_FRAME` real detections, the Ablage path and the queue) and
+`ccip.vision_oracle` (`vision_oracle_test` against
+`reference/make_vision_oracle.py`, which runs imgutils itself).
 
 ### Video concat (`POST /v1/videos/concat`)
 
@@ -1300,8 +1351,8 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
 Areas by endpoint: text = chat, completions, responses, messages,
-embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*` and
-the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
+embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*`,
+`/v1/vision/*` and the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
 ...); video = `/v1/videos*`; stimme = speech, transcriptions, convert,
 voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
 `/v1/3d/*`; ablage = `/v1/jobs*`; `/v1/previews/*` needs bild or video.

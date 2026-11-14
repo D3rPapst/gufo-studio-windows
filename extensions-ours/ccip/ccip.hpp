@@ -62,6 +62,44 @@ public:
                                          float iou = 0.7f) const;
 };
 
+// One box of a generic YOLOv8 detector (imgutils yolo_predict): integer
+// pixel corners like imgutils (_xy_postprocess: scaled back, clipped to the
+// image, numpy round), the arg-max label and its score.
+struct Detection {
+  std::array<int, 4> box{};  // x0, y0, x1, y1
+  int label{0};
+  float score{0};
+};
+
+// Any converted deepghs YOLOv8 detector (person, head, face, hand; n/s/m
+// sizes): `dir` holds <stem>.safetensors + <stem>.json from
+// reference/convert_weights.py (the JSON carries "names" and "imgsz" from
+// the ONNX metadata). Detect reproduces imgutils.generic.yolo_predict with
+// allow_dynamic=False: stretch to imgsz with Pillow BICUBIC, x/255, one
+// forward, keep anchors whose best class score is > conf, class-agnostic NMS
+// with imgutils' +1 pixel areas (suppress IoU > iou), boxes back to the
+// image. Thread-safe for concurrent Detect calls (no mutable state).
+class YoloDetector {
+public:
+  virtual ~YoloDetector() = default;
+  [[nodiscard]] static std::unique_ptr<YoloDetector> Load(const std::filesystem::path& dir,
+                                                          const std::string& stem,
+                                                          std::string* error);
+  [[nodiscard]] virtual const std::vector<std::string>& Labels() const = 0;
+  // imgsz of the export (square; 640 for every deepghs detector so far).
+  [[nodiscard]] virtual int InputSize() const = 0;
+  // Raw head output [4 + classes, anchors] (cx, cy, w, h, class scores) for a
+  // 3xSxS input.
+  [[nodiscard]] virtual std::vector<float> Raw(const float* chw, int size, int* anchors) const = 0;
+  [[nodiscard]] std::vector<Detection> Detect(const RgbImage& image, float conf,
+                                              float iou) const;
+};
+
+// imgutils _nms_postprocess on a raw output (exposed for tests).
+[[nodiscard]] std::vector<Detection> DecodeDetections(const std::vector<float>& raw, int anchors,
+                                                      int classes, int input_size, int width,
+                                                      int height, float conf, float iou);
+
 // OpenMP threads for CCIP work started from the calling thread (no-op
 // without OpenMP). The setting is per calling thread.
 void SetCpuThreads(int threads);

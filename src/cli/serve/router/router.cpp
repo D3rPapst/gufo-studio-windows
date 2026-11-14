@@ -42,6 +42,7 @@
 #include "src/cli/serve/router/remote.hpp"
 #include "src/cli/serve/router/residency.hpp"
 #include "src/cli/serve/router/strings.hpp"
+#include "src/cli/serve/router/vision.hpp"
 #include "src/cli/serve/router/workers.hpp"
 #include "src/cli/serve/router/ws_relay.hpp"
 #include "src/cli/serve/serve.hpp"
@@ -973,6 +974,9 @@ public:
   std::unique_ptr<router::names::NameService> names;
   /// POST /v1/figuren (figure check over the router's own vision chats).
   std::unique_ptr<router::figuren::FigurenService> figuren;
+  /// POST /v1/vision/detect (imgutils detectors on the CPU, own queue);
+  /// set after the gate (Ablage paths are read through it).
+  std::unique_ptr<router::vision::VisionService> vision;
   /// Users and access control (preset `[router]`, 2.0.3): the front hook
   /// in front of Dispatch. Always set; with auth = off it only answers the
   /// auth endpoints.
@@ -1185,6 +1189,10 @@ public:
     }
     if (figuren != nullptr) {
       if (auto answer = figuren->Handle(req))
+        return std::move(*answer);
+    }
+    if (vision != nullptr) {
+      if (auto answer = vision->Handle(req))
         return std::move(*answer);
     }
     if (comfy != nullptr) {
@@ -4085,6 +4093,15 @@ int RunRouter(std::span<const char* const> args) {
   std::filesystem::path ccip_face_dir;
 #endif
   std::size_t ccip_threads = 8;
+  // POST /v1/vision/detect: converted imgutils detectors (person, head,
+  // face, hand). Default: the .198 install path on Windows.
+#ifdef _WIN32
+  std::filesystem::path vision_dir = "D:\\llm-modelle\\deepghs\\vision\\gufo";
+#else
+  std::filesystem::path vision_dir;
+#endif
+  std::size_t vision_threads = 8;
+  std::size_t vision_queue = 4;
   std::size_t jobs_parallel = 1;
   std::string jobs_webhook_allow;
   std::string remote_allow;
@@ -4169,6 +4186,17 @@ int RunRouter(std::span<const char* const> args) {
   parser.AddOption("", "--ccip-threads", "N",
                    "CPU threads for \"verfahren\": \"ccip\" (default: 8)",
                    "Router", &ccip_threads);
+  parser.AddOption("", "--vision-dir", "DIR",
+                   "Detectors for POST /v1/vision/detect (person, head, face, "
+                   "hand: <model>.safetensors + .json; loaded on first use)",
+                   "Router", &vision_dir);
+  parser.AddOption("", "--vision-threads", "N",
+                   "CPU threads for /v1/vision/detect (default: 8)", "Router",
+                   &vision_threads);
+  parser.AddOption("", "--vision-queue", "N",
+                   "/v1/vision/detect requests that may wait behind the "
+                   "running one before 503 busy (default: 4)",
+                   "Router", &vision_queue);
   parser.AddOption("", "--jobs-parallel", "N",
                    "Jobs running at the same time (default: 1)", "Jobs",
                    &jobs_parallel);
@@ -4835,6 +4863,21 @@ int RunRouter(std::span<const char* const> args) {
                      std::string(router_section.mcp != "off" ? "yes" : "no") +
                      " tools=" + std::to_string(state->mcp->tools().size()) +
                      " jobs=" + (state->jobs != nullptr ? "yes" : "no"));
+  }
+  {
+    // POST /v1/vision/detect. Ablage paths are read through the gate under
+    // the caller's own token, as the MCP tools do.
+    router::vision::Options vision_options;
+    vision_options.model_dir = vision_dir;
+    vision_options.threads = static_cast<int>(vision_threads);
+    vision_options.max_waiting = vision_queue;
+    vision_options.serve = [raw](const HttpRequest& inner) {
+      return raw->gate->Serve(inner, [raw](const HttpRequest& checked) {
+        return raw->Dispatch(checked);
+      });
+    };
+    state->vision = std::make_unique<router::vision::VisionService>(
+        std::move(vision_options));
   }
 
   HttpServerOptions options;
