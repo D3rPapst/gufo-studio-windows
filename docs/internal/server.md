@@ -665,13 +665,36 @@ section (`ParseHint`) and never reach the worker. They tune
 
 | Key | Value | Effect |
 | --- | --- | --- |
-| `router-gpu-gb` | number >= 0 | Expected GPU memory of the loaded worker in GB; replaces the memory guard's estimate for this id (preset keys win over the learned `.memory.json` values). |
+| `router-gpu-gb` | number >= 0 | Expected GPU memory of the loaded worker in GB; replaces the memory guard's estimate for this id (it wins over the `estimate_*` values of `.memory.json`, not over the learned ones, see below). |
 | `router-host-gb` | number >= 0 | Expected host RAM in GB; used together with `router-gpu-gb` (without it the value is not applied). |
 | `router-exclusive` | `true` or `false` | `true`: nothing else may stay loaded beside this model; the guard evicts the others first. |
 | `router-idle-seconds` | number >= 0 | Idle unload for this model instead of `--sleep-idle-seconds`. |
 
 Any other `router-*` key is `unknown router key` and stops the start.
 In `[remote/<id>]` sections router hints are rejected.
+
+`router-gpu-gb` / `router-host-gb` only set the estimate. What the memory
+guard reserves for an id comes from the memory file (`--memory-file`,
+`MemoryBook::Need`), per GPU layout (dedicated GPU memory):
+
+- a complete learned peak for this layout (`learned_complete: true`):
+  that peak times `--memory-learned-factor`; the estimate, and with it the
+  preset value, is ignored;
+- a learned peak that is not complete yet: the larger of estimate times
+  `--memory-factor` and peak times `--memory-learned-factor` (a learned
+  peak only raises the reservation);
+- no peak for this layout, but one in `learned_layouts` from another
+  layout: that peak scaled to this layout, times `--memory-learned-factor`;
+- nothing learned: estimate times `--memory-factor`.
+
+So lowering `router-gpu-gb` does not lower the reservation of a model that
+already has a learned peak. To drop a stale peak (after a fix that made the
+worker smaller, or one measured in a different setup), stop the router (it
+keeps the book in memory and writes it back), remove `learned_gpu_gb`,
+`learned_host_gb`, `learned_shared_gb`, `learned_at`, `learned_complete`,
+`learned_layout_gb` and, if present, `learned_layouts` from that id's entry
+under `models` (or delete the whole entry), and start the router again.
+The preset values then apply until the next load measures a new peak.
 
 ### Routing and proxying
 
