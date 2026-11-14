@@ -1563,13 +1563,14 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
 Areas by endpoint: text = chat, completions, responses, messages,
-embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*`,
+embeddings, rerank, realtime, `/v1/figuren`, `POST /v1/systemone` (it loads
+its JSON `model`: model list and daily limit apply, one per request); bild = `/v1/images/*`,
 `/v1/vision/*` and the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
 ...); video = `/v1/videos*`; stimme = speech, transcriptions, convert,
 voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
 `/v1/3d/*`; ablage = `/v1/jobs*`; `/v1/previews/*` needs bild or video.
 `GET /v1/models`, `/router/status`, `/router/capabilities`, `GET
-/router/placement` and `/v1/names` are open to every signed-in user (the
+/router/placement`, `/v1/names` and `GET /v1/systemone` are open to every signed-in user (the
 pages need them); `pool` and `status` gate the pages of those names
 (`/pool/`, `/speicher/`, `/status/`, ...). Two of them say less to a
 `nutzer` or `dienst` than to an admin or the machine itself (2.0.5):

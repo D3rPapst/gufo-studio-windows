@@ -767,6 +767,24 @@ void TestAreasAndJobs() {
                     {{"Cookie", maler}}));
     CHECK_EQ(r.status, 403);
   }
+  // POST /v1/systemone loads the JSON "model": area text and the model
+  // list apply (2.1.1 let every signed-in user through); reading is open.
+  {
+    const std::string maler = f.LoginCookie("maler", "maler-pw");
+    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
+                    "{\"model\":\"qwen3.5-4b\"}", {{"Cookie", maler}}));
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(ErrorCode(r), std::string("forbidden"));
+    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
+                    "{\"model\":\"qwen3.8-27b\"}", {{"Cookie", tim}}));
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(ErrorCode(r), std::string("model_forbidden"));
+    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
+                    "{\"model\":\"qwen3.5-4b\"}", {{"Cookie", tim}}));
+    CHECK_EQ(r.status, 200);
+    r = f.Serve(Req("GET", "/v1/systemone", "192.168.178.50", "", {{"Cookie", maler}}));
+    CHECK_EQ(r.status, 200);
+  }
   // Admin control is admin only.
   r = f.Serve(Req("POST", "/models/unload", "192.168.178.50", "{}",
                   {{"Cookie", tim}}));
@@ -1609,6 +1627,20 @@ void TestFilterAndLimit() {
                   "{\"model\":\"m\"}", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 429);
   CHECK_EQ(ErrorCode(r), std::string("daily_limit"));
+  // A decision request (POST /v1/systemone) counts like a chat.
+  {
+    auth::Rights one;
+    one.tageslimit = 1;
+    f.AddUser("entscheider", "nutzer", "ent-pw", one);
+    const std::string ent = f.LoginCookie("entscheider", "ent-pw");
+    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
+                    "{\"model\":\"m\"}", {{"Cookie", ent}}));
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(f.gate->DailyCount("entscheider"), 1LL);
+    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
+                    "{\"model\":\"m\"}", {{"Cookie", ent}}));
+    CHECK_EQ(r.status, 429);
+  }
   // Reads never count.
   r = f.Serve(Req("GET", "/v1/videos/v1", "192.168.178.50", "", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 200);
