@@ -3,7 +3,7 @@
 gufo runs Real-ESRGAN's compact video models (`SRVGGNetCompact` from
 [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN), BSD 3-Clause) natively
 on HIP to bring finished videos and images to a delivery size such as
-1920x1200 or 1920x1080.
+1920x1080, the film format.
 
 Supported checkpoints (Real-ESRGAN release v0.2.5.0, published in the
 BSD-3-Clause repository without a separate model license):
@@ -45,13 +45,8 @@ start-up works as with a local conversion.
 hf download D3rPapst/realesrgan-srvgg-gufo --local-dir D:\llm-modelle\gufo\modelle\upscale
 ```
 
-| File | Size | Variant |
-|---|---:|---|
-| `realesr-general-x4v3.safetensors` | 4.9 MB | `general` (32 body convolutions) |
-| `realesr-general-wdn-x4v3.safetensors` | 4.9 MB | `wdn` (32) |
-| `realesr-animevideov3.safetensors` | 2.5 MB | `anime` (16) |
-
-That folder is what the `[external/gufo-upscale]` section under
+The files (`realesr-general-x4v3`, `realesr-general-wdn-x4v3`: 4.9 MB,
+`realesr-animevideov3`: 2.5 MB) are what the `[external/gufo-upscale]` section under
 [Router section](#router-section) loads (`model =` the general file, two `--model` lines
 without `NAME=` the other two; the variant comes from the file name).
 
@@ -59,11 +54,11 @@ without `NAME=` the other two; the variant comes from the file name).
 
 ```sh
 gufo video-upscale --model realesr-animevideov3.safetensors \
-  --input in.mp4 --output out.mp4 --size 1920x1200
+  --input in.mp4 --output out.mp4 --size 1920x1080
 ```
 
 `--fit pad` (default) keeps the aspect ratio and the whole picture with black
-bars (832x480 -> picture 1920x1108 at y 46 in 1920x1200); `--fit crop` keeps
+bars (832x480 -> picture 1872x1080 at x 24 in 1920x1080); `--fit crop` keeps
 the aspect ratio and fills the frame (centre crop); `--fit stretch` scales each
 axis on its own. Picture sizes and offsets are even, so 4:2:0 chroma stays
 aligned. The output keeps the input frame rate and copies the audio
@@ -89,11 +84,11 @@ accepts
 
 ```json
 {"gufo": {"interpolate": {"fps": 60},
-          "upscale": {"width": 1920, "height": 1200, "fit": "pad",
+          "upscale": {"width": 1920, "height": 1080, "fit": "crop",
                       "model": "realesr-animevideov3"}}}
 ```
 
-on `POST /v1/videos` (H3 and Wan 2.2). `"upscale": "1920x1200"` is short for
+on `POST /v1/videos` (H3 and Wan 2.2). `"upscale": "1920x1080"` is short for
 the default model with `pad`. Width and height must be even (at most
 7680x4320). The upscale runs after any interpolation (RIFE at the generated
 size, then every output frame upscaled) and reports progress phase `upscale`.
@@ -116,11 +111,9 @@ Every weight file carries a **variant** read from its file name: `general`
 32, weaker denoising) and `anime` (realesr-animevideov3, 16). Files given
 without `NAME=` share the public model id (`--served-model-name`, else the
 file stem) and are chosen per request with `"variant"`; a variant name alone
-also works as `model` on the worker itself. On the GPU the safetensors header
-is checked on the host at start-up (tensor names and shapes against the
-`__metadata__`), so a wrong file fails with a clear message before anything
-is uploaded; `GET /v1/models` lists the variants with their convolution
-count.
+also works as `model` on the worker itself. On the GPU a wrong safetensors
+file fails at start-up with a clear message; `GET /v1/models` lists the
+variants with their convolution count.
 
 - `--device npu` runs a Real-ESRGAN **body** ONNX (the convolutions before
   the pixel shuffle, int8 QDQ from AMD Quark, fixed input size) on the AMD
@@ -141,7 +134,8 @@ two row passes (rows 0..T-1 keep the top half, rows h-T..h-1 the bottom half),
 DepthToSpace(4) plus the nearest-neighbour input, clip, `uint8(v*255+0.5)`,
 then OpenCV `INTER_AREA` (bit-exact port) and a centre crop: 896x512 ->
 rows 16..2031 of the x4 picture -> 1920x1080; 832x512 -> 1950x1200 ->
-columns 15..1934 -> 1920x1200 (`fit: "crop"`). `pad` and `stretch` use the
+columns 15..1934 -> 1920x1200 (`fit: "crop"`; this is Take One's NPU path,
+the film itself uses 1920x1080). `pad` and `stretch` use the
 same area filter. One model name may have several files, one per frame
 width; the request's frame picks the file.
 
@@ -154,6 +148,9 @@ width; the request's frame picks the file.
 ```
 
 - `image`: data URL, raw base64, public https URL or `file:` path.
+- `images`: a list of 1..32 such images (or `{"image": ...}` objects) with
+  the same settings, answered in order as `data[i]` with `width`, `height`
+  and `input`; sync and `b64_json` only.
 - `scale`: 4 (native) or 2 (the x4 picture resized to half: Lanczos-3 on
   the GPU, OpenCV-exact `INTER_AREA` on the NPU / CPU). `size: "WxH"` or
   `width` + `height` (at most 8192 on a side) replace the scale and use
@@ -168,15 +165,16 @@ width; the request's frame picks the file.
 The sync answer is `{created, model, variant, device, model_file, width,
 height, input, scale, fit, format, data: [{b64_json}], cost: {seconds,
 queue_seconds, body_seconds, post_seconds, encode_seconds}}` with a
-`Server-Timing` header. Requests run one at a time; more than 8 waiting give
-429.
+`Server-Timing` header. The device runs one image at a time (in an `images`
+list the next image decodes and the previous one encodes meanwhile); more
+than 8 waiting requests give 429.
 
 ### `POST /v1/videos/upscale`
 
 ```json
 {"model": "gufo-upscale", "variant": "anime",
- "video": "data:video/mp4;base64,...", "scale": 2,
- "fit": "pad", "crf": 18, "keep_audio": true}
+ "video": "data:video/mp4;base64,...", "size": "1920x1080",
+ "fit": "crop", "crf": 18, "keep_audio": true}
 ```
 
 An async job (`"async": false` waits and returns the MP4): FFmpeg decodes
@@ -188,10 +186,43 @@ answer is a video-job object `{id, object: "video", status: queued |
 in_progress | completed | failed | cancelled, progress (0..100), model,
 variant, size, input, upscale: {frames, frames_done, fps, audio, crf},
 cost, error}` (202 + `Location`); `GET /v1/videos/{id}` reads it,
-`GET /v1/videos/{id}/content` returns the MP4 (409 while running) and
+`GET /v1/videos/{id}/content` returns the result (409 while running) and
 `DELETE /v1/videos/{id}` cancels a running job or drops a finished result.
 Up to 8 jobs queue; finished results stay for an hour (at most 8). Uploads
 are limited to 512 MiB.
+
+`"output_format": "png_zip"` returns the frames losslessly instead of an
+MP4: every upscaled frame as an 8-bit RGB PNG (the one-pass encoder below)
+in a ZIP without compression (stored entries, CRC-32), named `f_00001.png`,
+`f_00002.png`, ... in frame order, `Content-Type: application/zip`. There is
+no audio and no `crf`; the job object says `"output_format": "png_zip"`.
+Use it when the pipeline encodes the delivery itself, so the frames are not
+compressed twice. The archive is held in memory like the MP4 and is limited
+to 4 GiB and 65535 frames (no ZIP64): a 1920x1080 frame is about 3-5 MB as
+PNG, so send film segments, not whole films.
+
+### Speed
+
+Seconds per 832x512 frame (anime) at the worker, Strix Halo (gfx1151, XDNA 2):
+
+| Path | GPU | NPU |
+|---|---:|---:|
+| image, x4 PNG (3328x2048) | 0.16 | 0.34 |
+| image, `size` 1920x1080 PNG | 0.10 | 0.27 |
+| image, `size` 1920x1080 JPEG 95 | 0.07 | 0.21 |
+| `images` list of 10, 1920x1080 PNG | 0.06 | 0.22 |
+| `/v1/videos/upscale`, 240 frames, 1920x1080 | 0.040 | 0.19 |
+
+The network takes 37 ms on the GPU (145 ms on the NPU). For film segments
+send the whole MP4 with the delivery size (`"video": ..., "variant": "anime",
+"size": "1920x1080", "fit": "crop", "async": false`); a job adds about 0.4 s.
+For lossless frames that the pipeline encodes itself:
+
+```json
+{"model": "gufo-upscale", "variant": "anime",
+ "video": "data:video/mp4;base64,...", "size": "1920x1080",
+ "fit": "crop", "output_format": "png_zip", "async": false}
+```
 
 ### Router section
 
@@ -218,15 +249,8 @@ router-gpu-gb = 1
 router-host-gb = 1
 ```
 
-The NPU variant stays as before:
-
-```ini
-[external/realesr-npu]
-command = D:\path\to\gufo.exe
-args = serve upscale --device npu
-model = D:\path\to\body896q_h288_h3.onnx
-served-model-name = realesr-npu
-```
+An NPU section has `args = serve upscale --device npu` and the body ONNX as
+`model =` (Take One's `body512q_h280_h3.onnx` for 832x512 frames).
 
 `npu-upscale-probe` (built with `GUFO_ENABLE_ONNXRUNTIME`) runs one image
 and compares it with a reference: `npu-upscale-probe --device cpu --model
@@ -238,4 +262,6 @@ body896q_h288_h3.onnx --input in.png --size 1920x1080 --compare ref.png`.
 3x3 kernel of the RIFE port (FP16 WMMA, FP32 accumulation, 64x64 tiles) with
 the per-channel PReLU in its epilogue; the last convolution writes FP32. The
 pixel shuffle, the nearest-neighbour base, the clamp and the two separable
-resize passes are FP32 kernels; the result is downloaded as RGB24.
+resize passes are FP32 kernels; the result is downloaded as RGB24. PNG
+results are written in one pass (Sub filter, zlib level 1, row strips
+deflated on up to 8 threads into one stream).

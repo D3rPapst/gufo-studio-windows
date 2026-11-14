@@ -75,6 +75,11 @@ struct AdapterOptions {
   std::size_t parallel{1};
 };
 
+/// The user a request acts for when it may touch only that user's
+/// prompts: X-Gufo-User from the access gate, empty for an admin, the
+/// router itself, loopback and auth = off.
+[[nodiscard]] std::string RestrictedUser(const server::HttpRequest& request);
+
 class Adapter {
 public:
   explicit Adapter(AdapterOptions options);
@@ -124,9 +129,11 @@ public:
     std::string model;
   };
   /// nullopt: no preview of this adapter, or its prompt ended (or left the
-  /// queue) before the task started. Safe with the router's state mutex
-  /// held (own mutex, nothing called under it).
-  [[nodiscard]] std::optional<PreviewRoute> FindPreview(std::string_view id);
+  /// queue) before the task started, or it is another user's prompt and
+  /// `user` (RestrictedUser of the reader) is set. Safe with the router's
+  /// state mutex held (own mutex, nothing called under it).
+  [[nodiscard]] std::optional<PreviewRoute> FindPreview(std::string_view id,
+                                                        std::string_view user = {});
 
   struct Job;
 
@@ -188,8 +195,9 @@ private:
                    const std::string& preview_id = {});
   /// The preview id of `task` (Adapter::FindPreview).
   std::string TaskPreview(const Job& job, const Task& task) const;
-  /// Registers the preview ids of a queued prompt (no target yet).
-  void RegisterPreviews(const std::shared_ptr<Job>& job);
+  /// Registers the preview ids of a queued prompt (no target yet); false
+  /// (nothing registered) when one is taken by another user's live prompt.
+  bool RegisterPreviews(const std::shared_ptr<Job>& job);
   /// The task's request is about to go out: its preview renders as `target`.
   void SetPreviewTarget(const std::string& id, std::string target, bool video,
                         std::string model);
@@ -274,6 +282,8 @@ private:
   /// (FindPreview); guarded by preview_mutex_ alone.
   struct PreviewEntry {
     std::weak_ptr<Job> job;
+    /// The prompt's user (Job::user), kept after the prompt ended.
+    std::string user;
     std::string target;
     bool video{false};
     std::string model;

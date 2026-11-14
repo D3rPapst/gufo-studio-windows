@@ -56,6 +56,9 @@ struct Adapter::Job {
   json::Value prompt;
   json::Value extra_data = json::Value::object();
   std::string client_id;
+  /// The signed-in user who sent the prompt (X-Gufo-User from the gate);
+  /// empty for the router itself, loopback or auth = off.
+  std::string user;
   std::vector<std::string> outputs;
   Plan plan;
   std::atomic<bool> cancel{false};
@@ -604,6 +607,19 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
   return std::nullopt;
 }
 
+// The caller the gate names (auth.hpp kUserHeader/kRightsHeader): empty
+// when it is no user (router, loopback, auth = off) or an admin; such a
+// caller may stop or remove any prompt, a user only its own.
+std::string RestrictedUser(const HttpRequest& request) {
+  const std::string user = request.header("X-Gufo-User");
+  if (user.empty())
+    return {};
+  const std::string rights = request.header("X-Gufo-Rights");
+  if (rights == "rolle=admin" || rights.starts_with("rolle=admin;"))
+    return {};
+  return user;
+}
+
 HttpResponse Adapter::Submit(const HttpRequest& request) {
   json::Value body;
   try {
@@ -618,6 +634,7 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
   auto job = std::make_shared<Job>();
   job->prompt = *prompt;
   job->client_id = body.member_str("client_id");
+  job->user = request.header("X-Gufo-User");
   job->id = body.member_str("prompt_id");
   if (job->id.empty())
     job->id = NewUuid();
@@ -674,7 +691,10 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
                       return std::holds_alternative<ImageTask>(task.spec) ||
                              std::holds_alternative<VideoTask>(task.spec);
                     }) > 1;
-  RegisterPreviews(job);
+  if (!RegisterPreviews(job))
+    return ErrorResponse(400, "invalid_prompt",
+                         "extra_data.gufo_preview_id is in use by another "
+                         "user's prompt");
   json::Value reply = json::Value::object();
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -785,14 +805,20 @@ HttpResponse Adapter::QueuePost(const HttpRequest& request) {
   json::Value body = json::Value::object();
   if (!request.body.empty())
     body = json::parse(request.body);
+  // A signed-in user clears or deletes only its own waiting prompts.
+  const std::string user = RestrictedUser(request);
+  const auto mine = [&](const std::shared_ptr<Job>& job) {
+    return user.empty() || job->user == user;
+  };
   const std::lock_guard<std::mutex> lock(mutex_);
   if (body.find("clear") != nullptr && body.find("clear")->as_bool())
-    pending_.clear();
+    std::erase_if(pending_, mine);
   if (const json::Value* remove = body.find("delete");
       remove != nullptr && remove->is_array()) {
     for (const json::Value& id : remove->items())
-      std::erase_if(pending_,
-                    [&](const auto& job) { return job->id == id.str(); });
+      std::erase_if(pending_, [&](const auto& job) {
+        return id.is_string() && job->id == id.str() && mine(job);
+      });
   }
   EmitStatusLocked();
   return EmptyOk();
@@ -848,10 +874,14 @@ HttpResponse Adapter::Interrupt(const HttpRequest& request) {
     }
   }
   // Without a prompt id every running prompt stops (ComfyUI's global
-  // interrupt); with one only that prompt.
+  // interrupt); with one only that prompt. A signed-in user who is no
+  // admin stops only its own prompts either way.
+  const std::string user = RestrictedUser(request);
   const std::lock_guard<std::mutex> lock(mutex_);
   for (const auto& job : running_) {
     if (!wanted.empty() && wanted != job->id)
+      continue;
+    if (!user.empty() && job->user != user)
       continue;
     job->cancel.store(true);
     Logger::Info("comfy", "event=interrupt prompt_id=" + job->id);
@@ -1619,11 +1649,19 @@ std::string Adapter::TaskPreview(const Job& job, const Task& task) const {
   return TaskPreviewId(job.preview_base, task.node_id, job.several_previews);
 }
 
-void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
+bool Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
   const auto now = std::chrono::steady_clock::now();
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   // Ended prompts keep their ids for ten minutes (late readers still find
-  // the worker preview); at most 1024 entries.
+  // the worker preview); at most 1024 entries. A prompt that is gone
+  // without ending (deleted or cleared from the queue) counts as ended
+  // from now on, so its ids leave as well.
+  for (auto& [id, entry] : preview_ids_) {
+    if (!entry.ended && entry.job.expired()) {
+      entry.ended = true;
+      entry.ended_at = now;
+    }
+  }
   std::erase_if(preview_ids_, [&](const auto& entry) {
     return entry.second.ended &&
            now - entry.second.ended_at > std::chrono::minutes(10);
@@ -1639,14 +1677,26 @@ void Adapter::RegisterPreviews(const std::shared_ptr<Job>& job) {
       break;
     preview_ids_.erase(oldest);
   }
+  // Another user's live prompt keeps its id: no redirect of its preview.
+  for (const Task& task : job->plan.tasks) {
+    if (!std::holds_alternative<ImageTask>(task.spec) &&
+        !std::holds_alternative<VideoTask>(task.spec))
+      continue;
+    const auto it = preview_ids_.find(TaskPreview(*job, task));
+    if (it != preview_ids_.end() && !it->second.ended &&
+        it->second.user != job->user)
+      return false;
+  }
   for (const Task& task : job->plan.tasks) {
     if (!std::holds_alternative<ImageTask>(task.spec) &&
         !std::holds_alternative<VideoTask>(task.spec))
       continue;
     PreviewEntry entry;
     entry.job = job;
+    entry.user = job->user;
     preview_ids_[TaskPreview(*job, task)] = std::move(entry);
   }
+  return true;
 }
 
 void Adapter::SetPreviewTarget(const std::string& id, std::string target,
@@ -1682,10 +1732,14 @@ void Adapter::EndPreviews(const Job& job) {
 }
 
 std::optional<Adapter::PreviewRoute> Adapter::FindPreview(
-    std::string_view id) {
+    std::string_view id, std::string_view user) {
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   const auto it = preview_ids_.find(id);
   if (it == preview_ids_.end())
+    return std::nullopt;
+  // A signed-in user (no admin) sees the previews of its own prompts and
+  // of prompts without a user (the router's, loopback's).
+  if (!user.empty() && !it->second.user.empty() && it->second.user != user)
     return std::nullopt;
   if (it->second.target.empty() &&
       (it->second.ended || it->second.job.expired())) {
@@ -2495,6 +2549,50 @@ int CounterIn(const Destination& destination) {
   return NextCounter(names, destination.base);
 }
 
+/// Serialises counter lookup + reservation of output names. Parallel prompts
+/// (--comfy-parallel > 1) with the same filename_prefix would otherwise both
+/// read the same counter and overwrite each other's file.
+std::mutex& OutputMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+/// Creates `path` only if it does not exist yet (O_EXCL / CREATE_NEW).
+/// Returns false when it exists; throws on any other error.
+bool CreateExclusive(const fs::path& path) {
+#ifdef _WIN32
+  std::FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"wbx") != 0)
+    file = nullptr;
+#else
+  std::FILE* file = std::fopen(path.c_str(), "wbx");
+#endif
+  if (file != nullptr) {
+    std::fclose(file);
+    return true;
+  }
+  std::error_code ec;
+  if (fs::exists(path, ec))
+    return false;
+  throw std::runtime_error("cannot create " + PathU8(path));
+}
+
+/// Reserves the next free output name in `destination` by creating it empty
+/// and exclusively; the caller then fills it.
+std::string ReserveOutput(const Destination& destination, OutputKind kind,
+                          std::string_view extension) {
+  std::lock_guard<std::mutex> lock(OutputMutex());
+  int counter = CounterIn(destination);
+  for (int tries = 0; tries < 10000; ++tries, ++counter) {
+    const std::string filename =
+        OutputFilename(destination.base, counter, kind, extension);
+    if (CreateExclusive(destination.folder / U8Path(filename)))
+      return filename;
+  }
+  throw std::runtime_error("no free output name for '" + destination.base +
+                           "'");
+}
+
 json::Value FileEntry(const Destination& destination,
                       const std::string& filename) {
   json::Value entry = json::Value::object();
@@ -2510,8 +2608,8 @@ json::Value Adapter::SaveBytes(const OutputTarget& target,
                                std::string_view extension,
                                const std::string& bytes) {
   const Destination destination = DestinationFor(options_.root, target);
-  const std::string filename = OutputFilename(
-      destination.base, CounterIn(destination), target.kind, extension);
+  const std::string filename =
+      ReserveOutput(destination, target.kind, extension);
   WriteAll(destination.folder / U8Path(filename), bytes);
   json::Value list = json::Value::array();
   list.push_back(FileEntry(destination, filename));
@@ -2528,8 +2626,8 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
   const bool opus = target.class_type == "SaveAudioOpus";
   const std::string ext = mp3 ? "mp3" : opus ? "opus" : "flac";
   const Destination destination = DestinationFor(options_.root, target);
-  const std::string filename = OutputFilename(
-      destination.base, CounterIn(destination), OutputKind::kAudio, ext);
+  const std::string filename =
+      ReserveOutput(destination, OutputKind::kAudio, ext);
   std::vector<fs::path> codec;
   if (mp3)
     codec = {"-c:a", "libmp3lame", "-q:a", "0"};
@@ -2541,8 +2639,11 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
   args.insert(args.end(), codec.begin(), codec.end());
   args.push_back(destination.folder / U8Path(filename));
   std::string error;
-  if (!RunFfmpeg(args, &error))
+  if (!RunFfmpeg(args, &error)) {
+    std::error_code ec;
+    fs::remove(destination.folder / U8Path(filename), ec);  // the reservation
     throw std::runtime_error("cannot write the audio track: " + error);
+  }
   json::Value list = json::Value::array();
   list.push_back(FileEntry(destination, filename));
   json::Value ui = json::Value::object();
@@ -2553,19 +2654,53 @@ json::Value Adapter::SaveAudioTrack(const OutputTarget& target,
 json::Value Adapter::SaveVideoFrames(const OutputTarget& target,
                                      const fs::path& video) {
   const Destination destination = DestinationFor(options_.root, target);
-  const int first = CounterIn(destination);
+  // ffmpeg writes into a private folder first: a parallel prompt saving into
+  // the same output folder must neither get a number inside our range nor
+  // have its frames counted as ours.
+  const fs::path frames = WorkFile("frames");
+  fs::create_directories(frames);
+  struct RemoveFrames {
+    fs::path dir;
+    ~RemoveFrames() {
+      std::error_code ignored;
+      fs::remove_all(dir, ignored);
+    }
+  } cleanup{frames};
   std::string error;
-  if (!RunFfmpeg({"-i", video, "-start_number", std::to_string(first),
-                  destination.folder / U8Path(destination.base + "_%05d_.png")},
+  if (!RunFfmpeg({"-i", video, "-start_number", "1",
+                  frames / U8Path("f_%05d.png")},
                  &error))
     throw std::runtime_error("cannot extract the video frames: " + error);
   json::Value list = json::Value::array();
   std::error_code ec;
-  for (int counter = first;; ++counter) {
-    const std::string filename =
-        OutputFilename(destination.base, counter, OutputKind::kImage, "png");
-    if (!fs::exists(destination.folder / U8Path(filename), ec))
+  std::lock_guard<std::mutex> lock(OutputMutex());
+  int counter = CounterIn(destination);
+  for (int index = 1;; ++index) {
+    char own[32];
+    std::snprintf(own, sizeof(own), "f_%05d.png", index);
+    const fs::path source = frames / own;
+    if (!fs::exists(source, ec))
       break;
+    std::string filename;
+    for (int tries = 0;; ++tries, ++counter) {
+      if (tries >= 10000)
+        throw std::runtime_error("no free output name for '" +
+                                 destination.base + "'");
+      filename = OutputFilename(destination.base, counter, OutputKind::kImage,
+                                "png");
+      if (!fs::exists(destination.folder / U8Path(filename), ec))
+        break;
+    }
+    ++counter;
+    const fs::path target_file = destination.folder / U8Path(filename);
+    fs::rename(source, target_file, ec);
+    if (ec) {  // other volume: copy instead
+      ec.clear();
+      fs::copy_file(source, target_file, ec);
+      if (ec)
+        throw std::runtime_error("cannot store video frame " + filename +
+                                 ": " + ec.message());
+    }
     list.push_back(FileEntry(destination, filename));
   }
   json::Value ui = json::Value::object();

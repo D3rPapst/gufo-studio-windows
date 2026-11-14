@@ -761,7 +761,18 @@ in the queue (or the pool has not placed the request, or the worker
 loads) the router keeps the stream open with `: waiting` comments and
 then relays the worker's stream; a prompt that ends without the task
 (deleted from the queue, failed earlier) ends it with `event: done` and
-`"state": "failed"`; after 30 min of waiting it ends the same way. A
+`"state": "failed"`; after 30 min of waiting it ends the same way. Only
+an id this router knows waits (a ComfyUI prompt's, a pool request's, an
+open job's); any other id is `404` at once even with `?model=` of a model
+that is not loaded (a page connects again), and at most 4 such streams
+wait at the same time (`kMaxWaitingPreviews`; the next one: `503 busy`).
+With users, a preview id belongs to the user whose prompt (or pool image
+request) registered it: another signed-in user who is no admin can neither
+take it while that prompt lives (`/prompt` answers `400`, a pool request's
+side is not overwritten) nor reach that preview through the id (`404`);
+the router's own and loopback's prompts stay readable for everyone. A
+worker's preview read directly with `?model=` has no owner check (as
+before 2.1). A
 plain read answers `pending` (204, or JSON for `format=json|frame-json`)
 meanwhile. For a video task the id leads to the video job's preview
 (H3: a WebP loop with a JPEG middle frame for `format=frame`). The worker
@@ -787,7 +798,10 @@ prompts. `GET /queue` lists every running prompt in `queue_running`
 `POST /interrupt` with `{"prompt_id": id}` stops only that prompt, an
 empty body stops every running prompt (ComfyUI's global interrupt);
 waiting prompts are removed with `POST /queue {"delete": [...]}` as
-before. `GET /filmstudio/progress` keeps its top-level fields for the
+before. With users (`[router] auth`), a signed-in user who is no admin
+stops, clears (`{"clear": true}`) and deletes only the own prompts (the
+adapter keeps each prompt's `X-Gufo-User`); the admin, loopback and the
+router itself act on all of them. `GET /filmstudio/progress` keeps its top-level fields for the
 oldest running prompt (or the one `?prompt_id=` names) and adds
 `"running"`: the same fields for each running prompt; `GET
 /filmstudio/preview?prompt_id=` answers that prompt's newest preview
@@ -910,7 +924,10 @@ compared in double. Regions follow `erkennung.py`: the box plus
 `margin * max(w, h)` per side, clipped, then Pillow `crop`'s `round()` (half
 to even, `MarginCropBox`); `regions: "person"` uses this request's person
 boxes (detected on the brightened copy when `brighten_dark` applies) and adds
-the `person` task; the tagger always reads the original pixels. Further
+the `person` task; the tagger always reads the original pixels. Explicit
+`regions` are at most `kWd14MaxRegions` = 64 boxes with values within
++-1e6 (each is one SwinV2 run on the shared CPU queue; else 400), and a caller that disconnects stops
+the tagging between two pictures (499). Further
 pictures (`wd14_tags.images`, at most 16) are read like `image` (Ablage path
 through the gate) and inlined as data URLs when the request goes to the pool
 partner. Code: `src/cli/serve/router/vision_wd14.{hpp,cpp}`. Weights:
@@ -933,7 +950,7 @@ FIFO order with `--vision-threads` threads in the CPU queue shared with
 open; a caller that disconnects leaves the line), the next one gets
 `503 busy` with `Retry-After: 5`. An Ablage path
 `/v1/jobs/{id}/files/{name}` is read through the gate with the caller's own
-`Authorization` (as the MCP tools do; another user's job is the gate's 404,
+`Authorization` or session cookie (as the MCP tools do; another user's job is the gate's 404,
 relayed), at most 20 MB. RGBA input loses its alpha channel (imgutils puts it
 on white). Area `bild`; the request is not counted against `tageslimit`.
 Pool: see below; the relayed body carries the image and the further
@@ -941,8 +958,15 @@ Pool: see below; the relayed body carries the image and the further
 member as sent (`thresholds`, `ocr` passes, `wd14_tags` options). A missing
 OCR or tagger file counts as missing models, so the partner gets the request.
 All tasks share one input reader (`ReadInput` for every picture before the
-queue, `DecodeRgb` to RGB8 in it); detectors may see the brightened copy, OCR
-and tags always the original pixels.
+queue, `DecodeRgb` to RGB8 only once the request has its CPU turn, so a
+waiting request holds encoded bytes only); detectors may see the brightened
+copy, OCR and tags always the original pixels. Limits per request, `400`
+beyond: all pictures together (image and `wd14_tags.images`, whatever their
+source) at most 64 MiB encoded (`kMaxRequestBytes`, one shared
+`ImageReadBudget`; each https read keeps its own 15 s) and 64 megapixels
+decoded (`kMaxRequestPixels`, about 192 MB RGB8). With the brightened copy,
+the OCR enlargements and the tagger's cut-outs a request stays well below
+1 GB of pictures; waiting requests (at most `--vision-queue`) hold no pixels.
 Tests: `router_vision_test` (parsing and errors, ocr passes, the relayed ocr
 options; with `GUFO_VISION_DIR` and `GUFO_VISION_FRAME` real detections, the
 Ablage path, the queue, `ocr` plain, under `brighten_dark` (same texts) and
@@ -969,8 +993,17 @@ node list run in order; cv2-style warp of the float image, SimCC arg-max / 2) 13
 Files from `reference/convert_pose.py` and `reference/convert_dwpose.py` in
 `--vision-dir`; host RAM after loading: about 170 + 345 + 135 MB. The film
 pipeline's body-point merge (per point the surer of ViTPose and DWPose) and the
-mouth measurement stay with the caller. Test: `ccip.pose_oracle`
-(`pose_oracle_test` against `reference/make_pose_oracle.py`).
+mouth measurement stay with the caller. `"pose_boxes": [[x0, y0, x1, y1], ...]`
+(1 to `kMaxPoseBoxes` = 16, each with x1 > x0, y1 > y0 and |v| <= 1e6, only
+with a pose task; else 400) skips RT-DETR (not even loaded): ViTPose and
+DWPose run in exactly these boxes, in the caller's order, with the same
+preparation (box x 1.25 at 192:256 / 288:384), as `mundmessung.py`'s
+`wholebody(img, box)` with the first frame's box for every frame of a shot.
+Those poses carry no `score`; `models.pose_detector` is
+`{"model": "pose_boxes", "boxes": n}`. Test: `ccip.pose_oracle`
+(`pose_oracle_test` against `reference/make_pose_oracle.py`, including the
+reference boxes) and `router_vision_test` (the RT-DETR boxes given back as
+`pose_boxes` give the same points).
 
 ### CPU queue and pool for the router services
 
@@ -983,8 +1016,9 @@ or lacks the models, unless it was relayed already (`X-Gufo-Forwarded`) or is
 pinned (`X-Gufo-Pool: local`, also set by the gate for users with
 `pool = false`). It travels with the partner key and `X-Gufo-If-Idle: 1`; a
 partner whose queue is not idle answers `503 busy` at once. A partner that
-is unreachable or answers 404 (older router), 502, 503 or 504 does not count:
-the request queues here. `X-Gufo-Pool: remote` sends it without the idle
+is unreachable or answers anything but a success or `400` (a wrong pool key
+401/403, 404 of an older router, 429, any 5xx such as an OOM) does not count:
+the request queues here; a `400` (the request itself is wrong) is the answer. `X-Gufo-Pool: remote` sends it without the idle
 condition (`503 remote_unavailable` without a partner). A partner's answer
 carries `X-Gufo-Ran-On: partner`. Images must be inline in the relayed body:
 `/v1/vision/detect` inlines an Ablage path itself; `/v1/figuren` takes only
@@ -1004,8 +1038,12 @@ list of up to 4 passes (`Request::ocr`, `OcrPass`): `heat_threshold`,
 (Pillow `Image.resize(..., LANCZOS)` bit for bit: sinc windowed by sinc,
 support 3, Pillow's fixed-point passes like BICUBIC/BILINEAR in
 `image_ops.cpp`) and answers its boxes and corners divided by s as decimals;
-one enlargement per scale is made per request, at most 24 megapixels
-(`kMaxOcrPixels`, else 400). This is `erkennung_schrift.py`
+one enlargement per scale is made per request. Every pass, `scale` 1
+included, is at most 24 megapixels (`kMaxOcrPixels`, else 400): imgutils
+itself has no limit (it pads to a multiple of 32 and runs DBNet on the whole
+picture), but the detector's float32 feature maps of a larger input need
+several GB of host RAM; gufo refuses rather than shrinking, so the boxes
+never differ from imgutils. This is `erkennung_schrift.py`
 (`ocr(im, box_threshold=0.5)` and the same on a 3x LANCZOS copy, boxes / 3)
 in one request; with a list, `detections.ocr` and `models.ocr` are lists per
 pass. OCR always reads the original pixels, never the `brighten_dark` copy.
@@ -1051,6 +1089,65 @@ mixed; `lanczos.safetensors`) bit for bit.
 Measured on the six rendered images (640x480 to 1344x768, 8 threads, Ryzen AI
 Max+ 395): 0.56-1.76 s per image, mean 1.06 s; imgutils with onnxruntime
 0.63 s. Rectangles were identical, scores within 5e-6.
+
+### Vision worker (`gufo serve vision`)
+
+`POST /v1/vision/depth`, `/v1/vision/find` and `/v1/vision/segment` are worker
+routes: the router proxies them by the JSON `model` like `/v1/images/upscale`
+(`IsJsonModelPost`), so pool, memory guard, idle unloading and jobs apply. The
+worker is a media service (`src/cli/serve/media/vision_api.cpp`,
+`vision_backends.cpp`) started from an `[external/<id>]` section with
+`args = serve vision` and `--depth-model NAME=DIR`, `--find-model [NAME=]DIR`
+(both repeatable, the first is the default; requests choose with `size` /
+`depth_model` and `detector`), `--segment-model DIR`. Public page with requests, answers and licences:
+[docs/models/vision-dsg.md](../models/vision-dsg.md).
+
+The models (`src/models/vision_dsg`, HIP only, FP32 rocBLAS SGEMM, weights read
+from the Hugging Face `model.safetensors` without conversion) follow
+transformers 5.18.0:
+
+- Depth Anything V2 (`depth_anything.hip`, `depth_preprocess.cpp`):
+  DPTImageProcessorPil (518, keep aspect, multiples of 14 rounded half to even,
+  Pillow BICUBIC via the ccip extension's `ResizeBicubic`), DINOv2 with bicubic
+  position interpolation, DPT neck and head, bicubic to the image size.
+- Grounding DINO (`grounding_dino.hip`, `grounding_cpu.cpp`): image processor
+  (800 / 1333, Pillow BILINEAR), BERT WordPiece (ASCII lower-casing), the
+  phrase-block text mask and position ids
+  (`generate_masks_with_special_tokens_and_transfer_map`), Swin-B with shifted
+  windows, BERT-base, six encoder layers (bi-attention fusion, text enhancer,
+  multi-scale deformable attention), two-stage top-900 query selection, six
+  decoder layers with box refinement, `post_process_grounded_object_detection`.
+  One image and one prompt, no padding masks. MM-Grounding-DINO checkpoints
+  (`model_type` `mm-grounding-dino`, e.g. LLMDet base) use the same code with
+  contrastive logits / sqrt(256) plus the learned class bias and one box head
+  per decoder layer (`bbox_embed.0`, `model.decoder.bbox_embed.1..5`).
+  transformers 5.18 ties these heads wrongly without a warning (Grounding DINO:
+  the shared decoder head stays randomly initialised from the process's RNG
+  state; MM-Grounding-DINO: head 0 and class bias 0 in every layer); gufo and
+  `make_find_oracle.py --file-bbox` use the heads in the file.
+  Distill-Any-Depth Large is a Depth Anything V2 checkpoint and needs nothing
+  extra.
+- SAM ViT-H (`sam.hip`, `sam_cpu.cpp`): SamImageProcessorPil (longest side 1024,
+  BILINEAR, zero padding), ViT-H with 14 x 14 windows, global layers and
+  decomposed relative positions, neck, prompt encoder, two-way mask decoder,
+  `post_process_masks` (> 0). Each box is decoded on its own, as transformers
+  does for a batch of boxes.
+
+`hip_ops.hip` holds the shared pieces (weight store, linear / convolution /
+attention, layer and group norm, window partition, resampling). Requests run one
+at a time (`VisionModelService::run_mutex_`); each model loads on first use under
+its own mutex and stays until the worker exits.
+
+Oracle: `src/models/vision_dsg/reference/make_{depth,find,segment}_oracle.py`
+run transformers on the CPU (venv with transformers 5.18.0, torch 2.13,
+numpy 2.5.3, pillow 12.3.0, `python -I`); `vision-dsg-probe depth|find|segment`
+(build target, not shipped) writes the same raw tensors;
+`compare_depth.py` (cosine >= 0.9999, max-abs <= 1e-3 of the range) and
+`compare_find_segment.py` (detections paired by nearest box: boxes +-1 px,
+scores +-1e-3, same labels; mask IoU >= 0.999) decide. Near-equal encoder
+scores can swap places in the top-900 selection; `GUFO_VISION_TOPK=<file>`
+(one token index per line) forces the reference order and
+`GUFO_VISION_DUMP=<dir>` writes intermediate tensors of the find model. Request handling without a GPU: `vision_api_test`.
 
 ### Video concat (`POST /v1/videos/concat`)
 
@@ -1556,13 +1653,14 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
 Areas by endpoint: text = chat, completions, responses, messages,
-embeddings, rerank, realtime, `/v1/figuren`; bild = `/v1/images/*`,
+embeddings, rerank, realtime, `/v1/figuren`, `POST /v1/systemone` (it loads
+its JSON `model`: model list and daily limit apply, one per request); bild = `/v1/images/*`,
 `/v1/vision/*` and the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
 ...); video = `/v1/videos*`; stimme = speech, transcriptions, convert,
 voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
 `/v1/3d/*`; ablage = `/v1/jobs*`; `/v1/previews/*` needs bild or video.
 `GET /v1/models`, `/router/status`, `/router/capabilities`, `GET
-/router/placement` and `/v1/names` are open to every signed-in user (the
+/router/placement`, `/v1/names` and `GET /v1/systemone` are open to every signed-in user (the
 pages need them); `pool` and `status` gate the pages of those names
 (`/pool/`, `/speicher/`, `/status/`, ...). Two of them say less to a
 `nutzer` or `dienst` than to an admin or the machine itself (2.0.5):
@@ -2065,7 +2163,7 @@ the chat case answered, the child was stopped; see the C5 commit.
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `POST` | `/v1/images/upscale` | `gufo serve upscale` (Real-ESRGAN on the NPU, GPU or CPU); sync, or `"async": true` for a job read at `/v1/images/upscale/{id}[/content]` |
-| `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](../models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
+| `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 (or with `"output_format": "png_zip"` a stored ZIP of lossless PNG frames) at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](../models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
 | `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header |
 | `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds}}` |
 | `GET` | `/v1/3d/generations/{id}/content` | The finished GLB (`model/gltf-binary`, `Content-Disposition: attachment`) |

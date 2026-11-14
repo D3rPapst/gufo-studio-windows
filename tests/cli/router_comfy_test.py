@@ -999,6 +999,35 @@ def check_preview_ids(router):
     status, body = router.json("GET", "/v1/previews/%s?format=json" % victim)
     assert status == 404, (status, body)
 
+    # An id nobody knows waits for no model: 404 at once, even when the
+    # named model is not loaded (2.1.1 held such a stream up to 30 min).
+    started = time.monotonic()
+    status, _ = router.request("GET", "/v1/previews/made-up-id/events?model=minimax-h3")
+    assert status == 404 and time.monotonic() - started < 5, status
+
+    # No id: 404 (2.1.1 answered /v1/previews/events with a 500).
+    for path in ("/v1/previews/events", "/v1/previews//events", "/v1/previews/"):
+        status, payload = router.request("GET", path)
+        assert status == 404, (path, status, payload)
+
+    # At most 4 streams wait at once; the next one is 503 busy.
+    first = router.submit(qwen_graph(prompt="SLOW ahead limit", prefix="film/stil/ahead"))
+    queued = router.submit(qwen_graph(prompt="SLOW queued limit", prefix="film/stil/queued"))
+    streams = [{} for _ in range(4)]
+    readers = [threading.Thread(target=read_events,
+                                args=(router, "/v1/previews/%s/events" % queued, s))
+               for s in streams]
+    for reader in readers:
+        reader.start()
+    time.sleep(0.5)
+    status, payload = router.request("GET", "/v1/previews/%s/events" % queued)
+    assert status == 503 and b"busy" in payload, (status, payload)
+    router.wait(first)
+    router.wait(queued)
+    for reader in readers:
+        reader.join(30)
+    assert all(s.get("status") == 200 for s in streams), streams
+
 
 def check_filmstudio(router):
     """/filmstudio/progress and /filmstudio/preview answer like the film
@@ -1147,6 +1176,36 @@ def running_ids(router, path="/queue"):
     return [item[1] for item in queue["queue_running"]]
 
 
+def check_parallel_same_prefix(router):
+    """Two prompts with the same filename_prefix finish at the same time:
+    each gets its own file (the output counter is reserved atomically) and
+    each history entry shows its own image."""
+    seen = set()
+    for round_ in range(3):
+        sizes = {}
+        ids = []
+        for resolution in (512, 768):
+            graph = qwen_graph(prompt="SLOW same %d" % round_, prefix="film/par/same")
+            graph["5"]["inputs"]["resolution"] = resolution
+            prompt_id = router.submit(graph, client_id="same")
+            ids.append(prompt_id)
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        for prompt_id in ids:
+            entry = router.wait(prompt_id)
+            assert entry["status"]["status_str"] == "success", entry["status"]
+            image = entry["outputs"]["8"]["images"][0]
+            assert image["filename"] not in seen, (image, seen)
+            seen.add(image["filename"])
+            status, data = router.request("GET", "/view?" + urllib.parse.urlencode(image))
+            assert status == 200, image
+            sizes[prompt_id] = png_size(data)
+        # Both files exist and each prompt shows a different picture.
+        assert len(set(sizes.values())) == 2, sizes
+    folder = os.path.join(router.tmp, "comfy", "output", "film", "par")
+    files = sorted(n for n in os.listdir(folder) if n.startswith("same_"))
+    assert files == sorted(seen) and len(files) == 6, files
+
+
 def check_parallel(router):
     """--comfy-parallel 2: two prompts run at the same time, a third waits;
     /queue, /prompt, /filmstudio/progress, /ws, /interrupt and /history keep
@@ -1207,6 +1266,8 @@ def check_parallel(router):
     status, body = router.json("GET", "/filmstudio/progress")
     assert body["prompt_id"] is None and body["running"] == [], body
 
+    check_parallel_same_prefix(router)
+
     # Interrupt without a prompt id stops every running prompt.
     first = router.submit(qwen_graph(prompt="SLOW all one", prefix="film/par/all"))
     second = router.submit(qwen_graph(prompt="SLOW all two", prefix="film/par/all"))
@@ -1217,6 +1278,88 @@ def check_parallel(router):
         assert entry["status"]["status_str"] == "error", entry["status"]
         kinds = [m[0] for m in entry["status"]["messages"]]
         assert "execution_interrupted" in kinds, kinds
+
+
+def check_owners(binary, tmp):
+    """With users (auth = lan): /interrupt and POST /queue clear/delete of a
+    user who is no admin touch only that user's prompts; loopback (admin)
+    still stops every prompt (check_parallel)."""
+    own_tmp = os.path.join(tmp, "owners")
+    os.makedirs(own_tmp, exist_ok=True)
+    router = Router(binary, own_tmp, os.path.join(own_tmp, "comfy"),
+                    extra_args=["--comfy-parallel", "2"],
+                    extra_preset="[router]\nauth = lan\n")
+    try:
+        tokens = {}
+        for name in ("tim", "ina"):
+            status, body = router.json("POST", "/router/users", {
+                "name": name, "rolle": "nutzer", "passwort": name + "-passwort-1",
+                "rechte": {"bereiche": ["bild"]}})
+            assert status in (200, 201), (status, body)
+            status, body = router.json("POST", "/router/users/%s/tokens" % name,
+                                       {"name": "test", "tage": 1})
+            assert status == 201, (status, body)
+            tokens[name] = {"Authorization": "Bearer " + body["token"]}
+
+        def call(user, method, path, body=None):
+            data = json.dumps(body).encode() if body is not None else b""
+            headers = dict(tokens[user], **{"Content-Type": "application/json"})
+            return router.request(method, path, data, headers)
+
+        def submit(user, prompt, prefix):
+            status, payload = call(user, "POST", "/prompt", {
+                "prompt": qwen_graph(prompt=prompt, prefix=prefix), "client_id": user})
+            assert status == 200, payload
+            return json.loads(payload)["prompt_id"]
+
+        # A user's interrupt without prompt_id stops only its own prompt.
+        tim = submit("tim", "SLOW tim one", "film/own/tim")
+        ina = submit("ina", "SLOW ina one", "film/own/ina")
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        status, _ = call("ina", "POST", "/interrupt", None)
+        assert status == 200
+        assert router.wait(tim)["status"]["status_str"] == "success"
+        assert router.wait(ina)["status"]["status_str"] == "error"
+
+        # Another user's prompt id, clear and delete leave tim's prompts alone.
+        ina = submit("ina", "SLOW ina two", "film/own/ina")
+        tim = submit("tim", "SLOW tim two", "film/own/tim")
+        waiting = submit("tim", "SLOW tim three", "film/own/tim")
+        wait_until("two running prompts", lambda: len(running_ids(router)) == 2)
+        status, queue = router.json("GET", "/queue")
+        assert [item[1] for item in queue["queue_pending"]] == [waiting], queue
+        assert call("ina", "POST", "/interrupt", {"prompt_id": tim})[0] == 200
+        assert call("ina", "POST", "/queue", {"clear": True})[0] == 200
+        assert call("ina", "POST", "/queue", {"delete": [waiting]})[0] == 200
+        status, queue = router.json("GET", "/queue")
+        assert [item[1] for item in queue["queue_pending"]] == [waiting], queue
+        assert call("tim", "POST", "/queue", {"delete": [waiting]})[0] == 200
+        status, queue = router.json("GET", "/queue")
+        assert queue["queue_pending"] == [], queue
+        assert router.wait(tim)["status"]["status_str"] == "success"
+        assert router.wait(ina)["status"]["status_str"] == "success"
+
+        # Preview ids per user: ina can neither take tim's live
+        # gufo_preview_id nor read its preview; tim reads it.
+        status, payload = call("tim", "POST", "/prompt", {
+            "prompt": qwen_graph(prompt="SLOW tim preview", prefix="film/own/tim"),
+            "extra_data": {"gufo_preview_id": "szene-1"}})
+        assert status == 200, payload
+        tim = json.loads(payload)["prompt_id"]
+        status, payload = call("ina", "POST", "/prompt", {
+            "prompt": qwen_graph(prompt="SLOW ina preview", prefix="film/own/ina"),
+            "extra_data": {"gufo_preview_id": "szene-1"}})
+        assert status == 400 and b"gufo_preview_id" in payload, (status, payload)
+        status, payload = call("ina", "GET", "/v1/previews/szene-1?format=json")
+        assert status == 404, (status, payload)
+        status, payload = call("tim", "GET", "/v1/previews/szene-1?format=json")
+        assert status == 200, (status, payload)
+        assert router.wait(tim)["status"]["status_str"] == "success"
+    except BaseException:
+        print(router.tail())
+        raise
+    finally:
+        router.stop()
 
 
 def check_pool_view(binary, tmp, partner):
@@ -1434,6 +1577,7 @@ def main():
     finally:
         if router.proc.poll() is None:
             router.stop()
+    check_owners(binary, tmp)
     if not os.environ.get("COMFY_SKIP_AUTOLOAD"):
         check_autoload_retry(binary, tmp)
     shutil.rmtree(tmp, ignore_errors=True)

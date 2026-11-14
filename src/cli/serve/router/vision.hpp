@@ -49,6 +49,10 @@
 //                "keypoints": [[x, y, score] x 17],      with "pose"
 //                "wholebody": [[x, y, score] x 133]}]    with "pose_wholebody"
 //   in score order; the point names are in "models".
+//   "pose_boxes": [[x0, y0, x1, y1], ...] (at most kMaxPoseBoxes) skips
+//   RT-DETR: ViTPose / DWPose run in exactly these boxes, in this order
+//   (the film pipeline's mundmessung.py keeps the first frame's box for
+//   every frame); the poses then carry no "score".
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -63,8 +67,13 @@
 //   the request first (image inline as a data URL); X-Gufo-Ran-On: partner
 //   marks its answer.
 //   An Ablage path is read through the gate with the caller's own
-//   Authorization (another user's job is the gate's 404), at most 20 MB.
+//   Authorization or session cookie (another user's job is the gate's
+//   404), at most 20 MB.
+//   Limits per request (400 beyond): kMaxRequestBytes encoded over all
+//   input pictures, kMaxRequestPixels decoded over all of them (decoded
+//   only once the request has its CPU turn).
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -105,8 +114,18 @@ struct OcrPass {
 };
 inline constexpr std::size_t kMaxOcrPasses = 4;
 inline constexpr int kMaxOcrScale = 4;
-/// Largest enlarged OCR input (3x of 1920x1080 is 18.7 megapixels).
+/// Largest OCR input, enlarged or not (3x of 1920x1080 is 18.7 megapixels).
+/// imgutils.ocr has no limit (it pads to a multiple of 32 and runs DBNet on
+/// the whole picture); the detector's float32 feature maps of a larger
+/// input need several GB of host RAM, so gufo answers 400 instead.
 inline constexpr std::int64_t kMaxOcrPixels = 24'000'000;
+/// Encoded bytes of all input pictures of one request together (image and
+/// wd14_tags.images; data URLs, https URLs and Ablage paths alike).
+inline constexpr std::size_t kMaxRequestBytes = static_cast<std::size_t>(64) << 20;
+/// Decoded pixels of all input pictures of one request together (RGB8:
+/// about 192 MB). Pictures are decoded only once the request has its turn
+/// in the CPU queue, so waiting requests hold encoded bytes only.
+inline constexpr std::int64_t kMaxRequestPixels = 64'000'000;
 
 struct Request {
   std::string image;
@@ -129,7 +148,11 @@ struct Request {
   bool pose_wholebody{false};
   float pose_min_score{0.35f};
   int pose_max_persons{4};
+  /// "pose_boxes": the persons' boxes given by the caller (RT-DETR skipped).
+  std::vector<std::array<float, 4>> pose_boxes;
 };
+/// Most "pose_boxes" per request.
+inline constexpr std::size_t kMaxPoseBoxes = 16;
 
 /// The pose tasks ("pose", "pose_wholebody").
 const std::vector<std::string>& PoseTasks();

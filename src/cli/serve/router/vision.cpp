@@ -240,7 +240,8 @@ std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& 
   return out.dump();
 }
 
-/// Bytes of an Ablage path, read through the gate with the caller's token.
+/// Bytes of an Ablage path, read through the gate with the caller's token
+/// or browser session (Authorization, Cookie).
 /// A refusal of the gate or the job store is returned in *failure.
 std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& outer,
                                      const std::string& path,
@@ -254,7 +255,7 @@ std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& 
   inner.is_cancelled = outer.is_cancelled;
   inner.request_id = outer.request_id;
   for (const auto& [name, value] : outer.headers) {
-    if (EqualsIgnoreCase(name, "Authorization"))
+    if (EqualsIgnoreCase(name, "Authorization") || EqualsIgnoreCase(name, "Cookie"))
       inner.headers.emplace_back(name, value);
   }
   inner.headers.emplace_back("Accept", "*/*");
@@ -293,23 +294,42 @@ std::vector<std::uint8_t> ReadAblage(const Options& options, const HttpRequest& 
 
 /// Bytes of one input picture: an Ablage path through the gate, else a
 /// data URL, https URL or bare base64. A refusal of the gate is returned in
-/// *failure; anything else unreadable throws.
+/// *failure; anything else unreadable throws. `budget` is shared by all
+/// pictures of the request (kMaxRequestBytes); each read gets 15 s.
 std::vector<std::uint8_t> ReadInput(const Options& options, const HttpRequest& outer,
-                                    const std::string& source,
+                                    const std::string& source, core::ImageReadBudget& budget,
                                     std::optional<HttpResponse>* failure) {
-  if (IsAblagePath(source))
-    return ReadAblage(options, outer, source, failure);
-  const std::string url = source.starts_with("data:") || source.starts_with("https://")
-                              ? source
-                              : "data:image/png;base64," + source;
-  core::ImageReadBudget budget;
-  return core::ReadImageUrl(url, budget);
+  std::vector<std::uint8_t> bytes;
+  if (IsAblagePath(source)) {
+    bytes = ReadAblage(options, outer, source, failure);
+  } else {
+    const std::string url = source.starts_with("data:") || source.starts_with("https://")
+                                ? source
+                                : "data:image/png;base64," + source;
+    budget.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const std::size_t before = budget.remaining_bytes;
+    bytes = core::ReadImageUrl(url, budget);
+    if (budget.remaining_bytes != before)
+      return bytes;  // ReadImageUrl counted them itself
+  }
+  if (bytes.size() > budget.remaining_bytes)
+    throw std::invalid_argument("all pictures of the request together exceed " +
+                                std::to_string(kMaxRequestBytes >> 20) + " MB");
+  budget.remaining_bytes -= bytes.size();
+  return bytes;
 }
 
 /// RGB8 pixels of encoded bytes, the alpha channel dropped (the pipeline
-/// opens its pictures with .convert("RGB")).
-models::ccip::RgbImage DecodeRgb(const std::vector<std::uint8_t>& bytes) {
+/// opens its pictures with .convert("RGB")). `pixels_left` is the request's
+/// remaining kMaxRequestPixels.
+models::ccip::RgbImage DecodeRgb(const std::vector<std::uint8_t>& bytes,
+                                 std::int64_t* pixels_left) {
   core::Image rgb = core::DecodeImage(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+  const auto pixels = static_cast<std::int64_t>(rgb.width) * static_cast<std::int64_t>(rgb.height);
+  if (pixels > *pixels_left)
+    throw std::invalid_argument("all pictures of the request together exceed " +
+                                std::to_string(kMaxRequestPixels / 1000000) + " megapixels");
+  *pixels_left -= pixels;
   models::ccip::RgbImage image;
   image.width = static_cast<int>(rgb.width);
   image.height = static_cast<int>(rgb.height);
@@ -396,6 +416,27 @@ Request ParseRequest(const json::Value& body) {
         request.pose_max_persons = static_cast<int>(value.as_double());
       else
         throw std::invalid_argument("pose_options: min_score in (0, 1], max_persons 1-32");
+    }
+  }
+  if (const json::Value* boxes = body.find("pose_boxes"); boxes != nullptr && !boxes->is_null()) {
+    if (!request.pose && !request.pose_wholebody)
+      throw std::invalid_argument("pose_boxes needs the task pose or pose_wholebody");
+    if (!boxes->is_array() || boxes->empty() || boxes->size() > kMaxPoseBoxes)
+      throw std::invalid_argument("pose_boxes must list 1 to " + std::to_string(kMaxPoseBoxes) +
+                                  " boxes [x0, y0, x1, y1]");
+    for (const json::Value& box : boxes->items()) {
+      if (!box.is_array() || box.size() != 4)
+        throw std::invalid_argument("pose_boxes: every box is [x0, y0, x1, y1]");
+      std::array<float, 4> b{};
+      for (std::size_t i = 0; i < 4; ++i) {
+        const json::Value& v = box.items()[i];
+        if (!v.is_number() || !(std::fabs(v.as_double()) <= 1e6))
+          throw std::invalid_argument("pose_boxes: box values must be numbers within +-1e6");
+        b[i] = static_cast<float>(v.as_double());
+      }
+      if (!(b[2] > b[0] && b[3] > b[1]))
+        throw std::invalid_argument("pose_boxes: every box needs x1 > x0 and y1 > y0");
+      request.pose_boxes.push_back(b);
     }
   }
   if (const json::Value* dark = body.find("brighten_dark"); dark != nullptr && !dark->is_null()) {
@@ -632,7 +673,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const models::ccip::TextOcr* ocr = nullptr;
   if (!parsed.ocr.empty() && missing.empty())
     ocr = state_->GetOcr(options_, &missing);
-  if (missing.empty() && (parsed.pose || parsed.pose_wholebody))
+  if (missing.empty() && (parsed.pose || parsed.pose_wholebody) && parsed.pose_boxes.empty())
     state_->GetPose(options_, &state_->rtdetr, "rtdetr_r50vd_coco_o365", "convert_pose.py rtdetr", &missing);
   if (missing.empty() && parsed.pose)
     state_->GetPose(options_, &state_->vitpose, "vitpose_base_simple", "convert_pose.py vitpose", &missing);
@@ -642,9 +683,11 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   // and must not hold the CPU turn.
   std::vector<std::uint8_t> bytes;
   std::vector<std::vector<std::uint8_t>> wd14_bytes;
+  core::ImageReadBudget budget;
+  budget.remaining_bytes = kMaxRequestBytes;
   try {
     std::optional<HttpResponse> failure;
-    bytes = ReadInput(options_, request, parsed.image, &failure);
+    bytes = ReadInput(options_, request, parsed.image, budget, &failure);
     if (failure.has_value())
       return std::move(*failure);
   } catch (const std::exception& error) {
@@ -653,7 +696,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   for (std::size_t i = 0; i < parsed.wd14.images.size(); ++i) {
     try {
       std::optional<HttpResponse> failure;
-      wd14_bytes.push_back(ReadInput(options_, request, parsed.wd14.images[i], &failure));
+      wd14_bytes.push_back(
+          ReadInput(options_, request, parsed.wd14.images[i], budget, &failure));
       if (failure.has_value())
         return std::move(*failure);
     } catch (const std::exception& error) {
@@ -685,25 +729,41 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     return Error(503, "Service Unavailable", missing, "vision_unavailable");
   if (route == cpu::Route::kLocalIfIdle && !queue.Idle())
     return cpu::Busy("image recognition");
+  // The CPU turn first, then decoding: a waiting request holds only its
+  // encoded bytes (kMaxRequestBytes), never decoded pixels.
+  const auto queued = std::chrono::steady_clock::now();
+  switch (queue.Enter(request.is_cancelled)) {
+    case cpu::CpuQueue::Result::kOk:
+      break;
+    case cpu::CpuQueue::Result::kFull:
+      return cpu::Busy("image recognition");
+    case cpu::CpuQueue::Result::kCancelled:
+      return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
+  }
+  const cpu::CpuQueue::Turn turn(queue);
+  const auto started = std::chrono::steady_clock::now();
   models::ccip::RgbImage image;
   std::vector<models::ccip::RgbImage> wd14_images;
+  std::int64_t pixels_left = kMaxRequestPixels;
   try {
     // RGB8 with the alpha channel dropped (imgutils puts RGBA on white).
-    image = DecodeRgb(bytes);
+    image = DecodeRgb(bytes, &pixels_left);
   } catch (const std::exception& error) {
     return Error(400, "Bad Request", std::string("image: ") + error.what(), "invalid_request");
   }
+  bytes.clear();
+  bytes.shrink_to_fit();
   for (std::size_t i = 0; i < wd14_bytes.size(); ++i) {
     try {
-      wd14_images.push_back(DecodeRgb(wd14_bytes[i]));
+      wd14_images.push_back(DecodeRgb(wd14_bytes[i], &pixels_left));
     } catch (const std::exception& error) {
       return Error(400, "Bad Request",
                    "wd14_tags.images[" + std::to_string(i) + "]: " + error.what(),
                    "invalid_request");
     }
+    wd14_bytes[i].clear();
+    wd14_bytes[i].shrink_to_fit();
   }
-  bytes.clear();
-  bytes.shrink_to_fit();
   wd14_bytes.clear();
   // Explicit wd14 regions must leave a cut-out inside the image.
   for (std::size_t i = 0; i < parsed.wd14.boxes.size(); ++i) {
@@ -714,11 +774,12 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
                    "wd14_tags.regions[" + std::to_string(i) + "] lies outside the image",
                    "invalid_request");
   }
-  // Enlarged OCR passes stay within kMaxOcrPixels (host RAM).
+  // Every OCR pass, enlarged or not, stays within kMaxOcrPixels (host RAM
+  // of the detector's feature maps; imgutils itself has no limit).
   for (const OcrPass& pass : parsed.ocr) {
     const auto pixels = static_cast<std::int64_t>(image.width) * pass.scale *
                         static_cast<std::int64_t>(image.height) * pass.scale;
-    if (pass.scale > 1 && pixels > kMaxOcrPixels)
+    if (pixels > kMaxOcrPixels)
       return Error(400, "Bad Request",
                    "ocr scale " + std::to_string(pass.scale) + ": " +
                        std::to_string(image.width * pass.scale) + "x" +
@@ -734,18 +795,6 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   if (brightened)
     detect_image = models::ccip::ApplyGamma(image, parsed.dark_gamma);
   const models::ccip::RgbImage& detector_input = brightened ? detect_image : image;
-
-  const auto queued = std::chrono::steady_clock::now();
-  switch (queue.Enter(request.is_cancelled)) {
-    case cpu::CpuQueue::Result::kOk:
-      break;
-    case cpu::CpuQueue::Result::kFull:
-      return cpu::Busy("image recognition");
-    case cpu::CpuQueue::Result::kCancelled:
-      return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
-  }
-  const cpu::CpuQueue::Turn turn(queue);
-  const auto started = std::chrono::steady_clock::now();
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();
   std::vector<std::array<int, 4>> persons;  // for wd14_tags regions "person"
@@ -779,7 +828,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     // Tags on the original pixels (never the brightened copy), like the
     // pipeline's erkennung.py.
     if (tagger != nullptr) {
-      detections[kWd14Task] = RunWd14(*tagger, image, parsed.wd14, persons, wd14_images);
+      detections[kWd14Task] =
+          RunWd14(*tagger, image, parsed.wd14, persons, wd14_images, request.is_cancelled);
       used[kWd14Task] = Wd14ModelInfo(parsed.wd14);
     }
     // OCR on the original pixels too (erkennung.py / erkennung_schrift.py),
@@ -817,15 +867,25 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     }
     if (parsed.pose || parsed.pose_wholebody) {
       // posen_erkennung.erkenne on the original image (not the brightened copy).
+      // pose_boxes: the caller's boxes, in its order, without RT-DETR.
+      const bool given = !parsed.pose_boxes.empty();
       std::vector<models::ccip::ObjectBox> pose_persons;
-      for (const auto& o : state_->rtdetr->Detect(image, parsed.pose_min_score)) {
-        if (o.label == 0)
+      if (given) {
+        for (const auto& box : parsed.pose_boxes) {
+          models::ccip::ObjectBox o;
+          o.box = box;
           pose_persons.push_back(o);
+        }
+      } else {
+        for (const auto& o : state_->rtdetr->Detect(image, parsed.pose_min_score)) {
+          if (o.label == 0)
+            pose_persons.push_back(o);
+        }
+        std::stable_sort(pose_persons.begin(), pose_persons.end(),
+                         [](const auto& a, const auto& b) { return a.score > b.score; });
+        if (pose_persons.size() > static_cast<std::size_t>(parsed.pose_max_persons))
+          pose_persons.resize(static_cast<std::size_t>(parsed.pose_max_persons));
       }
-      std::stable_sort(pose_persons.begin(), pose_persons.end(),
-                       [](const auto& a, const auto& b) { return a.score > b.score; });
-      if (pose_persons.size() > static_cast<std::size_t>(parsed.pose_max_persons))
-        pose_persons.resize(static_cast<std::size_t>(parsed.pose_max_persons));
       auto points = [](const std::vector<models::ccip::Keypoint>& kps) {
         json::Value list = json::Value::array();
         for (const auto& k : kps) {
@@ -844,7 +904,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         for (float v : person.box)
           box.push_back(static_cast<double>(v));
         entry["box"] = std::move(box);
-        entry["score"] = static_cast<double>(person.score);
+        if (!given)
+          entry["score"] = static_cast<double>(person.score);
         if (parsed.pose)
           entry["keypoints"] = points(state_->vitpose->Estimate(image, person.box));
         if (parsed.pose_wholebody)
@@ -853,10 +914,15 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
       }
       out_poses = std::move(poses);
       json::Value det = json::Value::object();
-      det["repo"] = "PekingU/rtdetr_r50vd_coco_o365";
-      det["model"] = "rtdetr_r50vd_coco_o365";
-      det["min_score"] = std::round(static_cast<double>(parsed.pose_min_score) * 1e6) / 1e6;
-      det["max_persons"] = parsed.pose_max_persons;
+      if (given) {
+        det["model"] = "pose_boxes";
+        det["boxes"] = static_cast<long long>(parsed.pose_boxes.size());
+      } else {
+        det["repo"] = "PekingU/rtdetr_r50vd_coco_o365";
+        det["model"] = "rtdetr_r50vd_coco_o365";
+        det["min_score"] = std::round(static_cast<double>(parsed.pose_min_score) * 1e6) / 1e6;
+        det["max_persons"] = parsed.pose_max_persons;
+      }
       used["pose_detector"] = std::move(det);
       if (parsed.pose) {
         json::Value m = json::Value::object();
@@ -877,6 +943,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         used["pose_wholebody"] = std::move(m);
       }
     }
+  } catch (const Wd14Cancelled&) {
+    return Error(499, "Client Closed Request", "cancelled", "cancelled");
   } catch (const std::exception& error) {
     return Error(500, "Internal Server Error", std::string("detection failed: ") + error.what(),
                  "vision_failed");

@@ -491,7 +491,10 @@ bool IsJsonModelPost(const HttpRequest& req) {
       // Decision models (gufo serve decision, LFM3 d1); JSON in, scores out.
       "/v1/systemone",
       // TripoSG image-to-3D jobs (gufo serve objekt), async via /v1/jobs.
-      "/v1/3d/generations"};
+      "/v1/3d/generations",
+      // Depth / open-vocabulary boxes / masks (gufo serve vision); the
+      // router's own /v1/vision/detect is answered before routing.
+      "/v1/vision/depth", "/v1/vision/find", "/v1/vision/segment"};
   if (std::find(kPaths.begin(), kPaths.end(), req.path) != kPaths.end()) {
     return true;
   }
@@ -1016,6 +1019,10 @@ public:
   }
   /// Relays to remote routers still running (the shutdown drain waits).
   std::atomic<int> remote_inflight{0};
+  /// /v1/previews/<id>/events streams waiting for their preview to be
+  /// placed (WaitPreviewStream); more than kMaxWaitingPreviews: 503.
+  static constexpr int kMaxWaitingPreviews = 4;
+  std::atomic<int> waiting_previews_{0};
   /// Reachability and model states of the remote routers; null without
   /// [remote/<id>] sections.
   std::unique_ptr<router::RemoteHub> remotes;
@@ -1056,19 +1063,26 @@ public:
     std::string model;
     bool remote{false};
     std::chrono::steady_clock::time_point at{};
+    /// The request's user (comfy::RestrictedUser; "" for an admin, the
+    /// router, loopback): another user neither overwrites nor reads it.
+    std::string user;
   };
   std::map<std::string, PreviewSide, std::less<>> preview_sides_;
 
   /// Records the side of `preview_id` (state mutex held); forgets entries
   /// older than an hour, keeps at most 1024.
   void NotePreviewSideLocked(const std::string& preview_id,
-                             const std::string& model_id, bool remote) {
+                             const std::string& model_id, bool remote,
+                             const std::string& user) {
     if (preview_id.empty())
       return;
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(preview_sides_, [&](const auto& entry) {
       return now - entry.second.at > std::chrono::hours(1);
     });
+    if (const auto taken = preview_sides_.find(preview_id);
+        taken != preview_sides_.end() && taken->second.user != user)
+      return;  // another user's id: its preview stays where it is
     while (preview_sides_.size() >= 1024) {
       auto oldest = preview_sides_.begin();
       for (auto it = preview_sides_.begin(); it != preview_sides_.end(); ++it)
@@ -1076,7 +1090,7 @@ public:
           oldest = it;
       preview_sides_.erase(oldest);
     }
-    preview_sides_[preview_id] = PreviewSide{model_id, remote, now};
+    preview_sides_[preview_id] = PreviewSide{model_id, remote, now, user};
   }
 
   /// {job id: "wait"|"local"|"remote"}; entries older than a day go.
@@ -1969,7 +1983,8 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "local");
-        NotePreviewSideLocked(preview_id, model_id, /*remote=*/false);
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/false,
+                              router::comfy::RestrictedUser(req));
         ++pool_[model_id].local_picks;
         // The claim keeps the local worker "taken" for other pool requests
         // until this one's busy count is armed (after a cold load).
@@ -2008,7 +2023,8 @@ public:
         stop_waiting();
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "remote");
-        NotePreviewSideLocked(preview_id, model_id, /*remote=*/true);
+        NotePreviewSideLocked(preview_id, model_id, /*remote=*/true,
+                              router::comfy::RestrictedUser(req));
         ++pool_[model_id].remote_picks;
         pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
         HttpResponse response =
@@ -2591,10 +2607,15 @@ public:
   /// before that is known waits for it (WaitPreviewStream).
   HttpResponse PreviewLocked(const HttpRequest& req,
                              std::unique_lock<std::mutex>& lock) {
-    const bool events = req.path.ends_with("/events");
+    bool events = false;
+    (void)PreviewIdOf(req.path, &events);
     PreviewPlan plan = PlanPreviewLocked(req);
     if (plan.kind == PreviewPlan::Kind::kWait) {
       if (events) {
+        if (waiting_previews_.load() >= kMaxWaitingPreviews)
+          return Err(503, "Service Unavailable",
+                     "too many preview streams are waiting; try again",
+                     "server_error", "busy");
         lock.unlock();
         return WaitPreviewStream(req);
       }
@@ -2638,19 +2659,32 @@ public:
     return response;
   }
 
+  /// The id of /v1/previews/<id>[/events]; *events only with an id before
+  /// "/events" (/v1/previews/events is the id "events", a plain 404).
+  static std::string PreviewIdOf(const std::string& path, bool* events) {
+    std::string id = path.substr(std::string_view("/v1/previews/").size());
+    *events = id.size() > std::string_view("/events").size() && id.ends_with("/events");
+    if (*events)
+      id.resize(id.size() - std::string_view("/events").size());
+    return id;
+  }
+
   /// Decides where a /v1/previews request goes (state mutex held).
   PreviewPlan PlanPreviewLocked(const HttpRequest& req) {
     PreviewPlan plan;
     plan.request = req;
-    const bool events = req.path.ends_with("/events");
+    bool events = false;
+    std::string id = PreviewIdOf(req.path, &events);
     const bool forwarded = !req.header(router::kForwardedHeader).empty();
     std::string model_id = req.query_param("model");
-    std::string id = req.path.substr(std::string_view("/v1/previews/").size());
-    if (events)
-      id.resize(id.size() - std::string_view("/events").size());
+    if (id.empty()) {
+      plan.answer = Err(404, "Not Found", "no preview id", "invalid_request_error",
+                        "preview_not_found");
+      return plan;
+    }
     if (comfy != nullptr && !forwarded) {
       // A ComfyUI prompt's preview id (2.1): known from /prompt on.
-      if (auto route = comfy->FindPreview(id)) {
+      if (auto route = comfy->FindPreview(id, router::comfy::RestrictedUser(req))) {
         plan.comfy_known = true;
         if (route->target.empty()) {
           plan.kind = PreviewPlan::Kind::kWait;
@@ -2666,7 +2700,13 @@ public:
         model_id = route->video ? std::string() : route->model;
       }
     }
-    const auto side = preview_sides_.find(id);
+    auto side = preview_sides_.find(id);
+    if (side != preview_sides_.end() && !plan.comfy_known) {
+      // Another user's pool request: not this reader's preview.
+      const std::string reader = router::comfy::RestrictedUser(req);
+      if (!reader.empty() && !side->second.user.empty() && side->second.user != reader)
+        side = preview_sides_.end();
+    }
     if (side != preview_sides_.end() && model_id.empty())
       model_id = side->second.model;
     if (model_id.empty())
@@ -2714,8 +2754,13 @@ public:
                             ? nullptr
                             : FindWorkerLocked(model_id);
     if (worker == nullptr) {
-      if (events && preset != nullptr) {
-        // The worker loads for the request this stream waits for.
+      // The worker loads for the request this stream waits for. Only an id
+      // this router knows (a ComfyUI prompt's, a pool request's, a job's)
+      // waits; any other id is 404 at once (a page connects again), so a
+      // made-up id with ?model=<unloaded model> holds no connection.
+      const bool known_id = plan.comfy_known || side != preview_sides_.end() ||
+                            registry.JobOpen(id);
+      if (events && preset != nullptr && known_id) {
         plan.kind = PreviewPlan::Kind::kWait;
         return plan;
       }
@@ -2760,11 +2805,14 @@ public:
     response.headers = {{"Content-Type", "text/event-stream"},
                         {"Cache-Control", "no-cache"},
                         {"X-Accel-Buffering", "no"}};
-    response.streaming_body = [this, req](
+    // Counted from here until the stream (or the unsent response) ends.
+    ++waiting_previews_;
+    std::shared_ptr<void> waiting(nullptr,
+                                  [this](void*) { --waiting_previews_; });
+    response.streaming_body = [this, req, waiting](
                                   const HttpResponse::BodyWriter& write) {
-      std::string id =
-          req.path.substr(std::string_view("/v1/previews/").size());
-      id.resize(id.size() - std::string_view("/events").size());
+      bool events = false;
+      const std::string id = PreviewIdOf(req.path, &events);
       const auto failed = [&] {
         json::Value body = json::Value::object();
         body["id"] = id;

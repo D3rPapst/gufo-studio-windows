@@ -32,6 +32,8 @@ add_subdirectory(src/models/ace_step)
 add_subdirectory(src/models/yue2)
 add_subdirectory(src/models/mmaudio)
 add_subdirectory(src/models/realesrgan)
+# Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).
+add_subdirectory(src/models/vision_dsg)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
 add_subdirectory(src/models/qwen3_omni)
 
@@ -42,13 +44,20 @@ add_library(gufo_media STATIC
   src/cli/serve/music_encode.cpp
   src/cli/serve/media/foley_api.cpp
   src/cli/serve/media/omni_api.cpp
+  src/cli/serve/media/png_fast.cpp
   src/cli/serve/media/upscale_api.cpp
+  src/cli/serve/media/vision_api.cpp
+  src/cli/serve/media/vision_backends.cpp
   src/cli/serve/media/video_rife.cpp
   src/cli/serve/media/video_upscale.cpp
+  src/cli/serve/media/zip_store.cpp
 )
+# png_fast.cpp deflates Real-ESRGAN results with zlib directly; zip_store.cpp
+# takes its CRC-32 from zlib.
+find_package(ZLIB REQUIRED)
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
   gufo_yue2
-  gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG)
+  gufo_mmaudio gufo_rife gufo_realesrgan_cpu PNG::PNG ZLIB::ZLIB)
 # mp3 / m4a music results (src/cli/serve/music_encode.cpp) run this FFmpeg.
 target_compile_definitions(gufo_media PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}")
@@ -57,6 +66,10 @@ if (ENGINE_ENABLE_HIP)
   # `gufo video-interpolate` / `gufo video-upscale` (HIP only).
   target_sources(gufo PRIVATE src/cli/video/video_interpolate.cpp
                               src/cli/video/video_upscale.cpp)
+endif()
+if (TARGET gufo_vision_dsg)
+  target_link_libraries(gufo_media PUBLIC gufo_vision_dsg)
+  target_compile_definitions(gufo_media PRIVATE GUFO_HAVE_VISION_DSG=1)
 endif()
 if (TARGET gufo_qwen3_omni)
   target_link_libraries(gufo_media PUBLIC gufo_qwen3_omni)
@@ -81,6 +94,14 @@ if (BUILD_TESTING)
   add_test(NAME media_services_test COMMAND media_services_test)
   set_tests_properties(media_services_test PROPERTIES
     LABELS "cpu;server;media" TIMEOUT 60)
+
+  # gufo serve vision request handling with fake models (no GPU).
+  add_executable(vision_api_test tests/cli/vision_api_test.cpp)
+  target_link_libraries(vision_api_test PRIVATE gufo_media)
+  target_compile_options(vision_api_test PRIVATE ${gufo_media_test_undebug})
+  add_test(NAME vision_api_test COMMAND vision_api_test)
+  set_tests_properties(vision_api_test PROPERTIES
+    LABELS "cpu;server;media;vision" TIMEOUT 60)
 
   # /v1/audio/music response_format / bitrate_kbps parsing, the FFmpeg
   # argument list and a real mp3 transcode of a tiny WAV (skips without

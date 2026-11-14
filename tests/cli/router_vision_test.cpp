@@ -12,10 +12,14 @@
 // image inlined for the partner (with the ocr options and thresholds), the
 // ocr models missing here, X-Gufo-Pool local/remote, the partner's 503
 // falling back here, and /v1/figuren "ccip" over the same queue/relay.
+// Request limits: encoded bytes and decoded pixels over all pictures,
+// decoding only after the CPU turn.
 // Written with AI assistance (Claude Code).
 #undef NDEBUG
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -27,6 +31,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <png.h>
 
 #include "ccip/image_ops.hpp"
 #include "ccip/wd14.hpp"
@@ -164,8 +170,25 @@ void TestParse() {
   boxes["wd14_tags"] = std::move(wb);
   r = vision::ParseRequest(boxes);
   assert(r.wd14.boxes.size() == 1 && r.wd14.boxes[0][3] == 220.5 && r.tasks.empty());
+  // At most kWd14MaxRegions explicit regions (each is one tagger run).
+  {
+    const auto regions = [](std::size_t n) {
+      json::Value list = json::Value::array();
+      for (std::size_t i = 0; i < n; ++i)
+        list.push_back(json::parse("[0, 0, 1, 1]"));
+      json::Value body = Body("AAAA", {"wd14_tags"});
+      json::Value o = json::Value::object();
+      o["regions"] = std::move(list);
+      body["wd14_tags"] = std::move(o);
+      return body;
+    };
+    assert(vision::ParseRequest(regions(vision::kWd14MaxRegions)).wd14.boxes.size() ==
+           vision::kWd14MaxRegions);
+    assert(Throws([&] { (void)vision::ParseRequest(regions(vision::kWd14MaxRegions + 1)); }));
+  }
   for (const char* bad_options :
        {R"({"regions": [[10, 20, 5, 30]]})", R"({"regions": "face"})",
+        R"({"regions": [[0, 0, 1e12, 10]]})", R"({"regions": [[-2e6, 0, 10, 10]]})",
         R"({"general_threshold": 2})", R"({"colour": 1})", R"({"images": [1]})",
         R"({"regions": "person", "use_detections": "person"})"}) {
     assert(Throws([&] {
@@ -192,6 +215,34 @@ void TestParse() {
     bad["pose_options"] = std::move(o);
     (void)vision::ParseRequest(bad);
   }));
+  // pose_boxes: given boxes instead of RT-DETR, at most kMaxPoseBoxes.
+  {
+    json::Value given = Body("AAAA", {"pose_wholebody"});
+    given["pose_boxes"] = json::parse("[[10, 20, 110, 220.5], [0, 0, 5, 5]]");
+    r = vision::ParseRequest(given);
+    assert(r.pose_boxes.size() == 2 && r.pose_boxes[0][3] == 220.5f);
+    json::Value many = json::Value::array();
+    for (std::size_t i = 0; i <= vision::kMaxPoseBoxes; ++i)
+      many.push_back(json::parse("[0, 0, 1, 1]"));
+    for (const char* bad_boxes : {"[]", "[[0, 0, 1]]", "[[5, 0, 1, 1]]", "[[0, 0, 1e12, 1]]",
+                                  "\"person\""}) {
+      assert(Throws([&] {
+        json::Value bad = Body("AAAA", {"pose"});
+        bad["pose_boxes"] = json::parse(bad_boxes);
+        (void)vision::ParseRequest(bad);
+      }));
+    }
+    assert(Throws([&] {
+      json::Value bad = Body("AAAA", {"pose"});
+      bad["pose_boxes"] = many;
+      (void)vision::ParseRequest(bad);
+    }));
+    assert(Throws([&] {  // without a pose task
+      json::Value bad = Body("AAAA", {"face"});
+      bad["pose_boxes"] = json::parse("[[0, 0, 1, 1]]");
+      (void)vision::ParseRequest(bad);
+    }));
+  }
   }
   assert(Throws([&] {
     json::Value bad = Body("AAAA", {"face"});
@@ -426,6 +477,17 @@ void TestPool() {
   partner->status = 0;
   response = service.Handle(Post(Body("AAAA", {"face"})));
   assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  // A wrong pool key (401/403) or a partner error (500): back here as well.
+  for (int status : {401, 403, 500}) {
+    partner->status = status;
+    response = service.Handle(Post(Body("AAAA", {"face"})));
+    assert(response->status == 503 && response->body.find("vision_unavailable") != std::string::npos);
+  }
+  // A 400 of the partner (the request is wrong) is the answer.
+  partner->status = 400;
+  response = service.Handle(Post(Body("AAAA", {"face"})));
+  assert(response->status == 400);
+  partner->status = 0;
   // Pinned here: never relayed.
   const int before = partner->calls;
   HttpRequest local = Post(Body("AAAA", {"face"}));
@@ -470,6 +532,66 @@ void TestPool() {
   assert(response->status == 503);
 }
 
+/// A grey RGB PNG of width x height (compresses to a few hundred KB).
+std::string UniformPng(int width, int height) {
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  image.width = static_cast<png_uint_32>(width);
+  image.height = static_cast<png_uint_32>(height);
+  image.format = PNG_FORMAT_RGB;
+  const std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 3, 128);
+  png_alloc_size_t size = 0;
+  assert(png_image_write_to_memory(&image, nullptr, &size, 0, pixels.data(), 0, nullptr));
+  std::string out(size, '\0');
+  assert(png_image_write_to_memory(&image, out.data(), &size, 0, pixels.data(), 0, nullptr));
+  out.resize(size);
+  return out;
+}
+
+/// All pictures of one request share kMaxRequestBytes (encoded): four
+/// Ablage pictures of 20 MB each are refused before anything is decoded.
+/// A page user (session cookie) reads an Ablage path with its own session.
+void TestAblageCookie() {
+  vision::Options options;
+  std::string cookie;
+  options.serve = [&cookie](const HttpRequest& inner) {
+    cookie = inner.header("Cookie");
+    HttpResponse response;
+    response.status = 404;
+    response.reason = "Not Found";
+    response.body = R"({"error":{"code":"not_found","message":"no such job"}})";
+    return response;
+  };
+  const vision::VisionService service(options);
+  HttpRequest request = Post(Body("/v1/jobs/abc/files/a.png", {"face"}));
+  request.headers.emplace_back("Cookie", "gufo_sitzung=s-1");
+  assert(service.Handle(request)->status == 404);
+  assert(cookie == "gufo_sitzung=s-1");
+}
+
+void TestRequestBytes() {
+  vision::Options options;
+  options.serve = [](const HttpRequest&) {
+    HttpResponse response;
+    response.body.assign(static_cast<std::size_t>(20'000'000), 'x');
+    response.headers = {{"Content-Type", "image/png"}};
+    return response;
+  };
+  const vision::VisionService service(options);
+  json::Value body = Body("/v1/jobs/abc/files/a.png", {"wd14_tags"});
+  json::Value opt = json::Value::object();
+  json::Value pictures = json::Value::array();
+  for (const char* name : {"/v1/jobs/abc/files/b.png", "/v1/jobs/abc/files/c.png",
+                           "/v1/jobs/abc/files/d.png"})
+    pictures.push_back(std::string(name));
+  opt["images"] = std::move(pictures);
+  body["wd14_tags"] = std::move(opt);
+  const auto response = service.Handle(Post(body));
+  assert(response->status == 400);
+  assert(response->body.find("together exceed 64 MB") != std::string::npos);
+  assert(response->body.find("wd14_tags.images[2]") != std::string::npos);
+}
+
 std::string ReadFile(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -511,6 +633,15 @@ void TestReal(const char* dir, const char* frame) {
   assert(answer.find("detections")->find("ocr") == nullptr);
   // ocr when the converted PP-OCRv4 files are in the same directory.
   if (std::filesystem::exists(std::filesystem::path(dir) / "ch_PP-OCRv4_rec.dict.txt")) {
+    // kMaxOcrPixels holds for a pass without enlargement too: 400.
+    {
+      const std::string large = "data:image/png;base64," +
+                                gufo::core::EncodeBase64(std::string_view(UniformPng(6000, 4100)));
+      const auto refused = service.Handle(Post(Body(large, {"ocr"})));
+      assert(refused->status == 400);
+      assert(refused->body.find("ocr scale 1: 6000x4100 is more than 24 megapixels") !=
+             std::string::npos);
+    }
     response = service.Handle(Post(Body(data_url, {"ocr"})));
     std::cout << response->body.substr(0, 600) << '\n';
     assert(response->status == 200);
@@ -590,6 +721,31 @@ void TestReal(const char* dir, const char* frame) {
     queue->Leave();
     busy = busy_service.Handle(relayed);
     assert(busy->status == 200);
+    // Decoding waits for the CPU turn: a broken picture is only refused
+    // once the request's turn has come (waiting requests hold no pixels).
+    assert(queue->Enter({}) == cpu::CpuQueue::Result::kOk);
+    auto waiting = std::async(std::launch::async, [&] {
+      return busy_service.Handle(Post(Body("AAAA", {"face"})));
+    });
+    assert(waiting.wait_for(std::chrono::milliseconds(400)) == std::future_status::timeout);
+    queue->Leave();
+    assert(waiting.get()->status == 400);
+  }
+  // All pictures of one request together stay within kMaxRequestPixels:
+  // 32 MP each, the image and two wd14_tags pictures (96 MP) are refused.
+  {
+    const std::string big = "data:image/png;base64," +
+                            gufo::core::EncodeBase64(std::string_view(UniformPng(8000, 4000)));
+    json::Value many = Body(big, {"wd14_tags"});
+    json::Value opt = json::Value::object();
+    json::Value pictures = json::Value::array();
+    pictures.push_back(big);
+    pictures.push_back(big);
+    opt["images"] = std::move(pictures);
+    many["wd14_tags"] = std::move(opt);
+    response = service.Handle(Post(many));
+    assert(response->status == 400);
+    assert(response->body.find("megapixels") != std::string::npos);
   }
   // wd14_tags: whole frame, the person cut-outs (8 % margin), an explicit
   // region and a further picture (the frame again, so the same tags).
@@ -649,6 +805,43 @@ void TestReal(const char* dir, const char* frame) {
     outside["wd14_tags"] = std::move(oo);
     assert(service.Handle(Post(outside))->status == 400);
   }
+  // pose_boxes: the boxes RT-DETR found, given back, give the same points
+  // (ViTPose / DWPose in exactly these boxes); no "score", no RT-DETR info.
+  {
+    const auto found = service.Handle(Post(Body(data_url, {"pose", "pose_wholebody"})));
+    assert(found->status == 200);
+    const json::Value jf = json::parse(found->body);
+    const auto& poses = jf.find("poses")->items();
+    std::cout << "pose persons found: " << poses.size() << '\n';
+    if (!poses.empty()) {
+      json::Value boxes = json::Value::array();
+      for (const json::Value& p : poses)
+        boxes.push_back(*p.find("box"));
+      json::Value again = Body(data_url, {"pose", "pose_wholebody"});
+      again["pose_boxes"] = std::move(boxes);
+      const auto given = service.Handle(Post(again));
+      assert(given->status == 200);
+      const json::Value jg = json::parse(given->body);
+      const auto& gposes = jg.find("poses")->items();
+      assert(gposes.size() == poses.size());
+      double worst = 0;
+      for (std::size_t i = 0; i < poses.size(); ++i) {
+        assert(gposes[i].find("score") == nullptr);
+        for (const char* key : {"keypoints", "wholebody"}) {
+          const auto& a = poses[i].find(key)->items();
+          const auto& b = gposes[i].find(key)->items();
+          assert(a.size() == b.size());
+          for (std::size_t k = 0; k < a.size(); ++k)
+            for (std::size_t c = 0; c < 3; ++c)
+              worst = std::max(worst, std::fabs(a[k].items()[c].as_double() -
+                                                b[k].items()[c].as_double()));
+        }
+      }
+      std::cout << "pose_boxes vs RT-DETR boxes: max diff " << worst << '\n';
+      assert(worst <= 1e-4);  // the boxes round-trip through JSON doubles
+      assert(jg.find("models")->find("pose_detector")->member_str("model") == "pose_boxes");
+    }
+  }
   // Two at once: one waits for the other.
   auto a = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });
   auto b = std::async(std::launch::async, [&] { return service.Handle(Post(Body(data_url, {}))); });
@@ -667,6 +860,8 @@ int main() {
   TestLumaGamma();
   TestErrors();
   TestPool();
+  TestRequestBytes();
+  TestAblageCookie();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')

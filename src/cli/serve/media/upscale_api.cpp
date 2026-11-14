@@ -8,8 +8,10 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <string_view>
 #include <system_error>
@@ -17,10 +19,11 @@
 
 #include "src/cli/serve/audio_stream.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/media/png_fast.hpp"
+#include "src/cli/serve/media/zip_store.hpp"
 #include "src/cli/serve/preview.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
-#include <png.h>
 #include "src/models/realesrgan/srvgg_weights.hpp"
 #include "src/models/rife/video_io.hpp"
 
@@ -35,6 +38,10 @@ namespace gufo::server {
 namespace {
 
 constexpr int kMaxOutputSide = 8192;
+// `images: [...]` in one /v1/images/upscale request.
+constexpr std::size_t kMaxBatchImages = 32;
+// Batch images in flight: one on the GPU while the others decode / encode.
+constexpr std::size_t kBatchInFlight = 3;
 constexpr std::size_t kMaxVideoBytes = 512U << 20U;
 constexpr std::int64_t kKeepSeconds = 3600;
 
@@ -58,25 +65,15 @@ HttpResponse Error(int status, std::string reason, std::string message,
   return Json(status, std::move(reason), root);
 }
 
-// 8-bit RGB PNG (libpng). 1.x used Qwen-Image's RGBA encoder; on 2.0
-// Qwen-Image is an extension the server must not link.
+// 8-bit RGB PNG. libpng's simplified writer compressed every frame twice
+// (once to learn the size) at zlib level 6: 6.7 s for a 3328x2048 x4
+// result. The one-pass encoder (Sub filter, zlib level 1, strips deflated in
+// parallel) writes the same pixels in about 55 ms.
 std::vector<std::uint8_t> EncodePngRgb(const std::vector<std::uint8_t>& rgb,
                                        int w, int h) {
-  png_image image{};
-  image.version = PNG_IMAGE_VERSION;
-  image.width = static_cast<png_uint_32>(w);
-  image.height = static_cast<png_uint_32>(h);
-  image.format = PNG_FORMAT_RGB;
-  png_alloc_size_t size = 0;
-  if (!png_image_write_to_memory(&image, nullptr, &size, 0, rgb.data(), 0,
-                                 nullptr))
+  if (rgb.size() != static_cast<std::size_t>(w) * h * 3)
     return {};
-  std::vector<std::uint8_t> png(size);
-  if (!png_image_write_to_memory(&image, png.data(), &size, 0, rgb.data(), 0,
-                                 nullptr))
-    return {};
-  png.resize(size);
-  return png;
+  return EncodePngRgbFast(rgb.data(), w, h);
 }
 
 std::string Ms(double seconds) {
@@ -165,6 +162,7 @@ struct UpscaleService::Job {
   bool binary{false};         // image: bytes instead of b64_json
   int quality{90};            // image: JPEG quality
   int crf{18};                // video: H.264 CRF
+  std::string output_format{"mp4"};  // video: mp4 | png_zip
   bool keep_audio{true};      // video
   std::vector<std::uint8_t> input;  // encoded image or MP4 bytes
   // State.
@@ -629,6 +627,12 @@ HttpResponse UpscaleService::HandleImage(const HttpRequest& request) {
   if (job->quality < 1 || job->quality > 100)
     return Error(400, "Bad Request", "quality must be 1..100",
                  "invalid_quality");
+  if (const json::Value* images = body.find("images"); images != nullptr) {
+    if (!body.member_str("image").empty())
+      return Error(400, "Bad Request", "send image or images, not both",
+                   "invalid_media");
+    return HandleImageBatch(request, body, *images, *job);
+  }
   const std::string image_url = body.member_str("image");
   if (image_url.empty())
     return Error(400, "Bad Request", "image is required", "invalid_media");
@@ -658,6 +662,132 @@ HttpResponse UpscaleService::HandleImage(const HttpRequest& request) {
                  job->error_code.empty() ? "upscale_failed" : job->error_code);
   }
   return ImageResponse(*job);
+}
+
+HttpResponse UpscaleService::HandleImageBatch(const HttpRequest& request,
+                                              const json::Value& body,
+                                              const json::Value& images,
+                                              const Job& base) {
+  if (!images.is_array() || images.empty() ||
+      images.size() > kMaxBatchImages)
+    return Error(400, "Bad Request",
+                 "images must be a list of 1.." +
+                     std::to_string(kMaxBatchImages) + " images",
+                 "invalid_media");
+  if (base.binary)
+    return Error(400, "Bad Request",
+                 "images answers b64_json; response_format png / jpg takes "
+                 "one image",
+                 "unsupported_format");
+  if (const json::Value* async_value = body.find("async");
+      async_value != nullptr && async_value->as_bool())
+    return Error(400, "Bad Request",
+                 "images runs synchronously; send one image per async job",
+                 "invalid_request");
+  const auto started = std::chrono::steady_clock::now();
+  std::vector<std::unique_ptr<Job>> jobs;
+  jobs.reserve(images.size());
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    const json::Value& item = images.items()[i];
+    std::string url;
+    if (item.is_string())
+      url = item.str();
+    else if (item.is_object())
+      url = item.member_str("image");
+    if (url.empty())
+      return Error(400, "Bad Request",
+                   "images[" + std::to_string(i) + "] is empty",
+                   "invalid_media");
+    auto job = std::make_unique<Job>();
+    job->kind = "image";
+    job->model_index = base.model_index;
+    job->model = base.model;
+    job->variant = base.variant;
+    job->scale = base.scale;
+    job->out_w = base.out_w;
+    job->out_h = base.out_h;
+    job->fit = base.fit;
+    job->format = base.format;
+    job->quality = base.quality;
+    try {
+      core::ImageReadBudget budget;
+      budget.deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      job->input = core::ReadImageUrl(url, budget);
+    } catch (const std::exception& e) {
+      return Error(400, "Bad Request",
+                   "images[" + std::to_string(i) + "]: " + e.what(),
+                   "invalid_media");
+    }
+    job->created_at = Now();
+    jobs.push_back(std::move(job));
+  }
+  // A small window of images in flight: the device runs one at a time
+  // (run_mutex_), the others decode their input or encode their result.
+  std::vector<std::future<bool>> runs(jobs.size());
+  std::size_t failed = jobs.size();
+  for (std::size_t i = 0; i < jobs.size() && failed == jobs.size(); ++i) {
+    if (i >= kBatchInFlight && !runs[i - kBatchInFlight].get())
+      failed = i - kBatchInFlight;
+    if (failed != jobs.size())
+      break;
+    Job* job = jobs[i].get();
+    runs[i] = std::async(std::launch::async, [this, job, &request] {
+      return RunImage(job, false, &request);
+    });
+  }
+  for (std::size_t i = 0; i < runs.size(); ++i)
+    if (runs[i].valid() && !runs[i].get() && failed == jobs.size())
+      failed = i;
+  if (failed != jobs.size()) {
+    const Job& job = *jobs[failed];
+    const std::string message =
+        "images[" + std::to_string(failed) + "]: " + job.error;
+    if (job.error_code == "cancelled")
+      return Error(499, "Client Closed Request", message, "cancelled");
+    return Error(400, "Bad Request", message,
+                 job.error_code.empty() ? "upscale_failed" : job.error_code);
+  }
+  json::Value root = json::Value::object();
+  root["created"] = static_cast<double>(jobs.front()->created_at);
+  root["model"] = base.model;
+  root["variant"] = base.variant;
+  root["device"] = engine_->device;
+  root["model_file"] = jobs.front()->model_file;
+  root["scale"] = base.scale;
+  root["fit"] = base.fit;
+  root["format"] = base.format;
+  json::Value data = json::Value::array();
+  double body_seconds = 0, post_seconds = 0, encode_seconds = 0;
+  for (const auto& job : jobs) {
+    json::Value item = json::Value::object();
+    item["width"] = job->width;
+    item["height"] = job->height;
+    item["input"] = std::to_string(job->in_width) + "x" +
+                    std::to_string(job->in_height);
+    item["b64_json"] = EncodeAudioBase64(job->output);
+    std::string().swap(job->output);
+    data.push_back(std::move(item));
+    body_seconds += job->body_seconds;
+    post_seconds += job->post_seconds;
+    encode_seconds += job->encode_seconds;
+  }
+  root["data"] = std::move(data);
+  const double seconds = Seconds(started);
+  json::Value cost = json::Value::object();
+  cost["seconds"] = seconds;
+  cost["images"] = static_cast<double>(jobs.size());
+  cost["seconds_per_image"] = seconds / static_cast<double>(jobs.size());
+  cost["body_seconds"] = body_seconds;
+  cost["post_seconds"] = post_seconds;
+  cost["encode_seconds"] = encode_seconds;
+  root["cost"] = std::move(cost);
+  HttpResponse response = Json(200, "OK", root);
+  response.headers.emplace_back(
+      "Server-Timing", "total;dur=" + Ms(seconds) + ", body;dur=" +
+                           Ms(body_seconds) + ", encode;dur=" +
+                           Ms(encode_seconds));
+  return response;
 }
 
 bool UpscaleService::RunImage(Job* job, bool sync, const HttpRequest* request) {
@@ -811,9 +941,11 @@ HttpResponse UpscaleService::SubmitVideo(const HttpRequest& request) {
   if (const json::Value* keep = body.find("keep_audio");
       keep != nullptr && keep->is_bool())
     job->keep_audio = keep->as_bool();
-  const std::string output_format = body.member_str("output_format", "mp4");
-  if (output_format != "mp4")
-    return Error(400, "Bad Request", "output_format must be mp4",
+  // png_zip: every frame as a lossless PNG in a store-only ZIP, for a
+  // pipeline that encodes the delivery itself (no second lossy pass).
+  job->output_format = body.member_str("output_format", "mp4");
+  if (job->output_format != "mp4" && job->output_format != "png_zip")
+    return Error(400, "Bad Request", "output_format must be mp4 or png_zip",
                  "unsupported_format");
   const std::string video = body.member_str("video");
   if (video.empty())
@@ -868,8 +1000,9 @@ void UpscaleService::RunVideo(Job* job) {
   namespace io = models::rife;
   const auto started = std::chrono::steady_clock::now();
   const std::filesystem::path input = TempFile("gufo-" + job->id + "-in.mp4");
+  const bool zip = job->output_format == "png_zip";
   const std::filesystem::path output =
-      TempFile("gufo-" + job->id + "-out.mp4");
+      TempFile("gufo-" + job->id + (zip ? "-out.zip" : "-out.mp4"));
   std::error_code ec;
   const auto cleanup = [&] {
     std::filesystem::remove(input, ec);
@@ -915,17 +1048,26 @@ void UpscaleService::RunVideo(Job* job) {
     job->frames = std::max(0, info.frames);
     job->fps_num = info.fps_num > 0 ? info.fps_num : 24;
     job->fps_den = info.fps_num > 0 ? info.fps_den : 1;
-    job->audio = info.has_audio && job->keep_audio;
+    job->audio = info.has_audio && job->keep_audio && !zip;
   }
   io::FrameReader reader;
   io::FrameWriter writer;
+  ZipStoreWriter zip_writer;
   writer.SetCrf(job->crf);
+  const auto abort_output = [&] {
+    if (zip)
+      zip_writer.Abort();
+    else
+      writer.Abort();
+  };
   if (!reader.Open(input, info.width, info.height, &error)) {
     fail("video: " + error, "invalid_media");
     return;
   }
-  if (!writer.Open(output, out_w, out_h, job->fps_num, job->fps_den,
-                   job->audio ? input : std::filesystem::path{}, &error)) {
+  if (zip ? !zip_writer.Open(output, &error)
+          : !writer.Open(output, out_w, out_h, job->fps_num, job->fps_den,
+                         job->audio ? input : std::filesystem::path{},
+                         &error)) {
     reader.Close();
     fail("encoder: " + error, "encode_failed");
     return;
@@ -935,36 +1077,62 @@ void UpscaleService::RunVideo(Job* job) {
   int done = 0;
   double body_seconds = 0, post_seconds = 0;
   std::string model_file;
+  // The encoder pipe takes frame n while the device computes frame n + 1:
+  // two result slots, at most one write in flight.
+  UpscaleOutcome slots[2];
+  int slot = 0;
+  std::future<bool> pending;
+  std::string write_error;
+  const auto drain = [&] {
+    return !pending.valid() || pending.get();
+  };
   for (;;) {
     bool end = false;
     if (!reader.Read(frame.data(), &end, &error)) {
       if (end)
         break;
-      writer.Abort();
+      (void)drain();
+      abort_output();
       reader.Close();
       fail("decoder: " + error, "invalid_media");
       return;
     }
     if (job->cancel) {
-      writer.Abort();
+      (void)drain();
+      abort_output();
       reader.Close();
       fail("job cancelled", "cancelled");
       return;
     }
-    UpscaleOutcome out;
+    UpscaleOutcome& out = slots[slot];
     bool ok = false;
     {
       std::lock_guard run(run_mutex_);
       ok = engine_->run(job->model, job->variant, frame.data(), info.width,
                         info.height, out_w, out_h, job->fit, &out, &error);
     }
-    if (!ok || !writer.Write(out.rgb24.data(), &error)) {
-      writer.Abort();
+    const bool written = drain();
+    if (!ok || !written) {
+      abort_output();
       reader.Close();
-      fail((ok ? "encoder: " : "upscale: ") + error,
+      fail(ok ? "encoder: " + write_error : "upscale: " + error,
            ok ? "encode_failed" : "upscale_failed");
       return;
     }
+    pending = std::async(std::launch::async, [&, index = done + 1] {
+      if (!zip)
+        return writer.Write(out.rgb24.data(), &write_error);
+      const std::vector<std::uint8_t> png =
+          EncodePngRgbFast(out.rgb24.data(), out.width, out.height);
+      if (png.empty()) {
+        write_error = "PNG encoding failed";
+        return false;
+      }
+      char name[32];
+      std::snprintf(name, sizeof(name), "f_%05d.png", index);
+      return zip_writer.Add(name, png.data(), png.size(), &write_error);
+    });
+    slot ^= 1;
     body_seconds += out.body_seconds;
     post_seconds += out.post_seconds;
     model_file = out.model_file;
@@ -979,18 +1147,24 @@ void UpscaleService::RunVideo(Job* job) {
     }
   }
   reader.Close();
+  if (!drain()) {
+    abort_output();
+    fail("encoder: " + write_error, "encode_failed");
+    return;
+  }
   if (done == 0) {
-    writer.Abort();
+    abort_output();
     fail("video has no frames", "invalid_media");
     return;
   }
-  if (!writer.Finish(&error)) {
+  if (zip ? !zip_writer.Finish(&error) : !writer.Finish(&error)) {
     fail("encoder: " + error, "encode_failed");
     return;
   }
   std::string bytes;
   if (!ReadFile(output, &bytes)) {
-    fail("cannot read the encoded video", "io_error");
+    fail(zip ? "cannot read the frame archive" : "cannot read the encoded video",
+         "io_error");
     return;
   }
   cleanup();
@@ -1088,11 +1262,13 @@ HttpResponse UpscaleService::JobStatus(const std::string& id, bool content) {
                    "not_ready");
     if (job.kind == "image")
       return ImageResponse(job);
+    const bool zip = job.output_format == "png_zip";
     HttpResponse response;
     response.body = job.output;
     response.headers = {
-        {"Content-Type", "video/mp4"},
-        {"Content-Disposition", "attachment; filename=\"" + job.id + ".mp4\""},
+        {"Content-Type", zip ? "application/zip" : "video/mp4"},
+        {"Content-Disposition", "attachment; filename=\"" + job.id +
+                                    (zip ? ".zip\"" : ".mp4\"")},
         {"X-Gufo-Video-Id", job.id},
         {"X-Gufo-Device", engine_->device},
         {"X-Gufo-Model-File", job.model_file}};
@@ -1117,7 +1293,7 @@ HttpResponse UpscaleService::JobStatus(const std::string& id, bool content) {
   body["scale"] = job.scale;
   body["fit"] = job.fit;
   if (job.kind == "video") {
-    body["output_format"] = "mp4";
+    body["output_format"] = job.output_format;
     body["seconds"] = job.fps_num > 0 && job.frames > 0
                           ? std::to_string(static_cast<double>(job.frames) *
                                            job.fps_den / job.fps_num)
@@ -1129,7 +1305,8 @@ HttpResponse UpscaleService::JobStatus(const std::string& id, bool content) {
                                            std::to_string(job.fps_den)
                                      : std::string();
     upscale["audio"] = job.audio;
-    upscale["crf"] = job.crf;
+    if (job.output_format == "mp4")
+      upscale["crf"] = job.crf;
     body["upscale"] = std::move(upscale);
   } else {
     body["format"] = job.format;

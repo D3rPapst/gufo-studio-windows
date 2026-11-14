@@ -1193,7 +1193,7 @@ Route Classify(const HttpRequest& req) {
       p == "/router/partner/status" || p == "/router/partner/capabilities" ||
       p == "/router/placement" || p == "/v1/models" || p == "/models" ||
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||
-      p.starts_with("/v1/names/") || p == "/v1/systemone")
+      p.starts_with("/v1/names/") || (get && p == "/v1/systemone"))
     return set(Route::Kind::kAnyUser);
   // Generation endpoints by prefix.
   struct Prefix {
@@ -1217,6 +1217,9 @@ Route Classify(const HttpRequest& req) {
       {"/v1/reranking", "text", 0, false},
       {"/v1/realtime", "text", 0, false},
       {"/v1/figuren", "text", 0, false},
+      // Decision models (gufo serve decision): POST loads the JSON "model",
+      // so area, model list and daily limit apply as for a chat.
+      {"/v1/systemone", "text", 1, false},
       // GETs that load the model named by ?model= (router IsModelQueryGet
       // and the introspection paths): the model's area and model list.
       {"/props", "text", 0, false},

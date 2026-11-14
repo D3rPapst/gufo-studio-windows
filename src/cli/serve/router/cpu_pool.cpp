@@ -88,8 +88,10 @@ Route Decide(const server::HttpRequest& request, bool have_partner, bool local_b
 }
 
 bool PartnerAnswered(const server::HttpResponse& answer) {
-  return !(answer.status == 404 || answer.status == 502 || answer.status == 503 ||
-           answer.status == 504);
+  // A success, or 400: the request itself is wrong and would be here too.
+  // Anything else (401/403 pool key, 404, 429, 5xx such as an OOM) is the
+  // partner's trouble: this machine runs it.
+  return (answer.status >= 200 && answer.status < 400) || answer.status == 400;
 }
 
 server::HttpResponse Busy(const std::string& what) {
