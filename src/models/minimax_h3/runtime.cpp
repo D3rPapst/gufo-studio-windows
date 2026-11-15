@@ -539,6 +539,78 @@ std::optional<ModelInventory> ModelInventory::Inspect(
   }
 }
 
+std::optional<ModelInventory> ModelInventory::WithTransformerPartition(
+    std::string_view partition, std::string* error) const {
+  try {
+    if (partition.empty() || partition.find_first_of("/\\.:") !=
+                                 std::string_view::npos) {
+      throw json::Error("invalid transformer partition");
+    }
+    ModelInventory inventory = *this;
+    const std::filesystem::path relative =
+        std::filesystem::path(std::string(partition)) / "transformer";
+    const auto weight_map = ParseWeightMap(
+        model_root_ / relative / "model.safetensors.index.json",
+        &inventory.telemetry_);
+    std::map<std::string, ParsedHeader> headers;
+    std::size_t replaced = 0;
+    for (TensorDescriptor& tensor : inventory.tensors_) {
+      if (tensor.component != "transformer") {
+        continue;
+      }
+      const auto shard = weight_map.find(tensor.name);
+      if (shard == weight_map.end()) {
+        throw json::Error(std::string(partition) + " transformer lacks " +
+                          tensor.name);
+      }
+      const std::filesystem::path shard_path =
+          SafeRelativePath((relative / shard->second).generic_string());
+      auto header = headers.find(shard_path.generic_string());
+      if (header == headers.end()) {
+        header = headers
+                     .emplace(shard_path.generic_string(),
+                              ParseSafetensorsHeader(model_root_ / shard_path,
+                                                     &inventory.telemetry_))
+                     .first;
+      }
+      const auto found = header->second.tensors.find(tensor.name);
+      if (found == header->second.tensors.end() ||
+          found->second.dtype != tensor.dtype ||
+          found->second.shape != tensor.shape ||
+          found->second.end - found->second.begin != tensor.payload_bytes) {
+        throw json::Error(std::string(partition) +
+                          " transformer tensor differs: " + tensor.name);
+      }
+      tensor.shard = shard_path;
+      tensor.file_offset = header->second.payload_offset + found->second.begin;
+      ++replaced;
+    }
+    std::size_t indexed = 0;
+    for (const auto& entry : weight_map) {
+      (void)entry;
+      ++indexed;
+    }
+    if (replaced == 0 || indexed != replaced) {
+      throw json::Error(std::string(partition) +
+                        " transformer tensor set differs from FL2VA");
+    }
+    std::erase_if(inventory.shards_, [](const ShardDescriptor& shard) {
+      return shard.relative_path.generic_string().find("/transformer/") !=
+             std::string::npos;
+    });
+    for (const auto& [path, header] : headers) {
+      inventory.shards_.push_back({std::filesystem::path(path),
+                                   header.file_bytes, header.payload_offset,
+                                   header.tensors.size()});
+    }
+    return inventory;
+  } catch (const std::exception& exception) {
+    SetError(error, "MiniMax H3 " + std::string(partition) +
+                        " inspection failed: " + exception.what());
+    return std::nullopt;
+  }
+}
+
 std::optional<ModelInventory> ModelInventory::InspectControlPatch(
     const std::filesystem::path& file, std::string* error) {
   try {

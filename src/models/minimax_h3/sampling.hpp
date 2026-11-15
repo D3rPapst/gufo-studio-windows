@@ -219,6 +219,39 @@ struct ImageGuidePlacement {
     std::span<const ImageGuidePlacement> image_guides,
     std::span<const AudioGuidePlacement> audio_guides,
     std::string* error = nullptr);
+
+/// A Ref2VA reference block (ComfyUI's MiniMaxH3ReferenceToVideo "refs"), in
+/// request order: an image (one latent frame at its own latent size), a
+/// video (latent_frames frames at its own size, with audio_latent_frames of
+/// soundtrack, 0 = none) or a standalone audio (audio_latent_frames).
+enum class ReferenceKind : std::uint8_t { kImage, kVideo, kAudio };
+struct ReferencePlacement {
+  ReferenceKind kind{ReferenceKind::kImage};
+  int latent_frames{1};
+  int latent_height{0};
+  int latent_width{0};
+  int audio_latent_frames{0};
+};
+
+/// Rotary time span a reference takes ahead of the target streams: 1 for an
+/// image, its audio frames for an audio, max(audio frames, 5/3 * sum of the
+/// 1,4,4,4,4 pattern) for a video (the reference's _ref_t_span).
+[[nodiscard]] double ReferenceTimeSpan(const ReferencePlacement& reference);
+
+/// The Ref2VA packed sequence (the reference's PackedLayout with refs):
+/// references pack between the text and the targets in request order, from
+/// rotary time `text_rows` on; the target streams and the image / audio
+/// guides start after their spans. Reference image and video rows join the
+/// video condition segment after the image guides (time 0.999), a video's
+/// soundtrack rows (on its own frame grid's width extremes) and standalone
+/// audio rows (on the target's) join the audio condition segment after the
+/// audio guides (time 1).
+[[nodiscard]] std::optional<PackedLayout> BuildReferenceLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ImageGuidePlacement> image_guides,
+    std::span<const AudioGuidePlacement> audio_guides,
+    std::span<const ReferencePlacement> references,
+    std::string* error = nullptr);
 [[nodiscard]] std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
     const TimeRowSchedule& time_rows, int step, const PackedLayout& layout,
     std::span<const std::uint8_t> text_tags = {}, std::string* error = nullptr);

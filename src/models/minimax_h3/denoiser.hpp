@@ -77,6 +77,16 @@ struct AudioGuideLatent {
   std::vector<float> latent;
 };
 
+/// A Ref2VA reference block: its placement, the conditioning latent of its
+/// pictures ([24][latent frames][latent_height][latent_width], normalized
+/// and noise-augmented like a guide; empty for an audio) and of its sound
+/// ([32][2][audio latent frames], normalized; empty without sound).
+struct ReferenceLatent {
+  ReferencePlacement placement;
+  std::vector<float> video;
+  std::vector<float> audio;
+};
+
 struct DenoiserConditioning {
   std::span<const std::uint16_t> layer50;
   std::span<const std::uint8_t> tags;
@@ -96,6 +106,8 @@ struct DenoiserConditioning {
   // clean for every step. Both empty: the whole track generates.
   std::span<const float> audio_mask_latent;
   std::span<const std::uint8_t> audio_keep;
+  // Ref2VA references in request order (MiniMaxH3ReferenceToVideo).
+  std::span<const ReferenceLatent> references;
 };
 
 struct DenoiserVelocity {

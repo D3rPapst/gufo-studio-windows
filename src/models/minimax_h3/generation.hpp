@@ -16,6 +16,7 @@
 #include "src/models/minimax_h3/denoiser.hpp"
 #include "src/models/minimax_h3/media.hpp"
 #include "src/models/minimax_h3/prompt_encoder.hpp"
+#include "src/models/minimax_h3/references.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
 #include "src/models/minimax_h3/video_vae_encoder.hpp"
@@ -144,6 +145,11 @@ struct GenerationRequest {
   // Fun-ControlNet-Union (gufo.control; ComfyUI's
   // MiniMaxH3FunControlNetApply with a ModelPatchLoader).
   std::optional<GenerationControl> control;
+  // Ref2VA references (gufo.references; ComfyUI's
+  // MiniMaxH3ReferenceToVideo): non-empty runs the Ref2VA transformer of
+  // the model root. `reference_image_size_max`: ref_image_size "max".
+  std::vector<GenerationReference> references;
+  bool reference_image_size_max{false};
   // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
   // blocks in the prompt. Empty: keyframes condition the latents only.
   std::filesystem::path vision_projector;

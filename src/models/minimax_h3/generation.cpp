@@ -671,6 +671,9 @@ std::string PromptCacheKey(const ModelInventory& inventory,
     key.AddInteger("image_width", static_cast<std::uint64_t>(image.width));
     key.AddInteger("image_height", static_cast<std::uint64_t>(image.height));
     key.AddValues("image_rgb", image.rgb);
+    if (!image.second_rgb.empty()) {
+      key.AddValues("image_second_rgb", image.second_rgb);
+    }
   }
   if (!images.empty()) {
     key.AddFileIdentity("projector", projector);
@@ -868,6 +871,34 @@ bool GenerateTextVideo(const GenerationRequest& request,
     return false;
   }
 
+  // Ref2VA: the references replace keyframes and guides; their pictures
+  // and video blocks are the vision blocks of the presentation.
+  ReferencePlan reference_plan;
+  const bool references = !request.references.empty();
+  if (references) {
+    if (!request.keyframes.empty() || !request.video_guides.empty() ||
+        !request.audio_guides.empty() || request.control.has_value()) {
+      SetError(error, "MiniMax H3 Ref2VA references cannot be combined with "
+                      "keyframes, guides or a control");
+      return false;
+    }
+    if (request.vision_projector.empty()) {
+      SetError(error, "MiniMax H3 Ref2VA needs the vision projector "
+                      "(--vision-projector)");
+      return false;
+    }
+    if (!PlanReferences(request.references, *geometry,
+                        request.reference_image_size_max, &reference_plan,
+                        error)) {
+      return false;
+    }
+    vision_images = reference_plan.vision_images;
+  }
+  std::vector<PresentationEntry> presentation;
+  if (references) {
+    presentation = reference_plan.presentation;
+  }
+
   // The FL2VA presentation: per keyframe a "<Picture i>: " label and a
   // vision block (tagged as video for the DiT), then the prompt verbatim.
   // On Windows the vision tower and the text encoder run in a child process
@@ -908,14 +939,33 @@ bool GenerateTextVideo(const GenerationRequest& request,
                        &tokenizer, error)) {
     return false;
   }
-  for (std::size_t index = 0; index < vision_blocks.size(); ++index) {
+  if (!references) {
+    for (std::size_t index = 0; index < vision_blocks.size(); ++index) {
+      presentation.push_back(
+          {"<Picture " + std::to_string(index + 1) + ">: ",
+           static_cast<int>(index)});
+    }
+  } else if (!use_vision || vision_blocks.size() != vision_images.size()) {
+    SetError(error, "MiniMax H3 Ref2VA vision blocks are missing");
+    return false;
+  }
+  // Ref2VA: "<Picture i>: ", "<Audio j>: ", "<Video k>: " and the video's
+  // "<T.T seconds>" labels, each tokenized on its own as in the reference.
+  for (const PresentationEntry& entry : presentation) {
     std::vector<std::uint32_t> label;
-    if (!tokenizer.Encode("<Picture " + std::to_string(index + 1) + ">: ",
-                          false, &label, error)) {
+    if (!tokenizer.Encode(entry.label, false, &label, error)) {
       return false;
     }
     tokens.insert(tokens.end(), label.begin(), label.end());
     tags.insert(tags.end(), label.size(), 1);
+    if (entry.vision < 0) {
+      continue;
+    }
+    const auto index = static_cast<std::size_t>(entry.vision);
+    if (index >= vision_blocks.size()) {
+      SetError(error, "MiniMax H3 presentation names a missing vision block");
+      return false;
+    }
     tokens.push_back(kVisionStartToken);
     vision_blocks[index].begin = tokens.size();
     const std::size_t rows =
@@ -1249,6 +1299,25 @@ bool GenerateTextVideo(const GenerationRequest& request,
                        : "audio mask encoded");
     Report(progress, progress_opaque, "audio_mask", 1, 1);
   }
+  // Ref2VA: the reference blocks, and the Ref2VA transformer for them.
+  std::vector<ReferenceLatent> reference_latents;
+  std::optional<ModelInventory> reference_inventory;
+  if (references) {
+    begin = Clock::now();
+    Report(progress, progress_opaque, "references", 0, 1);
+    if (!EncodeReferences(*inventory, reference_plan, request.seed,
+                          cancellation, &reference_latents,
+                          &local.keyframe_encoder, error)) {
+      return false;
+    }
+    reference_inventory = inventory->WithTransformerPartition("Ref2VA", error);
+    if (!reference_inventory.has_value()) {
+      return false;
+    }
+    local.guide_clip_ms += Milliseconds(begin, Clock::now());
+    TraceStage("references encoded");
+    Report(progress, progress_opaque, "references", 1, 1);
+  }
   // Fun-ControlNet: the control rows from the control video, mask and
   // source video, encoded before the transformer loads.
   std::optional<ModelInventory> control_inventory;
@@ -1301,7 +1370,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
     return false;
   }
   auto denoiser = DenoiserSession::Create(
-      *inventory,
+      reference_inventory.has_value() ? *reference_inventory : *inventory,
       {.geometry = *geometry,
        .evaluations = request.parameters.evaluations,
        .text_rows = embedding.tokens,
@@ -1319,7 +1388,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .keyframe_latent_frames = keyframe_latent_frames,
        .audio_guides = audio_guides,
        .audio_mask_latent = audio_mask_latent,
-       .audio_keep = audio_keep},
+       .audio_keep = audio_keep,
+       .references = reference_latents},
       cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;

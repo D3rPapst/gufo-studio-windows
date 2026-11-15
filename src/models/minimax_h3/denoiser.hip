@@ -2490,9 +2490,17 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     audio_placements.push_back(
         {.frame = guide.frame, .latent_frames = guide.latent_frames});
   }
-  auto layout =
-      BuildImageGuideLayout(options.text_rows, options.geometry,
-                            image_placements, audio_placements, error);
+  std::vector<ReferencePlacement> reference_placements;
+  bool reference_pictures = false;
+  bool reference_sound = false;
+  for (const ReferenceLatent& reference : conditioning.references) {
+    reference_placements.push_back(reference.placement);
+    reference_pictures |= reference.placement.kind != ReferenceKind::kAudio;
+    reference_sound |= reference.placement.audio_latent_frames > 0;
+  }
+  auto layout = BuildReferenceLayout(options.text_rows, options.geometry,
+                                     image_placements, audio_placements,
+                                     reference_placements, error);
   auto schedule =
       BuildServingSchedule(options.evaluations, error,
                            options.video_sigma_shift, options.audio_sigma_shift);
@@ -2503,7 +2511,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   if (!time_rows) {
     return nullptr;
   }
-  if (!conditioning.keyframe_frames.empty()) {
+  if (!conditioning.keyframe_frames.empty() || reference_pictures) {
     AppendConditionTimeRow(&*time_rows);
   }
   // Audio noise mask: rows the mask keeps run on the audio guide's clean
@@ -2521,7 +2529,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   const bool keeps_audio =
       std::ranges::any_of(conditioning.audio_keep,
                           [](std::uint8_t keep) { return keep != 0; });
-  if (!conditioning.audio_guides.empty() || keeps_audio) {
+  if (!conditioning.audio_guides.empty() || keeps_audio || reference_sound) {
     AppendAudioConditionTimeRow(&*time_rows);
   }
   auto euler_plan = BuildEulerPlan(*schedule, options.reuse_interval, error);
@@ -2572,6 +2580,36 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
       }
       offset += elements;
     }
+    // Reference pictures after the guides, each at its own latent size.
+    for (const ReferenceLatent& reference : conditioning.references) {
+      const ReferencePlacement& placed = reference.placement;
+      if (placed.kind == ReferenceKind::kAudio) {
+        continue;
+      }
+      const std::size_t elements =
+          kH3VideoLatentChannels *
+          static_cast<std::size_t>(placed.latent_frames) *
+          static_cast<std::size_t>(placed.latent_height) *
+          static_cast<std::size_t>(placed.latent_width);
+      if (reference.video.size() != elements ||
+          offset + elements > impl->condition_rows_host.size() ||
+          !PatchifyVideo(reference.video, kH3VideoLatentChannels,
+                         placed.latent_frames, placed.latent_height,
+                         placed.latent_width,
+                         std::span(impl->condition_rows_host)
+                             .subspan(offset, elements),
+                         error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 reference latent differs from its placement";
+        }
+        return nullptr;
+      }
+      offset += elements;
+    }
+    if (offset != impl->condition_rows_host.size()) {
+      SetError(error, "MiniMax H3 condition rows differ from the layout");
+      return nullptr;
+    }
   }
   // Audio guide rows in the target audio packing (stereo track major).
   impl->audio_condition_rows_host.resize(impl->layout.audio_condition_rows *
@@ -2587,6 +2625,26 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
                      error)) {
         if (error != nullptr && error->empty()) {
           *error = "MiniMax H3 audio guide differs from the layout";
+        }
+        return nullptr;
+      }
+      offset += elements;
+    }
+    for (const ReferenceLatent& reference : conditioning.references) {
+      const int frames = reference.placement.audio_latent_frames;
+      if (frames == 0) {
+        continue;
+      }
+      const std::size_t elements = reference.audio.size();
+      if (elements != static_cast<std::size_t>(frames) *
+                          kH3AudioLatentChannels * kH3AudioTracks ||
+          offset + elements > impl->audio_condition_rows_host.size() ||
+          !PackAudio(reference.audio, kH3AudioLatentChannels, frames,
+                     std::span(impl->audio_condition_rows_host)
+                         .subspan(offset, elements),
+                     error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 reference audio differs from the layout";
         }
         return nullptr;
       }

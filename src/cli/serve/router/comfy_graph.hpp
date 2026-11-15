@@ -367,6 +367,20 @@ struct VideoTask {
   /// through ImageToMask "red", white = regenerate) and the source video
   /// behind it; strength and the start / end percent of the schedule.
   bool h3_control{false};
+  /// H3 MiniMaxH3ReferenceToVideo (Ref2VA) -> gufo.references: reference
+  /// images, videos (each with an optional soundtrack: a LoadAudio file, or
+  /// the video's own track the executor extracts), standalone audio, and
+  /// ref_image_size "max".
+  struct Reference {
+    FileRef file;
+    std::optional<FileRef> audio;
+    bool audio_from_video{false};
+  };
+  bool h3_references{false};
+  std::vector<FileRef> h3_ref_images;
+  std::vector<Reference> h3_ref_videos;
+  std::vector<FileRef> h3_ref_audios;
+  bool h3_ref_image_max{false};
   std::optional<FileRef> h3_control_mask;
   std::optional<FileRef> h3_control_source;
   double h3_control_strength{1.0};
