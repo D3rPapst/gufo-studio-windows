@@ -1237,13 +1237,14 @@ Route Classify(const HttpRequest& req) {
       {"/v1/images", "bild", 1, true},
       {"/v1/previews/", "bild|video", 0, false},
       {"/v1/videos", "video", 2, true},
-      {"/v1/audio/speech", "stimme", 1, false},
+      // Speech and music are filtered on their texts since 2.1.8 (e48).
+      {"/v1/audio/speech", "stimme", 1, true},
       // Speech recognition is no generation: not counted (2.1.8).
       {"/v1/audio/transcriptions", "stimme", 0, false},
       {"/v1/audio/convert", "stimme", 1, false},
       {"/v1/audio/voices", "stimme", 0, false},
       {"/v1/audio/separate", "stimme", 1, false},
-      {"/v1/audio/music", "musik", 1, false},
+      {"/v1/audio/music", "musik", 1, true},
       {"/v1/audio/foley", "musik", 1, false},
       {"/v1/3d/", "3d", 1, false},
       // ComfyUI adapter: graphs make images and videos; counted and
@@ -1425,6 +1426,33 @@ std::string WordFilter::HitText(std::string_view text) {
       if (start_ok && end_ok)
         return entry;
       at = lower.find(word, at + 1);
+    }
+  }
+  return {};
+}
+
+std::string WordFilter::HitFields(const HttpRequest& req,
+                                  std::initializer_list<const char*> keys) {
+  if (req.body.empty() || !IsJsonBody(req))
+    return {};
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception&) {
+    return {};  // the worker refuses what is not JSON
+  }
+  for (const char* key : keys) {
+    const json::Value* value = body.find(key);
+    if (value == nullptr)
+      continue;
+    if (value->is_string()) {
+      if (const std::string word = HitText(value->str()); !word.empty())
+        return word;
+    } else if (value->is_array()) {
+      for (const json::Value& item : value->items())
+        if (item.is_string())
+          if (const std::string word = HitText(item.str()); !word.empty())
+            return word;
     }
   }
   return {};
@@ -2346,9 +2374,16 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                              model + " is not enabled for this user)",
                          "model_forbidden");
       if (route.filtered && who.rechte.FilterOn(who.rolle)) {
-        const std::string word = route.area == "text"
-                                     ? filter_.HitChat(req)
-                                     : filter_.Hit(req, req.path == "/prompt");
+        std::string word;
+        if (route.area == "text")
+          word = filter_.HitChat(req);
+        else if (req.path == "/v1/audio/music")
+          word = filter_.HitFields(
+              req, {"tags", "prompt", "style", "caption", "lyrics"});
+        else if (req.path == "/v1/audio/speech")
+          word = filter_.HitFields(req, {"input", "instructions"});
+        else
+          word = filter_.Hit(req, req.path == "/prompt");
         if (!word.empty()) {
           Log(req, who, "abgelehnt:content_filtered", model);
           return AuthError(400, "Bad Request",

@@ -16,6 +16,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -344,6 +345,11 @@ public:
   /// `prompt`, the last user message of `messages` and the last user item
   /// of `input`, as a string or text parts; "" when clean.
   [[nodiscard]] std::string HitChat(const server::HttpRequest& req);
+  /// The first blocked word in the named top-level fields of a JSON body
+  /// (2.1.8): a string or an array of strings each; "" when clean. Music
+  /// reads tags/prompt/style/caption/lyrics, speech input/instructions.
+  [[nodiscard]] std::string HitFields(const server::HttpRequest& req,
+                                      std::initializer_list<const char*> keys);
   /// Every string of a parsed body (a ComfyUI graph).
   [[nodiscard]] std::string HitJson(const json::Value& body);
   [[nodiscard]] std::string HitText(std::string_view text);

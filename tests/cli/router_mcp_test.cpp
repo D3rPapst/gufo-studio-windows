@@ -2318,6 +2318,31 @@ void TestMediaJobs() {
     CHECK(RpcMessage(r).find(field) != std::string::npos);
   }
 
+  // 2.1.8 (e48): the word filter reads the speech text and the voice
+  // description; the job is never submitted.
+  {
+    const std::size_t before = f.requests.size();
+    r = f.Call("stimme", "{\"text\":\"Sag nackt\"}", kLan,
+               Fixture::Bearer(mia));
+    CheckShape(r, true);
+    CHECK_EQ(FailureCode(r), std::string("content_filtered"));
+    CHECK_EQ(FailureStatus(r), 400);
+    r = f.Call("stimme",
+               "{\"text\":\"Hallo\",\"model\":\"qwen3-tts-voicedesign\","
+               "\"beschreibung\":\"porno stimme\"}",
+               kLan, Fixture::Bearer(mia));
+    CHECK_EQ(FailureCode(r), std::string("content_filtered"));
+    r = f.Call("musik", "{\"stil\":\"gore metal\"}", kLan,
+               Fixture::Bearer(mia));
+    CheckShape(r, true);
+    CHECK_EQ(FailureCode(r), std::string("content_filtered"));
+    r = f.Call("musik", "{\"stil\":\"pop\",\"liedtext\":\"[Verse] blood\"}",
+               kLan, Fixture::Bearer(mia));
+    CHECK_EQ(FailureCode(r), std::string("content_filtered"));
+    CHECK_EQ(f.requests.size(), before);
+    CHECK(f.Logged({"\tmia\t", "mcp:musik:abgelehnt:content_filtered"}, 6));
+  }
+
   // musik: the music body.
   r = f.Call(
       "musik",

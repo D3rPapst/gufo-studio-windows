@@ -1705,6 +1705,74 @@ void TestDailyLimitMediaOnly() {
   CHECK_EQ(auth::Classify(Req("POST", "/v1/videos", "x")).counts, 2);
 }
 
+// 2.1.8 (Fabian e48): the word filter reads music (tags, prompt, style,
+// caption, lyrics) and speech (input, instructions) as well, direct and
+// wrapped in a job; the refusal is the image one (400 content_filtered).
+void TestMusicSpeechFilter() {
+  Fixture f;
+  f.AddUser("kind", "nutzer", "kind-pw");
+  auth::Rights free_rights;
+  free_rights.filter = false;
+  f.AddUser("frei", "nutzer", "frei-pw", free_rights);
+  f.AddUser("fabian", "admin", "geheim123");
+  const std::string kind = f.LoginCookie("kind", "kind-pw");
+  const std::string frei = f.LoginCookie("frei", "frei-pw");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  const auto post = [&](const std::string& cookie, const std::string& path,
+                        const std::string& body) {
+    return f.Serve(Req("POST", path, "192.168.178.50", body, {{"Cookie", cookie}}));
+  };
+  CHECK(auth::Classify(Req("POST", "/v1/audio/music", "x")).filtered);
+  CHECK(auth::Classify(Req("POST", "/v1/audio/speech", "x")).filtered);
+  CHECK(!auth::Classify(Req("POST", "/v1/audio/transcriptions", "x")).filtered);
+  for (const char* body :
+       {"{\"model\":\"ace\",\"tags\":\"pop, nackt\"}",
+        "{\"model\":\"ace\",\"prompt\":\"Porno-Song\"}",
+        "{\"model\":\"ace\",\"style\":\"gore metal\"}",
+        "{\"model\":\"ace\",\"caption\":\"blood rain\"}",
+        "{\"model\":\"ace\",\"prompt\":\"pop\",\"lyrics\":\"[Verse] ganz nackt\"}",
+        "{\"model\":\"ace\",\"lyrics\":[\"la la\",\"NACKT\"]}"}) {
+    const HttpResponse r = post(kind, "/v1/audio/music", body);
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+    CHECK(r.body.find("gesperrtes Wort") != std::string::npos);
+  }
+  for (const char* body :
+       {"{\"model\":\"tts\",\"input\":\"Sag nackt\"}",
+        "{\"model\":\"tts\",\"input\":\"Hallo\",\"instructions\":\"klingt nach porno\"}"}) {
+    const HttpResponse r = post(kind, "/v1/audio/speech", body);
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  }
+  // Clean texts and other fields pass (the voice name is no prompt).
+  HttpResponse r = post(kind, "/v1/audio/music",
+                        "{\"model\":\"ace\",\"prompt\":\"pop\",\"lyrics\":\"Sonne\"}");
+  CHECK_EQ(r.status, 200);
+  r = post(kind, "/v1/audio/speech",
+           "{\"model\":\"tts\",\"input\":\"Guten Morgen\",\"voice\":\"nackt\"}");
+  CHECK_EQ(r.status, 200);
+  // Wrapped in a job (the MCP tools musik and stimme submit so).
+  r = post(kind, "/v1/jobs",
+           "{\"request\":{\"path\":\"/v1/audio/music\",\"body\":"
+           "{\"model\":\"ace\",\"prompt\":\"pop\",\"lyrics\":\"blood\"}}}");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("content_filtered"));
+  r = post(kind, "/v1/jobs",
+           "{\"request\":{\"path\":\"/v1/audio/speech\",\"body\":"
+           "{\"model\":\"tts\",\"input\":\"nackt\"}}}");
+  CHECK_EQ(r.status, 400);
+  // Filter off for this user and for admins.
+  r = post(frei, "/v1/audio/music", "{\"model\":\"ace\",\"tags\":\"nackt\"}");
+  CHECK_EQ(r.status, 200);
+  r = post(admin, "/v1/audio/speech", "{\"model\":\"tts\",\"input\":\"nackt\"}");
+  CHECK_EQ(r.status, 200);
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(40))
+    logged = logged || (line.find("/v1/audio/speech") != std::string::npos &&
+                        line.find("abgelehnt:content_filtered") != std::string::npos);
+  CHECK(logged);
+}
+
 void TestUsersApi() {
   Fixture f;
   // First setup: nothing but loopback gets in; the LAN sees the hint.
@@ -2604,6 +2672,7 @@ int main() {
   TestFailedLogins();
   TestFilterAndLimit();
   TestDailyLimitMediaOnly();
+  TestMusicSpeechFilter();
   TestUsersApi();
   TestPasswordChange();
   TestLoopbackBearer();
