@@ -157,6 +157,15 @@ def write_merged(tensors, out: Path, metadata: dict, keep_dtype: bool, chunk_ele
 
 
 def dit_variant(src: Path) -> str:
+    # The checkpoint directory name wins: the published acestep-v15-xl-sft
+    # config.json says model_version "base" (sft is a fine-tune of base and
+    # kept its config), so trusting config.json first tagged sft weights as
+    # base and the worker sampled them with the base defaults (32 steps
+    # instead of 50). config.json only decides when the name does not.
+    name = src.name.lower()
+    for v in ("turbo", "sft", "base"):
+        if v in name:
+            return v
     config = src / "config.json"
     if config.exists():
         cfg = json.load(open(config, encoding="utf-8"))
@@ -165,11 +174,9 @@ def dit_variant(src: Path) -> str:
             return version
         if cfg.get("is_turbo"):
             return "turbo"
-    name = src.name.lower()
-    for v in ("turbo", "sft", "base"):
-        if v in name:
-            return v
-    raise SystemExit(f"cannot tell the variant of {src}: pass a directory with config.json")
+    raise SystemExit(f"cannot tell the variant of {src}: name the directory "
+                     "after the variant (turbo, sft or base) or pass one "
+                     "with config.json")
 
 
 def check_dit(tensors, src: Path) -> None:
