@@ -659,6 +659,10 @@ struct DenoiserSession::Impl {
   std::vector<float> condition_rows_host;
   models::PreviewHook preview;
   std::vector<float> audio_condition_rows_host;
+  // Audio noise mask: packed source rows ([2T][32], track-major) and the
+  // [begin, end) row ranges they hold clean (empty: none).
+  std::vector<float> audio_keep_rows_host;
+  std::vector<std::pair<std::size_t, std::size_t>> audio_keep_ranges;
   const LoraAdapter* lora{nullptr};
   std::vector<std::unique_ptr<DitBlockSession>> blocks;
   std::vector<double> forward_history;
@@ -684,6 +688,7 @@ struct DenoiserSession::Impl {
   DeviceBuffer audio_sample;
   DeviceBuffer condition_sample;
   DeviceBuffer audio_condition_sample;
+  DeviceBuffer audio_keep_sample;
   DeviceBuffer projection_scratch_f32;
   DeviceBuffer hidden_device;
   DeviceBuffer block_row_map;
@@ -1690,6 +1695,22 @@ struct DenoiserSession::Impl {
         return false;
       }
     }
+    if (!audio_keep_ranges.empty()) {
+      if (audio_keep_rows_host.size() != audio_elements ||
+          !audio_keep_sample.Allocate(audio_elements * sizeof(float), error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax H3 audio mask rows differ from the layout";
+        }
+        return false;
+      }
+      const hipError_t status =
+          hipMemcpy(audio_keep_sample.data(), audio_keep_rows_host.data(),
+                    audio_keep_sample.bytes(), hipMemcpyHostToDevice);
+      if (status != hipSuccess) {
+        SetError(error, HipError("copy H3 audio mask rows", status));
+        return false;
+      }
+    }
     video_rows_host.resize(video_elements);
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
@@ -1726,6 +1747,22 @@ struct DenoiserSession::Impl {
     return true;
   }
 
+  // Audio noise mask: the kept rows back to the clean source (queued on
+  // the stream; the caller synchronizes).
+  bool RestoreKeptAudio(std::string* error) {
+    for (const auto& [begin, end] : audio_keep_ranges) {
+      const std::size_t offset = begin * kH3AudioLatentChannels;
+      if (!CopyAsync(audio_sample.As<float>() + offset,
+                     audio_keep_sample.As<float>() + offset,
+                     (end - begin) * kH3AudioLatentChannels * sizeof(float),
+                     hipMemcpyDeviceToDevice, "restore H3 kept audio rows",
+                     error)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool UploadLatents(std::span<const float> video_latent,
                      std::span<const float> audio_latent, std::string* error) {
     if (!PatchifyVideo(video_latent, kH3VideoLatentChannels,
@@ -1740,7 +1777,8 @@ struct DenoiserSession::Impl {
                    hipMemcpyHostToDevice, "copy H3 video latent", error) ||
         !CopyAsync(audio_sample.data(), audio_rows_host.data(),
                    audio_rows_host.size() * sizeof(float),
-                   hipMemcpyHostToDevice, "copy H3 audio latent", error)) {
+                   hipMemcpyHostToDevice, "copy H3 audio latent", error) ||
+        !RestoreKeptAudio(error)) {
       return false;
     }
     const hipError_t status = hipStreamSynchronize(stream);
@@ -2007,7 +2045,9 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   auto layout =
       BuildImageGuideLayout(options.text_rows, options.geometry,
                             image_placements, audio_placements, error);
-  auto schedule = BuildServingSchedule(options.evaluations, error);
+  auto schedule =
+      BuildServingSchedule(options.evaluations, error,
+                           options.video_sigma_shift, options.audio_sigma_shift);
   if (!layout || !schedule) {
     return nullptr;
   }
@@ -2018,7 +2058,22 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   if (!conditioning.keyframe_frames.empty()) {
     AppendConditionTimeRow(&*time_rows);
   }
-  if (!conditioning.audio_guides.empty()) {
+  // Audio noise mask: rows the mask keeps run on the audio guide's clean
+  // timestep (ComfyUI pins them at max(t_audio, 1.0)).
+  const std::size_t audio_rows_expected =
+      kH3AudioTracks *
+      static_cast<std::size_t>(options.geometry.temporal.audio_latent_frames);
+  if (!conditioning.audio_keep.empty() &&
+      (conditioning.audio_keep.size() != audio_rows_expected ||
+       conditioning.audio_mask_latent.size() !=
+           audio_rows_expected * kH3AudioLatentChannels)) {
+    SetError(error, "MiniMax H3 audio mask differs from the audio track");
+    return nullptr;
+  }
+  const bool keeps_audio =
+      std::ranges::any_of(conditioning.audio_keep,
+                          [](std::uint8_t keep) { return keep != 0; });
+  if (!conditioning.audio_guides.empty() || keeps_audio) {
     AppendAudioConditionTimeRow(&*time_rows);
   }
   auto euler_plan = BuildEulerPlan(*schedule, options.reuse_interval, error);
@@ -2101,6 +2156,40 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
       return nullptr;
     }
     impl->row_maps.push_back(std::move(*rows));
+  }
+  if (keeps_audio) {
+    const auto target = std::ranges::find_if(
+        impl->layout.segments, [](const LayoutSegment& segment) {
+          return segment.kind == SegmentKind::kAudioTarget;
+        });
+    if (target == impl->layout.segments.end() ||
+        target->end - target->begin != audio_rows_expected) {
+      SetError(error, "MiniMax H3 audio mask differs from the layout");
+      return nullptr;
+    }
+    const std::uint32_t kept_modulation =
+        impl->time_rows.audio_condition_row * 3U + 2U;
+    for (std::size_t row = 0; row < audio_rows_expected; ++row) {
+      if (conditioning.audio_keep[row] == 0) {
+        continue;
+      }
+      for (auto& map : impl->row_maps) {
+        map[target->begin + row] = kept_modulation;
+      }
+      if (impl->audio_keep_ranges.empty() ||
+          impl->audio_keep_ranges.back().second != row) {
+        impl->audio_keep_ranges.emplace_back(row, row + 1);
+      } else {
+        impl->audio_keep_ranges.back().second = row + 1;
+      }
+    }
+    impl->audio_keep_rows_host.resize(audio_rows_expected *
+                                      kH3AudioLatentChannels);
+    if (!PackAudio(conditioning.audio_mask_latent, kH3AudioLatentChannels,
+                   options.geometry.temporal.audio_latent_frames,
+                   impl->audio_keep_rows_host, error)) {
+      return nullptr;
+    }
   }
   if (!ValidateTarget(&impl->device, error)) {
     return nullptr;
@@ -2317,7 +2406,8 @@ bool DenoiserSession::DenoiseWithProgress(
                         impl_->audio_velocity_f32.data(), previous_audio,
                         impl_->audio_velocity_f32.bytes() / sizeof(float),
                         plan.audio_sigma_from_timestep, plan.audio_ratio,
-                        plan.audio_extrapolation, impl_->stream, error)) {
+                        plan.audio_extrapolation, impl_->stream, error) ||
+        !impl_->RestoreKeptAudio(error)) {
       return false;
     }
     const hipError_t status = hipStreamSynchronize(impl_->stream);

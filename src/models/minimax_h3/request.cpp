@@ -347,6 +347,9 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   int audio_reference_frame = 0;
   const json::Value* guide_keyframes = nullptr;
   const json::Value* guide_video_value = nullptr;
+  float video_shift = kH3VideoSigmaShift;
+  float audio_shift = kH3AudioSigmaShift;
+  const json::Value* audio_mask_value = nullptr;
   if (const json::Value* extension = body.json.find("gufo")) {
     // "interpolate" and "upscale" never reach the provider (the host runs
     // them); "preview" is the host's too.
@@ -355,7 +358,8 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
                         {"preset", "seed", "frames", "output_format",
                          "selected_frame", "steps", "lora", "lora_strength",
                          "interpolate", "upscale", "keyframes",
-                         "audio_reference_frame", "guide_video", "preview"}))
+                         "audio_reference_frame", "guide_video", "preview",
+                         "sigma_shift", "audio_mask"}))
       return Fail(error, "invalid_strix_options",
                   "'gufo' must contain only supported video options");
     if (extension->contains("preset")) {
@@ -425,6 +429,29 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
                     "'gufo.audio_reference_frame' must be an integer");
       audio_reference_frame = *parsed;
     }
+    if (extension->contains("sigma_shift")) {
+      // MiniMaxH3SigmaShift: {"video": 12, "audio": 3}, either may be left
+      // out.
+      const json::Value* shift = extension->find("sigma_shift");
+      if (!shift->is_object() || !HasOnlyMembers(*shift, {"video", "audio"}))
+        return Fail(error, "invalid_sigma_shift",
+                    "'gufo.sigma_shift' must be {\"video\", \"audio\"}");
+      for (auto [key, target] : {std::pair{"video", &video_shift},
+                                 std::pair{"audio", &audio_shift}}) {
+        const json::Value* value = shift->find(key);
+        if (value == nullptr)
+          continue;
+        const double number = value->is_number() ? value->as_double(0.0) : 0.0;
+        if (!(number >= kH3MinimumSigmaShift &&
+              number <= kH3MaximumSigmaShift))
+          return Fail(error, "invalid_sigma_shift",
+                      std::string("'gufo.sigma_shift.") + key +
+                          "' must be a number in 0.01..100");
+        *target = static_cast<float>(number);
+      }
+    }
+    if (extension->contains("audio_mask"))
+      audio_mask_value = extension->find("audio_mask");
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
       if (!selected_frame.has_value())
@@ -681,6 +708,45 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   }
   options["audio_guides"] = std::move(audio_list);
 
+  // Audio noise mask (ComfyUI's LTXVConcatAVLatent with SetLatentNoiseMask
+  // over VAEEncodeAudio): {"audio": <audio>, "mask": [2N numbers]}, two
+  // rows (one per stereo track) of 0 = keep the audio .. 1 = generate,
+  // stretched over the audio's latent frames.
+  if (audio_mask_value != nullptr) {
+    if (!audio_mask_value->is_object() ||
+        !HasOnlyMembers(*audio_mask_value, {"audio", "mask"}))
+      return Fail(error, "invalid_audio_mask",
+                  "'gufo.audio_mask' must be {\"audio\", \"mask\"}");
+    const json::Value* mask = audio_mask_value->find("mask");
+    if (mask == nullptr || !mask->is_array() || mask->items().size() < 2 ||
+        mask->items().size() % 2 != 0 ||
+        mask->items().size() > kH3MaximumAudioMaskValues)
+      return Fail(error, "invalid_audio_mask",
+                  "'gufo.audio_mask.mask' must be two equal rows (one per "
+                  "stereo track) of together 2.." +
+                      std::to_string(kH3MaximumAudioMaskValues) + " numbers");
+    json::Value values = json::Value::array();
+    for (const json::Value& item : mask->items()) {
+      const double value = item.is_number() ? item.as_double(-1.0) : -1.0;
+      if (!(value >= 0.0 && value <= 1.0))
+        return Fail(error, "invalid_audio_mask",
+                    "'gufo.audio_mask.mask' values must be numbers in 0..1");
+      values.push_back(value);
+    }
+    std::vector<std::uint8_t> bytes;
+    std::string audio_error;
+    if (!ReadAudio(audio_mask_value->find("audio"), nullptr, &bytes,
+                   &audio_error))
+      return Fail(error, "invalid_audio_mask",
+                  "'gufo.audio_mask.audio' " + audio_error);
+    json::Value entry = json::Value::object();
+    entry["attachment"] = "audio_mask_source";
+    entry["mask"] = std::move(values);
+    options["audio_mask"] = std::move(entry);
+    prepared->attachments.push_back(
+        {.name = "audio_mask_source", .bytes = std::move(bytes)});
+  }
+
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256")
       return Fail(error, "invalid_output_format",
@@ -707,6 +773,12 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
     options["lora"] = lora;
     if (lora_strength.has_value())
       options["lora_strength"] = *lora_strength;
+  }
+  if (video_shift != kH3VideoSigmaShift || audio_shift != kH3AudioSigmaShift) {
+    json::Value shift = json::Value::object();
+    shift["video"] = static_cast<double>(video_shift);
+    shift["audio"] = static_cast<double>(audio_shift);
+    options["sigma_shift"] = std::move(shift);
   }
   prepared->prompt = prompt;
   prepared->size = size;
@@ -857,6 +929,26 @@ bool DecodePreparedRequest(const ext::VideoRequest& request,
         generation->video_guides.push_back(std::move(guide));
         ++index;
       }
+    }
+    if (const json::Value* mask = options.find("audio_mask")) {
+      const auto* bytes = attachment(mask->member_str("attachment"));
+      if (bytes == nullptr) {
+        *error = "missing MiniMax H3 audio mask attachment";
+        return false;
+      }
+      AudioWaveform waveform;
+      if (!DecodeGuideAudio(*bytes, &waveform, error))
+        return false;
+      generation->audio_mask_source = std::move(waveform);
+      for (const json::Value& value : mask->find("mask")->items())
+        generation->audio_mask.push_back(
+            static_cast<float>(value.as_double(1.0)));
+    }
+    if (const json::Value* shift = options.find("sigma_shift")) {
+      generation->video_sigma_shift = static_cast<float>(
+          shift->member_double("video", kH3VideoSigmaShift));
+      generation->audio_sigma_shift = static_cast<float>(
+          shift->member_double("audio", kH3AudioSigmaShift));
     }
     if (const json::Value* lora = options.find("lora")) {
       const auto found = provider.loras.find(lora->str());

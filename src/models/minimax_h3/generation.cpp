@@ -1177,6 +1177,78 @@ bool GenerateTextVideo(const GenerationRequest& request,
     TraceStage("audio guides encoded");
     Report(progress, progress_opaque, "audio_guides", 1, 1);
   }
+  // Audio noise mask: the source audio's latent (AudioVAE posterior mean,
+  // like an audio guide) and the rows it keeps.
+  std::vector<float> audio_mask_latent;
+  std::vector<std::uint8_t> audio_keep;
+  if (request.audio_mask_source.has_value()) {
+    Report(progress, progress_opaque, "audio_mask", 0, 1);
+    const int frames = geometry->temporal.audio_latent_frames;
+    const AudioWaveform& source = *request.audio_mask_source;
+    // The mask is stretched over the whole source clip, like ComfyUI.
+    const int source_frames = static_cast<int>(
+        (static_cast<std::size_t>(source.samples) + kH3AudioVaeHopLength - 1U) /
+        kH3AudioVaeHopLength);
+    bool partial = false;
+    auto keep = AudioKeepRows(request.audio_mask, source_frames, frames,
+                              &partial, error);
+    if (!keep) {
+      return false;
+    }
+    audio_keep = std::move(*keep);
+    AudioVaeEncoderTelemetry encoder_telemetry;
+    auto encoder = AudioVaeEncoder::Create(*inventory, cancellation,
+                                           &encoder_telemetry, error);
+    if (encoder == nullptr) {
+      return false;
+    }
+    // As for the guides: encode only the frames the video keeps, with 16
+    // frames of margin for the encoder's reach.
+    AudioWaveform clip = source;
+    const std::size_t keep_samples =
+        static_cast<std::size_t>(frames + 16) * kH3AudioVaeHopLength;
+    if (static_cast<std::size_t>(clip.samples) > keep_samples) {
+      std::vector<float> cropped(keep_samples * 2U);
+      for (int track = 0; track < 2; ++track) {
+        std::copy_n(clip.pcm.begin() +
+                        static_cast<std::ptrdiff_t>(track) * clip.samples,
+                    keep_samples,
+                    cropped.begin() +
+                        static_cast<std::ptrdiff_t>(track * keep_samples));
+      }
+      clip.pcm = std::move(cropped);
+      clip.samples = static_cast<int>(keep_samples);
+    }
+    std::vector<float> latent;
+    int latent_frames = 0;
+    if (!encoder->Encode(clip, cancellation, &latent, &latent_frames,
+                         &encoder_telemetry, error)) {
+      return false;
+    }
+    encoder.reset();
+    // [32][2][frames]: the source trimmed, zero-padded behind its end
+    // (those rows generate anyway).
+    audio_mask_latent.assign(static_cast<std::size_t>(frames) *
+                                 kH3AudioLatentChannels * kH3AudioTracks,
+                             0.0F);
+    const int copied = std::min(latent_frames, frames);
+    for (std::size_t row = 0; row < kH3AudioLatentChannels * kH3AudioTracks;
+         ++row) {
+      std::copy_n(latent.begin() + static_cast<std::ptrdiff_t>(row) *
+                                       latent_frames,
+                  copied,
+                  audio_mask_latent.begin() +
+                      static_cast<std::ptrdiff_t>(row) * frames);
+    }
+    for (int track = 0; track < 2; ++track) {
+      for (int frame = copied; frame < frames; ++frame) {
+        audio_keep[static_cast<std::size_t>(track * frames + frame)] = 0U;
+      }
+    }
+    TraceStage(partial ? "audio mask encoded (partial values rounded)"
+                       : "audio mask encoded");
+    Report(progress, progress_opaque, "audio_mask", 1, 1);
+  }
   std::shared_ptr<const LoraAdapter> lora;
   if (!request.lora_path.empty()) {
     lora = LoraAdapter::Open(request.lora_path, request.lora_strength, error);
@@ -1197,13 +1269,17 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .active_blocks = request.parameters.active_blocks,
        .reuse_interval = request.parameters.reuse_interval,
        .row_parallel_attention = request.parameters.row_parallel_attention,
-       .lora = lora.get()},
+       .lora = lora.get(),
+       .video_sigma_shift = request.video_sigma_shift,
+       .audio_sigma_shift = request.audio_sigma_shift},
       {.layer50 = embedding.values,
        .tags = tags,
        .keyframe_latents = keyframe_latents,
        .keyframe_frames = keyframe_frames,
        .keyframe_latent_frames = keyframe_latent_frames,
-       .audio_guides = audio_guides},
+       .audio_guides = audio_guides,
+       .audio_mask_latent = audio_mask_latent,
+       .audio_keep = audio_keep},
       cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;

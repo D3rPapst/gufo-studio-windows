@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -163,6 +164,56 @@ void TestSchedules() {
   std::string error;
   CHECK(!BuildServingSchedule(1, &error).has_value());
   CHECK(!BuildServingSchedule(1001, &error).has_value());
+  // MiniMaxH3SigmaShift: another audio shift changes only the audio sigmas
+  // (shift * b / (1 + (shift - 1) * b) on the same linspace).
+  const auto trained = BuildServingSchedule(8, &error);
+  const auto shifted = BuildServingSchedule(8, &error, 12.0F, 6.0F);
+  CHECK(trained.has_value() && shifted.has_value());
+  if (trained.has_value() && shifted.has_value()) {
+    CHECK(trained->video == shifted->video);
+    CHECK(shifted->audio[4] > trained->audio[4]);
+    CHECK(std::fabs(shifted->audio[4] - 6.0F * 0.5F / (1.0F + 5.0F * 0.5F)) <
+          1e-6F);
+    CHECK(shifted->audio.front() == 1.0F && shifted->audio.back() == 0.0F);
+    CHECK(BuildTimeRowSchedule(*shifted, &error).has_value());
+  }
+  CHECK(!BuildServingSchedule(8, &error, 0.0F, 3.0F).has_value());
+  CHECK(!BuildServingSchedule(8, &error, 12.0F, 101.0F).has_value());
+}
+
+void TestAudioKeepRows() {
+  using gufo::minimax_h3::AudioKeepRows;
+  std::string error;
+  bool partial = true;
+  // SolidMask 0: every row of both tracks keeps the source.
+  const std::vector<float> keep_all = {0.0F, 0.0F};
+  auto rows = AudioKeepRows(keep_all, 10, 10, &partial, &error);
+  CHECK(rows.has_value() && !partial);
+  if (rows.has_value()) {
+    CHECK(rows->size() == 20);
+    CHECK(std::ranges::all_of(*rows, [](std::uint8_t k) { return k == 1; }));
+  }
+  // A shorter source: the padding behind it generates (LTXVConcatAVLatent).
+  rows = AudioKeepRows(keep_all, 6, 10, &partial, &error);
+  CHECK(rows.has_value() && (*rows)[5] == 1 && (*rows)[6] == 0 &&
+        (*rows)[15] == 1 && (*rows)[16] == 0);
+  // First half kept, second half generated, stretched over the source.
+  const std::vector<float> half = {0.0F, 0.0F, 1.0F, 1.0F,
+                                   0.0F, 0.0F, 1.0F, 1.0F};
+  rows = AudioKeepRows(half, 8, 8, &partial, &error);
+  CHECK(rows.has_value());
+  if (rows.has_value()) {
+    CHECK((*rows)[0] == 1 && (*rows)[3] == 1 && (*rows)[4] == 0 &&
+          (*rows)[7] == 0 && (*rows)[8] == 1 && (*rows)[15] == 0);
+  }
+  // Interpolated edges are partial; 0.5 generates.
+  const std::vector<float> soft = {0.25F, 0.5F};
+  rows = AudioKeepRows(soft, 4, 4, &partial, &error);
+  CHECK(rows.has_value() && partial && (*rows)[0] == 1 && (*rows)[4] == 0);
+  const std::vector<float> odd = {0.0F, 0.0F, 0.0F};
+  CHECK(!AudioKeepRows(odd, 4, 4, &partial, &error).has_value());
+  const std::vector<float> high = {0.0F, 2.0F};
+  CHECK(!AudioKeepRows(high, 4, 4, &partial, &error).has_value());
 }
 
 void TestLayouts() {
@@ -749,6 +800,7 @@ void TestReuseAndEulerPlan() {
 int main() {
   TestGeometry();
   TestSchedules();
+  TestAudioKeepRows();
   TestLayouts();
   TestPacking();
   TestNoise();

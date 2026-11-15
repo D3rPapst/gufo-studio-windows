@@ -130,6 +130,16 @@ struct GenerationRequest {
   // Optional transformer LoRA (original/ComfyUI layout), merged at load.
   std::filesystem::path lora_path;
   float lora_strength{1.0F};
+  // Flow shifts of the video / audio sigma schedules
+  // (MiniMaxH3SigmaShift, gufo.sigma_shift).
+  float video_sigma_shift{kH3VideoSigmaShift};
+  float audio_sigma_shift{kH3AudioSigmaShift};
+  // Audio noise mask (gufo.audio_mask; ComfyUI's LTXVConcatAVLatent with
+  // SetLatentNoiseMask over VAEEncodeAudio): the source audio and two mask
+  // rows (AudioKeepRows). Its rows below 0.5 hold the source audio clean
+  // for every step (timestep 1, like an audio guide), the others generate.
+  std::optional<AudioWaveform> audio_mask_source;
+  std::vector<float> audio_mask;
   // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
   // blocks in the prompt. Empty: keyframes condition the latents only.
   std::filesystem::path vision_projector;
