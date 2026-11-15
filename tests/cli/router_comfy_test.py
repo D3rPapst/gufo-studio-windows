@@ -1281,9 +1281,10 @@ def check_parallel(router):
 
 
 def check_owners(binary, tmp):
-    """With users (auth = lan): /interrupt and POST /queue clear/delete of a
-    user who is no admin touch only that user's prompts; loopback (admin)
-    still stops every prompt (check_parallel)."""
+    """With users (auth = lan): /interrupt, POST /queue and POST /history
+    clear/delete of a user who is no admin touch only that user's prompts;
+    loopback (admin) still stops every prompt (check_parallel) and clears
+    every history entry, also after a restart."""
     own_tmp = os.path.join(tmp, "owners")
     os.makedirs(own_tmp, exist_ok=True)
     router = Router(binary, own_tmp, os.path.join(own_tmp, "comfy"),
@@ -1339,6 +1340,20 @@ def check_owners(binary, tmp):
         assert router.wait(tim)["status"]["status_str"] == "success"
         assert router.wait(ina)["status"]["status_str"] == "success"
 
+        # POST /history: ina's clear leaves tim's entries alone;
+        # GET shows the entries without their owner.
+        status, history = router.json("GET", "/history")
+        assert tim in history and ina in history and len(history) == 4, list(history)
+        assert "gufo_user" not in history[tim], history[tim]
+        assert call("ina", "POST", "/history", {"clear": True})[0] == 200
+        # (A delete naming another user's prompt is 404 at the gate.)
+        assert call("ina", "POST", "/history", {"delete": [tim]})[0] == 404
+        status, history = router.json("GET", "/history")
+        assert tim in history and ina not in history and len(history) == 2, list(history)
+        assert call("tim", "POST", "/history", {"delete": [tim]})[0] == 200
+        status, history = router.json("GET", "/history")
+        assert tim not in history and len(history) == 1, list(history)
+
         # Preview ids per user: ina can neither take tim's live
         # gufo_preview_id nor read its preview; tim reads it.
         status, payload = call("tim", "POST", "/prompt", {
@@ -1355,6 +1370,24 @@ def check_owners(binary, tmp):
         status, payload = call("tim", "GET", "/v1/previews/szene-1?format=json")
         assert status == 200, (status, payload)
         assert router.wait(tim)["status"]["status_str"] == "success"
+    except BaseException:
+        print(router.tail())
+        raise
+    finally:
+        router.stop()
+
+    # The owners are saved with the history: after a restart ina's clear
+    # still leaves tim's entries, loopback (admin) clears them all.
+    router = Router(binary, own_tmp, os.path.join(own_tmp, "comfy"),
+                    extra_args=["--comfy-parallel", "2"],
+                    extra_preset="[router]\nauth = lan\n")
+    try:
+        status, history = router.json("GET", "/history")
+        assert tim in history and "gufo_user" not in history[tim], list(history)
+        assert call("ina", "POST", "/history", {"clear": True})[0] == 200
+        assert tim in router.json("GET", "/history")[1]
+        assert router.request("POST", "/history", {"clear": True})[0] == 200
+        assert router.json("GET", "/history")[1] == {}
     except BaseException:
         print(router.tail())
         raise

@@ -230,6 +230,10 @@ private:
   std::atomic<int> queue_remaining_{0};
   std::map<std::string, json::Value> history_;
   std::vector<std::string> history_order_;
+  /// The signed-in user (X-Gufo-User) of each history entry that has one;
+  /// POST /history clear/delete of a user who is no admin touch only these.
+  /// Saved in history.json as the entry's "gufo_user", left out of GET.
+  std::map<std::string, std::string> history_users_;
   long long next_number_{0};
   bool stopping_{false};
   std::vector<std::thread> workers_;

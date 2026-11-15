@@ -849,17 +849,34 @@ HttpResponse Adapter::HistoryPost(const HttpRequest& request) {
   json::Value body = json::Value::object();
   if (!request.body.empty())
     body = json::parse(request.body);
+  // A signed-in user who is no admin clears or deletes only the entries of
+  // its own prompts (like POST /queue); admin and loopback touch all.
+  const std::string user = RestrictedUser(request);
   const std::lock_guard<std::mutex> lock(mutex_);
+  const auto mine = [&](const std::string& id) {
+    if (user.empty())
+      return true;
+    const auto owner = history_users_.find(id);
+    return owner != history_users_.end() && owner->second == user;
+  };
+  const auto erase = [&](const std::string& id) {
+    history_.erase(id);
+    history_users_.erase(id);
+    std::erase(history_order_, id);
+  };
   if (body.find("clear") != nullptr && body.find("clear")->as_bool()) {
-    history_.clear();
-    history_order_.clear();
+    std::vector<std::string> ids;
+    for (const std::string& id : history_order_)
+      if (mine(id))
+        ids.push_back(id);
+    for (const std::string& id : ids)
+      erase(id);
   }
   if (const json::Value* remove = body.find("delete");
       remove != nullptr && remove->is_array()) {
-    for (const json::Value& id : remove->items()) {
-      history_.erase(id.str());
-      std::erase(history_order_, id.str());
-    }
+    for (const json::Value& id : remove->items())
+      if (id.is_string() && history_.count(id.str()) != 0 && mine(id.str()))
+        erase(id.str());
   }
   PersistLocked();
   return EmptyOk();
@@ -1615,8 +1632,11 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
     if (history_.find(job->id) == history_.end())
       history_order_.push_back(job->id);
     history_[job->id] = std::move(entry);
+    if (!job->user.empty())
+      history_users_[job->id] = job->user;
     while (history_order_.size() > options_.history_limit) {
       history_.erase(history_order_.front());
+      history_users_.erase(history_order_.front());
       history_order_.erase(history_order_.begin());
     }
     PersistLocked();
@@ -2710,8 +2730,16 @@ json::Value Adapter::SaveVideoFrames(const OutputTarget& target,
 
 void Adapter::PersistLocked() {
   json::Value all = json::Value::object();
-  for (const std::string& id : history_order_)
-    all.append_member(id, history_.at(id));
+  for (const std::string& id : history_order_) {
+    const auto owner = history_users_.find(id);
+    if (owner == history_users_.end()) {
+      all.append_member(id, history_.at(id));
+      continue;
+    }
+    json::Value entry = history_.at(id);
+    entry["gufo_user"] = owner->second;
+    all.append_member(id, std::move(entry));
+  }
   const fs::path file = options_.root / "history.json";
   const fs::path temp = options_.root / "history.json.tmp";
   try {
@@ -2733,8 +2761,19 @@ void Adapter::LoadHistory() {
     return;
   try {
     const json::Value all = json::parse(ReadAll(file));
-    for (const auto& [id, entry] : all.members()) {
+    for (const auto& [id, saved] : all.members()) {
       history_order_.push_back(id);
+      // The owner goes back to history_users_; GET /history shows the
+      // entry as ComfyUI does, without it.
+      json::Value entry = saved;
+      if (const json::Value* owner = saved.find("gufo_user");
+          owner != nullptr && owner->is_string() && saved.is_object()) {
+        history_users_[id] = owner->str();
+        entry = json::Value::object();
+        for (const auto& [key, value] : saved.members())
+          if (key != "gufo_user")
+            entry.append_member(key, value);
+      }
       history_[id] = entry;
       if (const json::Value* prompt = entry.find("prompt");
           prompt != nullptr && prompt->is_array() && !prompt->empty())
