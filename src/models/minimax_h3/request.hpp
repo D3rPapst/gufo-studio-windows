@@ -26,11 +26,13 @@ struct RegisteredLora {
   float strength{1.0F};
 };
 
-/// Provider options of `serve video` (in order): "lora" and
-/// "vision-projector". Unknown names fail.
+/// Provider options of `serve video` (in order): "lora",
+/// "vision-projector" and "control-model". Unknown names fail.
 struct ProviderOptions {
   std::map<std::string, RegisteredLora, std::less<>> loras;
   std::filesystem::path vision_projector;
+  // Fun-ControlNet-Union checkpoint for "gufo.control".
+  std::filesystem::path control_model;
 };
 [[nodiscard]] bool ParseProviderOptions(
     const std::vector<std::pair<std::string, std::string>>& options,

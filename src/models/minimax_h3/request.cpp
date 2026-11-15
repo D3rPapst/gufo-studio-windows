@@ -12,6 +12,7 @@
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <tuple>
 
 #include <gufo/ext/image.hpp>
 #include <gufo/ext/json.hpp>
@@ -209,6 +210,16 @@ bool ParseProviderOptions(
       parsed->vision_projector = value;
       continue;
     }
+    if (name == "control-model") {
+      std::error_code ignored;
+      if (value.empty() ||
+          !std::filesystem::is_regular_file(value, ignored)) {
+        *error = "--control-model file not found: " + value;
+        return false;
+      }
+      parsed->control_model = value;
+      continue;
+    }
     if (name != "lora") {
       *error = "minimax-h3 does not take --" + name;
       return false;
@@ -286,8 +297,9 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   }
   for (const auto& [name, file] : body.files) {
     (void)file;
-    if (name == "control_video" || name == "mask" ||
-        name.starts_with("reference_image"))
+    // control_video, control_mask and control_source are gufo.control's
+    // multipart files.
+    if (name == "mask" || name.starts_with("reference_image"))
       return Fail(error, "unsupported_field",
                   "request contains an unsupported video field");
   }
@@ -350,6 +362,7 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   float video_shift = kH3VideoSigmaShift;
   float audio_shift = kH3AudioSigmaShift;
   const json::Value* audio_mask_value = nullptr;
+  const json::Value* control_value = nullptr;
   if (const json::Value* extension = body.json.find("gufo")) {
     // "interpolate" and "upscale" never reach the provider (the host runs
     // them); "preview" is the host's too.
@@ -359,7 +372,7 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
                          "selected_frame", "steps", "lora", "lora_strength",
                          "interpolate", "upscale", "keyframes",
                          "audio_reference_frame", "guide_video", "preview",
-                         "sigma_shift", "audio_mask"}))
+                         "sigma_shift", "audio_mask", "control"}))
       return Fail(error, "invalid_strix_options",
                   "'gufo' must contain only supported video options");
     if (extension->contains("preset")) {
@@ -452,6 +465,8 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
     }
     if (extension->contains("audio_mask"))
       audio_mask_value = extension->find("audio_mask");
+    if (extension->contains("control"))
+      control_value = extension->find("control");
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
       if (!selected_frame.has_value())
@@ -747,6 +762,121 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
         {.name = "audio_mask_source", .bytes = std::move(bytes)});
   }
 
+  // Fun-ControlNet-Union (ComfyUI's MiniMaxH3FunControlNetApply):
+  // {"video": <MP4>, "mask": <MP4, white = regenerate>, "source_video":
+  // <MP4>, "strength": 1, "start_percent": 0, "end_percent": 1}, the videos
+  // as data URLs or base64, or multipart files control_video, control_mask
+  // and control_source.
+  {
+    const ext::VideoAttachment* control_file = body.file("control_video");
+    const ext::VideoAttachment* mask_file = body.file("control_mask");
+    const ext::VideoAttachment* source_file = body.file("control_source");
+    if (control_value != nullptr || control_file != nullptr ||
+        mask_file != nullptr || source_file != nullptr) {
+      if (control_value != nullptr &&
+          (!control_value->is_object() ||
+           !HasOnlyMembers(*control_value,
+                           {"video", "mask", "source_video", "strength",
+                            "start_percent", "end_percent"})))
+        return Fail(error, "invalid_control",
+                    "'gufo.control' must be {\"video\", \"mask\", "
+                    "\"source_video\", \"strength\", \"start_percent\", "
+                    "\"end_percent\"}");
+      if (ActiveProviderOptions().control_model.empty())
+        return Fail(error, "invalid_control",
+                    "this server has no Fun-ControlNet (--control-model)");
+      if (parameters->active_blocks != 50)
+        return Fail(error, "invalid_control",
+                    "'gufo.control' needs the preset 'exact' (or a step "
+                    "LoRA): the control blocks follow all 50 layers");
+      json::Value entry = json::Value::object();
+      const auto number = [&](const char* key, double fallback, double low,
+                              double high, const char* range,
+                              double* out) -> bool {
+        *out = fallback;
+        const json::Value* value =
+            control_value != nullptr ? control_value->find(key) : nullptr;
+        if (value == nullptr)
+          return true;
+        const double parsed = value->is_number() ? value->as_double(-1e30)
+                                                 : -1e30;
+        if (!(parsed >= low && parsed <= high))
+          return Fail(error, "invalid_control",
+                      std::string("'gufo.control.") + key +
+                          "' must be a number in " + range);
+        *out = parsed;
+        return true;
+      };
+      double strength = 1.0;
+      double start = 0.0;
+      double end = 1.0;
+      if (!number("strength", 1.0, 0.0, 10.0, "0..10", &strength) ||
+          !number("start_percent", 0.0, 0.0, 1.0, "0..1", &start) ||
+          !number("end_percent", 1.0, 0.0, 1.0, "0..1", &end))
+        return false;
+      entry["strength"] = strength;
+      entry["start_percent"] = start;
+      entry["end_percent"] = end;
+      const auto attach = [&](const char* key, const ext::VideoAttachment* file,
+                              const char* name) -> bool {
+        const json::Value* value =
+            control_value != nullptr ? control_value->find(key) : nullptr;
+        if (value != nullptr && file != nullptr)
+          return Fail(error, "invalid_control",
+                      std::string("'gufo.control.") + key +
+                          "' and the multipart file '" + name +
+                          "' are the same input");
+        std::vector<std::uint8_t> bytes;
+        if (file != nullptr) {
+          bytes = file->bytes;
+        } else if (value != nullptr) {
+          if (!value->is_string())
+            return Fail(error, "invalid_control",
+                        std::string("'gufo.control.") + key +
+                            "' must be an MP4 data URL or base64");
+          std::string_view text = value->str();
+          if (text.starts_with("data:")) {
+            const auto comma = text.find(',');
+            if (comma == std::string_view::npos ||
+                text.substr(0, comma).find(";base64") == std::string_view::npos)
+              return Fail(error, "invalid_control",
+                          std::string("'gufo.control.") + key +
+                              "' data URL must be base64");
+            text.remove_prefix(comma + 1);
+          }
+          auto decoded = DecodeBase64(text);
+          if (!decoded.has_value())
+            return Fail(error, "invalid_control",
+                        std::string("'gufo.control.") + key +
+                            "' is not valid base64");
+          bytes = std::move(*decoded);
+        } else {
+          return true;
+        }
+        if (bytes.size() < 64)
+          return Fail(error, "invalid_control",
+                      std::string("'gufo.control.") + key +
+                          "' is not a video file");
+        entry[key] = std::string(name);
+        prepared->attachments.push_back(
+            {.name = std::string(name), .bytes = std::move(bytes)});
+        return true;
+      };
+      if (!attach("video", control_file, "control_video") ||
+          !attach("mask", mask_file, "control_mask") ||
+          !attach("source_video", source_file, "control_source"))
+        return false;
+      if (entry.find("video") == nullptr && entry.find("mask") == nullptr)
+        return Fail(error, "invalid_control",
+                    "'gufo.control' needs a 'video' or a 'mask'");
+      if (entry.find("source_video") != nullptr &&
+          entry.find("mask") == nullptr)
+        return Fail(error, "invalid_control",
+                    "'gufo.control.source_video' is only read with a 'mask'");
+      options["control"] = std::move(entry);
+    }
+  }
+
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256")
       return Fail(error, "invalid_output_format",
@@ -803,6 +933,72 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   prepared->options_json = options.dump();
   return true;
 }
+
+namespace {
+// A control input video decoded with FFmpeg into `frames` (at most `limit`
+// frames); `gray` keeps the red channel (ComfyUI's ImageToMask) as the
+// mask.
+bool DecodeControlFrames(const std::vector<std::uint8_t>& bytes,
+                         const std::filesystem::path& work_directory,
+                         const std::string& name, int limit, bool gray,
+                         ControlFrames* frames, std::string* error) {
+  std::error_code ignored;
+  std::filesystem::create_directories(work_directory, ignored);
+  const std::filesystem::path path = work_directory / (name + ".mp4");
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    if (!file) {
+      *error = "cannot store MiniMax H3 " + name;
+      return false;
+    }
+  }
+  models::rife::VideoInfo info;
+  if (!models::rife::ProbeVideo(path, &info, error))
+    return false;
+  if (info.width < 16 || info.height < 16 || info.width > 4096 ||
+      info.height > 4096) {
+    *error = "MiniMax H3 " + name + " has an unsupported size";
+    return false;
+  }
+  models::rife::FrameReader reader;
+  if (!reader.Open(path, info.width, info.height, error))
+    return false;
+  frames->width = info.width;
+  frames->height = info.height;
+  frames->frames = 0;
+  const std::size_t pixels = static_cast<std::size_t>(info.width) *
+                             static_cast<std::size_t>(info.height);
+  std::vector<std::uint8_t> frame(pixels * 3U);
+  while (frames->frames < limit) {
+    bool end = false;
+    if (!reader.Read(frame.data(), &end, error)) {
+      if (!end) {
+        reader.Close();
+        return false;
+      }
+      error->clear();
+      break;
+    }
+    if (gray) {
+      for (std::size_t pixel = 0; pixel < pixels; ++pixel)
+        frames->pixels.push_back(frame[pixel * 3U]);
+    } else {
+      frames->pixels.insert(frames->pixels.end(), frame.begin(), frame.end());
+    }
+    ++frames->frames;
+  }
+  reader.Close();
+  std::filesystem::remove(path, ignored);
+  if (frames->frames == 0) {
+    *error = "MiniMax H3 " + name + " has no frames";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
 
 bool DecodePreparedRequest(const ext::VideoRequest& request,
                            const ProviderOptions& provider,
@@ -943,6 +1139,37 @@ bool DecodePreparedRequest(const ext::VideoRequest& request,
       for (const json::Value& value : mask->find("mask")->items())
         generation->audio_mask.push_back(
             static_cast<float>(value.as_double(1.0)));
+    }
+    if (const json::Value* control = options.find("control")) {
+      if (provider.control_model.empty()) {
+        *error = "this server has no Fun-ControlNet (--control-model)";
+        return false;
+      }
+      GenerationControl spec;
+      spec.model = provider.control_model;
+      spec.strength = static_cast<float>(control->member_double("strength", 1.0));
+      spec.start_percent =
+          static_cast<float>(control->member_double("start_percent", 0.0));
+      spec.end_percent =
+          static_cast<float>(control->member_double("end_percent", 1.0));
+      const int frame_limit = request.parameters.frames;
+      for (const auto& [key, target, gray] :
+           {std::tuple{"video", &spec.video, false},
+            std::tuple{"mask", &spec.mask, true},
+            std::tuple{"source_video", &spec.source, false}}) {
+        const json::Value* name = control->find(key);
+        if (name == nullptr)
+          continue;
+        const auto* bytes = attachment(name->str());
+        if (bytes == nullptr) {
+          *error = "missing MiniMax H3 control attachment";
+          return false;
+        }
+        if (!DecodeControlFrames(*bytes, work_directory, name->str(),
+                                 frame_limit, gray, target, error))
+          return false;
+      }
+      generation->control = std::move(spec);
     }
     if (const json::Value* shift = options.find("sigma_shift")) {
       generation->video_sigma_shift = static_cast<float>(

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/audio_vae.hpp"
+#include "src/models/minimax_h3/control.hpp"
 #include "src/models/minimax_h3/denoiser.hpp"
 #include "src/models/minimax_h3/media.hpp"
 #include "src/models/minimax_h3/prompt_encoder.hpp"
@@ -140,6 +141,9 @@ struct GenerationRequest {
   // for every step (timestep 1, like an audio guide), the others generate.
   std::optional<AudioWaveform> audio_mask_source;
   std::vector<float> audio_mask;
+  // Fun-ControlNet-Union (gufo.control; ComfyUI's
+  // MiniMaxH3FunControlNetApply with a ModelPatchLoader).
+  std::optional<GenerationControl> control;
   // Qwen3-VL vision tower (mmproj GGUF) for the keyframes' "<Picture i>"
   // blocks in the prompt. Empty: keyframes condition the latents only.
   std::filesystem::path vision_projector;
@@ -182,6 +186,7 @@ struct GenerationTelemetry {
   std::size_t audio_guides{0};
   std::size_t audio_guide_frames{0};
   double guide_clip_ms{0.0};
+  double control_ms{0.0};
   std::size_t guide_clips{0};
   std::size_t guide_clip_latent_frames{0};
   double vision_ms{0.0};

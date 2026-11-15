@@ -1249,6 +1249,45 @@ bool GenerateTextVideo(const GenerationRequest& request,
                        : "audio mask encoded");
     Report(progress, progress_opaque, "audio_mask", 1, 1);
   }
+  // Fun-ControlNet: the control rows from the control video, mask and
+  // source video, encoded before the transformer loads.
+  std::optional<ModelInventory> control_inventory;
+  std::vector<float> control_rows;
+  DenoiserControl denoiser_control;
+  if (request.control.has_value()) {
+    begin = Clock::now();
+    Report(progress, progress_opaque, "control", 0, 1);
+    control_inventory =
+        ModelInventory::InspectControlPatch(request.control->model, error);
+    if (!control_inventory.has_value()) {
+      return false;
+    }
+    // Fun-ControlNet-Union 2.0 (10 control blocks) puts the masked holes at
+    // the VAE's mid-gray (inpaint_masked_pixel_mode post_norm); v1 (5)
+    // leaves them black.
+    const bool post_norm = CountControlBlocks(*control_inventory) >= 10;
+    VideoVaeEncoderTelemetry control_telemetry;
+    if (!BuildControlRows(*inventory, *request.control, *geometry, post_norm,
+                          cancellation, &control_rows, &control_telemetry,
+                          error)) {
+      return false;
+    }
+    local.keyframe_encoder.encode_ms += control_telemetry.encode_ms;
+    local.keyframe_encoder.load_ms += control_telemetry.load_ms;
+    local.keyframe_encoder.tiles += control_telemetry.tiles;
+    denoiser_control = {
+        .inventory = &*control_inventory,
+        .rows = control_rows,
+        .columns = kH3ControlColumns,
+        .strength = request.control->strength,
+        .sigma_start = ControlPercentToSigma(request.control->start_percent,
+                                             request.video_sigma_shift),
+        .sigma_end = ControlPercentToSigma(request.control->end_percent,
+                                           request.video_sigma_shift)};
+    local.control_ms = Milliseconds(begin, Clock::now());
+    TraceStage("control encoded");
+    Report(progress, progress_opaque, "control", 1, 1);
+  }
   std::shared_ptr<const LoraAdapter> lora;
   if (!request.lora_path.empty()) {
     lora = LoraAdapter::Open(request.lora_path, request.lora_strength, error);
@@ -1271,7 +1310,8 @@ bool GenerateTextVideo(const GenerationRequest& request,
        .row_parallel_attention = request.parameters.row_parallel_attention,
        .lora = lora.get(),
        .video_sigma_shift = request.video_sigma_shift,
-       .audio_sigma_shift = request.audio_sigma_shift},
+       .audio_sigma_shift = request.audio_sigma_shift,
+       .control = request.control.has_value() ? &denoiser_control : nullptr},
       {.layer50 = embedding.values,
        .tags = tags,
        .keyframe_latents = keyframe_latents,
@@ -1430,6 +1470,13 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << "  \"guide_clip_latent_frames\": "
          << telemetry.guide_clip_latent_frames << ",\n"
          << "  \"guide_clip_ms\": " << telemetry.guide_clip_ms << ",\n"
+         << "  \"control_ms\": " << telemetry.control_ms << ",\n"
+         << "  \"control_blocks\": " << telemetry.denoiser.control_blocks
+         << ",\n"
+         << "  \"control_weight_bytes\": "
+         << telemetry.denoiser.control_weight_bytes << ",\n"
+         << "  \"control_load_ms\": " << telemetry.denoiser.control_load_ms
+         << ",\n"
          << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
          << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"
          << "  \"keyframe_encoder_load_ms\": "

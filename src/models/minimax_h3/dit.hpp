@@ -64,6 +64,11 @@ struct DitBlockOptions {
   bool validate_gemm_plans{true};
   // Merged into the projection weights at load; must outlive Create.
   const LoraAdapter* lora{nullptr};
+  // >= 0: a Fun-ControlNet control block ("control_blocks.<index>." of a
+  // VideoX-Fun checkpoint: separate to_q/to_k/to_v, norm_q/norm_k,
+  // to_out.0 and a [value; gate] ff.net.0.proj), loaded into the native
+  // block layout. block_index is then its injection layer.
+  int control_index{-1};
 };
 
 struct DitBlockInput {
