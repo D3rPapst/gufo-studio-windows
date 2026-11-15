@@ -225,7 +225,9 @@ struct RemoteObservation {
 [[nodiscard]] inline PoolSide RemotePoolSide(const RemoteObservation& in) {
   PoolSide side;
   const RemoteHub::ModelView& view = in.view;
-  side.available = view.served && in.reachable;
+  // A draining partner (2.1.8) takes no new pool work: as if gone.
+  side.available = view.served && in.reachable &&
+                   !(view.has_activity && view.activity.draining);
   side.warm = view.status == "loaded" || view.status == "loading";
   const bool theirs = view.has_activity && view.activity.busy && !in.stale;
   side.free = in.ours < static_cast<std::size_t>(kPoolRemoteCapacity) &&

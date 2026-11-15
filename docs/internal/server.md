@@ -1474,6 +1474,58 @@ it. Submitting a job and the pool's LoRA check stay capability-only, so a
 passing failure never turns into `400 no_capable_router`. A router older
 than this sends no field, which counts as available.
 
+### Maintenance drain (2.1.8)
+
+A machine in the pool never became quiet for a maintenance pause while
+the partner kept sending it work: `pause-run.ps1` waits for 30 quiet
+seconds, and on 15.11. the .56 sent pool requests (qwen-image) to the
+.198 without a break for over 40 minutes. The drain stops new partner
+work without touching the placement (which only an admin may change).
+
+- `POST /router/pool/drain {"an": true|false, "grund": "..."}` turns it
+  on or off; `GET /router/pool/drain` reads it. Both answer `{"an",
+  "grund", "seit" (unix seconds, null when off), "seit_s", "abgelehnt"
+  (relayed requests refused since the start)}`; `/router/status` carries
+  the same object as `"pool_drain"`. Switching is admin control (the
+  gate's `kAdminControl`, like `/router/placement`): an admin, loopback
+  (with the CSRF rule for browsers), never the partner and never a
+  user (`403`); reading is open to any user. Bad body: `400
+  invalid_drain`. Logged as `event=pool_drain an=1 grund="..."`.
+- While on, a `POST` the partner relays here (`X-Gufo-Forwarded`) that
+  would start new work (a pool model request, `/v1/figuren`,
+  `/v1/vision/detect`) gets `503 pool_busy` with `Retry-After: 30`
+  (`event=pool_drain_refused`). That is the answer every partner
+  version already handles without an error at its client: its pool
+  takes a `503` as "partner failed" and runs the request itself at once
+  (and keeps the model off this machine for 60 s, see *Pool failures*);
+  its CPU queue runs anything but a success or `400` itself; its job
+  store puts a job that got `pool_busy` back at the front of its queue.
+  Video, music and 3D creates relayed in the few seconds before the
+  partner's probe sees the drain are the exception: its pool does not
+  retry those, so the client gets the `503`.
+- Passes as before: every request that does not come from the partner,
+  reads (`GET`: job status, `/v1/models`, previews), job relays
+  (`/v1/jobs/...`), the pool's own paths (`/router/pool/pull`,
+  `/router/pool/filter`, ...), model control, and the requests of a job
+  this router pulled from the partner before the drain (`X-Gufo-Job` in
+  its `pulling` list): work already running here always finishes.
+- The probe sees it: each model's `"activity"` in `GET /v1/models` adds
+  `"draining": true` and reports `"busy"` and `"others_busy"` as true
+  (an older partner, which does not know the field, then sees the
+  machine occupied and does not pick it); a partner of 2.1.8 treats a
+  draining machine as gone (`RemotePoolSide`: not available), so it also
+  runs its own requests beside its own GPU work instead of waiting.
+  `GET /router/capabilities` adds `"draining": true` and marks every
+  model `"available": false, "unavailable": "draining"`, so the owner
+  hands this router no job to pull; this router's own runners pull
+  nothing while draining (`may_pull` answers "draining"). The partner may
+  still pull jobs from here: that only takes work away.
+- Memory only: a restarted router starts with the drain off.
+  `pause-run.ps1` turns it on at the start of its wait for quiet (`grund
+  = "pause <name>"`), turns it off again when it gives up before the
+  pause, and leaves it to the restart otherwise. A router older than
+  2.1.8 answers `404` to the POST; the script then waits as before.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same

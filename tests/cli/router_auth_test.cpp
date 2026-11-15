@@ -509,6 +509,11 @@ void TestClassify() {
         Kind::kAdminControl);
   CHECK(auth::Classify(Req("GET", "/router/placement", "x")).kind ==
         Kind::kAnyUser);
+  // Maintenance drain (2.1.8): switching it is admin control, reading not.
+  CHECK(auth::Classify(Req("POST", "/router/pool/drain", "x")).kind ==
+        Kind::kAdminControl);
+  CHECK(auth::Classify(Req("GET", "/router/pool/drain", "x")).kind ==
+        Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/v1/models", "x")).kind == Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/router/status", "x")).kind == Kind::kAnyUser);
   CHECK(auth::Classify(Req("GET", "/router/partner/status", "x")).kind ==
@@ -797,6 +802,16 @@ void TestAreasAndJobs() {
   r = f.Serve(Req("POST", "/router/pool/pull", "192.168.178.50", "{}",
                   {{"Cookie", tim}}));
   CHECK_EQ(r.status, 403);
+  // The maintenance drain (2.1.8): admin only, reading for everyone.
+  r = f.Serve(Req("POST", "/router/pool/drain", "192.168.178.50",
+                  "{\"an\":true}", {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("GET", "/router/pool/drain", "192.168.178.50", "",
+                  {{"Cookie", tim}}));
+  CHECK_EQ(r.status, 200);
+  r = f.Serve(Req("POST", "/router/pool/drain", "192.168.178.50",
+                  "{\"an\":true}", {{"Cookie", admin}}));
+  CHECK_EQ(r.status, 200);
   // Admin sees everything, even a closed-looking area.
   r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
                   "{\"model\":\"qwen-image-2.1\",\"prompt\":\"Haus\"}",
@@ -1006,6 +1021,18 @@ void TestPoolSecret() {
   r = f.Serve(Req("POST", "/router/placement", "192.168.100.56", "{}",
                   {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK_EQ(r.status, 403);
+  // The partner may not switch this router's drain (2.1.8).
+  r = f.Serve(Req("POST", "/router/pool/drain", "192.168.100.56",
+                  "{\"an\":false}", {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
+  CHECK_EQ(r.status, 403);
+  // The machine itself (pause-run.ps1 on 127.0.0.1) counts as admin.
+  r = f.Serve(Req("POST", "/router/pool/drain", "127.0.0.1",
+                  "{\"an\":true,\"grund\":\"pause\"}"));
+  CHECK_EQ(r.status, 200);
+  // An anonymous LAN client may not switch it.
+  r = f.Serve(Req("POST", "/router/pool/drain", "192.168.178.50",
+                  "{\"an\":true}"));
+  CHECK(r.status == 401 || r.status == 403);
   r = f.Serve(Req("DELETE", "/v1/jobs?older_than=1", "192.168.100.56", "",
                   {{"X-Gufo-Pool-Key", "sehr-geheim"}}));
   CHECK_EQ(r.status, 403);
@@ -2626,6 +2653,12 @@ void TestModes() {
     r = f.Serve(Req("POST", "/router/pool/pull", "127.0.0.1", "{}",
                     {{"Origin", "http://boese.example"}, {"Host", "127.0.0.1:8081"}}));
     CHECK_EQ(r.status, 403);
+    r = f.Serve(Req("POST", "/router/pool/drain", "127.0.0.1", "{\"an\":true}",
+                    {{"Sec-Fetch-Site", "cross-site"}}));
+    CHECK_EQ(r.status, 403);
+    CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+    r = f.Serve(Req("POST", "/router/pool/drain", "127.0.0.1", "{\"an\":true}"));
+    CHECK_EQ(r.status, 200);  // pause-run.ps1: loopback, no browser
     CHECK(!f.store->Find("csrf").has_value());
     r = f.Serve(Req("POST", "/models/unload", "127.0.0.1", "{}",
                     {{"Origin", "http://127.0.0.1:8096"}, {"Host", "127.0.0.1:8081"}}));

@@ -130,6 +130,10 @@ constexpr std::string_view kPresetGrammar =
     "    invalid_priority.\n"
     "    GET /v1/models lists per model \"activity\" {busy, gpu_busy,\n"
     "    others_busy} (read by the partner's probe) and \"inflight\".\n"
+    "    POST /router/pool/drain {\"an\": true|false, \"grund\"} (2.1.8,\n"
+    "    admin or loopback): while on, new work the partner relays here\n"
+    "    gets 503 pool_busy (it runs it itself) and the probe reports\n"
+    "    \"draining\"; own requests run as before. Memory only.\n"
     "\n"
     "    [router]              users and access control (2.0.3), optional:\n"
     "      auth = off                   off (default): everyone may use\n"
@@ -1045,6 +1049,18 @@ public:
   std::optional<json::Value> partner_caps_;
   std::chrono::steady_clock::time_point partner_caps_at_{};
   bool partner_caps_old_logged_{false};
+  /// POST /router/pool/drain (2.1.8): while on, new work the partner
+  /// relays here (pool, CPU services) is refused with 503 pool_busy, so
+  /// the partner computes it itself; /v1/models and /router/capabilities
+  /// report "draining" so it stops picking this machine. Own requests and
+  /// work already running are untouched. Memory only: a restart starts
+  /// with it off. The flag is read without a lock; reason and time under
+  /// drain_mutex_ (never nested inside the state mutex).
+  std::atomic<bool> draining_{false};
+  std::mutex drain_mutex_;
+  std::string drain_reason_;
+  std::chrono::system_clock::time_point drain_since_{};
+  std::atomic<long long> drain_refused_{0};
   /// Where the pool put each job's request (X-Gufo-Job), state mutex:
   /// "wait" while it waits for a machine, then "local" or "remote"; the
   /// job store reads it for running_on / position and may redirect a
@@ -1180,6 +1196,10 @@ public:
       return RouterStatus();
     if (req.path == "/router/placement")
       return PlacementControl(req);
+    if (req.path == "/router/pool/drain")
+      return DrainControl(req);
+    if (auto refused = RefuseWhileDraining(req))
+      return std::move(*refused);
     if (req.method == "GET" && req.path == "/router/capabilities")
       return JsonOk(Capabilities());
     if (req.method == "GET" && req.path.starts_with("/router/partner/"))
@@ -1644,6 +1664,14 @@ public:
       out["gpu_busy_reason"] = reason;
     out["others_busy"] =
         OthersBusyLocked(model_id, false, /*count_waiting=*/false);
+    if (draining_.load()) {
+      // Draining (2.1.8): a partner of this version leaves this machine
+      // out (RemotePoolSide); an older one sees it occupied and does not
+      // pick it either.
+      out["draining"] = true;
+      out["busy"] = true;
+      out["others_busy"] = true;
+    }
     return out;
   }
 
@@ -1654,6 +1682,10 @@ public:
   /// claimed or waits (12.11. 17:34 and 17:50 the .56 pulled while its GPU
   /// ran ComfyUI and the film). *why gets the reason.
   bool MayPull(const std::string& model_id, std::string* why) {
+    if (draining_.load()) {
+      *why = "draining";
+      return false;
+    }
     const std::lock_guard<std::mutex> lock(mutex);
     if (registry.Busy(model_id)) {
       *why = model_id + " busy";
@@ -2186,6 +2218,120 @@ public:
       out["fallbacks"] = 0LL;
     }
     return out;
+  }
+
+  /// GET /router/pool/drain and the "pool_drain" of /router/status.
+  json::Value DrainJson() {
+    json::Value out = json::Value::object();
+    const bool on = draining_.load();
+    out["an"] = on;
+    {
+      const std::lock_guard<std::mutex> lock(drain_mutex_);
+      out["grund"] = on ? json::Value(drain_reason_) : json::Value();
+      if (on) {
+        const auto since = drain_since_;
+        out["seit"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                since.time_since_epoch())
+                .count());
+        out["seit_s"] = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now() - since)
+                .count());
+      } else {
+        out["seit"] = json::Value();
+      }
+    }
+    out["abgelehnt"] = drain_refused_.load();
+    return out;
+  }
+
+  /// GET|POST /router/pool/drain (2.1.8). POST {"an": true|false,
+  /// "grund": "..."} turns draining on or off (admin or loopback, the
+  /// gate's kAdminControl rule; the partner may not); the answer is the
+  /// state as GET gives it: {"an", "grund", "seit", "seit_s",
+  /// "abgelehnt"}. Not persisted.
+  HttpResponse DrainControl(const HttpRequest& req) {
+    if (req.method == "POST") {
+      json::Value body;
+      try {
+        body = json::parse(req.body);
+      } catch (const std::exception&) {
+        return Err(400, "Bad Request", "request body must be JSON",
+                   "invalid_request_error", "invalid_json");
+      }
+      const json::Value* on = body.is_object() ? body.find("an") : nullptr;
+      if (on == nullptr || !on->is_bool()) {
+        return Err(400, "Bad Request",
+                   "send {\"an\": true|false, \"grund\": \"...\"}",
+                   "invalid_request_error", "invalid_drain");
+      }
+      const bool want = on->as_bool();
+      const std::string reason = body.member_str("grund");
+      bool was = false;
+      {
+        const std::lock_guard<std::mutex> lock(drain_mutex_);
+        was = draining_.load();
+        if (want) {
+          if (!was)
+            drain_since_ = std::chrono::system_clock::now();
+          drain_reason_ = reason;
+        } else {
+          drain_reason_.clear();
+        }
+        draining_.store(want);
+      }
+      if (was != want)
+        Logger::Info("router", std::string("event=pool_drain an=") +
+                                   (want ? "1" : "0") + " grund=\"" +
+                                   reason + "\"");
+    } else if (req.method != "GET" && req.method != "HEAD") {
+      return Err(405, "Method Not Allowed", "method is not allowed",
+                 "invalid_request_error", "method_not_allowed");
+    }
+    return JsonOk(DrainJson());
+  }
+
+  /// While draining: new work the partner relays here (a POST with
+  /// X-Gufo-Forwarded: a pool model request, a CPU service) gets 503
+  /// pool_busy with Retry-After. The partner's pool takes a 503 as
+  /// "partner failed": it runs the request itself at once and keeps the
+  /// model off this machine for kPoolRemoteFailHold; its CPU queue runs
+  /// anything but a success or 400 itself; its job store puts a job that
+  /// got pool_busy back at the front of its queue. Passes: reads, job
+  /// relays (/v1/jobs), the pool's control paths (/router/...), model
+  /// control, and the requests of a job this router pulled from the
+  /// partner before (X-Gufo-Job in its pulling list: it runs to its end).
+  /// Called without the state mutex (the job store has its own lock).
+  std::optional<HttpResponse> RefuseWhileDraining(const HttpRequest& req) {
+    if (!draining_.load() || req.method != "POST")
+      return std::nullopt;
+    const std::string forwarded_by = req.header(router::kForwardedHeader);
+    if (forwarded_by.empty() || req.path.starts_with("/router/") ||
+        req.path == "/v1/jobs" || req.path.starts_with("/v1/jobs/") ||
+        req.path.starts_with("/models/"))
+      return std::nullopt;
+    const std::string job = req.header(router::jobs::kJobHeader);
+    if (!job.empty() && jobs != nullptr && jobs->Pulling(job))
+      return std::nullopt;
+    ++drain_refused_;
+    std::string reason;
+    {
+      const std::lock_guard<std::mutex> lock(drain_mutex_);
+      reason = drain_reason_;
+    }
+    Logger::Info("router", "event=pool_drain_refused path=" + req.path +
+                               " forwarded_by=" + forwarded_by +
+                               (job.empty() ? std::string()
+                                            : " job=" + job));
+    HttpResponse refused =
+        Err(503, "Service Unavailable",
+            "this router is draining for maintenance" +
+                (reason.empty() ? std::string() : " (" + reason + ")") +
+                "; run the request on your own machine",
+            "server_error", "pool_busy");
+    refused.headers.emplace_back("Retry-After", "30");
+    return refused;
   }
 
   /// GET|POST /router/placement. POST {"model": id, "placement":
@@ -3448,7 +3594,9 @@ public:
         model["switchable"] = preset->switchable;
         model["status"] = std::string(status);
         model["loaded"] = status == "loaded";
-        const std::string unavailable = UnavailableLocked(preset->id, status);
+        std::string unavailable = UnavailableLocked(preset->id, status);
+        if (unavailable.empty() && draining_.load())
+          unavailable = "draining";
         model["available"] = unavailable.empty();
         if (!unavailable.empty())
           model["unavailable"] = unavailable;
@@ -3470,6 +3618,7 @@ public:
     out["partner"] = partner_name.empty() ? json::Value()
                                           : json::Value(partner_name);
     out["models"] = std::move(models);
+    out["draining"] = draining_.load();
     return out;
   }
 
@@ -3609,6 +3758,7 @@ public:
       // and handed to it.
       body["pool_queue"] = jobs->PoolQueueStatus();
     }
+    body["pool_drain"] = DrainJson();
     return HttpResponse{.status = 200,
                         .reason = "OK",
                         .body = body.dump(),

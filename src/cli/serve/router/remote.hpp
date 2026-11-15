@@ -91,6 +91,9 @@ struct RemoteActivity {
   /// Pool requests of this model waiting there for a machine (0 from a
   /// router older than the field).
   long long waiting{0};
+  /// The router there is draining (2.1.8, POST /router/pool/drain): it
+  /// refuses new pool work, so the pool leaves it out.
+  bool draining{false};
 };
 
 /// One GET /v1/models against a remote router.

@@ -3025,6 +3025,11 @@ bool JobQueue::TryPull(int mine_priority, long long mine_created_at) {
   return true;
 }
 
+bool JobQueue::Pulling(const std::string& id) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return std::find(pulling_.begin(), pulling_.end(), id) != pulling_.end();
+}
+
 void JobQueue::WaitForPulled(const std::string& id) {
   int failures = 0;
   for (;;) {

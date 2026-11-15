@@ -301,6 +301,45 @@ void TestWaitingIsNotBusy() {
   CHECK(!RemotePoolSide(seen).available);
 }
 
+/// 2.1.8: a router in maintenance drain (POST /router/pool/drain)
+/// reports "draining" (and busy, for partners older than the field); the
+/// pool leaves it out like a partner that is gone.
+void TestDrainingPartner() {
+  using gufo::router::RemoteObservation;
+  using gufo::router::RemotePoolSide;
+  const std::vector<gufo::router::PresetModel> presets = {PoolTwin()};
+  gufo::router::RemoteHub hub(presets);
+  const auto& url = presets[0].remote->url;
+  RemoteObservation seen;
+  seen.reachable = true;
+  seen.view = ProbedView(
+      hub, url, R"({"busy":false,"gpu_busy":false,"others_busy":false})");
+  CHECK(!seen.view.activity.draining);  // missing field: not draining
+  CHECK(RemotePoolSide(seen).available);
+  CHECK(Choose(Warm(false), RemotePoolSide(seen)) == PoolChoice::kRemote);
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"waiting":0,"gpu_busy":false,)"
+                         R"("others_busy":true,"draining":true})");
+  CHECK(seen.view.activity.draining);
+  const PoolSide drained = RemotePoolSide(seen);
+  CHECK(!drained.available);
+  // Never the draining partner: a cold idle machine here loads at once,
+  // a busy one is waited for, GPU work here no longer holds it back.
+  CHECK(Choose(Cold(), drained) == PoolChoice::kLocal);
+  CHECK(Choose(Warm(false), drained) == PoolChoice::kWait);
+  PoolSide gpu = Cold();
+  gpu.gpu_busy = true;
+  CHECK(Choose(gpu, drained) == PoolChoice::kLocal);
+  // A partner older than the field reads only "busy": it does not pick
+  // the draining machine either (after the hysteresis it loads its own).
+  RemoteObservation old_reader = seen;
+  old_reader.view.activity.draining = false;
+  const PoolSide busy = RemotePoolSide(old_reader);
+  CHECK(busy.available && !busy.free && !busy.idle);
+  CHECK(Choose(Warm(false), busy) == PoolChoice::kWait);
+  CHECK(Choose(Cold(), busy, std::chrono::seconds(11)) == PoolChoice::kLocal);
+}
+
 gufo::router::PresetModel PoolTwin() {
   gufo::router::PresetModel model;
   model.modality = "llm";
@@ -644,6 +683,7 @@ int main() {
   TestRemoteAnswerClassification();
   TestWaitingIsNotBusy();
   TestProbeActivity();
+  TestDrainingPartner();
   TestGpuSlotIdle();
   TestRegistryCounts();
   TestFallback();

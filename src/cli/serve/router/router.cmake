@@ -112,6 +112,17 @@ if (BUILD_TESTING)
   set_tests_properties(router_pool_relay_test PROPERTIES
     LABELS "cpu;router" TIMEOUT 90)
 
+  # Maintenance drain (2.1.8): two `gufo router` processes as pool partners.
+  add_executable(router_pool_drain_test tests/cli/router_pool_drain_test.cpp)
+  target_link_libraries(router_pool_drain_test PRIVATE gufo_router)
+  target_compile_options(router_pool_drain_test PRIVATE
+    ${gufo_router_test_undebug})
+  add_dependencies(router_pool_drain_test gufo)
+  add_test(NAME router_pool_drain_test
+    COMMAND router_pool_drain_test $<TARGET_FILE:gufo>)
+  set_tests_properties(router_pool_drain_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 120)
+
   # The ComfyUI graph translator alone: no server library needed.
   foreach (router_test IN ITEMS router_comfy_graph_test
       router_comfy_control_test router_comfy_h3_test)

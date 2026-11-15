@@ -1192,10 +1192,13 @@ Route Classify(const HttpRequest& req) {
   if (p == "/v1/jobs" || p.starts_with("/v1/jobs/") ||
       p == "/router/partner/jobs")
     return set(Route::Kind::kJobs, "ablage");
+  // POST /router/pool/drain (2.1.8): admin or loopback, never the partner.
   if (post && (p == "/models/load" || p == "/models/unload" ||
-               p == "/router/placement" || p == "/router/pool/pull"))
+               p == "/router/placement" || p == "/router/pool/pull" ||
+               p == "/router/pool/drain"))
     return set(Route::Kind::kAdminControl);
   if (p == "/router/status" || p == "/router/capabilities" ||
+      p == "/router/pool/drain" ||
       p == "/router/partner/status" || p == "/router/partner/capabilities" ||
       p == "/router/placement" || p == "/v1/models" || p == "/models" ||
       p == "/v1/metrics" || p == "/metrics" || p == "/v1/names" ||

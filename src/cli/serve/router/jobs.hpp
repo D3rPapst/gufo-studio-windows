@@ -493,6 +493,9 @@ public:
   /// there (null when unknown), "pulled": jobs this router fetched from the
   /// partner, "pushed": jobs handed to the partner, ...}.
   json::Value PoolQueueStatus();
+  /// Whether `id` is a partner job this router pulled and still waits for
+  /// (its requests may run here while the router drains, 2.1.8).
+  bool Pulling(const std::string& id);
 
   struct Job;
 

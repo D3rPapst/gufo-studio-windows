@@ -273,7 +273,8 @@ void ParseRemoteModels(const std::string& body, RemoteProbe* probe) {
           flag("busy"), flag("gpu_busy"), flag("others_busy"),
           waiting != nullptr && waiting->is_number()
               ? static_cast<long long>(waiting->as_double())
-              : 0LL};
+              : 0LL,
+          flag("draining")};
     }
   }
 }
