@@ -37,6 +37,12 @@
         "testing"
       ]
     },
+    "ocr_latin_test": {
+      "role": "test",
+      "requires": [
+        "testing"
+      ]
+    },
     "pose_oracle_test": {
       "role": "test",
       "requires": [

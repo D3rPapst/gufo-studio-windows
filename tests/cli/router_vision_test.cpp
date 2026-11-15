@@ -280,10 +280,18 @@ void TestParse() {
   r = vision::ParseRequest(ocr_body);
   assert(r.ocr.size() == 2 && r.ocr_list && r.ocr[0].scale == 1 && r.ocr[1].scale == 3 &&
          r.ocr[1].box_threshold == 0.5 && r.ocr[1].heat_threshold == 0.4);
+  // "rec": the recognizer per pass, ch_v4 (imgutils) unless named.
+  assert(r.ocr[0].rec == "ch_v4" && r.ocr[1].rec == "ch_v4");
+  ocr_body["ocr"] = json::parse(R"([{"rec": "latin_v5"}, {"scale": 3}])");
+  r = vision::ParseRequest(ocr_body);
+  assert(r.ocr.size() == 2 && r.ocr[0].rec == "latin_v5" && r.ocr[1].rec == "ch_v4");
+  ocr_body["ocr"] = json::parse(R"({"rec": "ch_v4"})");
+  assert(vision::ParseRequest(ocr_body).ocr[0].rec == "ch_v4");
   for (const char* bad_options :
        {R"({"scale": 0})", R"({"scale": 2.5})", R"({"scale": 5})", R"({"box_threshold": 0})",
         R"({"heat_threshold": "x"})", R"({"unclip_ratio": -1})", R"({"box": 0.5})", R"([])",
-        R"([{}, {}, {}, {}, {}])", R"([1])", R"("fast")"}) {
+        R"([{}, {}, {}, {}, {}])", R"([1])", R"("fast")", R"({"rec": "german"})",
+        R"({"rec": 5})", R"({"rec": "LATIN_V5"})"}) {
     assert(Throws([&] {
       json::Value bad = Body("AAAA", {"ocr"});
       bad["ocr"] = json::parse(bad_options);
@@ -682,6 +690,28 @@ void TestReal(const char* dir, const char* frame) {
     }
     std::cout << "ocr passes: " << per_pass[0].size() << " texts plain, " << per_pass[1].size()
               << " texts 3x, " << jp.member_double("seconds") << " s\n";
+    // latin_v5 (German umlauts): its own recognizer beside ch_v4 in one
+    // request, 503 naming the file when it is not converted.
+    json::Value both = Body(data_url, {"ocr"});
+    both["ocr"] = json::parse(R"([{"rec": "latin_v5"}, {"rec": "ch_v4"}])");
+    response = service.Handle(Post(both));
+    if (std::filesystem::exists(std::filesystem::path(dir) / "latin_PP-OCRv5_mobile_rec.dict.txt")) {
+      assert(response->status == 200);
+      const json::Value jl = json::parse(response->body);
+      const auto& latin_infos = jl.find("models")->find("ocr")->items();
+      assert(latin_infos[0].member_str("rec") == "latin_v5" &&
+             latin_infos[0].member_str("rec_model") == "latin_PP-OCRv5_mobile_rec" &&
+             latin_infos[0].member_str("rec_repo") == "monkt/paddleocr-onnx");
+      assert(latin_infos[1].member_str("rec_model") == "ch_PP-OCRv4_rec");
+      // Same detector: the same boxes in both passes.
+      const auto& lists = jl.find("detections")->find("ocr")->items();
+      assert(lists[0].size() == lists[1].size());
+      for (const json::Value& t : lists[0].items())
+        std::cout << "latin_v5: " << t.member_str("text") << '\n';
+    } else {
+      assert(response->status == 503);
+      assert(response->body.find("latin_PP-OCRv5_mobile_rec.safetensors") != std::string::npos);
+    }
   }
   // Ablage path through the scripted gate: same answer.
   HttpRequest ablage = Post(Body("/v1/jobs/abc/files/frame.png", {"person"}));

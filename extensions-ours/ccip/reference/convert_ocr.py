@@ -24,12 +24,12 @@ from safetensors.numpy import save_file
 # Ops implemented by cpu/ocr_net.cpp (with the attributes listed in SUPPORTED_ATTRS).
 SUPPORTED = {
     "Add", "AveragePool", "BatchNormalization", "Cast", "Clip", "Concat", "Conv", "ConvTranspose", "Div",
-    "GlobalAveragePool", "HardSigmoid", "MatMul", "Mul", "Pow", "ReduceMean", "Relu", "Reshape", "Resize",
-    "Shape", "Sigmoid", "Slice", "Softmax", "Sqrt", "Squeeze", "Sub", "Transpose",
+    "GlobalAveragePool", "HardSigmoid", "HardSwish", "MatMul", "Mul", "Pow", "ReduceMean", "Relu", "Reshape", "Resize",
+    "Shape", "Sigmoid", "Slice", "Softmax", "Sqrt", "Squeeze", "Sub", "Transpose", "Unsqueeze",
 }
 SUPPORTED_ATTRS = {
     "AveragePool": {"ceil_mode", "count_include_pad", "kernel_shape", "pads", "strides"},
-    "BatchNormalization": {"epsilon", "momentum"},
+    "BatchNormalization": {"epsilon", "momentum", "training_mode"},
     "Cast": {"to"},
     "Clip": {"min", "max"},
     "Concat": {"axis"},
@@ -37,10 +37,12 @@ SUPPORTED_ATTRS = {
     "ConvTranspose": {"dilations", "group", "kernel_shape", "pads", "strides"},
     "HardSigmoid": {"alpha", "beta"},
     "ReduceMean": {"axes", "keepdims"},
+    "Reshape": {"allowzero"},
     "Resize": {"coordinate_transformation_mode", "mode", "nearest_mode"},
     "Softmax": {"axis"},
     "Squeeze": {"axes"},
     "Transpose": {"perm"},
+    "Unsqueeze": {"axes"},
 }
 
 
@@ -101,6 +103,10 @@ def main():
             assert attrs.get("coordinate_transformation_mode") == "asymmetric"
         if n.op_type == "AveragePool":
             assert attrs.get("ceil_mode", 0) == 0 and not any(attrs.get("pads", [0])), n.name
+        if n.op_type == "Reshape":
+            assert attrs.get("allowzero", 0) == 0, n.name  # 0 copies the input dim (the runtime's rule)
+        if n.op_type == "BatchNormalization":
+            assert attrs.get("training_mode", 0) == 0, n.name  # inference form only
         if n.op_type == "Cast":
             assert attrs["to"] in (1, 6, 7), n.name
         nodes.append(OrderedDict(op=n.op_type, inputs=list(n.input), outputs=list(n.output), attrs=attrs))

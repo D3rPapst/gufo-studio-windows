@@ -30,8 +30,11 @@ the requests instead of letting several processes compete for the cores.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per detector; for `ocr` `heat` and `box`. Each in (0, 1].
 - `ocr`: one object or a list of up to 4 passes: `heat_threshold` (0.3), `box_threshold`
-  (0.7), `unclip_ratio` (2.0) and `scale` (1 to 4, the image enlarged with Pillow's LANCZOS,
-  boxes divided back as decimals). The list above is the pipeline's text search.
+  (0.7), `unclip_ratio` (2.0), `scale` (1 to 4, the image enlarged with Pillow's LANCZOS,
+  boxes divided back as decimals) and `rec`, the text recognizer: `"ch_v4"` (default,
+  imgutils' PP-OCRv4: Chinese and Latin without umlauts) or `"latin_v5"` (PP-OCRv5 latin:
+  German `ä ö ü Ä Ö Ü ß`, French, Polish and 29 more Latin-script languages). The list
+  above is the pipeline's text search; `{"rec": "latin_v5"}` reads German text.
 - `brighten_dark`: optional. `true` runs the detectors on a brightened copy (each channel
   `round(255 * (v / 255) ** 0.5)`) when the mean brightness (Pillow `L`) is below 70; `{"below": 50, "gamma": 0.7}` changes both
   values. The boxes still refer to your image. OCR and tags always read the original.
@@ -65,7 +68,8 @@ the requests instead of letting several processes compete for the cores.
   `score` is imgutils' unrounded value; `seconds`: compute time, `queue_seconds`: CPU wait.
 - `ocr`: the box, its four corners and the text; `score` is the box score times the
   text score. When you send `ocr` as a list, `detections.ocr` and `models.ocr` are
-  lists with one entry per pass.
+  lists with one entry per pass. `models.ocr` names the recognizer (`rec`, `rec_repo`,
+  `rec_model`).
 - `wd14_tags`: one entry per tagged picture. `source` is `image`, `region` or `person`
   (`index` into your regions or the person list, `box` the cut-out) or `images`.
   Ratings are always listed, the other tags only above their threshold.
@@ -91,6 +95,7 @@ pixels of the original image, also with `brighten_dark`. `"pose_boxes": [[x0, y0
 | `face` | `deepghs/anime_face_detection` `face_detect_v1.4_s` | YOLOv8s | 0.25 / 0.7 | 45 MB | MIT |
 | `hand` | `deepghs/anime_hand_detection` `hand_detect_v1.0_s` | YOLOv8s | 0.35 / 0.7 | 45 MB | OpenRAIL |
 | `ocr` | `deepghs/paddleocr` `ch_PP-OCRv4_det` + `ch_PP-OCRv4_rec` | PP-OCRv4 mobile | heat 0.3 / box 0.7 | 5 + 11 MB | Apache-2.0 |
+| `ocr` `rec: latin_v5` | `monkt/paddleocr-onnx` `languages/latin` (`latin_PP-OCRv5_mobile_rec`, 502 symbols) | PP-OCRv5 latin mobile | as above | 8 MB | Apache-2.0 |
 | `wd14_tags` | `SmilingWolf/wd-swinv2-tagger-v3` + `selected_tags.csv` | SwinV2-B, 448 px | 0.35 / 0.85 | 467 MB | Apache-2.0 |
 | `pose` (persons) | `PekingU/rtdetr_r50vd_coco_o365` | RT-DETR R50-vd | 0.35, 4 persons | 172 MB | Apache-2.0 |
 | `pose` | `usyd-community/vitpose-base-simple` | ViTPose-B | - | 344 MB | Apache-2.0 |
@@ -100,7 +105,14 @@ The detectors, OCR and tagger are the defaults of dghs-imgutils 0.19, the pose m
 follow the film pipeline (transformers 5.18, onnxruntime). The router loads the converted files from `--vision-dir` (Windows default `D:\llm-modelle\gufo\modelle\deepghs\vision\gufo`)
 on first use; the converters are in the server reference below.
 
-The OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and `ß`; those come out as similar letters (`Bahnhofstraße` reads as `BahnhofstraBe`).
+The default OCR model reads Chinese and Latin script. Its alphabet lacks `ö`, `Ö`, `Ä` and `ß`; those come out as similar letters (`Bahnhofstraße` reads as `BahnhofstraBe`).
+`"rec": "latin_v5"` keeps the same detector and reads the lines with PaddleOCR's PP-OCRv5
+latin recognizer (the community ONNX export of `monkt/paddleocr-onnx`, converted with
+`convert_ocr.py`; repeated symbols are merged as in PaddleOCR). On 160 rendered German
+lines (8 fonts, 20 to 48 px, some blurred or light on dark) it read 159 exactly (character
+error rate 0.06 %), the default 15 (8.0 %); the one miss is an en dash read as `-`. On
+four rendered signs (12 lines) the whole pipeline read 11 lines exactly with `latin_v5`
+and none with `ch_v4`.
 
 ## Limits and errors
 

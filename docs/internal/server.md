@@ -500,7 +500,8 @@ Router:
   --ccip-threads <N>            CPU threads for "verfahren": "ccip" (default: 8)
   --vision-dir <DIR>            Models for POST /v1/vision/detect (tasks person, head, face, hand,
                                 pose, pose_wholebody, ocr, wd14_tags: <model>.safetensors + .json, ocr also
-                                ch_PP-OCRv4_rec.dict.txt; each loaded on first use)
+                                ch_PP-OCRv4_rec.dict.txt, "rec": "latin_v5" the three
+                                latin_PP-OCRv5_mobile_rec files; each loaded on first use)
   --vision-threads <N>          CPU threads for /v1/vision/detect (default: 8)
   --vision-queue <N>            Requests of the shared CPU queue (/v1/vision/detect, /v1/figuren
                                 ccip) that may wait behind the running one before 503 busy (default: 4)
@@ -1079,6 +1080,27 @@ convex hull, rotating calipers, `boxPoints`, `fillPoly`) and Clipper 6.4.2
 `ch_PP-OCRv4_rec.{safetensors,json}`, `ch_PP-OCRv4_rec.dict.txt` (~16 MB,
 loaded on the first ocr request; missing: `503 vision_unavailable`). An
 empty rectangle gives empty text with score 0 (imgutils would raise).
+German (2.1.6): a pass with `"rec": "latin_v5"` (`OcrPass::rec`, default
+`"ch_v4"`) keeps the detector and recognizes with PP-OCRv5 latin mobile
+(`latin_PP-OCRv5_mobile_rec`: PP-LCNetV3 + SVTR neck, CTC over `<blank>` + 502
+symbols + space, umlauts and `ß` included, 7.8 MB). Source: the community ONNX
+export `monkt/paddleocr-onnx` `languages/latin/rec.onnx` + `dict.txt`
+(Apache-2.0, revision 7b02d0a3; opset 14, so `ocr_net.cpp` gained HardSwish,
+Unsqueeze, Squeeze/Unsqueeze axes as an input and the opset-13 Softmax rule),
+converted with `convert_ocr.py <rec.onnx> <vision-dir> latin_PP-OCRv5_mobile_rec
+<dict.txt>`. Its CTC decoding merges repeated symbols like PaddleOCR's
+`CTCLabelDecode` (without that 11 of 160 German lines are right, with it 159).
+The current `PaddlePaddle/latin_PP-OCRv5_mobile_rec` inference model on Hugging
+Face is a later training with 836 symbols; on the same 160 lines it read 156
+(Paddle 3.3.1 CPU), so the 502-symbol export stays. Each recognizer loads once
+(`VisionState::ocrs`); one request may mix them per pass. `models.ocr` names
+`rec`, `rec_repo` and `rec_model`. Test: `ccip.ocr_latin` (`ocr_latin_test`,
+env `GUFO_OCR_DIR`, `GUFO_OCR_LATIN_ORACLE` from
+`reference/make_ocr_latin_oracle.py`): logits within 2e-3 of onnxruntime on 30
+rendered German lines (worst 8.7e-5), the same greedy text, at least 29 of 30
+exactly right (30), and the whole pipeline on four rendered signs (latin_v5 11
+of 12 lines exact, ch_v4 0; the v4 detector finds no box for the twelfth).
+
 Test: `ccip.ocr_oracle` (`ocr_oracle_test`, env `GUFO_OCR_DIR`,
 `GUFO_OCR_ORACLE`) against `reference/make_ocr_oracle.py`, which runs
 imgutils itself (`--render` draws German and English name plates, signs and

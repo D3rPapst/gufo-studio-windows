@@ -33,8 +33,8 @@ using Shape = std::vector<std::int64_t>;
 
 enum class Op {
   kAdd, kAveragePool, kBatchNorm, kCast, kClip, kConcat, kConv, kConvTranspose, kDiv,
-  kGlobalAveragePool, kHardSigmoid, kMatMul, kMul, kPow, kReduceMean, kRelu, kReshape, kResize,
-  kShape, kSigmoid, kSlice, kSoftmax, kSqrt, kSqueeze, kSub, kTranspose,
+  kGlobalAveragePool, kHardSigmoid, kHardSwish, kMatMul, kMul, kPow, kReduceMean, kRelu, kReshape,
+  kResize, kShape, kSigmoid, kSlice, kSoftmax, kSqrt, kSqueeze, kSub, kTranspose, kUnsqueeze,
 };
 
 Op ParseOp(const std::string& s) {
@@ -43,12 +43,13 @@ Op ParseOp(const std::string& s) {
       {"BatchNormalization", Op::kBatchNorm}, {"Cast", Op::kCast}, {"Clip", Op::kClip},
       {"Concat", Op::kConcat}, {"Conv", Op::kConv}, {"ConvTranspose", Op::kConvTranspose},
       {"Div", Op::kDiv}, {"GlobalAveragePool", Op::kGlobalAveragePool},
-      {"HardSigmoid", Op::kHardSigmoid}, {"MatMul", Op::kMatMul}, {"Mul", Op::kMul},
+      {"HardSigmoid", Op::kHardSigmoid}, {"HardSwish", Op::kHardSwish},
+      {"MatMul", Op::kMatMul}, {"Mul", Op::kMul},
       {"Pow", Op::kPow}, {"ReduceMean", Op::kReduceMean}, {"Relu", Op::kRelu},
       {"Reshape", Op::kReshape}, {"Resize", Op::kResize}, {"Shape", Op::kShape},
       {"Sigmoid", Op::kSigmoid}, {"Slice", Op::kSlice}, {"Softmax", Op::kSoftmax},
       {"Sqrt", Op::kSqrt}, {"Squeeze", Op::kSqueeze}, {"Sub", Op::kSub},
-      {"Transpose", Op::kTranspose},
+      {"Transpose", Op::kTranspose}, {"Unsqueeze", Op::kUnsqueeze},
   };
   auto it = ops.find(s);
   if (it == ops.end()) Fail("unsupported op " + s);
@@ -231,6 +232,11 @@ void BinaryLoop(const float* pa, const float* pb, float* po, const Shape& dims, 
   }
 }
 
+// ONNX HardSwish: x * max(0, min(1, x / 6 + 1 / 2)) (alpha 1/6 as float, like onnxruntime).
+inline float HardSwish(float v) {
+  return v * std::max(0.0f, std::min(1.0f, (1.0f / 6.0f) * v + 0.5f));
+}
+
 // y[q] = op(a, b) over one tile; a null pointer means the scalar value.
 template <Bin op>
 inline void FusedBinary(const float* xa, float va, const float* xb, float vb, float* y, std::int64_t len) {
@@ -273,6 +279,9 @@ __attribute__((target("avx2"))) void FusedOpTile(const FusedOp& op, const float*
       for (std::int64_t q = 0; q < len; ++q) y[q] = std::min(hi, std::max(lo, xa[q]));
       break;
     }
+    case Op::kHardSwish:
+      for (std::int64_t q = 0; q < len; ++q) y[q] = HardSwish(xa[q]);
+      break;
     default:
       break;
   }
@@ -881,6 +890,22 @@ NetTensor Squeeze(const NetTensor& x, const std::vector<std::int64_t>& axes) {
   return out;
 }
 
+NetTensor Unsqueeze(const NetTensor& x, const std::vector<std::int64_t>& axes) {
+  const std::size_t rank = x.shape.size() + axes.size();
+  std::vector<bool> inserted(rank, false);
+  for (std::int64_t a : axes) {
+    const std::int64_t d = Axis(a, rank);
+    if (inserted[Sz(d)]) Fail("Unsqueeze: repeated axis");
+    inserted[Sz(d)] = true;
+  }
+  NetTensor out = x;
+  Shape os;
+  std::size_t src = 0;
+  for (std::size_t d = 0; d < rank; ++d) os.push_back(inserted[d] ? 1 : x.shape[src++]);
+  out.shape = os;
+  return out;
+}
+
 class CpuOcrNet final : public OcrNet {
 public:
   bool Init(const std::filesystem::path& dir, const std::string& stem, std::string* error) {
@@ -921,6 +946,8 @@ public:
           names[name] = -static_cast<int>(consts_.size());
         }
       }
+      if (const json::Value* op = arch.find("opset"); op != nullptr && op->is_number())
+        opset_ = static_cast<std::int64_t>(op->as_double());
       const std::string input = arch.member_str("input");
       const std::string output = arch.member_str("output");
       input_ = slots_++;
@@ -1025,7 +1052,7 @@ private:
         return n.in.size() == 2 && operand(0) && operand(1) && (n.in[0] >= 0 || n.in[1] >= 0);
       case Op::kPow:
         return n.in.size() == 2 && n.in[0] >= 0 && ScalarConst(n.in[1]) != nullptr;
-      case Op::kRelu: case Op::kSigmoid: case Op::kSqrt: case Op::kHardSigmoid:
+      case Op::kRelu: case Op::kSigmoid: case Op::kSqrt: case Op::kHardSigmoid: case Op::kHardSwish:
         return n.in.size() == 1 && n.in[0] >= 0;
       case Op::kClip:
         if (n.in.empty() || n.in[0] < 0) return false;
@@ -1201,6 +1228,7 @@ private:
       case Op::kSigmoid:
         return Unary(x, [](float v) { return 1.0f / (1.0f + std::exp(-v)); }, r0);
       case Op::kSqrt: return Unary(x, [](float v) { return std::sqrt(v); }, r0);
+      case Op::kHardSwish: return Unary(x, [](float v) { return HardSwish(v); }, r0);
       case Op::kHardSigmoid: {
         const float alpha = static_cast<float>(n.attrs.Float("alpha", 0.2));
         const float beta = static_cast<float>(n.attrs.Float("beta", 0.5));
@@ -1256,18 +1284,37 @@ private:
         return y;
       }
       case Op::kSlice: return Slice(x, in(1), Opt(s, n, 2), Opt(s, n, 3), Opt(s, n, 4));
-      case Op::kSqueeze: return Squeeze(x, n.attrs.List("axes", {}));
+      // opset >= 13: the axes are an int input instead of an attribute.
+      case Op::kSqueeze: return Squeeze(x, AxesOf(n, s));
+      case Op::kUnsqueeze: return Unsqueeze(x, AxesOf(n, s));
       case Op::kReshape: return Reshape(x, in(1));
       case Op::kTranspose: return Transpose(x, n.attrs.List("perm", {}));
       case Op::kReduceMean: return ReduceMeanLast(x, n.attrs);
       case Op::kMatMul: return MatMul(x, in(1));
-      case Op::kSoftmax: return Softmax(x, n.attrs.Int("axis", 1));
+      case Op::kSoftmax: {
+        // opset 13 changed the default axis to -1 and the meaning to one
+        // axis; both agree when it is the last one, which is all that runs.
+        const std::int64_t axis = n.attrs.Int("axis", opset_ >= 13 ? -1 : 1);
+        if (opset_ >= 13 && Axis(axis, x.shape.size()) != static_cast<std::int64_t>(x.shape.size()) - 1)
+          Fail("Softmax over a non-last axis (opset >= 13) is not implemented");
+        return Softmax(x, axis);
+      }
     }
     Fail("unhandled op");
   }
 
+  // Squeeze / Unsqueeze axes: the second (int) input when present, else the attribute.
+  std::vector<std::int64_t> AxesOf(const Node& n, const std::vector<NetTensor>& s) const {
+    if (const NetTensor* t = Opt(s, n, 1)) {
+      if (!t->is_int) Fail("axes must be an int tensor");
+      return t->i;
+    }
+    return n.attrs.List("axes", {});
+  }
+
   std::vector<NetTensor> consts_;
   std::vector<Node> nodes_;
+  std::int64_t opset_{11};
   std::vector<FusedRun> runs_;
   int slots_{0};
   int input_{0};

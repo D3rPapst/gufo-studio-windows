@@ -105,12 +105,15 @@ const std::vector<TaskSpec>& DetectorTasks();
 
 /// One "ocr" pass: imgutils.ocr.ocr keyword arguments (its defaults) and an
 /// enlargement before it (erkennung_schrift.py: 3x Pillow LANCZOS, boxes
-/// divided back by 3).
+/// divided back by 3). `rec` names the text recognizer: "ch_v4" (imgutils'
+/// PP-OCRv4, Chinese + Latin without umlauts) or "latin_v5" (PP-OCRv5 latin
+/// mobile: German umlauts and ß, French, Polish, ...).
 struct OcrPass {
   double heat_threshold{0.3};
   double box_threshold{0.7};
   double unclip_ratio{2.0};
   int scale{1};
+  std::string rec{"ch_v4"};
 };
 inline constexpr std::size_t kMaxOcrPasses = 4;
 inline constexpr int kMaxOcrScale = 4;

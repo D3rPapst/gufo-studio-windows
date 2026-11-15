@@ -140,6 +140,28 @@ if(TARGET ocr_oracle_test)
     TIMEOUT 1200)
 endif()
 
+# "ocr" recognizer latin_v5 (PP-OCRv5 latin, German umlauts) against onnxruntime
+# (reference/make_ocr_latin_oracle.py). Needs GUFO_OCR_DIR (ch_PP-OCRv4_det and
+# latin_PP-OCRv5_mobile_rec from reference/convert_ocr.py) and
+# GUFO_OCR_LATIN_ORACLE; skips (77) otherwise.
+gufo_extension_target(
+  NAME ocr_latin_test
+  SOURCES
+    tests/ocr_latin_test.cpp
+  LINK_LIBRARIES
+    gufo_ccip
+    gufo_ext_runtime
+)
+
+if(TARGET ocr_latin_test)
+  ccip_use_openmp(ocr_latin_test)
+  add_test(NAME ccip.ocr_latin COMMAND ocr_latin_test)
+  set_tests_properties(ccip.ocr_latin PROPERTIES
+    LABELS "ccip;cpu;quality;external-model"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 600)
+endif()
+
 if(TARGET vision_oracle_test)
   ccip_use_openmp(vision_oracle_test)
   add_test(NAME ccip.vision_oracle COMMAND vision_oracle_test)

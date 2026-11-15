@@ -36,7 +36,29 @@ constexpr std::size_t kAblageBytesLimit = static_cast<std::size_t>(20) << 20;
 constexpr const char* kOcrTask = "ocr";
 constexpr const char* kOcrRepo = "deepghs/paddleocr";
 constexpr const char* kOcrDet = "ch_PP-OCRv4_det";
-constexpr const char* kOcrRec = "ch_PP-OCRv4_rec";
+
+/// The text recognizers of "ocr": {"rec": name}. The detector is always
+/// kOcrDet (it finds lines of any script). ch_v4 decodes like imgutils
+/// (repeated symbols kept); latin_v5 like PaddleOCR's CTCLabelDecode
+/// (repeats merged, which the model needs: without it 11 of 160 German test
+/// lines come out right, with it 159).
+struct OcrRecSpec {
+  const char* name;
+  const char* repo;
+  const char* stem;
+  bool remove_duplicate;
+};
+constexpr OcrRecSpec kOcrRecs[] = {
+    {"ch_v4", "deepghs/paddleocr", "ch_PP-OCRv4_rec", false},
+    {"latin_v5", "monkt/paddleocr-onnx", "latin_PP-OCRv5_mobile_rec", true},
+};
+
+const OcrRecSpec* FindOcrRec(std::string_view name) {
+  for (const OcrRecSpec& spec : kOcrRecs)
+    if (name == spec.name)
+      return &spec;
+  return nullptr;
+}
 
 HttpResponse JsonResponse(int status, std::string reason, std::string body) {
   HttpResponse response;
@@ -129,9 +151,13 @@ std::vector<OcrPass> ParseOcr(const json::Value& body, bool requested, const Ocr
           throw std::invalid_argument(what + " must be a whole number from 1 to " +
                                       std::to_string(kMaxOcrScale));
         pass.scale = static_cast<int>(s);
+      } else if (key == "rec") {
+        if (!option.is_string() || FindOcrRec(option.str()) == nullptr)
+          throw std::invalid_argument(what + " must be \"ch_v4\" or \"latin_v5\"");
+        pass.rec = option.str();
       } else {
-        throw std::invalid_argument(what +
-                                    ": use heat_threshold, box_threshold, unclip_ratio or scale");
+        throw std::invalid_argument(
+            what + ": use heat_threshold, box_threshold, unclip_ratio, scale or rec");
       }
     }
     passes.push_back(pass);
@@ -186,9 +212,12 @@ json::Value OcrEntries(const std::vector<models::ccip::OcrText>& texts, int scal
 json::Value OcrModelInfo(const OcrPass& pass) {
   const auto round6 = [](double v) { return std::round(v * 1e6) / 1e6; };
   json::Value model = json::Value::object();
+  const OcrRecSpec* rec = FindOcrRec(pass.rec);
   model["repo"] = kOcrRepo;
   model["model"] = kOcrDet;
-  model["rec_model"] = kOcrRec;
+  model["rec"] = rec->name;
+  model["rec_repo"] = rec->repo;
+  model["rec_model"] = rec->stem;
   model["heat"] = round6(pass.heat_threshold);
   model["box"] = round6(pass.box_threshold);
   model["unclip_ratio"] = round6(pass.unclip_ratio);
@@ -506,7 +535,7 @@ struct VisionState {
   std::mutex load_mutex;
   std::map<std::string, std::unique_ptr<models::ccip::YoloDetector>> detectors;
   std::unique_ptr<models::ccip::Wd14Tagger> wd14;
-  std::unique_ptr<models::ccip::TextOcr> ocr;
+  std::map<std::string, std::unique_ptr<models::ccip::TextOcr>> ocrs;  // by OcrRecSpec::name
   std::unique_ptr<models::ccip::RtDetr> rtdetr;
   std::unique_ptr<models::ccip::VitPose> vitpose;
   std::unique_ptr<models::ccip::DwPose> dwpose;
@@ -602,24 +631,25 @@ struct VisionState {
     return wd14.get();
   }
 
-  /// The text recognizer (detector + recognizer + dictionary), loaded on
-  /// first use; null with *error set.
-  const models::ccip::TextOcr* GetOcr(const Options& options, std::string* error) {
+  /// The text recognizer `spec` (detector + recognizer + dictionary),
+  /// loaded on first use; null with *error set.
+  const models::ccip::TextOcr* GetOcr(const Options& options, const OcrRecSpec& spec,
+                                      std::string* error) {
     std::lock_guard<std::mutex> lock(load_mutex);
-    if (ocr != nullptr)
-      return ocr.get();
+    if (auto it = ocrs.find(spec.name); it != ocrs.end())
+      return it->second.get();
     if (options.model_dir.empty()) {
       *error = "image recognition is not configured: start the router with --vision-dir";
       return nullptr;
     }
-    const std::string det = kOcrDet, rec = kOcrRec;
+    const std::string det = kOcrDet, rec = spec.stem;
     for (const std::string& name : {det + ".safetensors", det + ".json", rec + ".safetensors",
                                     rec + ".json", rec + ".dict.txt"}) {
       const std::filesystem::path path = options.model_dir / name;
       std::error_code ec;
       if (!std::filesystem::is_regular_file(path, ec)) {
-        *error = "model file missing: " + path.string() + " (convert " + kOcrRepo +
-                 " det/" + det + " and rec/" + rec +
+        *error = "model file missing: " + path.string() + " (convert " + kOcrRepo + " det/" +
+                 det + " and " + spec.repo + " " + rec +
                  " with extensions-ours/ccip/reference/convert_ocr.py)";
         return nullptr;
       }
@@ -630,8 +660,9 @@ struct VisionState {
       *error = "ocr: " + load_error;
       return nullptr;
     }
-    ocr = std::move(loaded);
-    return ocr.get();
+    const auto* result = loaded.get();
+    ocrs.emplace(spec.name, std::move(loaded));
+    return result;
   }
 };
 
@@ -670,9 +701,13 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   const models::ccip::Wd14Tagger* tagger = nullptr;
   if (parsed.wd14.enabled && missing.empty())
     tagger = state_->GetWd14(options_, &missing);
-  const models::ccip::TextOcr* ocr = nullptr;
-  if (!parsed.ocr.empty() && missing.empty())
-    ocr = state_->GetOcr(options_, &missing);
+  std::map<std::string, const models::ccip::TextOcr*> ocrs;  // by OcrPass::rec
+  for (const OcrPass& pass : parsed.ocr) {
+    if (!missing.empty() || ocrs.count(pass.rec) != 0)
+      continue;
+    if (const auto* net = state_->GetOcr(options_, *FindOcrRec(pass.rec), &missing))
+      ocrs[pass.rec] = net;
+  }
   if (missing.empty() && (parsed.pose || parsed.pose_wholebody) && parsed.pose_boxes.empty())
     state_->GetPose(options_, &state_->rtdetr, "rtdetr_r50vd_coco_o365", "convert_pose.py rtdetr", &missing);
   if (missing.empty() && parsed.pose)
@@ -834,7 +869,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     }
     // OCR on the original pixels too (erkennung.py / erkennung_schrift.py),
     // each pass on its own Pillow-LANCZOS enlargement when scale > 1.
-    if (ocr != nullptr) {
+    if (!parsed.ocr.empty() && !ocrs.empty()) {
       std::map<int, models::ccip::RgbImage> enlarged;
       json::Value lists = json::Value::array();
       json::Value infos = json::Value::array();
@@ -854,7 +889,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         ocr_options.heat_threshold = pass.heat_threshold;
         ocr_options.box_threshold = pass.box_threshold;
         ocr_options.unclip_ratio = pass.unclip_ratio;
-        lists.push_back(OcrEntries(ocr->Run(*input, ocr_options), pass.scale));
+        ocr_options.remove_duplicate = FindOcrRec(pass.rec)->remove_duplicate;
+        lists.push_back(OcrEntries(ocrs.at(pass.rec)->Run(*input, ocr_options), pass.scale));
         infos.push_back(OcrModelInfo(pass));
       }
       if (parsed.ocr_list) {
