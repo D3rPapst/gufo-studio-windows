@@ -13,7 +13,8 @@
 //          / ConditioningSetArea(Percentage) with SolidMask / MaskComposite
 //          masks -> gufo.regions (each region with its own references);
 //          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only)
-//   h3     KSampler <- MiniMaxH3ImageToVideo (+ MiniMaxH3AddGuide, whose
+//   h3     KSampler <- MiniMaxH3ImageToVideo, or EmptyMiniMaxH3LatentAV
+//          with a CLIPTextEncode positive (+ MiniMaxH3AddGuide, whose
 //          image / audio may come from LoadVideo -> GetVideoComponents as a
 //          guide clip with its soundtrack) -> /v1/videos (minimax-h3)
 //   wan    KSampler <- Wan22ImageToVideoLatent -> /v1/videos (wan2.2-ti2v-5b)
@@ -63,6 +64,11 @@
 #include "src/core/json.hpp"
 
 namespace gufo::router::comfy {
+
+/// The flow shifts MiniMax H3 was trained with (MiniMaxH3SigmaShift
+/// defaults).
+inline constexpr double kH3VideoShift = 12.0;
+inline constexpr double kH3AudioShift = 3.0;
 
 /// Router model ids each node family is sent to.
 struct ModelIds {
@@ -344,6 +350,18 @@ struct VideoTask {
   /// sent as gufo.guide_video {frame, video} by the executor.
   std::optional<FileRef> guide_video;
   int guide_video_frame{0};
+  /// H3 MiniMaxH3SigmaShift values other than the trained 12 / 3, sent as
+  /// gufo.sigma_shift {video, audio}.
+  std::optional<double> shift_video;
+  std::optional<double> shift_audio;
+  /// H3 audio noise mask (LTXVConcatAVLatent audio_latent from
+  /// SetLatentNoiseMask over VAEEncodeAudio): the source audio (LoadAudio,
+  /// or a LoadVideo's soundtrack the executor extracts) and the mask as two
+  /// track rows of its width, track-major (0 = keep the source audio,
+  /// 1 = generate), sent as gufo.audio_mask {audio, mask}.
+  std::optional<FileRef> audio_source;
+  bool audio_source_from_video{false};
+  std::vector<float> audio_mask;
   /// Camera family: a preset move or a rendered guide video (LoadVideo),
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;

@@ -37,6 +37,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/comfy_node_info.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/pool.hpp"
@@ -1130,6 +1131,10 @@ HttpResponse Adapter::ObjectInfo(std::string_view class_type) {
   for (const std::string& cls : SupportedClassTypes()) {
     if (!class_type.empty() && cls != class_type)
       continue;
+    if (auto info = NodeInfo(cls)) {
+      body[cls] = std::move(*info);
+      continue;
+    }
     json::Value required = json::Value::object();
     if (cls == "LoadImage" || cls == "LoadAudio") {
       json::Value spec = json::Value::array();
@@ -2416,6 +2421,35 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     body["audio_reference"] =
         "data:" + ContentTypeFor(spec.audio_reference->name) + ";base64," +
         Base64Encode(audio);
+  }
+  if (spec.audio_source) {
+    // H3 audio noise mask: the source audio of the masked audio latent.
+    std::string url;
+    if (spec.audio_source_from_video) {
+      if (options_.ffmpeg.empty())
+        throw std::runtime_error(
+            "the H3 masked audio comes from a video; start the router with "
+            "--comfy-ffmpeg to extract it");
+      const fs::path flac = WorkFile("flac");
+      std::string error;
+      const bool extracted =
+          RunFfmpeg({"-i", FilePath(*spec.audio_source), "-vn", "-map",
+                     "0:a:0", "-ac", "2", "-c:a", "flac", flac},
+                    &error);
+      if (extracted)
+        url = "data:audio/flac;base64," + Base64Encode(ReadAll(flac));
+      std::error_code ignored;
+      fs::remove(flac, ignored);
+      if (!extracted)
+        throw std::runtime_error(spec.audio_source->name +
+                                 " has no usable audio track for the H3 "
+                                 "audio mask: " +
+                                 error);
+    } else {
+      url = "data:" + ContentTypeFor(spec.audio_source->name) + ";base64," +
+            Base64Encode(ReadFileRef(*spec.audio_source));
+    }
+    body["gufo"]["audio_mask"]["audio"] = std::move(url);
   }
   const FetchResult created =
       Call(job, "POST", "/v1/videos", body.dump(), "application/json");

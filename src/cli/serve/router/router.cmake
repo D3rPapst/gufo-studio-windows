@@ -19,6 +19,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/chats.cpp
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
+  src/cli/serve/router/comfy_node_info.cpp
   src/cli/serve/router/cpu_pool.cpp
   src/cli/serve/router/download.cpp
   src/cli/serve/router/einrichtung.cpp
@@ -113,9 +114,10 @@ if (BUILD_TESTING)
 
   # The ComfyUI graph translator alone: no server library needed.
   foreach (router_test IN ITEMS router_comfy_graph_test
-      router_comfy_control_test)
+      router_comfy_control_test router_comfy_h3_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp
-      src/cli/serve/router/comfy_graph.cpp)
+      src/cli/serve/router/comfy_graph.cpp
+      src/cli/serve/router/comfy_node_info.cpp)
     target_include_directories(${router_test} PRIVATE ${PROJECT_SOURCE_DIR})
     target_compile_features(${router_test} PRIVATE cxx_std_20)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})

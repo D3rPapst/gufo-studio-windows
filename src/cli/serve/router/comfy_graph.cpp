@@ -59,6 +59,11 @@ constexpr std::string_view kPlumbing[] = {
     "PrimitiveBoolean",
     "TextEncodeQwenImage21",
     "MiniMaxH3AddGuide",
+    "EmptyMiniMaxH3LatentAV",
+    // H3 audio noise mask: the source audio's latent with its mask.
+    "LTXVConcatAVLatent",
+    "VAEEncodeAudio",
+    "LTXVAudioVAEEncode",
     "RIFE VFI",
     "FB_Qwen3TTSVoiceClonePrompt",
     "FB_Qwen3TTSRoleBank",
@@ -401,6 +406,9 @@ struct ModelChain {
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
   std::string talk;   // WanInfiniteTalkToVideo node id, "" if none
   std::string control;  // Qwen-Image ControlNet apply node id, "" if none
+  // MiniMaxH3SigmaShift nearest the sampler (the one ComfyUI applies last),
+  // "" if none.
+  std::string sigma_shift;
 };
 
 ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
@@ -436,8 +444,10 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
       chain.loader = graph.Str(link.node, "ckpt_name", "");
       chain.loader_node = link.node;
       return chain;
-    } else if (cls != "ModelSamplingAuraFlow" && cls != "ModelSamplingSD3" &&
-               cls != "MiniMaxH3SigmaShift") {
+    } else if (cls == "MiniMaxH3SigmaShift") {
+      if (chain.sigma_shift.empty())
+        chain.sigma_shift = link.node;
+    } else if (cls != "ModelSamplingAuraFlow" && cls != "ModelSamplingSD3") {
       throw NodeFailure(
           sampler, "unsupported_link",
           "the model input passes through unsupported node " + cls);
@@ -1316,13 +1326,99 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
   return task;
 }
 
+/// The rows of an H3 audio noise mask: `grid` stretched bilinearly
+/// (torch's align_corners=False) to the two stereo tracks, keeping its
+/// width; the worker stretches each row over the source audio. Track-major.
+std::vector<float> AudioMaskRows(const MaskGrid& grid) {
+  std::vector<float> rows(2U * static_cast<std::size_t>(grid.width));
+  for (int track = 0; track < 2; ++track) {
+    const double source =
+        std::max(0.0, (track + 0.5) * grid.height / 2.0 - 0.5);
+    const int y0 = std::min(static_cast<int>(source), grid.height - 1);
+    const int y1 = std::min(y0 + 1, grid.height - 1);
+    const double weight = source - y0;
+    for (int x = 0; x < grid.width; ++x) {
+      const double value =
+          (1.0 - weight) *
+              grid.values[static_cast<std::size_t>(y0) * grid.width + x] +
+          weight * grid.values[static_cast<std::size_t>(y1) * grid.width + x];
+      rows[static_cast<std::size_t>(track) * grid.width + x] =
+          static_cast<float>(value);
+    }
+  }
+  return rows;
+}
+
+/// LTXVConcatAVLatent's audio_latent for H3: SetLatentNoiseMask over
+/// VAEEncodeAudio (LTXVAudioVAEEncode) of a LoadAudio or of a LoadVideo's
+/// soundtrack. Without a mask ComfyUI regenerates the whole track.
+void ReadAudioLatent(const Graph& graph, const std::string& sampler,
+                     const std::string& concat, const Link& audio_latent,
+                     VideoTask* task, std::vector<std::string>* warnings) {
+  Link source = audio_latent;
+  std::optional<Link> mask;
+  std::string mask_node;
+  if (graph.Class(source.node) == "SetLatentNoiseMask") {
+    mask_node = source.node;
+    mask = graph.RequireLink(source.node, "mask");
+    source = graph.RequireLink(source.node, "samples");
+  }
+  const std::string encoder = graph.Class(source.node);
+  if (encoder != "VAEEncodeAudio" && encoder != "LTXVAudioVAEEncode")
+    throw NodeFailure(concat, "unsupported_link",
+                      "the H3 audio_latent must come from VAEEncodeAudio, "
+                      "optionally through SetLatentNoiseMask, not " +
+                          encoder);
+  const Link audio = graph.RequireLink(source.node, "audio");
+  const bool from_video = graph.Class(audio.node) == "GetVideoComponents";
+  const FileRef file =
+      from_video ? VideoComponentsFile(graph, source.node, "audio", audio, 1)
+                 : AudioFile(graph, source.node, "audio", audio);
+  if (!mask) {
+    warnings->push_back("node " + concat +
+                        ": the audio latent has no noise mask, so it is "
+                        "generated anew (as ComfyUI does at denoise 1)");
+    return;
+  }
+  const MaskSource values = EvalMask(graph, mask_node, "mask", *mask);
+  if (!values.grid)
+    throw NodeFailure(mask_node, "unsupported_link",
+                      "gufo H3 audio masks are computed masks (SolidMask, "
+                      "MaskComposite, InvertMask), not mask files");
+  if (values.grid->width > 4096)
+    throw NodeFailure(mask_node, "unsupported_value",
+                      "gufo H3 audio masks are at most 4096 pixels wide");
+  task->audio_source = file;
+  task->audio_source_from_video = from_video;
+  task->audio_mask = AudioMaskRows(*values.grid);
+  if (std::any_of(task->audio_mask.begin(), task->audio_mask.end(),
+                  [](float v) { return v > 0.0F && v < 1.0F; }))
+    warnings->push_back("node " + sampler +
+                        ": gufo keeps the audio where the noise mask is "
+                        "below 0.5 and generates it elsewhere (no partial "
+                        "strength)");
+}
+
+/// MiniMaxH3ImageToVideo (prompt, frames and size in one node) or
+/// EmptyMiniMaxH3LatentAV with the prompt in a CLIPTextEncode on the
+/// positive input (ComfyUI's text to video+audio wiring), either one
+/// directly or as the video_latent of an LTXVConcatAVLatent whose
+/// audio_latent carries an audio noise mask.
 VideoTask BuildH3(const Graph& graph, const std::string& sampler,
-                  const ModelIds& models, const Link& latent) {
-  const std::string video = latent.node;
+                  const ModelIds& models, const Link& latent,
+                  std::vector<std::string>* warnings) {
+  std::string video = latent.node;
+  std::optional<Link> audio_latent;
+  if (graph.Class(latent.node) == "LTXVConcatAVLatent") {
+    video = graph.RequireLink(latent.node, "video_latent").node;
+    audio_latent = graph.RequireLink(latent.node, "audio_latent");
+  }
+  const bool empty_latent = graph.Class(video) == "EmptyMiniMaxH3LatentAV";
   VideoTask task;
   task.family = VideoFamily::kH3;
   task.model = models.h3;
-  task.prompt = graph.Str(video, "prompt");
+  if (!empty_latent)
+    task.prompt = graph.Str(video, "prompt");
   task.width = static_cast<int>(graph.Num(video, "width", 1344));
   task.height = static_cast<int>(graph.Num(video, "height", 768));
   const int length = static_cast<int>(graph.Num(video, "length", 124));
@@ -1350,10 +1446,22 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
   if (auto last = graph.LinkOf(video, "last_frame"))
     task.last_frame = ImageFile(graph, video, "last_frame", *last);
   const Conditioning positive = FollowConditioning(graph, sampler, "positive");
-  if (positive.encoder != video)
+  if (empty_latent) {
+    if (positive.encoder.empty() ||
+        graph.Class(positive.encoder) != "CLIPTextEncode")
+      throw NodeFailure(sampler, "unsupported_link",
+                        "with EmptyMiniMaxH3LatentAV the positive "
+                        "conditioning must come from CLIPTextEncode");
+    task.prompt = graph.Str(positive.encoder, "text");
+  } else if (positive.encoder != video) {
     throw NodeFailure(sampler, "unsupported_link",
                       "positive conditioning must come from the "
                       "MiniMaxH3ImageToVideo that makes the latent");
+  }
+  if (positive.zeroed)
+    throw NodeFailure(sampler, "unsupported_link",
+                      "the H3 positive conditioning passes through "
+                      "ConditioningZeroOut");
   for (const std::string& guide : positive.guides) {
     const int frame = static_cast<int>(graph.Num(guide, "frame_idx", 0));
     if (auto audio = graph.LinkOf(guide, "audio")) {
@@ -1438,6 +1546,36 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
     if (strength != 1.0)
       task.lora_strength = strength;
   }
+  // MiniMaxH3SigmaShift: the worker's video / audio flow shifts (12 / 3
+  // unless set).
+  if (!chain.sigma_shift.empty()) {
+    const double video_shift =
+        graph.Num(chain.sigma_shift, "shift_video", kH3VideoShift);
+    const double audio_shift =
+        graph.Num(chain.sigma_shift, "shift_audio", kH3AudioShift);
+    for (const double shift : {video_shift, audio_shift})
+      if (!(shift >= 0.01 && shift <= 100.0))
+        throw NodeFailure(chain.sigma_shift, "unsupported_value",
+                          "shift_video and shift_audio must be 0.01..100");
+    if (video_shift != kH3VideoShift || audio_shift != kH3AudioShift) {
+      task.shift_video = video_shift;
+      task.shift_audio = audio_shift;
+    }
+  }
+  if (audio_latent)
+    ReadAudioLatent(graph, sampler, latent.node, *audio_latent, &task,
+                    warnings);
+  // The released H3 weights are CFG-distilled: gufo runs one pass per step
+  // without a negative branch (as diffusers and SGLang do).
+  if (graph.Num(sampler, "cfg", 1.0) != 1.0)
+    warnings->push_back("node " + sampler +
+                        ": cfg and the negative conditioning are ignored; "
+                        "the MiniMax H3 weights are CFG-distilled and gufo "
+                        "samples without guidance");
+  if (graph.Num(sampler, "denoise", 1.0) != 1.0)
+    warnings->push_back("node " + sampler +
+                        ": denoise is ignored; gufo samples MiniMax H3 from "
+                        "pure noise");
   return task;
 }
 
@@ -2804,6 +2942,21 @@ json::Value VideoRequestBody(const VideoTask& task) {
       gufo["lora_strength"] = *task.lora_strength;
     if (task.audio_reference)
       gufo["audio_reference_frame"] = task.audio_reference_frame;
+    if (task.audio_source) {
+      // The executor adds the audio as gufo.audio_mask.audio.
+      json::Value mask = json::Value::array();
+      for (const float value : task.audio_mask)
+        mask.push_back(std::round(value * 10000.0) / 10000.0);
+      json::Value audio_mask = json::Value::object();
+      audio_mask["mask"] = std::move(mask);
+      gufo["audio_mask"] = std::move(audio_mask);
+    }
+    if (task.shift_video || task.shift_audio) {
+      json::Value shift = json::Value::object();
+      shift["video"] = task.shift_video.value_or(kH3VideoShift);
+      shift["audio"] = task.shift_audio.value_or(kH3AudioShift);
+      gufo["sigma_shift"] = std::move(shift);
+    }
   } else if (task.family == VideoFamily::kCamera) {
     // 16 fps, 4k+1 frames: gufo maps seconds back to 4 * round(4 s) + 1.
     body["size"] =
@@ -3406,8 +3559,18 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
         } else {
           const Link latent = graph.RequireLink(generator, "latent_image");
           const std::string latent_class = graph.Class(latent.node);
-          if (latent_class == "MiniMaxH3ImageToVideo")
-            task.spec = BuildH3(graph, generator, models, latent);
+          const auto is_h3 = [](const std::string& cls) {
+            return cls == "MiniMaxH3ImageToVideo" ||
+                   cls == "EmptyMiniMaxH3LatentAV";
+          };
+          const auto concat_video =
+              latent_class == "LTXVConcatAVLatent"
+                  ? graph.LinkOf(latent.node, "video_latent")
+                  : std::nullopt;
+          if (is_h3(latent_class) ||
+              (concat_video && is_h3(graph.Class(concat_video->node))))
+            task.spec =
+                BuildH3(graph, generator, models, latent, &plan->warnings);
           else if (latent_class == "Wan22ImageToVideoLatent")
             task.spec = BuildWan(graph, generator, models, latent);
           else if (latent_class == "WanImageToVideo" ||
