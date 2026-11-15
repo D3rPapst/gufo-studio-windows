@@ -22,6 +22,9 @@ struct KeyframeImage {
   int height{0};
   /// Packed RGB8, row-major, width * height * 3 bytes.
   std::span<const std::uint8_t> rgb;
+  /// Vision only: the second frame of a two-frame video block (Ref2VA
+  /// reference videos), same size; empty for a still.
+  std::span<const std::uint8_t> second_rgb;
 };
 
 struct VideoVaeEncoderTelemetry {

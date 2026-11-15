@@ -490,6 +490,15 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
           for (const FrameRun& run : *runs)
             if (run.image)
               files->push_back(*run.image);
+        files->insert(files->end(), video->h3_ref_images.begin(),
+                      video->h3_ref_images.end());
+        for (const VideoTask::Reference& reference : video->h3_ref_videos) {
+          files->push_back(reference.file);
+          if (reference.audio)
+            files->push_back(*reference.audio);
+        }
+        files->insert(files->end(), video->h3_ref_audios.begin(),
+                      video->h3_ref_audios.end());
         files->insert(files->end(), video->reference_images.begin(),
                       video->reference_images.end());
       }
@@ -2931,6 +2940,59 @@ json::Value Adapter::VideoBody(const std::shared_ptr<Job>& job,
   if (spec.source_video)
     body["source_video"] = "data:video/mp4;base64," +
                            Base64Encode(ReadFileRef(*spec.source_video));
+  if (spec.h3_references) {
+    // MiniMaxH3ReferenceToVideo: files as data URLs; a soundtrack from the
+    // reference video itself is extracted to FLAC first.
+    json::Value& references = body["gufo"]["references"];
+    const auto audio_url = [&](const FileRef& ref, bool from_video) {
+      if (!from_video)
+        return "data:" + ContentTypeFor(ref.name) + ";base64," +
+               Base64Encode(ReadFileRef(ref));
+      if (options_.ffmpeg.empty())
+        throw std::runtime_error(
+            "a Ref2VA soundtrack comes from a video; start the router with "
+            "--comfy-ffmpeg to extract it");
+      const fs::path flac = WorkFile("flac");
+      std::string error;
+      const bool extracted =
+          RunFfmpeg({"-i", FilePath(ref), "-vn", "-map", "0:a:0", "-ac", "2",
+                     "-c:a", "flac", flac},
+                    &error);
+      std::string url;
+      if (extracted)
+        url = "data:audio/flac;base64," + Base64Encode(ReadAll(flac));
+      std::error_code ignored;
+      fs::remove(flac, ignored);
+      if (!extracted)
+        throw std::runtime_error(ref.name + " has no usable audio track: " +
+                                 error);
+      return url;
+    };
+    json::Value images = json::Value::array();
+    for (const FileRef& ref : spec.h3_ref_images) {
+      const std::string bytes = ReadFileRef(ref);
+      images.push_back(json::Value("data:" + SniffImageType(bytes) +
+                                   ";base64," + Base64Encode(bytes)));
+    }
+    json::Value videos = json::Value::array();
+    for (const VideoTask::Reference& reference : spec.h3_ref_videos) {
+      json::Value entry = json::Value::object();
+      entry["video"] = "data:video/mp4;base64," +
+                       Base64Encode(ReadFileRef(reference.file));
+      if (reference.audio)
+        entry["audio"] = audio_url(*reference.audio, reference.audio_from_video);
+      videos.push_back(std::move(entry));
+    }
+    json::Value audios = json::Value::array();
+    for (const FileRef& ref : spec.h3_ref_audios)
+      audios.push_back(json::Value(audio_url(ref, false)));
+    if (!spec.h3_ref_images.empty())
+      references["images"] = std::move(images);
+    if (!spec.h3_ref_videos.empty())
+      references["videos"] = std::move(videos);
+    if (!spec.h3_ref_audios.empty())
+      references["audios"] = std::move(audios);
+  }
   if (spec.h3_control) {
     // MiniMaxH3FunControlNetApply: gufo fits and encodes the videos itself.
     json::Value& control = body["gufo"]["control"];

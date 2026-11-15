@@ -78,9 +78,18 @@ bool EncodeKeyframeVision(const std::filesystem::path& projector,
       canvas.width = static_cast<std::uint32_t>(image.width);
       canvas.height = static_cast<std::uint32_t>(image.height);
       canvas.pixels.assign(image.rgb.begin(), image.rgb.end());
-      const auto embedding = encoder.Encode(canvas, {}, [cancellation] {
+      const auto cancelled = [cancellation] {
         return cancellation != nullptr && cancellation->IsCancelled();
-      });
+      };
+      std::shared_ptr<const models::qwen::vision::Encoder::Embedding>
+          embedding;
+      if (image.second_rgb.empty()) {
+        embedding = encoder.Encode(canvas, {}, cancelled);
+      } else {
+        core::Image second = canvas;
+        second.pixels.assign(image.second_rgb.begin(), image.second_rgb.end());
+        embedding = encoder.EncodePair(canvas, second, {}, cancelled);
+      }
       PromptVisionBlock block;
       block.grid_height = canvas.height / 32U;
       block.grid_width = canvas.width / 32U;
@@ -129,6 +138,9 @@ namespace {
 constexpr std::uint32_t kRequestMagic = 0x51503348U;   // "H3PQ"
 constexpr std::uint32_t kResponseMagic = 0x52503348U;  // "H3PR"
 constexpr std::uint64_t kMaximumPayloadBytes = 1ULL << 32U;
+// Keyframes (2), Ref2VA reference images (9) and the two-frame blocks of
+// up to three 15-second reference videos at 2 fps (45).
+constexpr std::uint32_t kMaximumVisionBlocks = 64;
 
 template<typename T>
 void Put(std::ostream& output, T value) {
@@ -181,6 +193,8 @@ struct PromptRequest {
   std::filesystem::path projector;
   std::vector<std::int32_t> sizes;  // width, height per image
   std::vector<std::vector<std::uint8_t>> pixels;
+  // Second frames of two-frame video blocks (empty for stills).
+  std::vector<std::vector<std::uint8_t>> second_pixels;
   std::vector<std::uint32_t> tokens;
 };
 
@@ -196,6 +210,7 @@ bool WriteRequest(const std::filesystem::path& path,
     Put<std::int32_t>(output, image.width);
     Put<std::int32_t>(output, image.height);
     PutVector(output, image.rgb);
+    PutVector(output, image.second_rgb);
   }
   PutVector(output, input.tokens);
   Put<std::uint32_t>(output, static_cast<std::uint32_t>(input.blocks.size()));
@@ -217,10 +232,11 @@ bool ReadRequest(const std::filesystem::path& path, PromptRequest* request,
       !GetPath(input, &request->model_root) ||
       !GetPath(input, &request->manifest) ||
       !GetPath(input, &request->projector) || !Get(input, &images) ||
-      images > 2) {
+      images > kMaximumVisionBlocks) {
     return false;
   }
   request->pixels.resize(images);
+  request->second_pixels.resize(images);
   for (std::uint32_t index = 0; index < images; ++index) {
     std::int32_t width = 0;
     std::int32_t height = 0;
@@ -228,14 +244,19 @@ bool ReadRequest(const std::filesystem::path& path, PromptRequest* request,
         height < 1 || !GetVector(input, &request->pixels[index]) ||
         request->pixels[index].size() != static_cast<std::size_t>(width) *
                                              static_cast<std::size_t>(height) *
-                                             3U) {
+                                             3U ||
+        !GetVector(input, &request->second_pixels[index]) ||
+        (!request->second_pixels[index].empty() &&
+         request->second_pixels[index].size() !=
+             request->pixels[index].size())) {
       return false;
     }
     request->sizes.push_back(width);
     request->sizes.push_back(height);
   }
   std::uint32_t count = 0;
-  if (!GetVector(input, &request->tokens) || !Get(input, &count) || count > 2) {
+  if (!GetVector(input, &request->tokens) || !Get(input, &count) ||
+      count > kMaximumVisionBlocks) {
     return false;
   }
   blocks->assign(count, {});
@@ -505,7 +526,8 @@ int RunPromptChild(const std::filesystem::path& request_path,
     for (std::size_t index = 0; index < request.pixels.size(); ++index) {
       images.push_back({.width = request.sizes[index * 2U],
                         .height = request.sizes[index * 2U + 1U],
-                        .rgb = request.pixels[index]});
+                        .rgb = request.pixels[index],
+                        .second_rgb = request.second_pixels[index]});
     }
     const auto begin = std::chrono::steady_clock::now();
     if (!EncodeKeyframeVision(request.projector, images, nullptr, &blocks,

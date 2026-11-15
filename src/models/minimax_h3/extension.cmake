@@ -6,6 +6,7 @@ gufo_extension_target(
     audio_input.cpp
     audio_vae.cpp
     control.cpp
+    references.cpp
     denoiser.cpp
     dit.cpp
     generation.cpp

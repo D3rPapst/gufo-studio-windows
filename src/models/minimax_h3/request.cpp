@@ -363,6 +363,7 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
   float audio_shift = kH3AudioSigmaShift;
   const json::Value* audio_mask_value = nullptr;
   const json::Value* control_value = nullptr;
+  const json::Value* references_value = nullptr;
   if (const json::Value* extension = body.json.find("gufo")) {
     // "interpolate" and "upscale" never reach the provider (the host runs
     // them); "preview" is the host's too.
@@ -372,7 +373,8 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
                          "selected_frame", "steps", "lora", "lora_strength",
                          "interpolate", "upscale", "keyframes",
                          "audio_reference_frame", "guide_video", "preview",
-                         "sigma_shift", "audio_mask", "control"}))
+                         "sigma_shift", "audio_mask", "control",
+                         "references"}))
       return Fail(error, "invalid_strix_options",
                   "'gufo' must contain only supported video options");
     if (extension->contains("preset")) {
@@ -467,6 +469,8 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
       audio_mask_value = extension->find("audio_mask");
     if (extension->contains("control"))
       control_value = extension->find("control");
+    if (extension->contains("references"))
+      references_value = extension->find("references");
     if (extension->contains("selected_frame")) {
       selected_frame = JsonFrame(extension->find("selected_frame"));
       if (!selected_frame.has_value())
@@ -877,6 +881,126 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
     }
   }
 
+  // Ref2VA references (ComfyUI's MiniMaxH3ReferenceToVideo):
+  // {"images": [<image>, ...<= 9], "videos": [{"video": <MP4>, "audio":
+  // <audio, the video's soundtrack>}, ... <= 3], "audios": [<audio>, ...
+  // <= 3], "image_size": "match" | "max"}; the prompt names them
+  // <Picture i>, <Video k> and <Audio j>.
+  if (references_value != nullptr) {
+    if (!references_value->is_object() ||
+        !HasOnlyMembers(*references_value,
+                        {"images", "videos", "audios", "image_size"}))
+      return Fail(error, "invalid_references",
+                  "'gufo.references' must be {\"images\", \"videos\", "
+                  "\"audios\", \"image_size\"}");
+    if (!anchors.empty() || clips != 0 || options.contains("control") ||
+        body.has("audio_reference"))
+      return Fail(error, "invalid_references",
+                  "'gufo.references' (Ref2VA) cannot be combined with "
+                  "keyframes, guides, an audio reference or a control");
+    const std::string image_size =
+        references_value->member_str("image_size", "match");
+    if (image_size != "match" && image_size != "max")
+      return Fail(error, "invalid_references",
+                  "'gufo.references.image_size' must be 'match' or 'max'");
+    json::Value items = json::Value::array();
+    std::size_t counts[3] = {0, 0, 0};
+    const auto list = [&](const char* key) -> std::vector<const json::Value*> {
+      std::vector<const json::Value*> out;
+      if (const json::Value* value = references_value->find(key)) {
+        if (value->is_array())
+          for (const json::Value& entry : value->items())
+            out.push_back(&entry);
+        else
+          out.push_back(nullptr);
+      }
+      return out;
+    };
+    std::size_t attachment = 0;
+    const auto attach = [&](std::vector<std::uint8_t> bytes) {
+      const std::string name = "reference_" + std::to_string(attachment++);
+      prepared->attachments.push_back({.name = name, .bytes = std::move(bytes)});
+      return name;
+    };
+    for (const json::Value* entry : list("images")) {
+      std::vector<std::uint8_t> bytes;
+      std::string image_error;
+      if (entry == nullptr ||
+          !ReadImage(entry, nullptr, budget, &bytes, &image_error))
+        return Fail(error, "invalid_references",
+                    "'gufo.references.images' must be an array of images" +
+                        (image_error.empty() ? std::string()
+                                             : ": " + image_error));
+      json::Value item = json::Value::object();
+      item["kind"] = std::string("image");
+      item["attachment"] = attach(std::move(bytes));
+      items.push_back(std::move(item));
+      ++counts[0];
+    }
+    for (const json::Value* entry : list("videos")) {
+      const json::Value* video =
+          entry != nullptr && entry->is_object() ? entry->find("video")
+                                                 : nullptr;
+      if (video == nullptr || !video->is_string() ||
+          !HasOnlyMembers(*entry, {"video", "audio"}))
+        return Fail(error, "invalid_references",
+                    "'gufo.references.videos' entries must be {\"video\": "
+                    "MP4 data URL or base64, \"audio\": optional audio}");
+      std::string_view text = video->str();
+      if (text.starts_with("data:")) {
+        const auto comma = text.find(',');
+        if (comma == std::string_view::npos ||
+            text.substr(0, comma).find(";base64") == std::string_view::npos)
+          return Fail(error, "invalid_references",
+                      "reference video data URLs must be base64");
+        text.remove_prefix(comma + 1);
+      }
+      auto decoded = DecodeBase64(text);
+      if (!decoded.has_value() || decoded->size() < 64)
+        return Fail(error, "invalid_references",
+                    "a reference video is not valid base64 video");
+      json::Value item = json::Value::object();
+      item["kind"] = std::string("video");
+      item["attachment"] = attach(std::move(*decoded));
+      if (const json::Value* audio = entry->find("audio")) {
+        std::vector<std::uint8_t> bytes;
+        std::string audio_error;
+        if (!ReadAudio(audio, nullptr, &bytes, &audio_error))
+          return Fail(error, "invalid_references",
+                      "a reference video's 'audio' " + audio_error);
+        item["audio"] = attach(std::move(bytes));
+      }
+      items.push_back(std::move(item));
+      ++counts[1];
+    }
+    for (const json::Value* entry : list("audios")) {
+      std::vector<std::uint8_t> bytes;
+      std::string audio_error;
+      if (entry == nullptr || !ReadAudio(entry, nullptr, &bytes, &audio_error))
+        return Fail(error, "invalid_references",
+                    "'gufo.references.audios' must be an array of audio" +
+                        (audio_error.empty() ? std::string()
+                                             : ": " + audio_error));
+      json::Value item = json::Value::object();
+      item["kind"] = std::string("audio");
+      item["attachment"] = attach(std::move(bytes));
+      items.push_back(std::move(item));
+      ++counts[2];
+    }
+    if (counts[0] > 9 || counts[1] > 3 || counts[2] > 3 ||
+        counts[0] + counts[1] + counts[2] > 12)
+      return Fail(error, "invalid_references",
+                  "Ref2VA takes at most 9 images, 3 videos and 3 audios, 12 "
+                  "references in all");
+    if (counts[0] + counts[1] == 0)
+      return Fail(error, "invalid_references",
+                  "Ref2VA audio references cannot be the only ones");
+    json::Value spec = json::Value::object();
+    spec["image_size"] = image_size;
+    spec["items"] = std::move(items);
+    options["references"] = std::move(spec);
+  }
+
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256")
       return Fail(error, "invalid_output_format",
@@ -1170,6 +1294,50 @@ bool DecodePreparedRequest(const ext::VideoRequest& request,
           return false;
       }
       generation->control = std::move(spec);
+    }
+    if (const json::Value* spec = options.find("references")) {
+      generation->reference_image_size_max =
+          spec->member_str("image_size", "match") == "max";
+      std::size_t index = 0;
+      for (const json::Value& item : spec->find("items")->items()) {
+        const std::string kind = item.member_str("kind");
+        const auto* bytes = attachment(item.member_str("attachment"));
+        if (bytes == nullptr) {
+          *error = "missing MiniMax H3 reference attachment";
+          return false;
+        }
+        GenerationReference reference;
+        if (kind == "image") {
+          reference.kind = ReferenceKind::kImage;
+          core::Image image = core::DecodeImage(*bytes);
+          reference.frames.width = static_cast<int>(image.width);
+          reference.frames.height = static_cast<int>(image.height);
+          reference.frames.frames = 1;
+          reference.frames.pixels = std::move(image.pixels);
+        } else if (kind == "video") {
+          reference.kind = ReferenceKind::kVideo;
+          if (!DecodeControlFrames(*bytes, work_directory,
+                                   "reference_video_" + std::to_string(index),
+                                   request.parameters.frames, false,
+                                   &reference.frames, error))
+            return false;
+          if (const json::Value* audio = item.find("audio")) {
+            const auto* sound = attachment(audio->str());
+            AudioWaveform waveform;
+            if (sound == nullptr || !DecodeGuideAudio(*sound, &waveform, error))
+              return false;
+            reference.audio = std::move(waveform);
+          }
+        } else {
+          reference.kind = ReferenceKind::kAudio;
+          AudioWaveform waveform;
+          if (!DecodeGuideAudio(*bytes, &waveform, error))
+            return false;
+          reference.audio = std::move(waveform);
+        }
+        generation->references.push_back(std::move(reference));
+        ++index;
+      }
     }
     if (const json::Value* shift = options.find("sigma_shift")) {
       generation->video_sigma_shift = static_cast<float>(

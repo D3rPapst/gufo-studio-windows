@@ -94,6 +94,15 @@ public:
   [[nodiscard]] static std::optional<ModelInventory> InspectControlPatch(
       const std::filesystem::path& file, std::string* error = nullptr);
 
+  /// This (pinned FL2VA) inventory with the transformer read from another
+  /// partition of the same model root, e.g. "Ref2VA": its
+  /// <partition>/transformer index and safetensors headers must name
+  /// exactly the FL2VA transformer's tensors with the same dtypes and
+  /// shapes (the released partitions share one architecture). The text
+  /// encoder and the VAEs stay FL2VA's.
+  [[nodiscard]] std::optional<ModelInventory> WithTransformerPartition(
+      std::string_view partition, std::string* error = nullptr) const;
+
   [[nodiscard]] const std::filesystem::path& model_root() const noexcept {
     return model_root_;
   }

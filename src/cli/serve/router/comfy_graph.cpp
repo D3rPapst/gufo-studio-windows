@@ -125,6 +125,7 @@ constexpr std::string_view kGenerators[] = {
     "KSampler",
     "KSamplerAdvanced",
     "MiniMaxH3ImageToVideo",
+    "MiniMaxH3ReferenceToVideo",
     "Wan22ImageToVideoLatent",
     "FB_Qwen3TTSVoiceDesign",
     "FB_Qwen3TTSVoiceClone",
@@ -535,6 +536,7 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
                                link->slot == 2 ? "negative" : "positive");
     } else if (cls == "TextEncodeQwenImage21" || cls == "CLIPTextEncode" ||
                cls == "MiniMaxH3ImageToVideo" ||
+               cls == "MiniMaxH3ReferenceToVideo" ||
                cls == "TextEncodeAceStepAudio1.5") {
       cond.encoder = link->node;
       cond.slot = link->slot;
@@ -1445,6 +1447,11 @@ void ReadAudioLatent(const Graph& graph, const std::string& sampler,
                         "strength)");
 }
 
+// Defined with the VACE builder below (fps defaults to 16 there).
+FileRef VideoFile(const Graph& graph, const std::string& id,
+                  const std::string& key, const Link& link,
+                  std::vector<std::string>* warnings, int fps);
+
 /// MiniMaxH3ImageToVideo (prompt, frames and size in one node) or
 /// EmptyMiniMaxH3LatentAV with the prompt in a CLIPTextEncode on the
 /// positive input (ComfyUI's text to video+audio wiring), either one
@@ -1487,6 +1494,49 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
                       "256..1344, at most 768x1344 pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));
+  if (graph.Class(video) == "MiniMaxH3ReferenceToVideo") {
+    // Autogrow inputs: "ref_images.ref_image_N" (ComfyUI's API names) or
+    // plain "ref_image_N".
+    const auto slot = [&](const char* group, const char* prefix,
+                          int index) -> std::optional<Link> {
+      const std::string name = std::string(prefix) + std::to_string(index);
+      if (auto link = graph.LinkOf(video, std::string(group) + "." + name))
+        return link;
+      return graph.LinkOf(video, name);
+    };
+    task.h3_references = true;
+    task.h3_ref_image_max = graph.Str(video, "ref_image_size", "match") == "max";
+    for (int index = 1; index <= 9; ++index)
+      if (auto link = slot("ref_images", "ref_image_", index))
+        task.h3_ref_images.push_back(
+            ImageFile(graph, video, "ref_image_" + std::to_string(index), *link));
+    for (int index = 1; index <= 3; ++index) {
+      auto link = slot("ref_videos", "ref_video_", index);
+      if (!link)
+        continue;
+      VideoTask::Reference reference;
+      reference.file = VideoFile(graph, video,
+                                 "ref_video_" + std::to_string(index), *link,
+                                 warnings, 24);
+      if (auto audio = slot("ref_video_audios", "ref_video_audio_", index)) {
+        reference.audio_from_video =
+            graph.Class(audio->node) == "GetVideoComponents";
+        reference.audio =
+            reference.audio_from_video
+                ? VideoComponentsFile(graph, video, "ref_video_audio", *audio, 1)
+                : AudioFile(graph, video, "ref_video_audio", *audio);
+      }
+      task.h3_ref_videos.push_back(std::move(reference));
+    }
+    for (int index = 1; index <= 3; ++index)
+      if (auto link = slot("ref_audios", "ref_audio_", index))
+        task.h3_ref_audios.push_back(
+            AudioFile(graph, video, "ref_audio_" + std::to_string(index), *link));
+    if (task.h3_ref_images.empty() && task.h3_ref_videos.empty())
+      throw NodeFailure(video, "unsupported_value",
+                        "MiniMax H3 Ref2VA needs a reference image or video "
+                        "(audio references cannot be the only ones)");
+  }
   if (auto first = graph.LinkOf(video, "first_frame"))
     task.first_frame = ImageFile(graph, video, "first_frame", *first);
   if (auto last = graph.LinkOf(video, "last_frame"))
@@ -4881,6 +4931,14 @@ json::Value VideoRequestBody(const VideoTask& task) {
       shift["audio"] = task.shift_audio.value_or(kH3AudioShift);
       gufo["sigma_shift"] = std::move(shift);
     }
+    if (task.h3_references) {
+      // The executor adds the files (gufo.references.images / videos /
+      // audios).
+      json::Value references = json::Value::object();
+      references["image_size"] =
+          std::string(task.h3_ref_image_max ? "max" : "match");
+      gufo["references"] = std::move(references);
+    }
     if (task.h3_control) {
       // The executor adds the videos (gufo.control.video / mask /
       // source_video).
@@ -5710,6 +5768,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           const std::string latent_class = graph.Class(latent.node);
           const auto is_h3 = [](const std::string& cls) {
             return cls == "MiniMaxH3ImageToVideo" ||
+                   cls == "MiniMaxH3ReferenceToVideo" ||
                    cls == "EmptyMiniMaxH3LatentAV";
           };
           const auto concat_video =
