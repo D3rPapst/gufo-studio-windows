@@ -17,16 +17,16 @@
 #include "src/models/ace_step/audio_io.hpp"
 #include "src/models/ace_step/vae.hpp"
 #include "src/models/yue2/protocol.hpp"
-#if defined(ENGINE_ENABLE_HIP)
 #include "src/models/yue2/pipeline.hpp"
-#endif
 
-namespace gufo::models::yue2 {
 #if !defined(ENGINE_ENABLE_HIP)
-// Without HIP the service never loads a pipeline.
-class SongPipeline {};
-#endif
+namespace gufo::models::yue2 {
+// Without HIP the service never loads a pipeline; the request types come
+// from pipeline.hpp, the destructor (pipeline.cpp is HIP only) from here.
+struct SongPipeline::Impl {};
+SongPipeline::~SongPipeline() = default;
 }  // namespace gufo::models::yue2
+#endif
 
 namespace gufo::server {
 namespace {
