@@ -129,6 +129,76 @@ int main() {
             failure.code == "invalid_keyframes",
         "two images on one frame fail");
 
+  // MiniMaxH3SigmaShift: gufo.sigma_shift reaches the generation; the
+  // trained 12 / 3 stay out of the job options.
+  gufo::ext::VideoPreparedRequest shifted;
+  Check(Prepare("minimax-h3",
+                R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"sigma_shift":{"audio":6.5}}})",
+                &shifted, &failure),
+        "gufo.sigma_shift is accepted");
+  gufo::ext::VideoRequest shifted_request;
+  shifted_request.parameters = shifted.parameters;
+  shifted_request.options_json = shifted.options_json;
+  h3::GenerationRequest shifted_generation;
+  Check(h3::DecodePreparedRequest(shifted_request, options, dir,
+                                  &shifted_generation, &error) &&
+            shifted_generation.audio_sigma_shift == 6.5F &&
+            shifted_generation.video_sigma_shift == 12.0F,
+        "the audio shift reaches the generation, the video shift stays 12");
+  gufo::ext::VideoPreparedRequest trained;
+  Check(Prepare("minimax-h3",
+                R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"sigma_shift":{"video":12,"audio":3}}})",
+                &trained, &failure) &&
+            trained.options_json.find("sigma_shift") == std::string::npos,
+        "the trained shifts add no job option");
+  for (const char* bad : {R"({"audio":0})", R"({"video":101})",
+                          R"({"audio":"3"})", R"({"text":3})", "3"}) {
+    gufo::ext::VideoPreparedRequest refused;
+    Check(!Prepare("minimax-h3",
+                   std::string(R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"sigma_shift":)") +
+                       bad + "}}",
+                   &refused, &failure) &&
+              failure.code == "invalid_sigma_shift",
+          "an invalid gufo.sigma_shift is refused");
+  }
+
+  // Audio noise mask: {"audio", "mask"} reaches the generation as the
+  // decoded source and the mask rows.
+  const std::string silence =
+      "data:audio/wav;base64,UklGRqQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+  gufo::ext::VideoPreparedRequest masked;
+  Check(Prepare("minimax-h3",
+                std::string(R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"audio_mask":{"audio":")") +
+                    silence + R"(","mask":[0,0,1,0]}}})",
+                &masked, &failure),
+        "gufo.audio_mask is accepted");
+  gufo::ext::VideoRequest masked_request;
+  masked_request.parameters = masked.parameters;
+  masked_request.options_json = masked.options_json;
+  masked_request.attachments = masked.attachments;
+  h3::GenerationRequest masked_generation;
+  Check(h3::DecodePreparedRequest(masked_request, options, dir,
+                                  &masked_generation, &error) &&
+            masked_generation.audio_mask_source.has_value() &&
+            masked_generation.audio_mask.size() == 4 &&
+            masked_generation.audio_mask[2] == 1.0F,
+        "the audio mask and its source reach the generation");
+  for (const char* bad : {R"([0,0,0])", R"([0,2])", R"([])", R"("0")"}) {
+    gufo::ext::VideoPreparedRequest refused;
+    Check(!Prepare("minimax-h3",
+                   std::string(R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"audio_mask":{"audio":")") +
+                       silence + R"(","mask":)" + bad + "}}}",
+                   &refused, &failure) &&
+              failure.code == "invalid_audio_mask",
+          "an invalid gufo.audio_mask.mask is refused");
+  }
+  gufo::ext::VideoPreparedRequest no_audio;
+  Check(!Prepare("minimax-h3",
+                 R"({"model":"minimax-h3","prompt":"x","seconds":"5","gufo":{"audio_mask":{"mask":[0,0]}}})",
+                 &no_audio, &failure) &&
+            failure.code == "invalid_audio_mask",
+        "an audio mask without audio is refused");
+
   std::error_code ignored;
   std::filesystem::remove_all(dir, ignored);
   if (failures == 0)

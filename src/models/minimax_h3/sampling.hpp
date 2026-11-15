@@ -18,6 +18,14 @@ inline constexpr int kH3AudioLatentFramesPerSecond = 40;
 inline constexpr int kH3VaeSpatialRatio = 16;
 inline constexpr int kH3MaximumFrames = 345;
 inline constexpr int kH3MaximumEvaluations = 1000;
+// Trained flow shifts of the video and the audio stream (the reference's
+// sigma_shift_scales, ComfyUI's MiniMaxH3SigmaShift defaults).
+inline constexpr float kH3VideoSigmaShift = 12.0F;
+inline constexpr float kH3AudioSigmaShift = 3.0F;
+inline constexpr float kH3MinimumSigmaShift = 0.01F;
+// Values of an audio noise mask row pair (gufo.audio_mask.mask).
+inline constexpr std::size_t kH3MaximumAudioMaskValues = 8192;
+inline constexpr float kH3MaximumSigmaShift = 100.0F;
 // Keyframe anchors are held just short of clean for every step.
 inline constexpr float kH3ConditionTime = 0.999F;
 // Audio guides are held exactly clean (the reference's audio condition
@@ -57,8 +65,12 @@ struct SigmaSchedule {
   }
 };
 
+/// linspace(1, 0) over `evaluations` steps, shifted per stream (shift in
+/// kH3MinimumSigmaShift..kH3MaximumSigmaShift).
 [[nodiscard]] std::optional<SigmaSchedule> BuildServingSchedule(
-    int evaluations, std::string* error = nullptr);
+    int evaluations, std::string* error = nullptr,
+    float video_shift = kH3VideoSigmaShift,
+    float audio_shift = kH3AudioSigmaShift);
 
 struct TimeRowSchedule {
   std::vector<std::uint32_t> video_rows;
@@ -72,6 +84,20 @@ struct TimeRowSchedule {
   // kNoConditionRow when the request has no audio guide.
   std::uint32_t audio_condition_row{kNoConditionRow};
 };
+
+/// ComfyUI's audio noise mask for MiniMax H3 (LTXVConcatAVLatent with
+/// SetLatentNoiseMask over VAEEncodeAudio): `mask` holds two rows of N
+/// values, one per stereo track (track-major). Each row
+/// is stretched linearly (align_corners=False) over the source audio's
+/// `source_frames` latent frames, quantized to 1/256 as ComfyUI's H3 model
+/// does, then trimmed or padded (padding generates, as LTXVConcatAVLatent)
+/// to the video's `frames`. Returns 1 per kept (track, frame) audio row,
+/// track-major (the packed audio row order); a value below 0.5 keeps the
+/// source audio, 0.5 and above generates. `partial` is set when a value
+/// lies strictly between 0 and 1.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> AudioKeepRows(
+    std::span<const float> mask, int source_frames, int frames,
+    bool* partial = nullptr, std::string* error = nullptr);
 
 [[nodiscard]] std::optional<TimeRowSchedule> BuildTimeRowSchedule(
     const SigmaSchedule& schedule, std::string* error = nullptr);

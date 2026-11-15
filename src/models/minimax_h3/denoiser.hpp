@@ -33,6 +33,9 @@ struct DenoiserOptions {
   // Merged into the token refiner and DiT projections at load; must outlive
   // the session's creation.
   const LoraAdapter* lora{nullptr};
+  // Flow shifts of the sigma schedules (MiniMaxH3SigmaShift).
+  float video_sigma_shift{kH3VideoSigmaShift};
+  float audio_sigma_shift{kH3AudioSigmaShift};
 };
 
 /// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE
@@ -58,6 +61,11 @@ struct DenoiserConditioning {
   // latent is [24][latent frames][latent_height][latent_width].
   std::span<const int> keyframe_latent_frames;
   std::span<const AudioGuideLatent> audio_guides;
+  // Audio noise mask: the source latent `[32][2][audio latent frames]` and
+  // one byte per target audio row (track-major), 1 = hold the source row
+  // clean for every step. Both empty: the whole track generates.
+  std::span<const float> audio_mask_latent;
+  std::span<const std::uint8_t> audio_keep;
 };
 
 struct DenoiserVelocity {

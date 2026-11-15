@@ -21,8 +21,6 @@ namespace {
 
 constexpr std::array<int, 5> kFramesPerToken = {1, 4, 4, 4, 4};
 constexpr double kFrameRescale = 5.0 / 3.0;
-constexpr float kVideoSigmaShift = 12.0F;
-constexpr float kAudioSigmaShift = 3.0F;
 constexpr std::uint32_t kDitModalities = 3;
 
 float ShiftSigma(float base, float shift) noexcept {
@@ -170,11 +168,19 @@ std::optional<GenerationGeometry> ResolveGenerationGeometry(
 }
 
 std::optional<SigmaSchedule> BuildServingSchedule(int evaluations,
-                                                  std::string* error) {
+                                                  std::string* error,
+                                                  float video_shift,
+                                                  float audio_shift) {
   if (evaluations < 2 || evaluations > kH3MaximumEvaluations) {
     SetError(error,
              "MiniMax H3 evaluation count must be in the range [2, 1000]");
     return std::nullopt;
+  }
+  for (const float shift : {video_shift, audio_shift}) {
+    if (!(shift >= kH3MinimumSigmaShift && shift <= kH3MaximumSigmaShift)) {
+      SetError(error, "MiniMax H3 sigma shift must be in the range [0.01, 100]");
+      return std::nullopt;
+    }
   }
   SigmaSchedule schedule;
   try {
@@ -196,13 +202,57 @@ std::optional<SigmaSchedule> BuildServingSchedule(int evaluations,
             ? std::fma(step, static_cast<float>(index), 1.0F)
             : std::fma(-step, static_cast<float>(evaluations - index), 0.0F);
     schedule.video[static_cast<std::size_t>(index)] =
-        ShiftSigma(base, kVideoSigmaShift);
+        ShiftSigma(base, video_shift);
     schedule.audio[static_cast<std::size_t>(index)] =
-        ShiftSigma(base, kAudioSigmaShift);
+        ShiftSigma(base, audio_shift);
   }
   schedule.video.back() = 0.0F;
   schedule.audio.back() = 0.0F;
   return schedule;
+}
+
+std::optional<std::vector<std::uint8_t>> AudioKeepRows(
+    std::span<const float> mask, int source_frames, int frames,
+    bool* partial, std::string* error) {
+  if (partial != nullptr) {
+    *partial = false;
+  }
+  if (mask.size() < 2 || mask.size() % 2 != 0 ||
+      mask.size() > kH3MaximumAudioMaskValues || source_frames < 1 ||
+      frames < 1) {
+    SetError(error,
+             "MiniMax H3 audio mask must be two rows of equal length");
+    return std::nullopt;
+  }
+  const std::size_t width = mask.size() / 2;
+  std::vector<std::uint8_t> keep(static_cast<std::size_t>(2 * frames), 0);
+  for (int track = 0; track < 2; ++track) {
+    const std::span<const float> row =
+        mask.subspan(static_cast<std::size_t>(track) * width, width);
+    for (int frame = 0; frame < frames && frame < source_frames; ++frame) {
+      // torch.nn.functional.interpolate(..., mode="bilinear",
+      // align_corners=False) along time.
+      const double source = std::max(
+          0.0, (frame + 0.5) * static_cast<double>(width) / source_frames -
+                   0.5);
+      const std::size_t x0 =
+          std::min(static_cast<std::size_t>(source), width - 1);
+      const std::size_t x1 = std::min(x0 + 1, width - 1);
+      const double weight = source - static_cast<double>(x0);
+      const double raw = (1.0 - weight) * row[x0] + weight * row[x1];
+      if (!(raw >= 0.0 && raw <= 1.0)) {
+        SetError(error, "MiniMax H3 audio mask values must be in [0, 1]");
+        return std::nullopt;
+      }
+      const double value = std::ceil(raw * 256.0) / 256.0;
+      if (partial != nullptr && value > 0.0 && value < 1.0) {
+        *partial = true;
+      }
+      keep[static_cast<std::size_t>(track * frames + frame)] =
+          value < 0.5 ? 1U : 0U;
+    }
+  }
+  return keep;
 }
 
 std::optional<TimeRowSchedule> BuildTimeRowSchedule(
