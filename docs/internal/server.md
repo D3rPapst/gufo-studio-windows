@@ -2592,8 +2592,19 @@ Qwen3-ASR serving uses its own model process:
 `max_tokens`, and `stream`. The native route is deterministic (`temperature=0`)
 and supports `json`, `text`, and `verbose_json`. `stream=true` with JSON emits
 OpenAI transcript delta/done events. Long uploads are split within model
-capacity; `max_tokens` applies per chunk. Timestamp (`timestamp_granularities[]`)
-and logprobs (`include[]`) requests are rejected; unknown fields are ignored.
+capacity; `max_tokens` applies per chunk. Logprobs (`include[]`) requests are
+rejected; unknown fields are ignored.
+
+`timestamp_granularities[]` (one field per value, `word` and/or `segment`)
+needs `response_format=verbose_json`; other formats answer 400
+`invalid_response_format`, other values 400 `invalid_timestamp_granularity`.
+`segments` is always listed. With `word`, the response also lists
+`"words": [{"word", "start", "end"}]` (seconds from the start of the audio,
+the word without surrounding spaces, punctuation attached as the model wrote
+it). Only runners with word alignment fill it (the Whisper extension, from
+extension API 0.3.9: `TranscriptionRequest::word_timestamps`,
+`TranscriptionResult::words`); Qwen3-ASR and other runners answer
+`"words": []`. The router passes the multipart body through unchanged.
 
 `GET /v1/realtime?intent=transcription` upgrades to OpenAI's manual-commit
 transcription WebSocket interface. [ASR streaming examples](../models/qwen3-asr.md#streaming-a-file)

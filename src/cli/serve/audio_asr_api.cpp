@@ -15,6 +15,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "src/cli/serve/multipart.hpp"
 #include "src/core/json.hpp"
@@ -27,6 +28,8 @@ constexpr std::string_view kTranscriptionsPath = "/v1/audio/transcriptions";
 constexpr std::size_t kMaximumTextFieldBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 512;
 constexpr std::size_t kMaximumFields = 12;
+// OpenAI clients send one field per granularity.
+constexpr std::string_view kGranularities = "timestamp_granularities[]";
 
 struct MultipartPart {
   std::string body;
@@ -87,16 +90,38 @@ std::string ServerTiming(const ext::TranscriptionTimings& timings) {
   return value.str();
 }
 
+// Words in the response: no surrounding spaces, as OpenAI shows them.
+std::string_view TrimSpaces(std::string_view text) {
+  const auto first = text.find_first_not_of(' ');
+  if (first == std::string_view::npos)
+    return {};
+  return text.substr(first, text.find_last_not_of(' ') - first + 1);
+}
+
 HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   Multipart parts;
+  std::vector<std::string> granularities;
+  std::string duplicate;
   MultipartResult form = ParseMultipart(
       request.header("content-type"), request.body,
-      {.max_fields = kMaximumFields, .unique_names = true},
-      [&parts](const MultipartField& field) {
-        parts.emplace(std::string(field.name),
-                      MultipartPart{.body = std::string(field.content)});
+      {.max_fields = kMaximumFields, .unique_names = false},
+      [&](const MultipartField& field) {
+        if (field.name == kGranularities) {
+          granularities.emplace_back(field.content);
+          return true;
+        }
+        if (!parts.emplace(std::string(field.name),
+                           MultipartPart{.body = std::string(field.content)})
+                 .second) {
+          duplicate = std::string(field.name);
+          return false;
+        }
         return true;
       });
+  if (form.status == MultipartStatus::kStopped && !duplicate.empty()) {
+    form.status = MultipartStatus::kDuplicateField;
+    form.detail = duplicate;
+  }
   if (form.status == MultipartStatus::kNotFormData ||
       form.status == MultipartStatus::kBadBoundary) {
     return Error(400, "Bad Request",
@@ -155,10 +180,20 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                    "invalid_temperature");
     }
   }
-  if (Find(parts, "timestamp_granularities[]") != nullptr) {
+  bool word_timestamps = false;
+  for (const auto& granularity : granularities) {
+    if (granularity == "word") {
+      word_timestamps = true;
+    } else if (granularity != "segment") {
+      return Error(400, "Bad Request",
+                   "timestamp_granularities[] must be word or segment",
+                   "invalid_timestamp_granularity");
+    }
+  }
+  if (!granularities.empty() && format != "verbose_json") {
     return Error(400, "Bad Request",
-                 "timestamp granularities are not supported",
-                 "unsupported_option");
+                 "timestamp_granularities[] requires verbose_json",
+                 "invalid_response_format");
   }
   // `include[]` only requests logprobs, which this server cannot return.
   if (Find(parts, "include[]") != nullptr) {
@@ -271,6 +306,7 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                               ? std::nullopt
                               : std::optional<std::string>(language->body),
               .max_new_tokens = maximum_tokens,
+              .word_timestamps = word_timestamps,
           },
           request.is_cancelled, &result, &error)) {
     if (request.is_cancelled && request.is_cancelled()) {
@@ -311,6 +347,17 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
         segment["avg_logprob"] = source.avg_logprob;
         segment["no_speech_prob"] = source.no_speech_prob;
         body["segments"].push_back(std::move(segment));
+      }
+      if (word_timestamps) {
+        body["words"] = json::Value::array();
+        for (const auto& source : result.words) {
+          const std::string text = core::Utf8Decoder{}.Push(source.word, true);
+          json::Value word = json::Value::object();
+          word["word"] = std::string(TrimSpaces(text));
+          word["start"] = source.start;
+          word["end"] = source.end;
+          body["words"].push_back(std::move(word));
+        }
       }
     }
     response.body = body.dump();

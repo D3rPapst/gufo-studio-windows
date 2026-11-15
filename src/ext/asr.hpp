@@ -33,6 +33,9 @@ struct TranscriptionRequest {
   /// Cumulative UTF-8 transcript, called during generation. Returning false
   /// cancels the operation; the view is valid only during the callback.
   std::function<bool(std::string_view)> on_text;
+  /// Asks for TranscriptionResult::words (extension API 0.3.9). Runners
+  /// without word timing ignore it and return no words.
+  bool word_timestamps{false};
 };
 
 /// One timed stretch of the transcript, as models with timestamp tokens
@@ -51,11 +54,29 @@ struct TranscriptionSegment {
 /// Defined while TranscriptionResult carries segments (extension API 0.3.8).
 #define GUFO_EXT_ASR_SEGMENTS 1
 
+/// One spoken word with its time span, as models with word alignment
+/// (Whisper) produce it.
+struct TranscriptionWord {
+  /// The word as the model wrote it; it may start with a space and carry
+  /// adjacent punctuation.
+  std::string word;
+  /// Seconds from the start of the audio.
+  double start{0.0};
+  double end{0.0};
+};
+
+/// Defined while TranscriptionRequest::word_timestamps and
+/// TranscriptionResult::words exist (extension API 0.3.9).
+#define GUFO_EXT_ASR_WORDS 1
+
 struct TranscriptionResult {
   std::string language;
   std::string text;
   /// Timed segments in order; empty when the model returns none.
   std::vector<TranscriptionSegment> segments;
+  /// Timed words in order, only when the request set word_timestamps; empty
+  /// when the model has no word timing.
+  std::vector<TranscriptionWord> words;
   std::string decoded;
   std::vector<std::uint32_t> generated_ids;
   std::uint32_t sample_rate{16000};

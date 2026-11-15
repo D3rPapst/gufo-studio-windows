@@ -86,7 +86,10 @@ def run(evidence, url, audio_root, model):
                               ({'temperature': '1'}, 'invalid_temperature'),
                               ({'response_format': 'srt'}, 'invalid_response_format'),
                               ({'max_tokens': '0'}, 'invalid_max_tokens'),
-                              ({'timestamp_granularities[]': 'word'}, 'unsupported_option'),
+                              ({'timestamp_granularities[]': 'word'}, 'invalid_response_format'),
+                              ({'response_format': 'verbose_json',
+                                'timestamp_granularities[]': 'sentence'},
+                               'invalid_timestamp_granularity'),
                               ({'include[]': 'logprobs'}, 'unsupported_option')]:
             evidence.reject(endpoint, code, label=code, data=fields(item, **options),
                 files={'file': ('speech.wav', item['path'].read_bytes(), 'audio/wav')})

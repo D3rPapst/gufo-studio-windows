@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "src/models/qwen3_asr/audio.hpp"
@@ -41,7 +43,12 @@ public:
     context = request.context;
     language = request.language;
     maximum_tokens = request.max_new_tokens;
+    word_timestamps = request.word_timestamps;
     result->language = "English";
+    if (request.word_timestamps && words)
+      result->words = {{.word = " A", .start = 0.0, .end = 0.32},
+                       {.word = " native", .start = 0.32, .end = 0.8},
+                       {.word = " transcript.", .start = 0.8, .end = 1.46}};
     result->text = "A native transcript.";
     result->audio_samples = 32000;
     result->audio_tokens = 25;
@@ -61,6 +68,8 @@ public:
   std::string context;
   std::optional<std::string> language;
   std::size_t maximum_tokens{0};
+  bool word_timestamps{false};
+  bool words{true};  // the fake model has word timing
 };
 
 AsrService MakeService(FakeRunner* runner) {
@@ -242,12 +251,68 @@ void TestStreamingAndChunks() {
   }
 }
 
+// A verbose_json request with the given repeated granularity fields.
+std::string GranularityMultipart(std::initializer_list<std::string_view> values,
+                                 std::string_view format = "verbose_json") {
+  std::string body;
+  const auto append = [&](std::string_view name, std::string_view value,
+                          std::string_view filename = {}) {
+    body += "--gufo-test-boundary\r\nContent-Disposition: form-data; name=\"";
+    body += name;
+    body += '"';
+    if (!filename.empty()) {
+      body += "; filename=\"";
+      body += filename;
+      body += '"';
+    }
+    body += "\r\n\r\n";
+    body += value;
+    body += "\r\n";
+  };
+  append("file", "RIFFfake", "sample.wav");
+  append("response_format", format);
+  for (const auto value : values)
+    append("timestamp_granularities[]", value);
+  body += "--gufo-test-boundary--\r\n";
+  return body;
+}
+
+void TestTimestampGranularities() {
+  FakeRunner runner;
+  AsrService service = MakeService(&runner);
+  const HttpResponse words = Send(service, GranularityMultipart({"word", "segment"}));
+  Check(words.status == 200 && runner.word_timestamps &&
+            words.body.find("\"words\":[{\"word\":\"A\",\"start\":0,\"end\":0.32}") !=
+                std::string::npos &&
+            words.body.find("{\"word\":\"transcript.\",\"start\":0.8,\"end\":1.46}") !=
+                std::string::npos &&
+            words.body.find("\"segments\":[]") != std::string::npos,
+        "word granularity lists trimmed OpenAI words beside segments");
+  const HttpResponse segments = Send(service, GranularityMultipart({"segment"}));
+  Check(segments.status == 200 && !runner.word_timestamps &&
+            segments.body.find("\"words\"") == std::string::npos,
+        "segment granularity alone asks for no words");
+  runner.words = false;
+  const HttpResponse none = Send(service, GranularityMultipart({"word"}));
+  Check(none.status == 200 && none.body.find("\"words\":[]") != std::string::npos,
+        "a model without word timing answers an empty word list");
+  const int calls = runner.calls;
+  Check(Send(service, GranularityMultipart({"word"}, "json")).status == 400 &&
+            Send(service, GranularityMultipart({"sentence"})).status == 400 &&
+            Send(service, GranularityMultipart({"word", "character"})).status == 400,
+        "granularities need verbose_json and known values");
+  Check(Send(service, Multipart("json", "model")).status == 400,
+        "other repeated fields stay duplicates");
+  Check(runner.calls == calls, "rejected granularities never invoke inference");
+}
+
 }  // namespace
 
 int main() {
   TestJsonRequest();
   TestFormatsAndValidation();
   TestStreamingAndChunks();
+  TestTimestampGranularities();
   std::cout << "PASS qwen3_asr_audio_api_test\n";
   return 0;
 }
