@@ -1444,6 +1444,29 @@ machine because of the partner (waited too long, unreachable, failed,
 out of memory) logs `event=pool_fallback reason="..."` and counts in the
 `pool` block's `"fallbacks"`.
 
+**Partner out: no idle wait (2.2.0).** With the partner out of the
+decision (gone, draining, or dropped by the fallback above) a cold load
+of a pool model here no longer waits for an idle machine: it goes to the
+local admission (`choice=local reason="load beside busy models, partner
+out"`), which still evicts idle models only and waits for room within
+`--load-timeout-seconds`. Only a request of the same model in flight or
+loading here is waited for. Before, the request waited for "idle", which
+other models' work and other pool models' waiting requests never gave
+(Regie #56-1003, 15.11.: qwen-image-2.1 from ComfyUI prompts, hemmingway
+and Whisper waited 900 s each on the .56 beside the busy 27B while the
+.198 drained). A ComfyUI prompt's own calls (origin `comfy`) already
+ignore the adapter queue (1.4.20); `/router/placement` still shows
+`local_gpu_busy` with `"comfy queue N"`, which is the view of other
+clients.
+
+**CPU-only models (2.2.0).** A pool model whose preset says
+`router-gpu-gb = 0` (Whisper/ASR on CPU threads) is never "GPU busy" on
+either machine, and a machine counts as idle for it as soon as no
+request of the model itself runs there: ComfyUI work and other models'
+requests do not hold it back, and its `"activity"` reports
+`"gpu_busy"`/`"others_busy"` false, so an older partner sends it here
+too (Regie #56-1002).
+
 **Waiting is not busy.** The `"activity"` object of a pool model in `GET
 /v1/models` (what the partner's probe reads) reports `"busy"` only for
 work of the model that runs or loads here (a request, socket or job, or

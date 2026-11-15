@@ -1658,11 +1658,17 @@ public:
     out["busy"] = router::PoolActivityBusy(registry.Busy(model_id), claims);
     out["waiting"] = static_cast<long long>(waiting);
     std::string reason;
-    const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
+    // A CPU-only model (router-gpu-gb = 0) is not held back by GPU work or
+    // other models here: a partner older than 2.2.0 reads only these flags.
+    const router::PresetModel* preset = registry.Find(model_id);
+    const bool cpu_model = preset != nullptr && router::IsCpuModel(*preset);
+    const bool gpu_busy =
+        !cpu_model && GpuBusyLocked(model_id, false, &reason);
     out["gpu_busy"] = gpu_busy;
     if (gpu_busy)
       out["gpu_busy_reason"] = reason;
     out["others_busy"] =
+        !cpu_model &&
         OthersBusyLocked(model_id, false, /*count_waiting=*/false);
     if (draining_.load()) {
       // Draining (2.1.8): a partner of this version leaves this machine
@@ -1738,6 +1744,9 @@ public:
     local.idle = local.free && stopping.empty() &&
                  !OthersBusyLocked(preset.id, from_comfy);
     local.empty = !others_loaded;
+    const bool cpu_model = router::IsCpuModel(preset);
+    if (cpu_model)
+      local = router::CpuModelSide(local, stopping.empty());
     if (local.warm)
       pool.local_warm_at = now;
     local.sticky = within(pool.local_warm_at);
@@ -1758,6 +1767,8 @@ public:
       seen.stale =
           seen.view.checked_at <= registry.LastRemoteFinished(preset.id);
       remote = router::RemotePoolSide(seen);
+      if (cpu_model)
+        remote = router::CpuModelSide(remote, seen.ours == 0);
       if (remote.available && remote.warm)
         pool.remote_warm_at = now;
       remote.sticky = within(pool.remote_warm_at);

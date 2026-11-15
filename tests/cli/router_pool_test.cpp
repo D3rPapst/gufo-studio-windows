@@ -340,6 +340,109 @@ void TestDrainingPartner() {
   CHECK(Choose(Cold(), busy, std::chrono::seconds(11)) == PoolChoice::kLocal);
 }
 
+/// Regie #56-1003 (15.11., .56 on 2.1.7): a ComfyUI prompt asked for
+/// qwen-image-2.1 (cold here) while the 27B ran without a gap and the
+/// .198 drained. The prompt's own queue entry does not count for its call
+/// (origin comfy, so no GPU busy), but this machine was never idle: the
+/// request waited 900 s and got 503. With the partner out (draining, gone
+/// or after the B5 fallback) a cold load goes to the local admission.
+void TestNoSelfBlockadeWithPartnerOut() {
+  using gufo::router::RemoteObservation;
+  using gufo::router::RemotePoolSide;
+  using gufo::router::WithoutPartner;
+  const std::vector<gufo::router::PresetModel> presets = {PoolTwin()};
+  gufo::router::RemoteHub hub(presets);
+  const auto& url = presets[0].remote->url;
+  // The comfy prompt's own call: cold here, another model in flight (not
+  // idle, not empty), no GPU busy (its own queue entry is exempt).
+  PoolSide here = Cold();
+  here.idle = false;
+  here.empty = false;
+  // Partner draining (2.2.0 reads "draining").
+  RemoteObservation seen;
+  seen.reachable = true;
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"waiting":0,"gpu_busy":false,)"
+                         R"("others_busy":true,"draining":true})");
+  const PoolSide drained = RemotePoolSide(seen);
+  const auto decision = gufo::router::ChoosePool([&] {
+    PoolInput in;
+    in.local = here;
+    in.remote = drained;
+    return in;
+  }());
+  CHECK(decision.choice == PoolChoice::kLocal);
+  CHECK(std::string(decision.reason) ==
+        "load beside busy models, partner out");
+  // Partner older than "draining" (reads busy) and the B5 fallback after
+  // pool-wait-seconds: the same, local instead of 900 s and 503.
+  RemoteObservation old_reader = seen;
+  old_reader.view.activity.draining = false;
+  PoolInput fallback;
+  fallback.local = here;
+  fallback.remote = RemotePoolSide(old_reader);
+  fallback.waited = std::chrono::seconds(61);
+  CHECK(ChoosePool(fallback).choice == PoolChoice::kWait);  // before B5
+  CHECK(ChoosePool(WithoutPartner(fallback)).choice == PoolChoice::kLocal);
+  // Partner gone, and GPU work here (a non-comfy request): local as well.
+  PoolSide gpu = here;
+  gpu.gpu_busy = true;
+  CHECK(Choose(gpu, Unreachable()) == PoolChoice::kLocal);
+  // A request of the model itself already runs (or loads) here: wait for
+  // it, never a second load (FIFO).
+  PoolSide loading = here;
+  loading.free = false;
+  CHECK(Choose(loading, drained) == PoolChoice::kWait);
+  // With a usable partner nothing changes: a busy machine never evicts.
+  CHECK(Choose(here, Cold()) == PoolChoice::kRemote);
+  CHECK(Choose(here, here) == PoolChoice::kWait);
+}
+
+/// Regie #56-1002 (15.11.): Whisper (router-gpu-gb = 0) waited on the .56
+/// behind ComfyUI image tests ("both busy", the partner counted as busy)
+/// until its clients gave up. A CPU-only model ignores GPU work and other
+/// models' requests on both machines.
+void TestCpuModel() {
+  using gufo::router::CpuModelSide;
+  using gufo::router::IsCpuModel;
+  gufo::router::PresetModel whisper;
+  whisper.modality = "external";
+  whisper.argv = {"serve", "asr"};
+  CHECK(!IsCpuModel(whisper));  // router-gpu-gb unset
+  whisper.hints.gpu_gb = 4.0;
+  CHECK(!IsCpuModel(whisper));
+  whisper.hints.gpu_gb = 0.0;
+  CHECK(IsCpuModel(whisper));
+  // Here: cold, Comfy queue (GPU busy) and the 27B in flight. Partner:
+  // busy with other work (an older partner reading a drain, or a real
+  // job), the model warm but busy there.
+  PoolSide here = Cold();
+  here.gpu_busy = true;
+  here.idle = false;
+  here.empty = false;
+  PoolSide there = Warm(false);
+  there.gpu_busy = true;
+  PoolInput in;
+  in.local = here;
+  in.remote = there;
+  in.waited = std::chrono::seconds(11);
+  CHECK(ChoosePool(in).choice == PoolChoice::kWait);  // the old hang
+  in.local = CpuModelSide(here, /*nothing_pending=*/true);
+  in.remote = CpuModelSide(there, /*nothing_pending=*/true);
+  CHECK(!in.local.gpu_busy && in.local.idle);
+  CHECK(ChoosePool(in).choice == PoolChoice::kLocal);
+  // Warm and free here: at once, whatever the GPU does.
+  PoolSide warm = Warm(true);
+  warm.gpu_busy = true;
+  warm.empty = false;
+  CHECK(Choose(CpuModelSide(warm, true), Warm(true)) == PoolChoice::kLocal);
+  // Its own request in flight (or a worker stopping): not idle.
+  PoolSide own = here;
+  own.free = false;
+  CHECK(!CpuModelSide(own, true).idle);
+  CHECK(!CpuModelSide(here, false).idle);
+}
+
 gufo::router::PresetModel PoolTwin() {
   gufo::router::PresetModel model;
   model.modality = "llm";
@@ -684,6 +787,8 @@ int main() {
   TestWaitingIsNotBusy();
   TestProbeActivity();
   TestDrainingPartner();
+  TestNoSelfBlockadeWithPartnerOut();
+  TestCpuModel();
   TestGpuSlotIdle();
   TestRegistryCounts();
   TestFallback();

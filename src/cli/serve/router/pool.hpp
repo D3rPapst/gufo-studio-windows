@@ -140,10 +140,22 @@ struct PoolDecision {
   const bool remote_first = in.remote.sticky && !in.local.sticky;
   const PoolSide* order[2] = {remote_first ? &in.remote : &in.local,
                               remote_first ? &in.local : &in.remote};
+  // With the other machine out of the picture (gone, draining, or dropped
+  // by the B5 fallback) a cold load here no longer needs an idle machine:
+  // nothing else can take the request, and the local admission still
+  // evicts idle models only and waits for room itself. Waiting for "idle"
+  // instead waited forever beside a busy model (Regie #56-1003, 15.11.:
+  // qwen-image-2.1 from a ComfyUI prompt, Whisper and hemmingway waited
+  // 900 s each on the .56 while the 27B ran without a gap and the .198
+  // drained; their waiting requests also kept each other from "idle").
+  const auto ready = [&in](const PoolSide& side) {
+    const PoolSide& other = &side == &in.local ? in.remote : in.local;
+    return side.idle || (side.free && !other.available);
+  };
   for (const bool need_empty : {true, false}) {
     for (const PoolSide* side : order) {
       const PoolSide& other = side == &in.local ? in.remote : in.local;
-      if (!usable(*side) || side->warm || !side->idle ||
+      if (!usable(*side) || side->warm || !ready(*side) ||
           (need_empty && !side->empty)) {
         continue;
       }
@@ -155,7 +167,9 @@ struct PoolDecision {
         continue;
       }
       return {side == &in.local ? PoolChoice::kLocal : PoolChoice::kRemote,
-              need_empty ? "load" : "load after evicting idle models"};
+              !side->idle  ? "load beside busy models, partner out"
+              : need_empty ? "load"
+                           : "load after evicting idle models"};
     }
   }
   return {PoolChoice::kWait, "both busy"};
@@ -320,6 +334,24 @@ struct PoolFallbackInput {
 [[nodiscard]] inline std::string PoolSideOf(std::string_view header) {
   return header == "local" || header == "remote" ? std::string(header)
                                                   : std::string();
+}
+
+/// A CPU-only model: its preset says `router-gpu-gb = 0` (Whisper/ASR on
+/// CPU threads). GPU work and other models' requests on a machine do not
+/// hold it back in the pool (Regie #56-1002, 15.11.: Whisper waited on
+/// the .56 behind ComfyUI image tests until its clients gave up).
+[[nodiscard]] inline bool IsCpuModel(const PresetModel& preset) {
+  return preset.hints.gpu_gb == 0.0;
+}
+
+/// A machine's PoolSide for a CPU-only model: never "GPU busy", and idle
+/// as soon as no request of the model itself runs there and `nothing_pending`
+/// (local: no worker is stopping; remote: no relay of ours is open).
+[[nodiscard]] inline PoolSide CpuModelSide(PoolSide side,
+                                           bool nothing_pending) {
+  side.gpu_busy = false;
+  side.idle = side.free && nothing_pending;
+  return side;
 }
 
 /// Whether a local model counts as GPU work for the pool's busy rule:
