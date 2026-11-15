@@ -12,6 +12,7 @@
 // and passes every other request through untouched.
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -299,6 +300,10 @@ struct Route {
     kMe,           // GET /router/me
     kPasswort,     // POST /router/me/passwort (own password)
     kMeChats,      // /router/me/chats[/<id>] (2.1.8): the own chat history
+    kFilter,       // /router/filter[/pruefen] (2.1.8): the word list,
+                   // loopback or admin; another user 403
+    kFilterSync,   // POST /router/pool/filter (2.1.8): the partner's word
+                   // list exchange, pool key only, else 404
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
     kAdminPage,    // /verwaltung/, /einrichtung/: loopback or admin, else 404
     kSetup,        // /router/setup/* (2.1 setup assistant): loopback or
@@ -331,14 +336,40 @@ struct Route {
 /// (Ä Ö Ü É ... -> ä ö ü é; ß stays), so "TÖTEN" meets "töt*".
 [[nodiscard]] std::string LowerUtf8(std::string_view text);
 
-/// Word filter for image/video prompts: one word per line in
-/// `filter-woerter.txt` next to the users file (created with a default
-/// list when missing). Case-insensitive whole-word match on the prompt
-/// strings of a JSON or multipart body.
+/// Word list limits (2.1.8): active words, entries with tombstones, bytes
+/// per word, kept backups of filter.json.
+inline constexpr std::size_t kFilterMaxWords = 500;
+inline constexpr std::size_t kFilterMaxEntries = 5000;
+inline constexpr std::size_t kFilterMaxWordBytes = 100;
+inline constexpr std::size_t kFilterKeepBackups = 10;
+
+/// Word filter for prompts: case-insensitive whole-word match (`*` at the
+/// end = any word form) on the prompt strings of a JSON or multipart body.
+///
+/// Since 2.1.8 the list lives in `filter.json` next to the users file:
+/// per word `{aktiv, geaendert_ms, von}` (a deleted word stays as a
+/// tombstone, aktiv = false, so a partner never brings it back). The pool
+/// partners keep their lists in step (Gate::SyncFilterOnce): per word the
+/// newer `geaendert_ms` wins, on a tie the larger `von` (the router's
+/// address), then the tombstone. `filter-woerter.txt` stays as a mirror of
+/// the active words (written after every change; an edit of it by hand is
+/// taken over as a change of this machine). A first start without
+/// filter.json takes the text file over (geaendert_ms 0).
 class WordFilter {
 public:
+  struct Entry {
+    bool aktiv{true};
+    long long geaendert_ms{0};
+    std::string von;
+  };
+  using Entries = std::map<std::string, Entry>;
+  /// Called (with the list's lock held: never call back into the filter)
+  /// with the entries a change of this machine set: the list API, a hand
+  /// edit of the text file. Never for entries merged from the partner.
+  using OnChange = std::function<void(const Entries&)>;
+
   explicit WordFilter(std::filesystem::path file);
-  /// Writes the default list when the file is missing.
+  /// Writes the default list when neither file exists.
   void EnsureDefaults();
   /// The first blocked word found in the request's prompt texts, "" when
   /// clean. `comfy` scans every string of the body (ComfyUI graphs).
@@ -355,16 +386,70 @@ public:
   /// Every string of a parsed body (a ComfyUI graph).
   [[nodiscard]] std::string HitJson(const json::Value& body);
   [[nodiscard]] std::string HitText(std::string_view text);
+  /// Active words.
   [[nodiscard]] std::size_t size();
+
+  /// This router's name in `von` (its address; "lokal" by default).
+  void SetSelf(std::string name);
+  [[nodiscard]] std::string self();
+  /// Test hook: the clock for geaendert_ms (unix milliseconds).
+  void SetClockMs(std::function<long long()> now_ms);
+  void SetOnChange(OnChange on_change);
+  [[nodiscard]] Entries All();
+  [[nodiscard]] std::vector<std::string> Comments();
+  [[nodiscard]] std::filesystem::path json_file() const { return json_; }
+  /// Sets the active list to `words` (lines; empty lines and `#`
+  /// comments are skipped): new words become active, missing ones
+  /// tombstones, both stamped now by this router. Keeps a backup
+  /// `filter.json.bak-<time>` (the last kFilterKeepBackups). `changed`
+  /// gets what changed. False with `error` for an invalid line or more
+  /// than kFilterMaxWords words.
+  bool Replace(const std::vector<std::string>& words, Entries* changed,
+               std::string* error);
+  /// Takes every entry of `incoming` that is newer than the own one
+  /// (Newer); `changed` gets them. Invalid words are skipped.
+  bool Merge(const Entries& incoming, Entries* changed, std::string* error);
+  /// `text` trimmed and lower-cased into `key`; false with `why` for an
+  /// empty line, a space, a control character, a comment, a `*` not at
+  /// the end or more than kFilterMaxWordBytes bytes.
+  [[nodiscard]] static bool NormalizeWord(std::string_view text,
+                                          std::string* key, std::string* why);
+  /// `a` replaces `b`: newer geaendert_ms, then the larger von, then the
+  /// tombstone.
+  [[nodiscard]] static bool Newer(const Entry& a, const Entry& b);
+  [[nodiscard]] static json::Value EntriesJson(const Entries& entries);
+  [[nodiscard]] static bool EntriesFromJson(const json::Value& value,
+                                            Entries* out, std::string* error);
 
 private:
   void Reload();
+  void ImportTextLocked(bool initial, Entries* changed);
+  bool SaveLocked(bool backup, bool export_text, std::string* error);
+  void RebuildLocked();
+  void CapLocked();
+  [[nodiscard]] long long NowMs() const;
   std::filesystem::path file_;
+  std::filesystem::path json_;
   std::mutex mutex_;
   std::vector<std::string> words_;
-  std::filesystem::file_time_type loaded_at_{};
+  Entries entries_;
+  std::vector<std::string> comments_;
+  std::filesystem::file_time_type text_at_{};
+  bool text_known_{false};
   bool loaded_{false};
+  std::string self_{"lokal"};
+  std::function<long long()> now_ms_;
+  OnChange on_change_;
 };
+
+/// One answer of the partner to POST /router/pool/filter: status 0 = not
+/// reached (`error` says why).
+struct FilterReply {
+  int status{0};
+  std::string body;
+  std::string error;
+};
+using FilterCall = std::function<FilterReply(const std::string& body)>;
 
 /// Prompt texts of a body: JSON `prompt`/`negative_prompt` (any depth) or
 /// every string with `all_strings`; multipart text parts named so.
@@ -414,6 +499,24 @@ public:
   [[nodiscard]] UserStore& store() { return *store_; }
   [[nodiscard]] WordFilter& filter() { return filter_; }
   [[nodiscard]] ChatStore& chats() { return chats_; }
+
+  /// Word list exchange with the pool partner (2.1.8). No timer: the
+  /// router asks for a full exchange at its start and when the partner is
+  /// reachable again (or still owed one), a local change is pushed at
+  /// once. `call` sends one POST /router/pool/filter to the partner.
+  void SetFilterPartner(std::string partner_name, FilterCall call);
+  /// Queues a full exchange (both lists merged on both sides).
+  void RequestFilterSync();
+  /// A push or exchange did not reach the partner: a full exchange is owed.
+  [[nodiscard]] bool FilterSyncOpen();
+  /// Runs the queued work once (a full exchange, else the pending push);
+  /// true when nothing failed. The loop calls it; tests call it directly.
+  bool SyncFilterOnce();
+  /// The sync thread: waits for queued work (no timer) until Stop.
+  void FilterSyncLoop();
+  void StopFilterSync();
+  /// {partner, rechner, offen, zuletzt_ok_ms, zuletzt_versuch_ms, fehler}.
+  [[nodiscard]] json::Value FilterSyncStatus();
 
   /// The front hook: answers the request itself (refusals, login, me,
   /// users API) or hands a checked copy to `next` and post-processes the
@@ -560,6 +663,14 @@ private:
   /// none (403 no_account: the page keeps them in the browser).
   [[nodiscard]] server::HttpResponse ChatsApi(const server::HttpRequest& req,
                                               const Identity& who);
+  /// GET/PUT /router/filter, POST /router/filter/pruefen (2.1.8).
+  [[nodiscard]] server::HttpResponse FilterApi(const server::HttpRequest& req,
+                                               const Identity& who);
+  /// POST /router/pool/filter from the partner (2.1.8).
+  [[nodiscard]] server::HttpResponse FilterSyncEndpoint(
+      const server::HttpRequest& req, const Identity& who);
+  [[nodiscard]] json::Value FilterListJson();
+  void QueueFilterPush(const WordFilter::Entries& changed);
   [[nodiscard]] bool CountDaily(const Identity& who, int weight,
                                 long long limit);
   void RotateLogLocked();
@@ -570,6 +681,20 @@ private:
   Hooks hooks_;
   WordFilter filter_;
   ChatStore chats_;
+  struct FilterSync {
+    std::string partner;
+    FilterCall call;
+    bool want_full{false};
+    WordFilter::Entries push;
+    bool open{false};
+    bool stopping{false};
+    long long last_try_ms{0};
+    long long last_ok_ms{0};
+    std::string last_error;
+  };
+  std::mutex sync_mutex_;
+  std::condition_variable sync_cv_;
+  FilterSync sync_;
   std::string internal_key_;
   std::function<long long()> now_;
   std::mutex mutex_;

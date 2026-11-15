@@ -1690,7 +1690,7 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | --- | --- | --- |
 | `bereiche` | all | Subset of `text`, `bild`, `video`, `stimme`, `musik`, `3d`, `ablage`, `pool`, `status`. A request outside the user's areas is `403 forbidden` ("Bereich bild ist für diesen Nutzer nicht freigegeben"); a page of a closed area is a small 403 page. |
 | `modelle` | all | Allowed model ids; another model is `403 model_forbidden`. |
-| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart), and since 2.0.5 on the user texts of a chat (`POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`: `prompt`, the last `user` message of `messages` and the last `user` item of `input`, as a string or `text` parts; earlier turns, system and assistant texts are not read, so a refused question left in the history does not block the next one), and since 2.1.8 (decision e48) on music (`POST /v1/audio/music`: `tags`, `prompt`, `style`, `caption`, `lyrics`) and speech (`POST /v1/audio/speech`: `input`, `instructions`), each a string or an array of strings, direct or wrapped in a `POST /v1/jobs` (so the MCP tools `musik` and `stimme` too); voice names, reference audio and other fields are not read: `400 content_filtered`, logged `abgelehnt:content_filtered`, before any stream starts. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
+| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart), and since 2.0.5 on the user texts of a chat (`POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`: `prompt`, the last `user` message of `messages` and the last `user` item of `input`, as a string or `text` parts; earlier turns, system and assistant texts are not read, so a refused question left in the history does not block the next one), and since 2.1.8 (decision e48) on music (`POST /v1/audio/music`: `tags`, `prompt`, `style`, `caption`, `lyrics`) and speech (`POST /v1/audio/speech`: `input`, `instructions`), each a string or an array of strings, direct or wrapped in a `POST /v1/jobs` (so the MCP tools `musik` and `stimme` too); voice names, reference audio and other fields are not read: `400 content_filtered`, logged `abgelehnt:content_filtered`, before any stream starts. Since 2.1.8 the list lives in `nutzer\filter.json` (per word `aktiv`, `geaendert_ms`, `von`; deleted words stay as tombstones) and is maintained on `/verwaltung/` through `GET/PUT /router/filter` (see the word list section below); `nutzer\filter-woerter.txt` stays as a mirror of the active words, one entry per line, `*` at the end matches word forms. A first start without `filter.json` takes the text file over; a default list (~28 words, de/en) is written when neither file exists; a hand edit of the text file is still picked up without a restart (as a change of this machine). |
 | `tageslimit` | 0 (unlimited) | Media jobs per UTC day, videos count twice: `429 daily_limit`. Since 2.1.8 (decision e47) only media count: `POST` on `/v1/images/*` (generation, edits, upscale), `/v1/videos*`, `/v1/audio/speech`, `/v1/audio/convert`, `/v1/audio/separate`, `/v1/audio/music`, `/v1/audio/foley`, `/v1/3d/*`, the ComfyUI `/prompt` graph and a `POST /v1/jobs` wrapping one of them (also the MCP media tools). Chat and text (`/v1/chat/completions`, `/v1/completions`, `/completion`, `/v1/responses`, `/v1/messages`, embeddings, rerank, `/v1/systemone`, the MCP `chat` tool) and speech recognition (`/v1/audio/transcriptions`) never count and still pass once the limit is reached. Counted in memory (a restart resets it). |
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
@@ -1743,6 +1743,10 @@ Endpoints (JSON):
 | `GET /router/partner/jobs?status=…` | area `ablage` | The partner's `/v1/jobs` list with the same query, passed through; a `nutzer` sees its own jobs in it, an admin all. |
 | `POST /router/me/passwort` | signed-in admin or nutzer | `{"alt", "neu"}` (2.0.4): checks the current password, sets the new one (same rules as the users API, at least 4 characters), ends the account's other sessions (this one stays, a remembered one is written again), logs `passwort_geaendert`. `403 wrong_password` (counts as a failed login), `400 invalid_password`, `403 no_account` for loopback/partner, `403 password_change_not_allowed` for `dienst`; the CSRF rule applies like to every browser write. The pages offer it as "Passwort ändern" beside "Abmelden". |
 | `GET/DELETE /router/me/chats`, `GET/PUT/DELETE /router/me/chats/<id>` | a signed-in account (any role) | The chat history of the own account (2.1.8, decision e51). `GET` lists `{konto, chats: [{id, titel, modell, zeit, bytes}] (newest `zeit` first), max: 100, max_bytes: 2097152, max_bild_bytes: 262144}`; `PUT …/<id>` stores a conversation (a JSON object as the /chat/ page keeps it; `id` 1-64 of `A-Z a-z 0-9 _ -`) and answers `{ok, id, entfernt: [ids]}`: at most 100 per account, the oldest `zeit` go; `GET …/<id>` returns it, `DELETE …/<id>` removes one, `DELETE /router/me/chats` all (logged `chats_geloescht:<n>`). Files: `nutzer\chats\<konto>\<id>.json` plus `index.json` (rebuilt from the files when missing). A conversation is at most 2 MB (`413 chat_too_large`); the page stores image data up to 256 KB per image with the conversation and only a placeholder `[Bild]` for larger ones, so big pictures are never kept twice. Only the own account: another user's id is `404 chat_not_found`, admins see only their own. Loopback as admin, `auth = off`, the router itself and the pool partner have no account: `403 no_account` (the page then keeps the browser's localStorage). Nothing goes to the pool partner: each router keeps its own accounts' chats. `400 invalid_id`, `400 invalid_request` (no JSON object), `405`; the CSRF rule applies like to every browser write. |
+| `GET /router/filter` | loopback or admin (another user `403`) | The word list (2.1.8): `{woerter (active), eintraege: [{wort, aktiv, geaendert_ms, von}], geloescht, kommentare, max: 500, rechner, datei, abgleich: {partner, offen, zuletzt_ok_ms, zuletzt_versuch_ms, fehler}}`. |
+| `PUT /router/filter` | loopback or admin | `{"woerter": [...]}` (or `{"text": "one word per line"}`): the new active list. Empty lines and `#` lines are skipped; a word has no space, no control character, `*` only at the end, at most 100 bytes; at most 500 words (`400 invalid_word` naming the line). New words become active, missing ones tombstones, stamped now by this router; `filter.json` is written atomically (temporary file + rename) after a backup `filter.json.bak-<time>` (the last 10 stay), the text mirror is rewritten, the list is in force at once (no restart), the access log gets `filter_geaendert:+<new>-<removed>`, and the change goes to the pool partner at once. JSON only (`415`), CSRF rule as for every browser write. |
+| `POST /router/filter/pruefen` | loopback or admin | `{"text"}` -> `{gesperrt, wort}`: whether this prompt would be blocked and by which entry. |
+| `POST /router/pool/filter` | the pool partner (pool key, no relayed user), else `404` | The word list exchange between the partners (2.1.8): `{rechner, voll, eintraege: {wort: {aktiv, geaendert_ms, von}}}`; the receiver merges (per word the newer entry) and answers `{ok, rechner, uebernommen, eintraege}`: on `voll` its whole merged list, on a push the entries of the pushed words that are newer there. |
 | `GET/POST /router/users` | loopback or admin | List (no hashes) / create `{"name", "rolle", "passwort", "rechte"}`. |
 | `GET/PUT/DELETE /router/users/<name>` | loopback or admin | Read / change `{rolle, rechte, passwort, gesperrt}` / block; `?loeschen=1` removes the user. |
 | `POST /router/users/<name>/tokens` | loopback or admin | `{"name", "tage"}` -> the token `gufo_<64 hex>` once; only its SHA-256 is stored. |
@@ -1834,6 +1838,44 @@ de/en, dark mode) and `gemeinsam/anmeldung.js`, which every page loads
 after `sprache.js`: it reads `/router/me`, shows the name and "Abmelden",
 hides tiles and menu entries of closed areas and goes to `/login/` on
 `401`.
+
+### Word list in the pool (2.1.8)
+
+Both pool routers keep the same word list: whoever changed a word last
+wins, whether the change deleted or added it. Each entry of
+`filter.json` carries `geaendert_ms` (unix milliseconds of the change)
+and `von` (the address of the router that made it, e.g.
+`http://192.168.178.198:8081`); a deleted word stays as a tombstone
+(`aktiv: false`) so the partner's older copy never brings it back.
+Merging takes per word the entry with the larger `geaendert_ms`; on the
+same millisecond the larger `von` (a fixed order of the two routers),
+then the tombstone. At most 5000 entries are kept (the oldest
+tombstones go first).
+
+There is no timer of its own:
+
+- A change on `/verwaltung/` (or a hand edit of the text mirror) is
+  pushed at once as one `POST /router/pool/filter` with the changed
+  entries; the partner answers with its own newer entries for those
+  words, so both agree after the one call.
+- A full exchange (`voll: true`, both whole lists, merged on both
+  sides) runs once at the router's start and whenever the remote probe,
+  which runs anyway, sees the partner reachable again after an
+  interruption.
+- When a push or exchange does not reach the partner, the router notes
+  "Abgleich offen" (`abgleich.offen`) and runs the full exchange at the
+  next probe that reaches the partner. Each router works on with its own
+  list meanwhile. A partner that answers but refuses (`404` from a
+  router older than 2.1.8, no pool secret) is not retried until the
+  next start or return.
+
+The exchange needs the pool secret (`pool-secret-env`) on both
+routers. The routers' clocks come from NTP; a skew of a few seconds
+only matters for two changes of the same word within that skew: the
+change stamped by the clock that runs ahead wins (with A 2 s ahead, a
+delete on A and a re-add on B one second later both end deleted; the
+tests run exactly this case). `GET /router/filter` shows the state as
+`abgleich` and the page writes "abgeglichen mit <partner> um <time>".
 
 ### MCP endpoint (`POST /mcp`)
 

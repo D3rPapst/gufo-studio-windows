@@ -1173,6 +1173,10 @@ Route Classify(const HttpRequest& req) {
     return set(Route::Kind::kPasswort);
   if (p == "/router/me/chats" || p.starts_with("/router/me/chats/"))
     return set(Route::Kind::kMeChats);
+  if (p == "/router/filter" || p == "/router/filter/pruefen")
+    return set(Route::Kind::kFilter);
+  if (p == "/router/pool/filter")
+    return set(Route::Kind::kFilterSync);
   if (p == "/router/users" || p.starts_with("/router/users/") ||
       p == "/router/zugriff")
     return set(Route::Kind::kUsers);
@@ -1327,11 +1331,13 @@ std::vector<std::string> PromptTexts(const HttpRequest& req, bool all_strings) {
   return out;
 }
 
-WordFilter::WordFilter(std::filesystem::path file) : file_(std::move(file)) {}
+WordFilter::WordFilter(std::filesystem::path file)
+    : file_(std::move(file)), json_(file_.parent_path() / "filter.json") {}
 
 void WordFilter::EnsureDefaults() {
   std::error_code ec;
-  if (std::filesystem::is_regular_file(file_, ec))
+  if (std::filesystem::is_regular_file(file_, ec) ||
+      std::filesystem::is_regular_file(json_, ec))
     return;
   std::filesystem::create_directories(file_.parent_path(), ec);
   std::ofstream out(file_, std::ios::binary | std::ios::trunc);
@@ -1339,18 +1345,120 @@ void WordFilter::EnsureDefaults() {
     out << kDefaultFilterWords;
 }
 
-void WordFilter::Reload() {
-  std::error_code ec;
-  const auto stamp = std::filesystem::last_write_time(file_, ec);
-  if (ec) {
-    if (loaded_)
-      words_.clear();
-    loaded_ = true;
-    return;
+void WordFilter::SetSelf(std::string name) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  self_ = std::move(name);
+}
+
+std::string WordFilter::self() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return self_;
+}
+
+void WordFilter::SetClockMs(std::function<long long()> now_ms) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  now_ms_ = std::move(now_ms);
+}
+
+void WordFilter::SetOnChange(OnChange on_change) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  on_change_ = std::move(on_change);
+}
+
+long long WordFilter::NowMs() const {
+  if (now_ms_)
+    return now_ms_();
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+bool WordFilter::NormalizeWord(std::string_view text, std::string* key,
+                               std::string* why) {
+  const std::string_view word = Trim(text);
+  if (word.empty()) {
+    *why = "leere Zeile (empty line)";
+    return false;
   }
-  if (loaded_ && stamp == loaded_at_)
-    return;
+  if (word.size() > kFilterMaxWordBytes) {
+    *why = "zu lang, höchstens " + std::to_string(kFilterMaxWordBytes) +
+           " Byte (too long)";
+    return false;
+  }
+  for (const char c : word) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u < 0x20 || u == 0x7F) {
+      *why = "Steuerzeichen (control character)";
+      return false;
+    }
+    if (c == ' ') {
+      *why = "ein Wort je Zeile, kein Leerzeichen (one word per line)";
+      return false;
+    }
+  }
+  if (word.front() == '#' || word.front() == ';') {
+    *why = "Kommentar, kein Wort (a comment, not a word)";
+    return false;
+  }
+  const auto star = word.find('*');
+  if (star != std::string_view::npos &&
+      (star + 1 != word.size() || word.size() == 1)) {
+    *why = "* nur am Ende eines Wortes (* only at the end of a word)";
+    return false;
+  }
+  *key = LowerUtf8(word);
+  return true;
+}
+
+bool WordFilter::Newer(const Entry& a, const Entry& b) {
+  if (a.geaendert_ms != b.geaendert_ms)
+    return a.geaendert_ms > b.geaendert_ms;
+  if (a.von != b.von)
+    return a.von > b.von;
+  return !a.aktiv && b.aktiv;
+}
+
+json::Value WordFilter::EntriesJson(const Entries& entries) {
+  json::Value out = json::Value::object();
+  for (const auto& [word, entry] : entries) {
+    json::Value item = json::Value::object();
+    item["aktiv"] = entry.aktiv;
+    item["geaendert_ms"] = entry.geaendert_ms;
+    item["von"] = entry.von;
+    out[word] = std::move(item);
+  }
+  return out;
+}
+
+bool WordFilter::EntriesFromJson(const json::Value& value, Entries* out,
+                                 std::string* error) {
+  if (!value.is_object()) {
+    *error = "eintraege must be an object";
+    return false;
+  }
+  if (value.size() > kFilterMaxEntries) {
+    *error = "more than " + std::to_string(kFilterMaxEntries) + " entries";
+    return false;
+  }
+  for (const auto& [word, item] : value.members()) {
+    if (!item.is_object()) {
+      *error = "entry " + word + " must be an object";
+      return false;
+    }
+    Entry entry;
+    const json::Value* aktiv = item.find("aktiv");
+    entry.aktiv = aktiv == nullptr || !aktiv->is_bool() || aktiv->as_bool();
+    entry.geaendert_ms =
+        static_cast<long long>(item.member_double("geaendert_ms", 0.0));
+    entry.von = item.member_str("von").substr(0, 200);
+    (*out)[word] = std::move(entry);
+  }
+  return true;
+}
+
+void WordFilter::ImportTextLocked(bool initial, Entries* changed) {
   std::ifstream in(file_, std::ios::binary);
+  std::vector<std::string> comments;
   std::vector<std::string> words;
   std::string line;
   bool first = true;
@@ -1361,19 +1469,331 @@ void WordFilter::Reload() {
         line.erase(0, 3);
     }
     const std::string_view trimmed = Trim(line);
-    if (trimmed.empty() || trimmed.front() == '#' || trimmed.front() == ';')
+    if (trimmed.empty())
       continue;
-    words.push_back(LowerUtf8(trimmed));
+    if (trimmed.front() == '#' || trimmed.front() == ';') {
+      comments.emplace_back(trimmed);
+      continue;
+    }
+    std::string key;
+    std::string why;
+    if (NormalizeWord(trimmed, &key, &why))
+      words.push_back(std::move(key));
   }
-  words_ = std::move(words);
-  loaded_at_ = stamp;
-  loaded_ = true;
+  comments_ = std::move(comments);
+  if (initial) {
+    for (const std::string& word : words)
+      entries_[word] = Entry{true, 0, ""};
+    return;
+  }
+  const long long now = NowMs();
+  for (auto& [word, entry] : entries_) {
+    if (entry.aktiv &&
+        std::find(words.begin(), words.end(), word) == words.end()) {
+      entry = Entry{false, now, self_};
+      if (changed != nullptr)
+        (*changed)[word] = entry;
+    }
+  }
+  for (const std::string& word : words) {
+    auto it = entries_.find(word);
+    if (it == entries_.end() || !it->second.aktiv) {
+      entries_[word] = Entry{true, now, self_};
+      if (changed != nullptr)
+        (*changed)[word] = entries_[word];
+    }
+  }
+}
+
+void WordFilter::RebuildLocked() {
+  words_.clear();
+  for (const auto& [word, entry] : entries_)
+    if (entry.aktiv)
+      words_.push_back(word);
+}
+
+void WordFilter::CapLocked() {
+  // Tombstones beyond kFilterMaxEntries go, the oldest first (a word
+  // deleted that long ago could come back from an old partner list).
+  while (entries_.size() > kFilterMaxEntries) {
+    auto oldest = entries_.end();
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+      if (!it->second.aktiv &&
+          (oldest == entries_.end() ||
+           it->second.geaendert_ms < oldest->second.geaendert_ms))
+        oldest = it;
+    if (oldest == entries_.end())
+      break;
+    entries_.erase(oldest);
+  }
+}
+
+bool WordFilter::SaveLocked(bool backup, bool export_text, std::string* error) {
+  std::error_code ec;
+  std::filesystem::create_directories(json_.parent_path(), ec);
+  if (backup && std::filesystem::is_regular_file(json_, ec)) {
+    const long long now = NowMs();
+    std::string stamp = IsoOf(now / 1000);
+    std::replace(stamp.begin(), stamp.end(), ':', '-');
+    char ms[8];
+    std::snprintf(ms, sizeof(ms), "-%03lld", now % 1000);
+    std::filesystem::path copy = json_;
+    copy += ".bak-" + stamp + ms;
+    std::filesystem::copy_file(json_, copy,
+                               std::filesystem::copy_options::overwrite_existing,
+                               ec);
+    std::vector<std::filesystem::path> backups;
+    const std::string prefix = json_.filename().string() + ".bak-";
+    for (const auto& item :
+         std::filesystem::directory_iterator(json_.parent_path(), ec))
+      if (item.path().filename().string().starts_with(prefix))
+        backups.push_back(item.path());
+    std::sort(backups.begin(), backups.end());
+    while (backups.size() > kFilterKeepBackups) {
+      std::filesystem::remove(backups.front(), ec);
+      backups.erase(backups.begin());
+    }
+  }
+  json::Value doc = json::Value::object();
+  doc["version"] = 1;
+  doc["rechner"] = self_;
+  doc["eintraege"] = EntriesJson(entries_);
+  doc["kommentare"] = ArrayOf(comments_);
+  const auto write = [error](const std::filesystem::path& file,
+                             const std::string& text) {
+    std::error_code wec;
+    const std::filesystem::path tmp = file.string() + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        *error = "cannot write " + tmp.string();
+        return false;
+      }
+      out << text;
+      if (!out) {
+        *error = "write failed: " + tmp.string();
+        return false;
+      }
+    }
+    std::filesystem::rename(tmp, file, wec);
+    if (wec) {
+      *error = "cannot replace " + file.string() + ": " + wec.message();
+      std::filesystem::remove(tmp, wec);
+      return false;
+    }
+    return true;
+  };
+  if (!write(json_, doc.tojson() + "\n"))
+    return false;
+  if (export_text) {
+    // The text file mirrors the active words for older routers and for
+    // reading; its comments stay.
+    std::string text;
+    for (const std::string& comment : comments_)
+      text += comment + "\n";
+    if (comments_.empty())
+      text +=
+          "# Wortsperre (gufo 2.1.8): wird aus filter.json geschrieben, "
+          "pflegen unter /verwaltung/.\n";
+    for (const auto& [word, entry] : entries_)
+      if (entry.aktiv)
+        text += word + "\n";
+    if (!write(file_, text))
+      return false;
+    const auto stamp = std::filesystem::last_write_time(file_, ec);
+    text_known_ = !ec;
+    if (!ec)
+      text_at_ = stamp;
+  }
+  return true;
+}
+
+void WordFilter::Reload() {
+  std::error_code ec;
+  if (!loaded_) {
+    loaded_ = true;
+    bool have_json = false;
+    if (std::filesystem::is_regular_file(json_, ec)) {
+      std::ifstream in(json_, std::ios::binary);
+      const std::string text((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+      try {
+        const json::Value doc = json::parse(text);
+        Entries entries;
+        std::string error;
+        const json::Value* list = doc.find("eintraege");
+        if (list != nullptr && EntriesFromJson(*list, &entries, &error)) {
+          entries_.clear();
+          for (auto& [word, entry] : entries) {
+            std::string key;
+            std::string why;
+            if (NormalizeWord(word, &key, &why) && key == word)
+              entries_[word] = std::move(entry);
+          }
+          comments_ = StringsOf(doc, "kommentare");
+          have_json = true;
+        } else {
+          Logger::Warn("router", "event=filter_json_invalid file=" +
+                                     json_.string() + " reason=\"" + error +
+                                     "\"");
+        }
+      } catch (const std::exception& e) {
+        Logger::Warn("router", "event=filter_json_invalid file=" +
+                                   json_.string() + " reason=\"" + e.what() +
+                                   "\"");
+      }
+    }
+    const auto text_stamp = std::filesystem::last_write_time(file_, ec);
+    const bool have_text = !ec;
+    if (have_json) {
+      // A text file written after filter.json (an edit while the router
+      // was down) is taken over as this machine's change.
+      const auto json_stamp = std::filesystem::last_write_time(json_, ec);
+      if (have_text && !ec && text_stamp > json_stamp) {
+        Entries changed;
+        ImportTextLocked(false, &changed);
+        if (!changed.empty()) {
+          std::string error;
+          if (!SaveLocked(false, false, &error))
+            Logger::Warn("router", "event=filter_save_failed reason=\"" +
+                                       error + "\"");
+          if (on_change_)
+            on_change_(changed);
+        }
+      }
+    } else if (have_text) {
+      ImportTextLocked(true, nullptr);
+      std::string error;
+      if (!SaveLocked(false, false, &error))
+        Logger::Warn("router",
+                     "event=filter_save_failed reason=\"" + error + "\"");
+    }
+    text_known_ = have_text;
+    if (have_text)
+      text_at_ = text_stamp;
+    RebuildLocked();
+    return;
+  }
+  const auto stamp = std::filesystem::last_write_time(file_, ec);
+  if (ec) {
+    text_known_ = false;  // the mirror is gone; filter.json still holds
+    return;
+  }
+  if (text_known_ && stamp == text_at_)
+    return;
+  text_known_ = true;
+  text_at_ = stamp;
+  Entries changed;
+  ImportTextLocked(false, &changed);
+  if (changed.empty())
+    return;
+  CapLocked();
+  std::string error;
+  if (!SaveLocked(false, false, &error))
+    Logger::Warn("router", "event=filter_save_failed reason=\"" + error + "\"");
+  RebuildLocked();
+  if (on_change_)
+    on_change_(changed);
 }
 
 std::size_t WordFilter::size() {
   const std::lock_guard<std::mutex> lock(mutex_);
   Reload();
   return words_.size();
+}
+
+WordFilter::Entries WordFilter::All() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Reload();
+  return entries_;
+}
+
+std::vector<std::string> WordFilter::Comments() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Reload();
+  return comments_;
+}
+
+bool WordFilter::Replace(const std::vector<std::string>& words,
+                         Entries* changed, std::string* error) {
+  std::vector<std::string> keys;
+  std::size_t line = 0;
+  for (const std::string& text : words) {
+    ++line;
+    const std::string_view trimmed = Trim(text);
+    if (trimmed.empty() || trimmed.front() == '#')
+      continue;
+    std::string key;
+    std::string why;
+    if (!NormalizeWord(trimmed, &key, &why)) {
+      *error = "Zeile " + std::to_string(line) + " (" +
+               std::string(trimmed.substr(0, 40)) + "): " + why;
+      return false;
+    }
+    if (std::find(keys.begin(), keys.end(), key) == keys.end())
+      keys.push_back(std::move(key));
+  }
+  if (keys.size() > kFilterMaxWords) {
+    *error = "höchstens " + std::to_string(kFilterMaxWords) +
+             " Wörter (at most " + std::to_string(kFilterMaxWords) +
+             " words), hier " + std::to_string(keys.size());
+    return false;
+  }
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Reload();
+  const long long now = NowMs();
+  Entries local;
+  for (auto& [word, entry] : entries_) {
+    if (entry.aktiv && std::find(keys.begin(), keys.end(), word) == keys.end()) {
+      entry = Entry{false, now, self_};
+      local[word] = entry;
+    }
+  }
+  for (const std::string& word : keys) {
+    auto it = entries_.find(word);
+    if (it == entries_.end() || !it->second.aktiv) {
+      entries_[word] = Entry{true, now, self_};
+      local[word] = entries_[word];
+    }
+  }
+  if (local.empty())
+    return true;
+  CapLocked();
+  if (!SaveLocked(true, true, error))
+    return false;
+  RebuildLocked();
+  if (on_change_)
+    on_change_(local);
+  if (changed != nullptr)
+    *changed = std::move(local);
+  return true;
+}
+
+bool WordFilter::Merge(const Entries& incoming, Entries* changed,
+                       std::string* error) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Reload();
+  Entries taken;
+  for (const auto& [word, entry] : incoming) {
+    std::string key;
+    std::string why;
+    if (!NormalizeWord(word, &key, &why) || key != word)
+      continue;
+    const auto it = entries_.find(word);
+    if (it == entries_.end() || Newer(entry, it->second)) {
+      entries_[word] = entry;
+      taken[word] = entry;
+    }
+  }
+  if (taken.empty())
+    return true;
+  CapLocked();
+  if (!SaveLocked(false, true, error))
+    return false;
+  RebuildLocked();
+  if (changed != nullptr)
+    *changed = std::move(taken);
+  return true;
 }
 
 namespace {
@@ -1577,6 +1997,10 @@ Gate::Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks)
       internal_key_(RandomHex(32)) {
   if (settings_.mode != Mode::kOff)
     filter_.EnsureDefaults();
+  // A change of this machine's word list goes to the partner at once.
+  filter_.SetOnChange([this](const WordFilter::Entries& changed) {
+    QueueFilterPush(changed);
+  });
   // The day of the last line decides when the log rotates next.
   std::ifstream in(log_file(), std::ios::binary);
   std::string line;
@@ -2997,6 +3421,326 @@ HttpResponse Gate::UsersApi(const HttpRequest& req, const Identity& who) {
   return NotFound();
 }
 
+json::Value Gate::FilterListJson() {
+  const WordFilter::Entries entries = filter_.All();
+  json::Value list = json::Value::array();
+  json::Value words = json::Value::array();
+  long long deleted = 0;
+  for (const auto& [word, entry] : entries) {
+    json::Value item = json::Value::object();
+    item["wort"] = word;
+    item["aktiv"] = entry.aktiv;
+    item["geaendert_ms"] = entry.geaendert_ms;
+    item["von"] = entry.von;
+    list.push_back(std::move(item));
+    if (entry.aktiv)
+      words.push_back(word);
+    else
+      ++deleted;
+  }
+  json::Value out = json::Value::object();
+  out["woerter"] = std::move(words);
+  out["eintraege"] = std::move(list);
+  out["geloescht"] = deleted;
+  out["kommentare"] = ArrayOf(filter_.Comments());
+  out["max"] = static_cast<long long>(kFilterMaxWords);
+  out["rechner"] = filter_.self();
+  out["datei"] = filter_.json_file().string();
+  out["abgleich"] = FilterSyncStatus();
+  return out;
+}
+
+HttpResponse Gate::FilterApi(const HttpRequest& req, const Identity& who) {
+  if (who.source == Identity::Source::kPool)
+    return NotFound();
+  const bool loopback_ok = IsLoopback(RequestAddress(req)) &&
+                           settings_.mode != Mode::kAll &&
+                           settings_.loopback == LoopbackPolicy::kAdmin;
+  const bool admin_ok = who.authenticated() && who.admin() &&
+                        who.source != Identity::Source::kOff;
+  if (!loopback_ok && !admin_ok) {
+    if (!who.authenticated())
+      return AuthError(401, "Unauthorized", "login required",
+                       "not_authenticated");
+    return Forbidden("nur admin: Wortliste (admin only: word list)",
+                     "forbidden");
+  }
+  if (req.method != "GET" && req.method != "HEAD" &&
+      !Lower(req.header("Content-Type")).starts_with("application/json"))
+    return AuthError(415, "Unsupported Media Type",
+                     "the word list API takes application/json",
+                     "json_required");
+  json::Value body;
+  if (req.method == "PUT" || req.method == "POST") {
+    try {
+      body = json::parse(req.body.empty() ? "{}" : req.body);
+    } catch (const std::exception&) {
+      body = json::Value();
+    }
+    if (!body.is_object())
+      return AuthError(400, "Bad Request", "a JSON object expected",
+                       "invalid_request");
+  }
+  if (req.path == "/router/filter/pruefen") {
+    if (req.method != "POST")
+      return AuthError(405, "Method Not Allowed", "POST {\"text\"}",
+                       "method_not_allowed");
+    const std::string text = body.member_str("text");
+    if (text.size() > 65536)
+      return AuthError(400, "Bad Request", "text longer than 64 KB",
+                       "invalid_request");
+    const std::string word = filter_.HitText(text);
+    json::Value out = json::Value::object();
+    out["gesperrt"] = !word.empty();
+    out["wort"] = word;
+    return JsonOk(out);
+  }
+  if (req.method == "GET" || req.method == "HEAD")
+    return JsonOk(FilterListJson());
+  if (req.method != "PUT")
+    return AuthError(405, "Method Not Allowed", "GET or PUT",
+                     "method_not_allowed");
+  std::vector<std::string> words;
+  if (const json::Value* list = body.find("woerter");
+      list != nullptr && list->is_array()) {
+    for (const json::Value& item : list->items()) {
+      if (!item.is_string())
+        return AuthError(400, "Bad Request", "woerter: strings only",
+                         "invalid_request");
+      words.push_back(item.str());
+    }
+  } else if (const json::Value* text = body.find("text");
+             text != nullptr && text->is_string()) {
+    words = Split(text->str(), '\n');
+  } else {
+    return AuthError(400, "Bad Request",
+                     "{\"woerter\": [...]} or {\"text\": \"...\"} expected",
+                     "invalid_request");
+  }
+  if (words.size() > 4 * kFilterMaxWords)
+    return AuthError(400, "Bad Request",
+                     "höchstens " + std::to_string(kFilterMaxWords) +
+                         " Wörter (at most " +
+                         std::to_string(kFilterMaxWords) + " words)",
+                     "invalid_word");
+  WordFilter::Entries changed;
+  std::string error;
+  if (!filter_.Replace(words, &changed, &error))
+    return AuthError(400, "Bad Request", error, "invalid_word");
+  long long added = 0;
+  long long removed = 0;
+  for (const auto& [word, entry] : changed)
+    (entry.aktiv ? added : removed) += 1;
+  Log(req, who,
+      "filter_geaendert:+" + std::to_string(added) + "-" +
+          std::to_string(removed));
+  json::Value out = FilterListJson();
+  out["ok"] = true;
+  out["neu"] = added;
+  out["entfernt"] = removed;
+  return JsonOk(out);
+}
+
+HttpResponse Gate::FilterSyncEndpoint(const HttpRequest& req,
+                                      const Identity& who) {
+  if (!who.partner_router())
+    return NotFound();
+  if (req.method != "POST")
+    return AuthError(405, "Method Not Allowed", "POST", "method_not_allowed");
+  WordFilter::Entries incoming;
+  bool full = false;
+  std::string from;
+  std::string error;
+  try {
+    const json::Value body = json::parse(req.body);
+    const json::Value* list = body.find("eintraege");
+    if (list == nullptr ||
+        !WordFilter::EntriesFromJson(*list, &incoming, &error)) {
+      return AuthError(400, "Bad Request",
+                       error.empty() ? "eintraege missing" : error,
+                       "invalid_request");
+    }
+    if (const json::Value* v = body.find("voll"); v != nullptr && v->is_bool())
+      full = v->as_bool();
+    from = body.member_str("rechner");
+  } catch (const std::exception&) {
+    return AuthError(400, "Bad Request", "JSON expected", "invalid_request");
+  }
+  WordFilter::Entries changed;
+  if (!filter_.Merge(incoming, &changed, &error))
+    return AuthError(500, "Internal Server Error", error, "filter_store_failed");
+  // A push is answered with the entries of its words that are newer here
+  // (a change of this machine that crossed it), so both agree at once.
+  WordFilter::Entries answer;
+  {
+    const WordFilter::Entries mine = filter_.All();
+    if (full) {
+      answer = mine;
+    } else {
+      for (const auto& [word, entry] : incoming) {
+        const auto it = mine.find(word);
+        if (it != mine.end() && WordFilter::Newer(it->second, entry))
+          answer[word] = it->second;
+      }
+    }
+  }
+  {
+    const std::lock_guard<std::mutex> lock(sync_mutex_);
+    sync_.last_ok_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    sync_.last_error.clear();
+  }
+  if (!changed.empty()) {
+    Log(req, who, "filter_abgleich:" + std::to_string(changed.size()));
+    Logger::Info("router", "event=filter_sync_received from=" + from +
+                               " changed=" + std::to_string(changed.size()) +
+                               (full ? " full=1" : ""));
+  }
+  json::Value out = json::Value::object();
+  out["ok"] = true;
+  out["rechner"] = filter_.self();
+  out["uebernommen"] = static_cast<long long>(changed.size());
+  out["eintraege"] = WordFilter::EntriesJson(answer);
+  return JsonOk(out);
+}
+
+void Gate::SetFilterPartner(std::string partner_name, FilterCall call) {
+  const std::lock_guard<std::mutex> lock(sync_mutex_);
+  sync_.partner = std::move(partner_name);
+  sync_.call = std::move(call);
+}
+
+void Gate::RequestFilterSync() {
+  {
+    const std::lock_guard<std::mutex> lock(sync_mutex_);
+    if (!sync_.call)
+      return;
+    sync_.want_full = true;
+  }
+  sync_cv_.notify_all();
+}
+
+void Gate::QueueFilterPush(const WordFilter::Entries& changed) {
+  {
+    const std::lock_guard<std::mutex> lock(sync_mutex_);
+    if (!sync_.call)
+      return;
+    for (const auto& [word, entry] : changed)
+      sync_.push[word] = entry;
+  }
+  sync_cv_.notify_all();
+}
+
+bool Gate::FilterSyncOpen() {
+  const std::lock_guard<std::mutex> lock(sync_mutex_);
+  return sync_.open;
+}
+
+bool Gate::SyncFilterOnce() {
+  FilterCall call;
+  bool full = false;
+  WordFilter::Entries push;
+  {
+    const std::lock_guard<std::mutex> lock(sync_mutex_);
+    call = sync_.call;
+    full = sync_.want_full;
+    sync_.want_full = false;
+    push.swap(sync_.push);
+  }
+  if (!call || (!full && push.empty()))
+    return true;
+  json::Value body = json::Value::object();
+  body["rechner"] = filter_.self();
+  body["voll"] = full;
+  // A full exchange sends everything, the partner answers with its merged
+  // list; a push sends the changed entries only.
+  body["eintraege"] = WordFilter::EntriesJson(full ? filter_.All() : push);
+  const FilterReply reply = call(body.dump());
+  const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+  std::string error;
+  WordFilter::Entries incoming;
+  if (reply.status == 200) {
+    try {
+      const json::Value answer = json::parse(reply.body);
+      const json::Value* list = answer.find("eintraege");
+      if (list == nullptr)
+        error = "answer without eintraege";
+      else
+        (void)WordFilter::EntriesFromJson(*list, &incoming, &error);
+    } catch (const std::exception& e) {
+      error = std::string("answer is no JSON: ") + e.what();
+    }
+  } else if (reply.status != 200) {
+    error = reply.status == 0 ? "nicht erreichbar (unreachable): " + reply.error
+                              : "HTTP " + std::to_string(reply.status) +
+                                    (reply.status == 404
+                                         ? " (Partner ohne Abgleich, älter "
+                                           "als 2.1.8?)"
+                                         : "");
+  }
+  if (error.empty() && !incoming.empty()) {
+    WordFilter::Entries changed;
+    if (!filter_.Merge(incoming, &changed, &error))
+      error = "merge: " + error;
+    else if (!changed.empty())
+      Logger::Info("router", "event=filter_sync_merged changed=" +
+                                 std::to_string(changed.size()));
+  }
+  const std::lock_guard<std::mutex> lock(sync_mutex_);
+  sync_.last_try_ms = now;
+  if (!error.empty()) {
+    sync_.last_error = error;
+    // Not reached: a full exchange is owed when the partner is back. An
+    // answer that refuses is not retried until the next start or return.
+    if (reply.status == 0)
+      sync_.open = true;
+    Logger::Warn("router", "event=filter_sync_failed partner=" +
+                               sync_.partner + " reason=\"" + error + "\"");
+    return false;
+  }
+  sync_.last_ok_ms = now;
+  sync_.last_error.clear();
+  if (full)
+    sync_.open = false;
+  return true;
+}
+
+void Gate::FilterSyncLoop() {
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock(sync_mutex_);
+      sync_cv_.wait(lock, [this] {
+        return sync_.stopping || sync_.want_full || !sync_.push.empty();
+      });
+      if (sync_.stopping)
+        return;
+    }
+    (void)SyncFilterOnce();
+  }
+}
+
+void Gate::StopFilterSync() {
+  {
+    const std::lock_guard<std::mutex> lock(sync_mutex_);
+    sync_.stopping = true;
+  }
+  sync_cv_.notify_all();
+}
+
+json::Value Gate::FilterSyncStatus() {
+  const std::lock_guard<std::mutex> lock(sync_mutex_);
+  json::Value out = json::Value::object();
+  out["partner"] = sync_.call ? json::Value(sync_.partner) : json::Value();
+  out["offen"] = sync_.open;
+  out["zuletzt_ok_ms"] = sync_.last_ok_ms;
+  out["zuletzt_versuch_ms"] = sync_.last_try_ms;
+  out["fehler"] = sync_.last_error;
+  return out;
+}
+
 HttpResponse Gate::ChatsApi(const HttpRequest& req, const Identity& who) {
   if (!who.authenticated())
     return AuthError(401, "Unauthorized", "login required",
@@ -3128,6 +3872,10 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
       return ChangePassword(req, who);
     case Route::Kind::kMeChats:
       return ChatsApi(req, who);
+    case Route::Kind::kFilter:
+      return FilterApi(req, who);
+    case Route::Kind::kFilterSync:
+      return FilterSyncEndpoint(req, who);
     case Route::Kind::kUsers:
     case Route::Kind::kAdminPage:
     case Route::Kind::kSetup: {
@@ -3174,7 +3922,8 @@ HttpResponse Gate::Serve(
     if (req.method != "GET" && req.method != "HEAD" &&
         (((route.kind == Route::Kind::kUsers ||
            route.kind == Route::Kind::kAdminControl ||
-           route.kind == Route::Kind::kSetup) &&
+           route.kind == Route::Kind::kSetup ||
+           route.kind == Route::Kind::kFilter) &&
           IsLoopback(RequestAddress(req))) ||
          ((route.kind == Route::Kind::kPasswort ||
            route.kind == Route::Kind::kMeChats) &&

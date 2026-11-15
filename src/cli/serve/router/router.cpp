@@ -3139,6 +3139,13 @@ public:
         std::string reachable_before;
         const bool was_reachable =
             remotes->Reachable(target.url, &reachable_before);
+        // The word list (2.1.8): a full exchange when the partner is back
+        // after an interruption, or when one is still owed. No timer of
+        // its own: this probe runs anyway.
+        if (probe.reachable && gate != nullptr && partner_spec.has_value() &&
+            key == router::EndpointKey(partner_spec->url) &&
+            (!was_reachable || gate->FilterSyncOpen()))
+          gate->RequestFilterSync();
         if (probe.reachable != was_reachable) {
           Logger::Info("router", "event=remote_" +
                                      std::string(probe.reachable
@@ -4843,6 +4850,44 @@ int RunRouter(std::span<const char* const> args) {
       if (!reachable.empty())
         state->self_name = reachable;
     }
+    // The word list (2.1.8): entries carry this router's address as
+    // "von"; with a partner, changes go there over the pool link.
+    state->gate->filter().SetSelf(state->self_name);
+    if (state->partner_spec.has_value()) {
+      const router::RemoteSpec spec = *state->partner_spec;
+      const std::string relay_id = state->router_id;
+      state->gate->SetFilterPartner(
+          state->partner_name,
+          [spec, relay_id](const std::string& body) {
+            router::UpstreamTarget target = router::RemoteTarget(spec, relay_id);
+            target.connect_timeout = std::chrono::seconds(3);
+            target.head_timeout = std::chrono::seconds(5);
+            HttpRequest req;
+            req.method = "POST";
+            req.path = "/router/pool/filter";
+            req.body = body;
+            req.headers.emplace_back("Content-Type", "application/json");
+            req.headers.emplace_back(router::jobs::kRelayHeader, "1");
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            req.is_cancelled = [deadline] {
+              return std::chrono::steady_clock::now() >= deadline;
+            };
+            HttpResponse response = router::ProxyToWorker(target, req);
+            router::auth::FilterReply reply;
+            constexpr std::string_view kPrefix = "upstream_unavailable detail=";
+            if (response.status == 502 && !response.streaming_body &&
+                std::string_view(response.log_details).starts_with(kPrefix)) {
+              reply.error = response.log_details.substr(kPrefix.size());
+              return reply;
+            }
+            const router::comfy::FetchResult result =
+                CollectResponse(std::move(response));
+            reply.status = result.status;
+            reply.body = result.body;
+            return reply;
+          });
+    }
   }
   // ComfyUI pool view (GET /queue?pool=1): the partner router's own queue,
   // 3 s to connect and answer; its answer is local (X-Gufo-Relay).
@@ -5066,6 +5111,13 @@ int RunRouter(std::span<const char* const> args) {
   std::thread remote_thread;
   if (state->remotes != nullptr)
     remote_thread = std::thread([&state] { state->RemoteMain(); });
+  // The word list exchange with the partner (2.1.8): once at the start,
+  // then on a change or when the partner is back (RemoteMain).
+  std::thread filter_sync;
+  if (state->partner_spec.has_value()) {
+    state->gate->RequestFilterSync();
+    filter_sync = std::thread([&state] { state->gate->FilterSyncLoop(); });
+  }
   // --autoload runs behind the listening front so a failed load (e.g. "bad
   // allocation" under memory pressure) never ends the router and other
   // models and pages stay reachable meanwhile.
@@ -5127,6 +5179,9 @@ int RunRouter(std::span<const char* const> args) {
       worker->Stop();
     }
   }
+  state->gate->StopFilterSync();
+  if (filter_sync.joinable())
+    filter_sync.join();
   supervision.join();
   if (autoloader.joinable())
     autoloader.join();

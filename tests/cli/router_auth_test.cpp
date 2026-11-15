@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
+#include <thread>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -1889,6 +1891,310 @@ void TestChatHistory() {
   CHECK_EQ(ErrorCode(r), std::string("no_account"));
 }
 
+// 2.1.8 (Fabian 15.11.): the word list is maintained in gufo. GET/PUT
+// /router/filter and POST /router/filter/pruefen for admins (another
+// user 403), validated, written atomically with a backup, in force at
+// once without a restart, logged filter_geaendert.
+void TestFilterListApi() {
+  Fixture f;
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("kind", "nutzer", "kind-pw");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  const std::string kind = f.LoginCookie("kind", "kind-pw");
+  const auto call = [&](const std::string& method, const std::string& path,
+                        const std::string& cookie, const std::string& body = {}) {
+    return f.Serve(Req(method, path, "192.168.178.50", body, {{"Cookie", cookie}}));
+  };
+  CHECK(auth::Classify(Req("GET", "/router/filter", "x")).kind ==
+        auth::Route::Kind::kFilter);
+  CHECK(auth::Classify(Req("POST", "/router/filter/pruefen", "x")).kind ==
+        auth::Route::Kind::kFilter);
+  CHECK(auth::Classify(Req("POST", "/router/pool/filter", "x")).kind ==
+        auth::Route::Kind::kFilterSync);
+  // Rights: a user 403, nobody 401, loopback as admin and admins fine.
+  HttpResponse r = call("GET", "/router/filter", kind);
+  CHECK_EQ(r.status, 403);
+  r = call("PUT", "/router/filter", kind, "{\"woerter\":[\"x\"]}");
+  CHECK_EQ(r.status, 403);
+  r = call("POST", "/router/filter/pruefen", kind, "{\"text\":\"nackt\"}");
+  CHECK_EQ(r.status, 403);
+  r = f.Serve(Req("GET", "/router/filter", "192.168.178.50"));
+  CHECK_EQ(r.status, 401);
+  r = f.Serve(Req("GET", "/router/filter", "127.0.0.1"));
+  CHECK_EQ(r.status, 200);
+  r = call("GET", "/router/filter", admin);
+  CHECK_EQ(r.status, 200);
+  json::Value list = json::parse(r.body);
+  // The default text file was taken over at the first start.
+  CHECK(list.find("woerter")->size() >= 20);
+  CHECK(list.find("kommentare")->size() >= 1);
+  CHECK_EQ(list.member_double("max"), 500.0);
+  CHECK(std::filesystem::is_regular_file(f.dir / "nutzer" / "filter.json"));
+  // The check field: which word would block a prompt.
+  r = call("POST", "/router/filter/pruefen", admin,
+           "{\"text\":\"Eine NACKTE Frau am See\"}");
+  CHECK_EQ(r.status, 200);
+  CHECK(json::parse(r.body).find("gesperrt")->as_bool());
+  CHECK_EQ(json::parse(r.body).member_str("wort"), std::string("nackt*"));
+  r = call("POST", "/router/filter/pruefen", admin, "{\"text\":\"Ein Haus\"}");
+  CHECK(!json::parse(r.body).find("gesperrt")->as_bool());
+  // Validation: one word per line, no control characters, * at the end,
+  // at most 500 words; nothing is written for a refused list.
+  for (const char* bad : {"{\"woerter\":[\"zwei woerter\"]}",
+                          "{\"woerter\":[\"bel\\u0007l\"]}",
+                          "{\"woerter\":[\"*abc\"]}",
+                          "{\"woerter\":[\"a*b\"]}",
+                          "{\"woerter\":[1]}", "{\"x\":1}"}) {
+    r = call("PUT", "/router/filter", admin, bad);
+    CHECK_EQ(r.status, 400);
+  }
+  {
+    std::string many = "{\"woerter\":[";
+    for (int i = 0; i < 501; ++i)
+      many += std::string(i ? "," : "") + "\"w" + std::to_string(i) + "\"";
+    many += "]}";
+    r = call("PUT", "/router/filter", admin, many);
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(ErrorCode(r), std::string("invalid_word"));
+  }
+  r = f.Serve(Req("PUT", "/router/filter", "192.168.178.50", "woerter=x",
+                  {{"Cookie", admin}, {"Content-Type", "text/plain"}}));
+  CHECK_EQ(r.status, 415);
+  // A cross-site page may not change it.
+  r = f.Serve(Req("PUT", "/router/filter", "192.168.178.50",
+                  "{\"woerter\":[\"x\"]}",
+                  {{"Cookie", admin}, {"Origin", "http://evil.example"}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  // Before: "banane" passes, "nackt" is blocked.
+  const auto image = [&](const std::string& prompt) {
+    return call("POST", "/v1/images/generations", kind,
+                "{\"model\":\"m\",\"prompt\":\"" + prompt + "\"}").status;
+  };
+  CHECK_EQ(image("eine Banane"), 200);
+  CHECK_EQ(image("nackt"), 400);
+  r = call("PUT", "/router/filter", admin,
+           "{\"woerter\":[\"# nur Obst\",\"banane\",\"Kiwi*\",\"\"]}");
+  CHECK_EQ(r.status, 200);
+  list = json::parse(r.body);
+  CHECK_EQ(list.find("woerter")->size(), std::size_t(2));
+  CHECK_EQ(list.member_double("neu"), 2.0);
+  CHECK(list.member_double("entfernt") >= 20.0);
+  CHECK(list.member_double("geloescht") >= 20.0);  // tombstones stay
+  // In force at once, without a restart.
+  CHECK_EQ(image("eine Banane"), 400);
+  CHECK_EQ(image("Kiwis"), 400);
+  CHECK_EQ(image("nackt"), 200);
+  CHECK_EQ(f.gate->filter().size(), std::size_t(2));
+  // Backup, the text mirror, the access log.
+  bool backup = false;
+  for (const auto& item : std::filesystem::directory_iterator(f.dir / "nutzer"))
+    backup = backup ||
+             item.path().filename().string().starts_with("filter.json.bak-");
+  CHECK(backup);
+  {
+    std::ifstream in(f.dir / "nutzer" / "filter-woerter.txt", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    CHECK(text.find("banane\n") != std::string::npos);
+    CHECK(text.find("kiwi*\n") != std::string::npos);
+    CHECK(text.find("nackt") == std::string::npos);
+  }
+  bool logged = false;
+  for (const std::string& line : f.gate->LogTail(20))
+    logged = logged || line.find("filter_geaendert:+2-") != std::string::npos;
+  CHECK(logged);
+  // A second gate on the same folder (a restart) reads filter.json.
+  {
+    auth::Settings settings;
+    settings.mode = auth::Mode::kLan;
+    settings.users_file = f.store->path();
+    auth::Gate again(settings, f.store, {});
+    CHECK_EQ(again.filter().size(), std::size_t(2));
+    CHECK_EQ(again.filter().HitText("Eine Banane"), std::string("banane"));
+    CHECK(again.filter().HitText("nackt").empty());
+  }
+  // The pool exchange is for the partner router only.
+  r = call("POST", "/router/pool/filter", admin, "{\"eintraege\":{}}");
+  CHECK_EQ(r.status, 404);
+}
+
+// The word list in the pool (Fabian 15.11.): both routers keep the same
+// list, the last change of a word wins (delete or add). A change is pushed
+// at once; a full exchange at the start and when the partner is back.
+// Clocks may differ by a little (NTP): within that skew the machine whose
+// clock is ahead wins, documented below with 2 s.
+void TestFilterPoolSync() {
+  Fixture a(auth::Mode::kLan, "pool-geheim");
+  Fixture b(auth::Mode::kLan, "pool-geheim");
+  a.AddUser("fabian", "admin", "geheim123");
+  b.AddUser("fabian", "admin", "geheim123");
+  const std::string admin_a = a.LoginCookie("fabian", "geheim123");
+  const std::string admin_b = b.LoginCookie("fabian", "geheim123");
+  long long now = 1763200000000;  // the real time, ms
+  long long skew_a = 0;           // A's clock ahead by this much
+  a.gate->filter().SetSelf("http://192.168.178.198:8081");
+  b.gate->filter().SetSelf("http://192.168.178.56:8081");
+  a.gate->filter().SetClockMs([&] { return now + skew_a; });
+  b.gate->filter().SetClockMs([&] { return now; });
+  bool online = true;
+  const auto link = [&online](Fixture* to) {
+    return [&online, to](const std::string& body) {
+      auth::FilterReply reply;
+      if (!online) {
+        reply.error = "connect failed";
+        return reply;
+      }
+      const HttpResponse r = to->Serve(Req("POST", "/router/pool/filter",
+                                           "192.168.100.56", body,
+                                           {{"X-Gufo-Pool-Key", "pool-geheim"}}));
+      reply.status = r.status;
+      reply.body = r.body;
+      return reply;
+    };
+  };
+  a.gate->SetFilterPartner("http://192.168.178.56:8081", link(&b));
+  b.gate->SetFilterPartner("http://192.168.178.198:8081", link(&a));
+  const auto put = [](Fixture& f, const std::string& cookie,
+                      const std::vector<std::string>& words) {
+    json::Value body = json::Value::object();
+    json::Value list = json::Value::array();
+    for (const std::string& w : words)
+      list.push_back(w);
+    body["woerter"] = std::move(list);
+    return f.Serve(Req("PUT", "/router/filter", "192.168.178.50", body.dump(),
+                       {{"Cookie", cookie}}));
+  };
+  const auto words = [](Fixture& f) {
+    std::vector<std::string> out;
+    for (const auto& [w, e] : f.gate->filter().All())
+      if (e.aktiv)
+        out.push_back(w);
+    return out;
+  };
+  // A wrong pool key or none is no partner.
+  HttpResponse r = a.Serve(Req("POST", "/router/pool/filter", "192.168.100.56",
+                               "{\"eintraege\":{}}",
+                               {{"X-Gufo-Pool-Key", "falsch"}}));
+  CHECK_EQ(r.status, 404);
+  // Start: both lists differ (own edits before the pool), a full exchange
+  // makes them equal.
+  CHECK_EQ(put(a, admin_a, {"apfel", "birne"}).status, 200);
+  now += 1000;
+  CHECK_EQ(put(b, admin_b, {"birne", "kirsche"}).status, 200);
+  // The pushes of these edits went out at once (queued), run them.
+  CHECK(a.gate->SyncFilterOnce());
+  CHECK(b.gate->SyncFilterOnce());
+  a.gate->RequestFilterSync();
+  CHECK(a.gate->SyncFilterOnce());
+  CHECK(words(a) == words(b));
+  // B never had "apfel" (no delete there), the defaults both deleted.
+  CHECK(words(a) == (std::vector<std::string>{"apfel", "birne", "kirsche"}));
+  CHECK(!a.gate->FilterSyncOpen());
+  CHECK(a.gate->FilterSyncStatus().member_double("zuletzt_ok_ms") > 0);
+  // Delete on A, then add on B: both end the same, the push is enough.
+  now += 1000;
+  CHECK_EQ(put(a, admin_a, {"kirsche"}).status, 200);  // birne deleted
+  CHECK(a.gate->SyncFilterOnce());
+  CHECK(words(b) == (std::vector<std::string>{"kirsche"}));  // apfel, birne gone
+  now += 1000;
+  CHECK_EQ(put(b, admin_b, {"birne", "kirsche"}).status, 200);  // back
+  CHECK(b.gate->SyncFilterOnce());
+  CHECK(words(a) == words(b));
+  CHECK(words(a) == (std::vector<std::string>{"birne", "kirsche"}));
+  // In force on the partner without a restart.
+  CHECK_EQ(a.gate->filter().HitText("eine Birne"), std::string("birne"));
+  // Partner offline: each works on locally, the exchange is owed.
+  online = false;
+  now += 1000;
+  CHECK_EQ(put(a, admin_a, {"kirsche"}).status, 200);  // birne deleted on A
+  CHECK(!a.gate->SyncFilterOnce());
+  CHECK(a.gate->FilterSyncOpen());
+  CHECK(!a.gate->FilterSyncStatus().member_str("fehler").empty());
+  now += 1000;
+  CHECK_EQ(put(b, admin_b, {"birne", "kirsche", "pflaume"}).status, 200);
+  CHECK(!b.gate->SyncFilterOnce());
+  CHECK(b.gate->FilterSyncOpen());
+  CHECK_EQ(a.gate->filter().HitText("Pflaume"), std::string());
+  // Back online: the router's probe sees the partner again and asks for
+  // the full exchange (RemoteMain); one exchange from A settles both.
+  online = true;
+  CHECK(a.gate->FilterSyncOpen());
+  a.gate->RequestFilterSync();
+  CHECK(a.gate->SyncFilterOnce());
+  CHECK(!a.gate->FilterSyncOpen());
+  CHECK(words(a) == words(b));
+  // A deleted birne (the last change of that word), B added pflaume.
+  CHECK(words(a) == (std::vector<std::string>{"kirsche", "pflaume"}));
+  b.gate->RequestFilterSync();
+  CHECK(b.gate->SyncFilterOnce());
+  CHECK(!b.gate->FilterSyncOpen());
+  // A tombstone is kept: an old active copy never brings a word back.
+  now += 1000;
+  CHECK_EQ(put(a, admin_a, {"birne", "kirsche"}).status, 200);  // pflaume weg
+  CHECK(a.gate->SyncFilterOnce());
+  CHECK(words(b) == (std::vector<std::string>{"birne", "kirsche"}));
+  {
+    auth::WordFilter::Entries old;
+    old["pflaume"] = auth::WordFilter::Entry{true, now - 5000, "http://alt"};
+    auth::WordFilter::Entries changed;
+    std::string error;
+    CHECK(b.gate->filter().Merge(old, &changed, &error));
+    CHECK(changed.empty());
+    CHECK(b.gate->filter().HitText("Pflaume").empty());
+  }
+  // Same millisecond on both: the larger router address wins (a fixed
+  // order: "http://192.168.178.56:8081" > "http://192.168.178.198:8081").
+  {
+    auth::WordFilter::Entry from_a{true, 5, "http://192.168.178.198:8081"};
+    auth::WordFilter::Entry from_b{false, 5, "http://192.168.178.56:8081"};
+    CHECK(auth::WordFilter::Newer(from_b, from_a));
+    CHECK(!auth::WordFilter::Newer(from_a, from_b));
+  }
+  // Clock skew of 2 s (documented): A's clock runs 2 s ahead. A deletes
+  // "kirsche", 1 s later (real time) B adds it again: A's stamp is still
+  // the newer one, so the delete wins on both. Beyond the skew the real
+  // order holds.
+  skew_a = 2000;
+  now += 1000;
+  CHECK_EQ(put(a, admin_a, {"birne"}).status, 200);
+  CHECK(a.gate->SyncFilterOnce());
+  now += 1000;
+  CHECK_EQ(put(b, admin_b, {"birne", "kirsche"}).status, 200);
+  CHECK(b.gate->SyncFilterOnce());
+  // The partner answers a push with its newer entries: B learns that
+  // A's delete carries the newer stamp, both agree at once.
+  CHECK(words(a) == words(b));
+  CHECK(words(a) == (std::vector<std::string>{"birne"}));
+  now += 3000;  // more than the skew later: B's change wins
+  CHECK_EQ(put(b, admin_b, {"birne", "kirsche"}).status, 200);
+  CHECK(b.gate->SyncFilterOnce());
+  CHECK(words(a) == (std::vector<std::string>{"birne", "kirsche"}));
+  CHECK(words(a) == words(b));
+  // A partner without the exchange (older than 2.1.8) answers 404: no
+  // exchange is owed then (no retry on every probe).
+  a.gate->SetFilterPartner("alt", [](const std::string&) {
+    auth::FilterReply reply;
+    reply.status = 404;
+    reply.body = "{}";
+    return reply;
+  });
+  a.gate->RequestFilterSync();
+  CHECK(!a.gate->SyncFilterOnce());
+  CHECK(!a.gate->FilterSyncOpen());
+  // The sync loop: queued work runs, Stop ends it.
+  a.gate->SetFilterPartner("http://192.168.178.56:8081", link(&b));
+  std::thread loop([&a] { a.gate->FilterSyncLoop(); });
+  now += 1000;
+  skew_a = 0;
+  CHECK_EQ(put(a, admin_a, {"birne", "kirsche", "quitte"}).status, 200);
+  for (int i = 0; i < 100 && b.gate->filter().HitText("Quitte").empty(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  CHECK_EQ(b.gate->filter().HitText("Quitte"), std::string("quitte"));
+  a.gate->StopFilterSync();
+  loop.join();
+}
+
 void TestUsersApi() {
   Fixture f;
   // First setup: nothing but loopback gets in; the LAN sees the hint.
@@ -2790,6 +3096,8 @@ int main() {
   TestDailyLimitMediaOnly();
   TestMusicSpeechFilter();
   TestChatHistory();
+  TestFilterListApi();
+  TestFilterPoolSync();
   TestUsersApi();
   TestPasswordChange();
   TestLoopbackBearer();
