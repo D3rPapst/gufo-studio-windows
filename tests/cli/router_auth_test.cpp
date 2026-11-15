@@ -517,7 +517,7 @@ void TestClassify() {
   const auto chat = auth::Classify(Req("POST", "/v1/chat/completions", "x"));
   CHECK(chat.kind == Kind::kWork);
   CHECK_EQ(chat.area, std::string("text"));
-  CHECK_EQ(chat.counts, 1);
+  CHECK_EQ(chat.counts, 0);  // 2.1.8: chats no longer count
   CHECK(chat.filtered);  // 2.0.5: chats are filtered on their user texts
   CHECK(!auth::Classify(Req("GET", "/v1/chat/completions", "x")).filtered);
   CHECK(!auth::Classify(Req("POST", "/v1/embeddings", "x")).filtered);
@@ -1615,32 +1615,23 @@ void TestFilterAndLimit() {
   CHECK_EQ(f.gate->DailyCount("kind"), 2LL);  // "Haus am See", "Rosexy"
   f.AddUser("knapp", "nutzer", "knapp-pw", limited);
   const std::string knapp = f.LoginCookie("knapp", "knapp-pw");
-  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
-                  "{\"model\":\"m\"}", {{"Cookie", knapp}}));
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"See\"}", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.gate->DailyCount("knapp"), 1LL);
   r = f.Serve(Req("POST", "/v1/videos", "192.168.178.50",
                   "{\"model\":\"m\",\"prompt\":\"See\"}", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.gate->DailyCount("knapp"), 3LL);
-  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
-                  "{\"model\":\"m\"}", {{"Cookie", knapp}}));
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"See\"}", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 429);
   CHECK_EQ(ErrorCode(r), std::string("daily_limit"));
-  // A decision request (POST /v1/systemone) counts like a chat.
-  {
-    auth::Rights one;
-    one.tageslimit = 1;
-    f.AddUser("entscheider", "nutzer", "ent-pw", one);
-    const std::string ent = f.LoginCookie("entscheider", "ent-pw");
-    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
-                    "{\"model\":\"m\"}", {{"Cookie", ent}}));
-    CHECK_EQ(r.status, 200);
-    CHECK_EQ(f.gate->DailyCount("entscheider"), 1LL);
-    r = f.Serve(Req("POST", "/v1/systemone", "192.168.178.50",
-                    "{\"model\":\"m\"}", {{"Cookie", ent}}));
-    CHECK_EQ(r.status, 429);
-  }
+  // 2.1.8: a chat still passes once the limit is reached.
+  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
+                  "{\"model\":\"m\"}", {{"Cookie", knapp}}));
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.gate->DailyCount("knapp"), 3LL);
   // Reads never count.
   r = f.Serve(Req("GET", "/v1/videos/v1", "192.168.178.50", "", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 200);
@@ -1650,10 +1641,68 @@ void TestFilterAndLimit() {
   r = f.Serve(Req("GET", "/router/me", "192.168.178.50", "", {{"Cookie", knapp}}));
   CHECK_EQ(r.status, 401);  // session expired
   const std::string knapp2 = f.LoginCookie("knapp", "knapp-pw");
-  r = f.Serve(Req("POST", "/v1/chat/completions", "192.168.178.50",
-                  "{\"model\":\"m\"}", {{"Cookie", knapp2}}));
+  r = f.Serve(Req("POST", "/v1/images/generations", "192.168.178.50",
+                  "{\"model\":\"m\",\"prompt\":\"See\"}", {{"Cookie", knapp2}}));
   CHECK_EQ(r.status, 200);
   CHECK_EQ(f.gate->DailyCount("knapp"), 1LL);
+}
+
+// 2.1.8 (Fabian e47): the daily limit counts media only. Chat and text
+// (completions, responses, messages, embeddings, decisions) and speech
+// recognition are free; image, video, music, 3D, speech, upscale and the
+// media jobs wrapping them count.
+void TestDailyLimitMediaOnly() {
+  Fixture f;
+  auth::Rights one;
+  one.tageslimit = 1;
+  f.AddUser("eins", "nutzer", "eins-pw", one);
+  const std::string c = f.LoginCookie("eins", "eins-pw");
+  const auto post = [&](const std::string& path, const std::string& body) {
+    return f.Serve(Req("POST", path, "192.168.178.50", body, {{"Cookie", c}}));
+  };
+  for (const char* path :
+       {"/v1/chat/completions", "/v1/completions", "/v1/responses",
+        "/v1/messages", "/v1/embeddings", "/completion", "/v1/systemone",
+        "/v1/audio/transcriptions"}) {
+    for (int i = 0; i < 3; ++i) {
+      const HttpResponse r = post(path, "{\"model\":\"m\",\"input\":\"Hallo\"}");
+      CHECK_EQ(r.status, 200);
+    }
+  }
+  CHECK_EQ(f.gate->DailyCount("eins"), 0LL);
+  // A chat wrapped in a job is free as well.
+  HttpResponse r = post("/v1/jobs",
+                        "{\"request\":{\"path\":\"/v1/chat/completions\","
+                        "\"body\":{\"model\":\"m\",\"messages\":[]}}}");
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.gate->DailyCount("eins"), 0LL);
+  // Media count: speech uses the one job of the day ...
+  r = post("/v1/audio/speech", "{\"model\":\"tts\",\"input\":\"Hallo\"}");
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.gate->DailyCount("eins"), 1LL);
+  for (const std::string& path :
+       {std::string("/v1/images/generations"), std::string("/v1/audio/music"),
+        std::string("/v1/3d/generations"), std::string("/v1/images/upscale"),
+        std::string("/v1/audio/speech")}) {
+    r = post(path, "{\"model\":\"m\",\"prompt\":\"See\"}");
+    CHECK_EQ(r.status, 429);
+    CHECK_EQ(ErrorCode(r), std::string("daily_limit"));
+  }
+  // ... a media job wrapping an image as well, a chat still passes.
+  r = post("/v1/jobs",
+           "{\"request\":{\"path\":\"/v1/images/generations\","
+           "\"body\":{\"model\":\"m\",\"prompt\":\"See\"}}}");
+  CHECK_EQ(r.status, 429);
+  r = post("/v1/chat/completions", "{\"model\":\"m\"}");
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(f.gate->DailyCount("eins"), 1LL);
+  // The weights the gate classifies with.
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/audio/transcriptions", "x")).counts, 0);
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/systemone", "x")).counts, 0);
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/messages", "x")).counts, 0);
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/audio/speech", "x")).counts, 1);
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/audio/music", "x")).counts, 1);
+  CHECK_EQ(auth::Classify(Req("POST", "/v1/videos", "x")).counts, 2);
 }
 
 void TestUsersApi() {
@@ -2554,6 +2603,7 @@ int main() {
   TestPoolSecret();
   TestFailedLogins();
   TestFilterAndLimit();
+  TestDailyLimitMediaOnly();
   TestUsersApi();
   TestPasswordChange();
   TestLoopbackBearer();

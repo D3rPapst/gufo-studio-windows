@@ -1690,13 +1690,13 @@ no password login, rights like `nutzer`). Rights per user, all optional:
 | --- | --- | --- |
 | `bereiche` | all | Subset of `text`, `bild`, `video`, `stimme`, `musik`, `3d`, `ablage`, `pool`, `status`. A request outside the user's areas is `403 forbidden` ("Bereich bild ist für diesen Nutzer nicht freigegeben"); a page of a closed area is a small 403 page. |
 | `modelle` | all | Allowed model ids; another model is `403 model_forbidden`. |
-| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart), and since 2.0.5 on the user texts of a chat (`POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`: `prompt`, the last `user` message of `messages` and the last `user` item of `input`, as a string or `text` parts; earlier turns, system and assistant texts are not read, so a refused question left in the history does not block the next one): `400 content_filtered`, logged `abgelehnt:content_filtered`, before any stream starts; the daily limit counts chats as before. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
-| `tageslimit` | 0 (unlimited) | POST requests on generation endpoints per UTC day, videos count twice: `429 daily_limit`. Counted in memory (a restart resets it). |
+| `filter` | role (admin off, others on) | Word block on the prompt and negative prompt of `/v1/images/*`, `/v1/videos*` and the ComfyUI `/prompt` graph (JSON and multipart), and since 2.0.5 on the user texts of a chat (`POST /v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`: `prompt`, the last `user` message of `messages` and the last `user` item of `input`, as a string or `text` parts; earlier turns, system and assistant texts are not read, so a refused question left in the history does not block the next one): `400 content_filtered`, logged `abgelehnt:content_filtered`, before any stream starts. The list is `nutzer\filter-woerter.txt`, one entry per line, `*` at the end matches word forms; a default list (~28 words, de/en) is written when the file is missing and edits are picked up without a restart. |
+| `tageslimit` | 0 (unlimited) | Media jobs per UTC day, videos count twice: `429 daily_limit`. Since 2.1.8 (decision e47) only media count: `POST` on `/v1/images/*` (generation, edits, upscale), `/v1/videos*`, `/v1/audio/speech`, `/v1/audio/convert`, `/v1/audio/separate`, `/v1/audio/music`, `/v1/audio/foley`, `/v1/3d/*`, the ComfyUI `/prompt` graph and a `POST /v1/jobs` wrapping one of them (also the MCP media tools). Chat and text (`/v1/chat/completions`, `/v1/completions`, `/completion`, `/v1/responses`, `/v1/messages`, embeddings, rerank, `/v1/systemone`, the MCP `chat` tool) and speech recognition (`/v1/audio/transcriptions`) never count and still pass once the limit is reached. Counted in memory (a restart resets it). |
 | `pool` | true | `false` pins the user's requests to this machine (`X-Gufo-Pool: local`); a job submitted so is marked `pin_local` (view `"pinned": "local"`), runs here only, is never handed to the partner and is refused `400 pool_not_allowed` when only the partner could run it. |
 
 Areas by endpoint: text = chat, completions, responses, messages,
 embeddings, rerank, realtime, `/v1/figuren`, `POST /v1/systemone` (it loads
-its JSON `model`: model list and daily limit apply, one per request); bild = `/v1/images/*`,
+its JSON `model`: the model list applies; not counted since 2.1.8); bild = `/v1/images/*`,
 `/v1/vision/*` and the ComfyUI adapter (`/prompt`, `/upload/*`, `/history`, `/view`, `/ws`,
 ...); video = `/v1/videos*`; stimme = speech, transcriptions, convert,
 voices, separate; musik = `/v1/audio/music*`, `/v1/audio/foley`; 3d =
@@ -1785,7 +1785,7 @@ before they run: each task is checked like a direct request (its area
 and model, the word filter on every text the plan carries: image, video
 and foley prompts, speech texts and instructions, dialogue lines, music
 tags and lyrics, and as the floor every string of the graph) and all of
-them count against the daily limit (videos twice). A client-chosen
+them count against the daily limit (videos twice; every task of a graph is media). A client-chosen
 `prompt_id` that belongs to another user's history entry is `409
 prompt_id_taken` for everyone, admins included; the id is taken for the
 submitter once every other check passed (a refused submit reserves
@@ -1929,7 +1929,8 @@ is this cap, without a default at 0).
 Every `tools/call` is one inner request through the same gate and
 dispatch as an HTTP client's, under the caller's token (never the
 router's internal key): area, model list, word filter, daily limit
-(counted once, by the inner request; `/mcp` itself counts nothing), own
+(counted once, by the inner request, media tools only since 2.1.8;
+`/mcp` itself and the `chat` tool count nothing), own
 jobs, `X-Gufo-User` and the access log hold unchanged, and the inner
 paths are a fixed list (`/v1/models`, `/v1/chat/completions`,
 `/v1/jobs...`; never `/mcp`). Every successful result carries

@@ -81,7 +81,9 @@ struct Rights {
   /// Word filter on image/video prompts; nullopt = role default (admin
   /// off, everyone else on).
   std::optional<bool> filter;
-  /// Jobs per day, 0 = unlimited (videos count twice).
+  /// Media jobs per day, 0 = unlimited (videos count twice). Since 2.1.8
+  /// only image, video, music, 3D, speech, upscale and media jobs count;
+  /// chat/text and speech recognition do not.
   long long tageslimit{0};
   /// May send work to the pool partner (otherwise X-Gufo-Pool: local).
   bool pool{true};
@@ -310,7 +312,8 @@ struct Route {
   Kind kind{Kind::kOther};
   /// "" = none; "bild|video" = either.
   std::string area;
-  /// POST on a work endpoint: counts against tageslimit (videos twice).
+  /// POST on a media endpoint: counts against tageslimit (videos twice;
+  /// chat/text and speech recognition 0 since 2.1.8).
   int counts{0};
   /// Prompts run through the word filter.
   bool filtered{false};

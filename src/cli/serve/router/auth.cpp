@@ -1204,22 +1204,27 @@ Route Classify(const HttpRequest& req) {
   };
   static constexpr Prefix kWork[] = {
       // Chats are filtered on their user texts since 2.0.5 (HitChat).
-      {"/v1/chat/completions", "text", 1, true},
-      {"/v1/completions", "text", 1, true},
-      {"/v1/responses", "text", 1, true},
-      {"/v1/messages", "text", 1, true},
+      // Since 2.1.8 (Fabian e47) the daily limit counts media only:
+      // image, video, music, 3D, speech, upscale and the media jobs
+      // wrapping them. Chat and text (completions, responses, messages,
+      // embeddings, decisions, the MCP chat) and speech recognition are
+      // free.
+      {"/v1/chat/completions", "text", 0, true},
+      {"/v1/completions", "text", 0, true},
+      {"/v1/responses", "text", 0, true},
+      {"/v1/messages", "text", 0, true},
       {"/v1/embeddings", "text", 0, false},
       {"/embeddings", "text", 0, false},
       {"/embedding", "text", 0, false},
-      {"/completion", "text", 1, false},
+      {"/completion", "text", 0, false},
       {"/apply-template", "text", 0, false},
       {"/v1/rerank", "text", 0, false},
       {"/v1/reranking", "text", 0, false},
       {"/v1/realtime", "text", 0, false},
       {"/v1/figuren", "text", 0, false},
       // Decision models (gufo serve decision): POST loads the JSON "model",
-      // so area, model list and daily limit apply as for a chat.
-      {"/v1/systemone", "text", 1, false},
+      // so area and model list apply as for a chat (not counted, 2.1.8).
+      {"/v1/systemone", "text", 0, false},
       // GETs that load the model named by ?model= (router IsModelQueryGet
       // and the introspection paths): the model's area and model list.
       {"/props", "text", 0, false},
@@ -1233,7 +1238,8 @@ Route Classify(const HttpRequest& req) {
       {"/v1/previews/", "bild|video", 0, false},
       {"/v1/videos", "video", 2, true},
       {"/v1/audio/speech", "stimme", 1, false},
-      {"/v1/audio/transcriptions", "stimme", 1, false},
+      // Speech recognition is no generation: not counted (2.1.8).
+      {"/v1/audio/transcriptions", "stimme", 0, false},
       {"/v1/audio/convert", "stimme", 1, false},
       {"/v1/audio/voices", "stimme", 0, false},
       {"/v1/audio/separate", "stimme", 1, false},

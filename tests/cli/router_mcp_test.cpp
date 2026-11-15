@@ -1325,8 +1325,8 @@ void TestChat() {
   }
   CHECK_EQ(f.requests.size(), sent);
   CHECK(f.Logged({"mcp:chat:abgelehnt:invalid_params"}, 2));
-  // The gate's refusals of the inner request: model list, word filter,
-  // daily limit (counted by the inner request alone).
+  // The gate's refusals of the inner request: model list, word filter.
+  // The daily limit no longer counts chats (2.1.8, Fabian e47).
   r = f.Call("chat", "{\"nachricht\":\"Hi\",\"model\":\"qwen3.8-27b\"}", kLan,
              Fixture::Bearer(eng));
   CheckShape(r, true);
@@ -1342,15 +1342,11 @@ void TestChat() {
   CheckShape(r, true);
   CHECK_EQ(FailureCode(r), std::string("content_filtered"));
   CHECK_EQ(FailureStatus(r), 400);
-  r = f.Call("chat", "{\"nachricht\":\"Hi\"}", kLan, Fixture::Bearer(knapp));
-  CheckShape(r, false);
-  r = f.Call("chat", "{\"nachricht\":\"Hi\"}", kLan, Fixture::Bearer(knapp));
-  CheckShape(r, true);
-  CHECK_EQ(FailureCode(r), std::string("daily_limit"));
-  CHECK_EQ(FailureStatus(r), 429);
-  // The gate sends no Retry-After for the daily limit: no retry_after.
-  CHECK(Failure(r).find("retry_after") == nullptr);
-  CHECK(f.Logged({"\tknapp\t", "mcp:chat:abgelehnt:daily_limit"}, 3));
+  for (int i = 0; i < 3; ++i) {
+    r = f.Call("chat", "{\"nachricht\":\"Hi\"}", kLan, Fixture::Bearer(knapp));
+    CheckShape(r, false);
+  }
+  CHECK(!f.Logged({"\tknapp\t", "mcp:chat:abgelehnt:daily_limit"}, 3));
   // An answer without choices.
   f.fake = [](const HttpRequest&) -> std::optional<HttpResponse> {
     return JsonAnswer(200, json::parse("{\"object\":\"list\"}"));
