@@ -130,10 +130,13 @@ public:
   };
   /// nullopt: no preview of this adapter, or its prompt ended (or left the
   /// queue) before the task started, or it is another user's prompt and
-  /// `user` (RestrictedUser of the reader) is set. Safe with the router's
-  /// state mutex held (own mutex, nothing called under it).
+  /// `user` (RestrictedUser of the reader) is set; then *foreign (when
+  /// given) is true, so the router answers 404 instead of asking a worker
+  /// for the id. Safe with the router's state mutex held (own mutex,
+  /// nothing called under it).
   [[nodiscard]] std::optional<PreviewRoute> FindPreview(std::string_view id,
-                                                        std::string_view user = {});
+                                                        std::string_view user = {},
+                                                        bool* foreign = nullptr);
 
   struct Job;
 

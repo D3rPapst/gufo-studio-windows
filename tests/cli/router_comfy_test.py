@@ -1367,6 +1367,10 @@ def check_owners(binary, tmp):
         assert status == 400 and b"gufo_preview_id" in payload, (status, payload)
         status, payload = call("ina", "GET", "/v1/previews/szene-1?format=json")
         assert status == 404, (status, payload)
+        # Naming the model does not send ina to the worker with tim's id.
+        for query in ("?format=json&model=qwen-image-2.1", "?model=qwen-image-2.1"):
+            status, payload = call("ina", "GET", "/v1/previews/szene-1" + query)
+            assert status == 404, (query, status, payload)
         status, payload = call("tim", "GET", "/v1/previews/szene-1?format=json")
         assert status == 200, (status, payload)
         assert router.wait(tim)["status"]["status_str"] == "success"

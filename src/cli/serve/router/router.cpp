@@ -2682,9 +2682,23 @@ public:
                         "preview_not_found");
       return plan;
     }
+    // A signed-in reader who is no admin ("" for admin, loopback, the
+    // router) reads no other user's preview: an id another user's prompt
+    // or pool request holds is 404 here, before ?model= could send the
+    // same id to the worker that renders it.
+    const std::string reader = router::comfy::RestrictedUser(req);
+    const auto foreign_id = [&plan] {
+      plan.answer = Err(404, "Not Found", "no preview with this id",
+                        "invalid_request_error", "preview_not_found");
+      return plan;
+    };
     if (comfy != nullptr && !forwarded) {
       // A ComfyUI prompt's preview id (2.1): known from /prompt on.
-      if (auto route = comfy->FindPreview(id, router::comfy::RestrictedUser(req))) {
+      bool foreign = false;
+      auto route = comfy->FindPreview(id, reader, &foreign);
+      if (foreign)
+        return foreign_id();
+      if (route) {
         plan.comfy_known = true;
         if (route->target.empty()) {
           plan.kind = PreviewPlan::Kind::kWait;
@@ -2703,9 +2717,8 @@ public:
     auto side = preview_sides_.find(id);
     if (side != preview_sides_.end() && !plan.comfy_known) {
       // Another user's pool request: not this reader's preview.
-      const std::string reader = router::comfy::RestrictedUser(req);
       if (!reader.empty() && !side->second.user.empty() && side->second.user != reader)
-        side = preview_sides_.end();
+        return foreign_id();
     }
     if (side != preview_sides_.end() && model_id.empty())
       model_id = side->second.model;

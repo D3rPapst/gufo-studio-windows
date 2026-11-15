@@ -1752,15 +1752,20 @@ void Adapter::EndPreviews(const Job& job) {
 }
 
 std::optional<Adapter::PreviewRoute> Adapter::FindPreview(
-    std::string_view id, std::string_view user) {
+    std::string_view id, std::string_view user, bool* foreign) {
+  if (foreign != nullptr)
+    *foreign = false;
   const std::lock_guard<std::mutex> lock(preview_mutex_);
   const auto it = preview_ids_.find(id);
   if (it == preview_ids_.end())
     return std::nullopt;
   // A signed-in user (no admin) sees the previews of its own prompts and
   // of prompts without a user (the router's, loopback's).
-  if (!user.empty() && !it->second.user.empty() && it->second.user != user)
+  if (!user.empty() && !it->second.user.empty() && it->second.user != user) {
+    if (foreign != nullptr)
+      *foreign = true;
     return std::nullopt;
+  }
   if (it->second.target.empty() &&
       (it->second.ended || it->second.job.expired())) {
     // Deleted from the queue (or ended) before the task started.
