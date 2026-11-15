@@ -24,6 +24,7 @@
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -160,6 +161,41 @@ void WriteAll(const fs::path& path, std::string_view bytes) {
   out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   if (!out)
     throw std::runtime_error("cannot write " + PathU8(path));
+}
+
+/// Creates `path` and writes `bytes` in one step, only if no file of that
+/// name exists yet (fopen "wbx": O_CREAT | O_EXCL, CREATE_NEW on
+/// Windows). False when it exists; throws on any other error. Never
+/// check-then-write: two uploads of one name could both see it free.
+bool WriteNew(const fs::path& path, std::string_view bytes) {
+  fs::create_directories(path.parent_path());
+#ifdef _WIN32
+  std::FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"wbx") != 0)
+    file = nullptr;
+#else
+  std::FILE* file = std::fopen(path.c_str(), "wbx");
+#endif
+  if (file == nullptr) {
+    std::error_code ec;
+    if (fs::exists(path, ec))
+      return false;
+    throw std::runtime_error("cannot create " + PathU8(path));
+  }
+  const bool written =
+      std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+  const bool closed = std::fclose(file) == 0;
+  if (!written || !closed)
+    throw std::runtime_error("cannot write " + PathU8(path));
+  return true;
+}
+
+/// Serialises the name choice of uploads in this process, so the "same
+/// content: reuse" check never reads a file another upload is still
+/// writing. WriteNew keeps it safe across processes as well.
+std::mutex& UploadMutex() {
+  static std::mutex mutex;
+  return mutex;
 }
 
 std::string ContentTypeFor(std::string_view name) {
@@ -1057,19 +1093,31 @@ HttpResponse Adapter::Upload(const HttpRequest& request) {
     return ErrorResponse(400, "invalid_request", "invalid file name");
   const fs::path folder = options_.root / type / U8Path(*safe_sub);
   std::string name = base;
-  std::error_code ec;
-  if (!overwrite) {
+  if (overwrite) {
+    WriteAll(folder / U8Path(name), image->data);
+  } else {
+    // Name and write in one step (Regie #56-986, 15.11.): 20 parallel
+    // uploads of "name.png" with different images all got "name.png"
+    // back and the last writer won. Each try creates the file
+    // exclusively; an existing one with the same bytes is reused, as
+    // ComfyUI does, else the next "name (n).png" is tried.
     const auto dot = base.rfind('.');
     const std::string stem =
         dot == std::string::npos ? base : base.substr(0, dot);
     const std::string ext = dot == std::string::npos ? "" : base.substr(dot);
-    for (int i = 1; fs::exists(folder / U8Path(name), ec); ++i) {
-      if (ReadAll(folder / U8Path(name)) == image->data)
-        break;  // same content: reuse, as ComfyUI does
+    const std::lock_guard<std::mutex> lock(UploadMutex());
+    for (int i = 1;; ++i) {
+      const fs::path path = folder / U8Path(name);
+      if (WriteNew(path, image->data))
+        break;
+      if (ReadAll(path) == image->data)
+        break;  // same content: reuse
+      if (i > 10000)
+        return ErrorResponse(500, "upload_failed",
+                             "no free file name for " + base);
       name = stem + " (" + std::to_string(i) + ")" + ext;
     }
   }
-  WriteAll(folder / U8Path(name), image->data);
   Logger::Info("comfy", "event=upload name=" + name +
                             " bytes=" + std::to_string(image->data.size()));
   json::Value body = json::Value::object();

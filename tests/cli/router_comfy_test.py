@@ -617,6 +617,45 @@ def check_uploads(router):
     assert status == 200 and data == png
     router.upload("leinwand.png", make_png(1344, 832))
     router.upload("voice.wav", make_wav())
+    check_parallel_uploads(router)
+
+
+def check_parallel_uploads(router, count=20):
+    # Regie #56-986 (15.11.): parallel uploads of different images under one
+    # name all got the same name back and the last writer won (17 of 20 reads
+    # showed another image). Each upload must get its own name and its own bytes.
+    images = [make_png(32, 32, 7 * index + 1) for index in range(count)]
+    assert len(set(images)) == count
+    names = [None] * count
+    errors = []
+    # Two waves of 10 at once: the listener's backlog is 16, more connects in
+    # the same instant are reset by Windows before the router sees them.
+    wave = 10
+
+    def one(index, start):
+        try:
+            start.wait()
+            names[index] = router.upload("gleich.png", images[index])["name"]
+        except BaseException as error:  # reported below
+            errors.append(error)
+
+    for first in range(0, count, wave):
+        indices = range(first, min(first + wave, count))
+        start = threading.Barrier(len(indices))
+        threads = [threading.Thread(target=one, args=(index, start)) for index in indices]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    assert not errors, errors
+    assert len(set(names)) == count, names
+    assert "gleich.png" in names
+    for index, name in enumerate(names):
+        status, data = router.request(
+            "GET", "/view?" + urllib.parse.urlencode({"filename": name, "type": "input"}))
+        assert status == 200 and data == images[index], (index, name)
+    # The same bytes again: reused, no new file.
+    assert router.upload("gleich.png", images[3])["name"] == names[3]
 
 
 def check_qwen(router):
