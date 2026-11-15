@@ -63,8 +63,17 @@ public:
   [[nodiscard]] std::shared_ptr<const Embedding> Encode(
       const core::Image& image, const Observer& observer = {},
       const CancellationCheck& is_cancelled = {});
+  /// A two-frame video block (temporal patch 2): `second` fills the second
+  /// temporal slot instead of a copy of `image` (Qwen3-VL video input, as
+  /// MiniMax H3 Ref2VA presents reference videos). Same size as `image`.
+  [[nodiscard]] std::shared_ptr<const Embedding> EncodePair(
+      const core::Image& image, const core::Image& second,
+      const Observer& observer = {}, const CancellationCheck& is_cancelled = {});
 
 private:
+  [[nodiscard]] std::shared_ptr<const Embedding> EncodeFrames(
+      const core::Image& image, const core::Image* second,
+      const Observer& observer, const CancellationCheck& is_cancelled);
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
