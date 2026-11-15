@@ -43,7 +43,11 @@ find-model = llmdet=D:\llm-modelle\gufo\modelle\iSEE-Laboratory\llmdet_base
 segment-model = D:\llm-modelle\gufo\modelle\regie-56\werkzeugtest_hf\sam_vit_huge
 ```
 
-`depth-model` and `find-model` repeat (the first is the default). Each model loads on
+`depth-model` and `find-model` repeat (the first is the default). With `--models-dir`
+the router resolves only the folder after `NAME=` against it (gufo 2.1.6; older routers
+joined the whole `large=D:\...` to the models directory, so put the options into
+`args` there: `args = serve vision --depth-model large=D:\... --find-model ...`).
+Each model loads on
 first use and stays: about 1.4 GB GPU memory per large depth model, 1 GB per find model,
 2.6 GB for SAM.
 

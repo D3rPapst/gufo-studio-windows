@@ -621,7 +621,9 @@ model = /models/qwen3-asr
 - Keys starting with `router-` are not passed to the worker; they are
   residency hints for the router itself (below).
 - Relative path values resolve against `--models-dir`, or against the
-  router's working directory when it is unset.
+  router's working directory when it is unset. In a `<x>-model = NAME=DIR`
+  value (`depth-model = large=...` of `gufo serve vision`) only `DIR` is a
+  path; `NAME` is letters, digits, `.`, `_` and `-` (2.1.6).
 - Startup validation feeds every section through the modality's real
   argument parser; unknown keys, bad values, empty bodies and duplicate
   ids abort with the same message `gufo serve <modality>` would print,

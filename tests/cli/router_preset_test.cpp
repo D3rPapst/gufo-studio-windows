@@ -130,6 +130,44 @@ void TestCrlfAndBomMatchLf() {
   assert(SameModels(lf_models, crlf_models));
 }
 
+void TestNamedPathValues() {
+  // 2.1.6: `<x>-model = NAME=DIR` (gufo serve vision's --depth-model and
+  // --find-model) resolves only DIR against the models directory; an
+  // absolute DIR stays as it is. `model` itself is always one path.
+  const auto command = WriteFixture("gufo_router_preset_named_cmd.exe", "x");
+  const std::string body =
+      "[external/vision]\n"
+      "command = " + command.string() + "\n"
+      "args = serve vision\n"
+      "depth-model = large=" + (std::filesystem::temp_directory_path() / "dav2").string() + "\n"
+      "depth-model = small=rel/dav2-small\n"
+      "find-model = rel/llmdet\n"
+      "segment-model = a=b/sam\n"
+      "find-model = we ird=rel/x\n";
+  const auto file = WriteFixture("gufo_router_preset_named.conf", body);
+  std::vector<PresetModel> models;
+  std::string error;
+  assert(LoadPreset(file, "/models", &models, &error));
+  assert(models.size() == 1);
+  const auto resolved = [](const char* value) {
+    return (std::filesystem::path("/models") / value).string();
+  };
+  const std::vector<std::string>& argv = models[0].argv;
+  const auto value_after = [&](std::size_t n) {
+    std::size_t seen = 0;
+    for (std::size_t i = 0; i + 1 < argv.size(); ++i)
+      if (argv[i].starts_with("--") && argv[i].ends_with("-model") && seen++ == n)
+        return argv[i + 1];
+    return std::string();
+  };
+  assert(value_after(0) == "large=" + (std::filesystem::temp_directory_path() / "dav2").string());
+  assert(value_after(1) == "small=" + resolved("rel/dav2-small"));
+  assert(value_after(2) == resolved("rel/llmdet"));
+  assert(value_after(3) == "a=" + resolved("b/sam"));
+  // A space is no NAME character: the whole value is one relative path.
+  assert(value_after(4) == resolved("we ird=rel/x"));
+}
+
 void TestEmptyModelsDirPassesValuesThrough() {
   const auto file = WriteFixture("gufo_router_preset_happy.conf", kHappyBody);
   std::vector<PresetModel> models;
@@ -434,6 +472,7 @@ int main() {
   TestErrors();
   TestCrlfAndBomMatchLf();
   TestEmptyModelsDirPassesValuesThrough();
+  TestNamedPathValues();
   TestIsReservedKey();
   TestRemoteSection();
   TestRemoteErrors();

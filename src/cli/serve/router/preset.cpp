@@ -76,11 +76,38 @@ bool SectionError(const Section& section, const std::string& message,
   return false;
 }
 
+// The NAME of a `NAME=DIR` value (gufo serve vision: `--depth-model
+// large=D:\...`, `--find-model llmdet=...`): letters, digits, '.', '_'
+// and '-' before the first '='. Empty for a plain path ("a=b/c" has a
+// slash before nothing, "D:\x=y" a colon and a backslash).
+std::string_view NamedValuePrefix(std::string_view value) {
+  const auto eq = value.find('=');
+  if (eq == std::string_view::npos || eq == 0 || eq + 1 >= value.size()) {
+    return {};
+  }
+  for (const char c : value.substr(0, eq)) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' &&
+        c != '-') {
+      return {};
+    }
+  }
+  return value.substr(0, eq);
+}
+
 std::string ResolvePathValue(std::string_view value,
                              const std::filesystem::path& models_dir,
                              std::string_view key) {
   if (models_dir.empty() || value.empty() || !IsPathKey(key)) {
     return std::string(value);
+  }
+  // `NAME=DIR`: only DIR is a path. Before 2.1.6 the whole value was joined
+  // to the models directory, so `depth-model = large=D:\x` became
+  // `<models-dir>\large=D:\x` and the vision worker found no model.
+  if (key != "model") {
+    if (const std::string_view name = NamedValuePrefix(value); !name.empty()) {
+      return std::string(name) + "=" +
+             ResolvePathValue(value.substr(name.size() + 1), models_dir, key);
+    }
   }
   const std::filesystem::path candidate(value);
   if (candidate.is_absolute()) {
