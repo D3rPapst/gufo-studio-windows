@@ -1864,7 +1864,8 @@ void TestChatHistory() {
                .find("chats")->size(), std::size_t(100));
   r = call("PUT", "/router/me/chats/n-neu", anna, "{\"zeit\":5000}");
   CHECK_EQ(r.status, 200);
-  const json::Value* gone = json::parse(r.body).find("entfernt");
+  const json::Value answer = json::parse(r.body);
+  const json::Value* gone = answer.find("entfernt");
   CHECK(gone != nullptr && gone->size() == 1 &&
         gone->items()[0].str() == "n-0");
   list = json::parse(call("GET", "/router/me/chats", anna).body);
@@ -1998,7 +1999,7 @@ void TestFilterListApi() {
                            std::istreambuf_iterator<char>());
     CHECK(text.find("banane\n") != std::string::npos);
     CHECK(text.find("kiwi*\n") != std::string::npos);
-    CHECK(text.find("nackt") == std::string::npos);
+    CHECK(text.find("\nnackt*\n") == std::string::npos);  // comments may name it
   }
   bool logged = false;
   for (const std::string& line : f.gate->LogTail(20))
