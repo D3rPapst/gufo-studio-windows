@@ -32,6 +32,12 @@ struct UpstreamTarget {
 /// Upgrade) are stripped both ways; `Authorization`, `Host`, `Connection`
 /// are not forwarded, and client headers named like an `extra_headers`
 /// entry are replaced by it.
+/// A body that stops before the worker's end of message (EOF or receive
+/// error mid-body, broken chunk framing) or because the client left sets
+/// `stream_log->error_code` (`upstream_closed`, `upstream_receive_failed`,
+/// `upstream_bad_framing`, `client_disconnected`) and logs
+/// `event=relay_end`; the front then ends the response without a clean
+/// chunked end. Text routes with an SSE body also get an `error` event.
 gufo::server::HttpResponse ProxyToWorker(
     const UpstreamTarget& target, const gufo::server::HttpRequest& request);
 

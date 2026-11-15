@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router {
@@ -28,6 +29,7 @@ namespace {
 
 using gufo::server::HttpRequest;
 using gufo::server::HttpResponse;
+using gufo::server::Logger;
 
 using Milliseconds = std::chrono::milliseconds;
 
@@ -290,24 +292,34 @@ std::string BuildUpstreamRequest(const UpstreamTarget& target,
 }
 
 /// recv with a timeout. Returns >0 bytes or 0 on EOF; on -1, *timed_out
-/// distinguishes a timeout from a hard error.
+/// distinguishes a timeout from a hard error, and *socket_error (when given)
+/// holds the error code of a hard error.
+/// The wait is a poll() for readability, not SO_RCVTIMEO: Winsock documents
+/// a connection whose blocking recv timed out as "in an indeterminate state"
+/// that "should be closed", and the relay ran into that timeout every 50 ms
+/// between two tokens of a stream (15.11.: streams ended early on the .56).
 std::intptr_t Receive(int fd, Milliseconds timeout, char* buffer,
-                      std::size_t size, bool* timed_out) {
-#ifdef _WIN32
-  // Winsock takes the receive timeout in milliseconds.
-  const DWORD slice = static_cast<DWORD>(std::max<long long>(timeout.count(), 1));
-  if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&slice), sizeof(slice)) != 0) {
-#else
-  const timeval slice{
-      static_cast<time_t>(timeout.count() / 1000),
-      static_cast<suseconds_t>((timeout.count() % 1000) * 1000)};
-  if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &slice, sizeof(slice)) != 0) {
-#endif
-    *timed_out = false;
-    return -1;
-  }
+                      std::size_t size, bool* timed_out,
+                      int* socket_error = nullptr) {
+  const int slice =
+      static_cast<int>(std::max<long long>(timeout.count(), 1));
   for (;;) {
+    const int ready = net::PollReadable(static_cast<net::Socket>(fd), slice);
+    if (ready == 0) {
+      *timed_out = true;
+      return -1;
+    }
+    if (ready < 0) {
+      if (net::IsSocketInterrupted()) {
+        continue;
+      }
+      *timed_out = false;
+      if (socket_error != nullptr) {
+        *socket_error = net::LastSocketError();
+      }
+      return -1;
+    }
+    // Readable, closed or failed: recv returns at once.
     const auto count = net::Receive(fd, buffer, size, 0);
     if (count >= 0) {
       *timed_out = false;
@@ -317,6 +329,9 @@ std::intptr_t Receive(int fd, Milliseconds timeout, char* buffer,
       continue;
     }
     *timed_out = net::IsSocketWouldBlockOrTimeout();
+    if (!*timed_out && socket_error != nullptr) {
+      *socket_error = net::LastSocketError();
+    }
     return -1;
   }
 }
@@ -460,22 +475,45 @@ bool Cancelled(const HttpRequest& request) {
   return request.is_cancelled && request.is_cancelled();
 }
 
+/// Why a relayed body stopped before the worker's end of message. Empty
+/// `code`: the body ended as the framing says (or the client write failed,
+/// which the front already logs as a disconnect).
+struct RelayEnd {
+  std::string code;
+  std::string detail;
+  std::size_t bytes{0};  // upstream body bytes received
+  std::chrono::steady_clock::time_point last_byte{
+      std::chrono::steady_clock::now()};
+};
+
 /// Read one more socket slice, honouring cancellation while the upstream is
-/// silent. Returns false to stop streaming (EOF, error, cancel).
-bool Refill(int fd, std::string& buffer, const HttpRequest& request) {
+/// silent. Returns false to stop streaming and records why in `end`.
+bool Refill(int fd, std::string& buffer, const HttpRequest& request,
+            RelayEnd& end) {
   char raw[8192];
   for (;;) {
     if (Cancelled(request)) {
+      end.code = "client_disconnected";
       return false;
     }
     bool timed_out = false;
-    const auto count =
-        Receive(fd, kBodyPollInterval, raw, sizeof(raw), &timed_out);
+    int socket_error = 0;
+    const auto count = Receive(fd, kBodyPollInterval, raw, sizeof(raw),
+                               &timed_out, &socket_error);
     if (count > 0) {
       buffer.append(raw, static_cast<std::size_t>(count));
+      end.bytes += static_cast<std::size_t>(count);
+      end.last_byte = std::chrono::steady_clock::now();
       return true;
     }
-    if (count == 0 || !timed_out) {
+    if (count == 0) {
+      end.code = "upstream_closed";
+      end.detail = "worker closed the connection";
+      return false;
+    }
+    if (!timed_out) {
+      end.code = "upstream_receive_failed";
+      end.detail = "socket error " + std::to_string(socket_error);
       return false;
     }
   }
@@ -506,9 +544,27 @@ bool ParseChunkSize(std::string_view token, std::size_t* size) {
   return true;
 }
 
+/// Printable excerpt of raw bytes for a log line.
+std::string Excerpt(std::string_view data) {
+  std::string out;
+  for (const char c : data.substr(0, 48)) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte == '\r') {
+      out += "\\r";
+    } else if (byte == '\n') {
+      out += "\\n";
+    } else if (byte < 0x20 || byte >= 0x7f || c == '"') {
+      out += '.';
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 void StreamContentLength(int fd, std::string buffer, std::size_t remaining,
                          const HttpResponse::BodyWriter& write,
-                         const HttpRequest& request) {
+                         const HttpRequest& request, RelayEnd& end) {
   if (buffer.size() > remaining) {
     buffer.resize(remaining);
   }
@@ -518,7 +574,9 @@ void StreamContentLength(int fd, std::string buffer, std::size_t remaining,
   remaining -= buffer.size();
   while (remaining > 0) {
     buffer.clear();
-    if (!Refill(fd, buffer, request)) {
+    if (!Refill(fd, buffer, request, end)) {
+      end.detail += ", " + std::to_string(remaining) +
+                    " bytes of the Content-Length missing";
       return;
     }
     if (buffer.size() > remaining) {
@@ -533,14 +591,16 @@ void StreamContentLength(int fd, std::string buffer, std::size_t remaining,
 
 void StreamChunked(int fd, std::string buffer,
                    const HttpResponse::BodyWriter& write,
-                   const HttpRequest& request) {
+                   const HttpRequest& request, RelayEnd& end) {
   for (;;) {
     if (Cancelled(request)) {
+      end.code = "client_disconnected";
       return;
     }
     const auto line_end = buffer.find("\r\n");
     if (line_end == std::string::npos) {
-      if (!Refill(fd, buffer, request)) {
+      if (!Refill(fd, buffer, request, end)) {
+        end.detail += ", before a chunk size line";
         return;
       }
       continue;
@@ -552,43 +612,88 @@ void StreamChunked(int fd, std::string buffer,
     }
     std::size_t payload = 0;
     if (!ParseChunkSize(size_line, &payload)) {
-      return;  // corrupt chunk framing
+      end.code = "upstream_bad_framing";
+      end.detail = "invalid chunk size line '" + Excerpt(buffer) + "'";
+      return;
     }
     const std::size_t consumed = line_end + 2;
     if (payload == 0) {
       return;  // final chunk; trailers are ignored
     }
     while (buffer.size() < consumed + payload + 2) {
-      if (!Refill(fd, buffer, request)) {
+      if (!Refill(fd, buffer, request, end)) {
+        end.detail += ", inside a chunk of " + std::to_string(payload) +
+                      " bytes";
         return;
       }
+    }
+    if (buffer.compare(consumed + payload, 2, "\r\n") != 0) {
+      end.code = "upstream_bad_framing";
+      end.detail = "chunk of " + std::to_string(payload) +
+                   " bytes not followed by CRLF: '" +
+                   Excerpt(std::string_view(buffer).substr(consumed + payload)) +
+                   "'";
+      return;
     }
     const std::string_view chunk(buffer.data() + consumed, payload);
     if (!write(chunk)) {
       return;
     }
     buffer.erase(0, consumed + payload + 2);
-    if (Cancelled(request)) {
-      return;
-    }
   }
 }
 
 void StreamToClose(int fd, std::string buffer,
                    const HttpResponse::BodyWriter& write,
-                   const HttpRequest& request) {
+                   const HttpRequest& request, RelayEnd& end) {
   if (!buffer.empty() && !write(buffer)) {
     return;
   }
   for (;;) {
     buffer.clear();
-    if (!Refill(fd, buffer, request)) {
+    if (!Refill(fd, buffer, request, end)) {
+      if (end.code == "upstream_closed") {
+        end.code.clear();  // close-delimited: EOF is the end of message
+        end.detail.clear();
+      }
       return;
     }
     if (!write(buffer)) {
       return;
     }
   }
+}
+
+/// Text routes whose clients read an SSE `error` event (the shape `gufo
+/// serve` itself sends when generation fails mid-stream).
+bool IsTextRoute(std::string_view path) {
+  return path == "/v1/chat/completions" || path == "/v1/completions" ||
+         path == "/v1/responses" || path == "/v1/messages" ||
+         path == "/completion";
+}
+
+bool IsEventStreamHead(
+    const std::vector<std::pair<std::string, std::string>>& headers) {
+  for (const auto& [name, value] : headers) {
+    if (IEquals(name, "Content-Type") &&
+        value.find("text/event-stream") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string RelayErrorEvent(std::string_view path, const RelayEnd& end) {
+  json::Value error = json::Value::object();
+  error["message"] =
+      "upstream worker stream ended early (" + end.code + "): " + end.detail;
+  error["type"] = "server_error";
+  error["code"] = end.code;
+  json::Value event = json::Value::object();
+  event["error"] = std::move(error);
+  const bool named = path == "/v1/messages" || path == "/v1/responses";
+  return (named ? "event: error\n" : "") + std::string("data: ") +
+         event.dump() + "\n\n";
 }
 
 }  // namespace
@@ -619,25 +724,69 @@ gufo::server::HttpResponse ProxyToWorker(
   response.headers = std::move(head.headers);
   const Framing framing = head.framing;
   const std::size_t content_length = head.content_length;
+  const bool sse = IsEventStreamHead(response.headers);
   std::string remainder = std::move(head.remainder);
+  // A worker stream that stops before its end of message must not reach
+  // the client as a clean end: the front withholds the final chunk for a
+  // stream_log error and logs outcome=stream_error (15.11.: two qwen
+  // streams on the .56 ended without [DONE], logged as "completed").
+  auto log = std::make_shared<HttpResponse::StreamLog>();
+  response.stream_log = log;
   HttpRequest front = request;
+  const int port = target.port;
   response.streaming_body =
       [cell, framing, content_length, remainder = std::move(remainder),
-       front](const HttpResponse::BodyWriter& write) mutable {
+       front, log, sse, port](const HttpResponse::BodyWriter& write) mutable {
         const int upstream = cell->fd.load();
+        const auto started = std::chrono::steady_clock::now();
+        RelayEnd end;
+        end.bytes = remainder.size();
         switch (framing) {
           case Framing::kContentLength:
             StreamContentLength(upstream, std::move(remainder), content_length,
-                                write, front);
+                                write, front, end);
             break;
           case Framing::kChunked:
-            StreamChunked(upstream, std::move(remainder), write, front);
+            StreamChunked(upstream, std::move(remainder), write, front, end);
             break;
           case Framing::kToClose:
-            StreamToClose(upstream, std::move(remainder), write, front);
+            StreamToClose(upstream, std::move(remainder), write, front, end);
             break;
         }
         cell->Close();
+        if (end.code.empty()) {
+          return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = [&now](std::chrono::steady_clock::time_point since) {
+          return std::to_string(
+              std::chrono::duration_cast<Milliseconds>(now - since).count());
+        };
+        log->error_code = end.code;
+        log->details = "relay_end=" + end.code;
+        const bool client_left = end.code == "client_disconnected";
+        // A client that left is routine (Info); everything else is the
+        // worker side breaking off and names what the relay saw (a socket
+        // error 10038 WSAENOTSOCK, for example, means the descriptor was
+        // closed under the relay).
+        Logger::Log(client_left ? gufo::server::LogLevel::kInfo
+                                : gufo::server::LogLevel::kWarn,
+                    "router",
+                    "event=relay_end request=" + front.request_id +
+                        " path=" + front.path +
+                        " worker_port=" + std::to_string(port) +
+                        " reason=" + end.code + " detail=\"" + end.detail +
+                        "\" upstream_bytes=" + std::to_string(end.bytes) +
+                        " since_last_byte_ms=" + ms(end.last_byte) +
+                        " relay_ms=" + ms(started));
+        if (!client_left) {
+          // The error event tells SSE clients why; error_event_sent stays
+          // false on purpose, so the front still ends the chunked body
+          // without its final chunk and plain HTTP clients see an error too.
+          if (sse && IsTextRoute(front.path)) {
+            (void)write(RelayErrorEvent(front.path, end));
+          }
+        }
       };
   return response;
 }

@@ -2700,7 +2700,11 @@ void HttpServer::handle_connection(int client_fd,
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
       if (!resp.stream_log->error_code.empty()) {
-        outcome = "stream_error";
+        // A relay that stopped because its client left is a disconnect,
+        // not a stream failure (router proxy, 15.11.).
+        outcome = resp.stream_log->error_code == "client_disconnected"
+                      ? "disconnected"
+                      : "stream_error";
         resp.log_details += " error_code=" + resp.stream_log->error_code;
       }
     }

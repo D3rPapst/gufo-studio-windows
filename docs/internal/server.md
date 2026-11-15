@@ -743,6 +743,22 @@ verbatim, WebSocket upgrades complete against the worker and frames relay
 in both directions until either side closes, and multipart bodies stream
 to the worker under the front's `--max-request-bytes` bound. Closing the
 front connection closes the worker connection, propagating cancellation.
+A worker body that stops before its end of message (connection closed or
+receive error mid-body, chunk framing that does not line up) is never
+relayed as a clean end (after 2.1.6): the router logs `[router] event=relay_end
+reason=upstream_closed|upstream_receive_failed|upstream_bad_framing` with
+the socket error, the upstream bytes and the time since the last byte,
+the request ends with `outcome=stream_error error_code=<reason>`, text
+routes (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
+`/v1/messages`, `/completion`) with an SSE body get a `data:
+{"error":{...,"code":"<reason>"}}` event (`event: error` first for
+messages and responses), and the chunked response closes without its
+final `0` chunk, so plain HTTP clients see a truncated body. A client that
+left logs `reason=client_disconnected` at INFO and `outcome=disconnected`.
+Up to 2.1.6 all of these ended with `0\r\n\r\n` and `outcome=completed`
+(15.11.: two qwen streams on the .56 stopped mid-answer that way). The
+relay waits for upstream bytes with poll(), not with SO_RCVTIMEO, which
+Winsock leaves "in an indeterminate state" after a timeout.
 Video job ids returned by `POST /v1/videos` are recorded with their
 model: while a tracked job is non-terminal its worker is exempt from
 eviction and idle unload, and a status or content read for a recorded job

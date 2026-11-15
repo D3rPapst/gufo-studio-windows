@@ -80,7 +80,7 @@ if (BUILD_TESTING)
       router_names_test router_figuren_test router_proxy_remote_test
       router_jobs_test router_pool_test router_figuren_ccip_endpoint_test
       router_auth_test router_mcp_test router_einrichtung_test
-      router_vision_test)
+      router_vision_test router_proxy_stream_end_test)
     add_executable(${router_test} tests/cli/${router_test}.cpp)
     target_link_libraries(${router_test} PRIVATE gufo_router)
     target_compile_options(${router_test} PRIVATE ${gufo_router_test_undebug})
