@@ -1171,6 +1171,8 @@ Route Classify(const HttpRequest& req) {
     return set(Route::Kind::kMe);
   if (post && p == "/router/me/passwort")
     return set(Route::Kind::kPasswort);
+  if (p == "/router/me/chats" || p.starts_with("/router/me/chats/"))
+    return set(Route::Kind::kMeChats);
   if (p == "/router/users" || p.starts_with("/router/users/") ||
       p == "/router/zugriff")
     return set(Route::Kind::kUsers);
@@ -1571,6 +1573,7 @@ Gate::Gate(Settings settings, std::shared_ptr<UserStore> store, Hooks hooks)
       store_(std::move(store)),
       hooks_(std::move(hooks)),
       filter_(store_->dir() / "filter-woerter.txt"),
+      chats_(store_->dir() / "chats"),
       internal_key_(RandomHex(32)) {
   if (settings_.mode != Mode::kOff)
     filter_.EnsureDefaults();
@@ -2128,7 +2131,8 @@ std::optional<HttpResponse> Gate::Refuse(const HttpRequest& req,
                      "pool_key_invalid");
   }
   if (route.kind == Route::Kind::kLogin || route.kind == Route::Kind::kLogout ||
-      route.kind == Route::Kind::kMe || route.kind == Route::Kind::kPasswort)
+      route.kind == Route::Kind::kMe || route.kind == Route::Kind::kPasswort ||
+      route.kind == Route::Kind::kMeChats)
     return std::nullopt;
   if (!who.authenticated()) {
     const std::string bearer = BearerOf(req);
@@ -2993,6 +2997,109 @@ HttpResponse Gate::UsersApi(const HttpRequest& req, const Identity& who) {
   return NotFound();
 }
 
+HttpResponse Gate::ChatsApi(const HttpRequest& req, const Identity& who) {
+  if (!who.authenticated())
+    return AuthError(401, "Unauthorized", "login required",
+                     "not_authenticated");
+  if (who.placeholder || who.source == Identity::Source::kPool ||
+      who.source == Identity::Source::kInternal ||
+      who.source == Identity::Source::kOff)
+    return Forbidden("kein Nutzerkonto: die Chat-Seite speichert im Browser "
+                     "(no account; the page keeps chats in the browser)",
+                     "no_account");
+  // The users file may move (setup assistant): the chats move with it.
+  chats_.SetRoot(store_->dir() / "chats");
+  constexpr std::string_view kBase = "/router/me/chats";
+  std::string id = req.path.substr(kBase.size());
+  if (id.starts_with('/'))
+    id.erase(0, 1);
+  const auto not_allowed = [] {
+    return AuthError(405, "Method Not Allowed",
+                     "GET, PUT or DELETE (method not allowed)",
+                     "method_not_allowed");
+  };
+  if (id.empty()) {
+    if (req.method == "GET" || req.method == "HEAD") {
+      json::Value body = json::Value::object();
+      body["konto"] = who.name;
+      body["chats"] = chats_.List(who.name);
+      body["max"] = static_cast<long long>(kMaxChats);
+      body["max_bytes"] = static_cast<long long>(kMaxChatBytes);
+      body["max_bild_bytes"] = static_cast<long long>(kMaxChatImageBytes);
+      return JsonOk(body);
+    }
+    if (req.method == "DELETE") {
+      const std::size_t count = chats_.RemoveAll(who.name);
+      Log(req, who, "chats_geloescht:" + std::to_string(count));
+      json::Value body = json::Value::object();
+      body["ok"] = true;
+      body["entfernt"] = static_cast<long long>(count);
+      return JsonOk(body);
+    }
+    return not_allowed();
+  }
+  if (!IsValidChatId(id))
+    return AuthError(400, "Bad Request",
+                     "Kennung: 1-64 Zeichen A-Z a-z 0-9 _ - (invalid "
+                     "conversation id)",
+                     "invalid_id");
+  if (req.method == "GET" || req.method == "HEAD") {
+    auto text = chats_.Get(who.name, id);
+    if (!text.has_value())
+      return AuthError(404, "Not Found",
+                       "Gespräch nicht gefunden (conversation not found)",
+                       "chat_not_found");
+    return HttpResponse{.status = 200,
+                        .reason = "OK",
+                        .body = std::move(*text),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-store"}}};
+  }
+  if (req.method == "PUT") {
+    if (req.body.size() > kMaxChatBytes)
+      return AuthError(413, "Payload Too Large",
+                       "Gespräch größer als " +
+                           std::to_string(kMaxChatBytes / (1024 * 1024)) +
+                           " MB (conversation exceeds " +
+                           std::to_string(kMaxChatBytes) + " bytes)",
+                       "chat_too_large");
+    json::Value chat;
+    try {
+      chat = json::parse(req.body);
+    } catch (const std::exception&) {
+      chat = json::Value();
+    }
+    if (!chat.is_object())
+      return AuthError(400, "Bad Request",
+                       "JSON-Objekt erwartet (a JSON object expected)",
+                       "invalid_request");
+    std::vector<std::string> removed;
+    std::string error;
+    if (!chats_.Put(who.name, id, std::move(chat), &removed, &error)) {
+      Logger::Warn("router", "event=chat_save_failed user=" + who.name +
+                                 " reason=\"" + error + "\"");
+      return AuthError(500, "Internal Server Error",
+                       "Gespräch nicht gespeichert (cannot store)",
+                       "chat_store_failed");
+    }
+    json::Value body = json::Value::object();
+    body["ok"] = true;
+    body["id"] = id;
+    body["entfernt"] = ArrayOf(removed);
+    return JsonOk(body);
+  }
+  if (req.method == "DELETE") {
+    if (!chats_.Remove(who.name, id))
+      return AuthError(404, "Not Found",
+                       "Gespräch nicht gefunden (conversation not found)",
+                       "chat_not_found");
+    json::Value body = json::Value::object();
+    body["ok"] = true;
+    return JsonOk(body);
+  }
+  return not_allowed();
+}
+
 std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
                                                const Route& route,
                                                const Identity& who) {
@@ -3019,6 +3126,8 @@ std::optional<HttpResponse> Gate::AuthEndpoint(const HttpRequest& req,
       return Logout(req, who);
     case Route::Kind::kPasswort:
       return ChangePassword(req, who);
+    case Route::Kind::kMeChats:
+      return ChatsApi(req, who);
     case Route::Kind::kUsers:
     case Route::Kind::kAdminPage:
     case Route::Kind::kSetup: {
@@ -3067,7 +3176,8 @@ HttpResponse Gate::Serve(
            route.kind == Route::Kind::kAdminControl ||
            route.kind == Route::Kind::kSetup) &&
           IsLoopback(RequestAddress(req))) ||
-         (route.kind == Route::Kind::kPasswort &&
+         ((route.kind == Route::Kind::kPasswort ||
+           route.kind == Route::Kind::kMeChats) &&
           who.source == Identity::Source::kCookie))) {
       if (auto refusal = CsrfCheck(req)) {
         Log(req, who, "abgelehnt:csrf_rejected");

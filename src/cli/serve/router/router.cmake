@@ -16,6 +16,7 @@ endif()
 
 add_library(gufo_router STATIC
   src/cli/serve/router/auth.cpp
+  src/cli/serve/router/chats.cpp
   src/cli/serve/router/comfy_adapter.cpp
   src/cli/serve/router/comfy_graph.cpp
   src/cli/serve/router/cpu_pool.cpp

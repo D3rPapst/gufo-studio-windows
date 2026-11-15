@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/router/chats.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::auth {
@@ -297,6 +298,7 @@ struct Route {
     kLogout,       // POST /logout
     kMe,           // GET /router/me
     kPasswort,     // POST /router/me/passwort (own password)
+    kMeChats,      // /router/me/chats[/<id>] (2.1.8): the own chat history
     kUsers,        // /router/users*, /router/zugriff: loopback or admin
     kAdminPage,    // /verwaltung/, /einrichtung/: loopback or admin, else 404
     kSetup,        // /router/setup/* (2.1 setup assistant): loopback or
@@ -411,6 +413,7 @@ public:
   }
   [[nodiscard]] UserStore& store() { return *store_; }
   [[nodiscard]] WordFilter& filter() { return filter_; }
+  [[nodiscard]] ChatStore& chats() { return chats_; }
 
   /// The front hook: answers the request itself (refusals, login, me,
   /// users API) or hands a checked copy to `next` and post-processes the
@@ -551,6 +554,12 @@ private:
       const server::HttpRequest& req, const Identity& who);
   [[nodiscard]] server::HttpResponse UsersApi(const server::HttpRequest& req,
                                               const Identity& who);
+  /// GET/DELETE /router/me/chats, GET/PUT/DELETE /router/me/chats/<id>
+  /// (2.1.8): a signed-in account's own conversations (chats.hpp); the
+  /// router itself, loopback as admin, auth = off and the partner have
+  /// none (403 no_account: the page keeps them in the browser).
+  [[nodiscard]] server::HttpResponse ChatsApi(const server::HttpRequest& req,
+                                              const Identity& who);
   [[nodiscard]] bool CountDaily(const Identity& who, int weight,
                                 long long limit);
   void RotateLogLocked();
@@ -560,6 +569,7 @@ private:
   std::shared_ptr<UserStore> store_;
   Hooks hooks_;
   WordFilter filter_;
+  ChatStore chats_;
   std::string internal_key_;
   std::function<long long()> now_;
   std::mutex mutex_;

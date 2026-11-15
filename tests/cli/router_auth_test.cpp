@@ -1773,6 +1773,122 @@ void TestMusicSpeechFilter() {
   CHECK(logged);
 }
 
+// 2.1.8 (Fabian e51): the chat history per account on the router,
+// /router/me/chats[/<id>]: own conversations only (admins too), at most
+// 100 per account (the oldest go), 2 MB per conversation, files under
+// nutzer/chats/<account>/, nothing for loopback, auth = off or the partner.
+void TestChatHistory() {
+  Fixture f(auth::Mode::kLan, "pool-geheim");
+  f.AddUser("fabian", "admin", "geheim123");
+  f.AddUser("tim", "nutzer", "tim-pw");
+  f.AddUser("anna", "nutzer", "anna-pw");
+  const std::string tim = f.LoginCookie("tim", "tim-pw");
+  const std::string anna = f.LoginCookie("anna", "anna-pw");
+  const std::string admin = f.LoginCookie("fabian", "geheim123");
+  const auto call = [&](const std::string& method, const std::string& path,
+                        const std::string& cookie, const std::string& body = {}) {
+    return f.Serve(Req(method, path, "192.168.178.50", body, {{"Cookie", cookie}}));
+  };
+  CHECK(auth::Classify(Req("GET", "/router/me/chats", "x")).kind ==
+        auth::Route::Kind::kMeChats);
+  CHECK(auth::Classify(Req("PUT", "/router/me/chats/c-1", "x")).kind ==
+        auth::Route::Kind::kMeChats);
+  HttpResponse r = call("GET", "/router/me/chats", tim);
+  CHECK_EQ(r.status, 200);
+  json::Value list = json::parse(r.body);
+  CHECK_EQ(list.find("chats")->size(), std::size_t(0));
+  CHECK_EQ(list.member_double("max"), 100.0);
+  CHECK_EQ(list.member_double("max_bytes"), 2.0 * 1024 * 1024);
+  CHECK_EQ(list.member_str("konto"), std::string("tim"));
+  r = call("PUT", "/router/me/chats/c-1", tim,
+           "{\"titel\":\"Hallo\",\"modell\":\"qwen\",\"zeit\":1763200000000,"
+           "\"nachrichten\":[{\"role\":\"user\",\"content\":\"Hi\"}]}");
+  CHECK_EQ(r.status, 200);
+  CHECK(std::filesystem::is_regular_file(f.dir / "nutzer" / "chats" / "tim" / "c-1.json"));
+  r = call("GET", "/router/me/chats/c-1", tim);
+  CHECK_EQ(r.status, 200);
+  json::Value chat = json::parse(r.body);
+  CHECK_EQ(chat.member_str("id"), std::string("c-1"));
+  CHECK_EQ(chat.member_str("titel"), std::string("Hallo"));
+  CHECK_EQ(chat.member_double("zeit"), 1763200000000.0);
+  CHECK(r.body.find("1763200000000") != std::string::npos);
+  r = call("GET", "/router/me/chats", tim);
+  list = json::parse(r.body);
+  CHECK_EQ(list.find("chats")->size(), std::size_t(1));
+  CHECK_EQ(list.find("chats")->items()[0].member_str("titel"), std::string("Hallo"));
+  // Only the own conversations: anna and the admin see none of tim's.
+  r = call("GET", "/router/me/chats/c-1", anna);
+  CHECK_EQ(r.status, 404);
+  CHECK_EQ(ErrorCode(r), std::string("chat_not_found"));
+  r = call("GET", "/router/me/chats", admin);
+  CHECK_EQ(json::parse(r.body).find("chats")->size(), std::size_t(0));
+  r = call("DELETE", "/router/me/chats/c-1", anna);
+  CHECK_EQ(r.status, 404);
+  CHECK(std::filesystem::is_regular_file(f.dir / "nutzer" / "chats" / "tim" / "c-1.json"));
+  // Ids and bodies.
+  r = call("PUT", "/router/me/chats/..%2Fx", tim, "{}");
+  CHECK_EQ(r.status, 400);
+  CHECK_EQ(ErrorCode(r), std::string("invalid_id"));
+  r = call("PUT", "/router/me/chats/c-2", tim, "[1,2]");
+  CHECK_EQ(r.status, 400);
+  r = call("PUT", "/router/me/chats/c-2", tim,
+           "{\"t\":\"" + std::string(2 * 1024 * 1024, 'x') + "\"}");
+  CHECK_EQ(r.status, 413);
+  CHECK_EQ(ErrorCode(r), std::string("chat_too_large"));
+  r = call("POST", "/router/me/chats/c-1", tim, "{}");
+  CHECK_EQ(r.status, 405);
+  // Nobody signed in, loopback as admin, the partner: no account here.
+  r = f.Serve(Req("GET", "/router/me/chats", "192.168.178.50"));
+  CHECK_EQ(r.status, 401);
+  r = f.Serve(Req("GET", "/router/me/chats", "127.0.0.1"));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("no_account"));
+  r = f.Serve(Req("GET", "/router/me/chats", "192.168.178.56", "",
+                  {{"X-Gufo-Pool-Key", "pool-geheim"}, {"X-Gufo-User", "tim"}}));
+  CHECK_EQ(r.status, 403);
+  // A page of another site may not write (CSRF rule of the cookie session).
+  r = f.Serve(Req("PUT", "/router/me/chats/c-9", "192.168.178.50", "{}",
+                  {{"Cookie", tim}, {"Origin", "http://evil.example"}}));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("csrf_rejected"));
+  // At most 100 per account: the oldest `zeit` goes, the new one stays.
+  for (int i = 0; i < 100; ++i) {
+    r = call("PUT", "/router/me/chats/n-" + std::to_string(i), anna,
+             "{\"titel\":\"" + std::to_string(i) + "\",\"zeit\":" +
+                 std::to_string(1000 + i) + "}");
+    CHECK_EQ(r.status, 200);
+  }
+  CHECK_EQ(json::parse(call("GET", "/router/me/chats", anna).body)
+               .find("chats")->size(), std::size_t(100));
+  r = call("PUT", "/router/me/chats/n-neu", anna, "{\"zeit\":5000}");
+  CHECK_EQ(r.status, 200);
+  const json::Value* gone = json::parse(r.body).find("entfernt");
+  CHECK(gone != nullptr && gone->size() == 1 &&
+        gone->items()[0].str() == "n-0");
+  list = json::parse(call("GET", "/router/me/chats", anna).body);
+  CHECK_EQ(list.find("chats")->size(), std::size_t(100));
+  CHECK_EQ(list.find("chats")->items()[0].member_str("id"), std::string("n-neu"));
+  CHECK(!std::filesystem::exists(f.dir / "nutzer" / "chats" / "anna" / "n-0.json"));
+  // A lost index is rebuilt from the files.
+  std::filesystem::remove(f.dir / "nutzer" / "chats" / "anna" / "index.json");
+  CHECK_EQ(json::parse(call("GET", "/router/me/chats", anna).body)
+               .find("chats")->size(), std::size_t(100));
+  // Delete one, then all.
+  r = call("DELETE", "/router/me/chats/c-1", tim);
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(call("GET", "/router/me/chats/c-1", tim).status, 404);
+  r = call("DELETE", "/router/me/chats", anna);
+  CHECK_EQ(r.status, 200);
+  CHECK_EQ(json::parse(r.body).member_double("entfernt"), 100.0);
+  CHECK_EQ(json::parse(call("GET", "/router/me/chats", anna).body)
+               .find("chats")->size(), std::size_t(0));
+  // auth = off: everyone is "lokal", no account, the page keeps the browser.
+  Fixture off(auth::Mode::kOff);
+  r = off.Serve(Req("GET", "/router/me/chats", "192.168.178.50"));
+  CHECK_EQ(r.status, 403);
+  CHECK_EQ(ErrorCode(r), std::string("no_account"));
+}
+
 void TestUsersApi() {
   Fixture f;
   // First setup: nothing but loopback gets in; the LAN sees the hint.
@@ -2673,6 +2789,7 @@ int main() {
   TestFilterAndLimit();
   TestDailyLimitMediaOnly();
   TestMusicSpeechFilter();
+  TestChatHistory();
   TestUsersApi();
   TestPasswordChange();
   TestLoopbackBearer();
