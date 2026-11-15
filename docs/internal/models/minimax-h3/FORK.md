@@ -48,3 +48,25 @@ pixels.
 The production preset of the two Strix Halo machines registers the
 `turbo` LoRA with `steps=8`, the vision projector and the RIFE weights
 (`gufo-router-combo7.ini`, `[external/minimax-h3]`).
+
+## Flow shifts and the audio noise mask
+
+Two request fields of `gufo.` mirror ComfyUI nodes (feature branch
+`feat/h3-knoten`):
+
+| Field | ComfyUI | Effect |
+| --- | --- | --- |
+| `"sigma_shift": {"video": 12, "audio": 3}` | `MiniMaxH3SigmaShift` (`shift_video`, `shift_audio`) | Flow shift of the video and the audio sigma schedule, each 0.01 to 100; a missing one keeps its trained value (12, 3). |
+| `"audio_mask": {"audio": <audio>, "mask": [2N numbers]}` | `LTXVConcatAVLatent` with `SetLatentNoiseMask` over `VAEEncodeAudio` | The audio (WAV, FLAC, Ogg or MP3 as a base64 `data:` URL) and two mask rows of N values each, one per stereo track, 0 = keep, 1 = generate. Each row is stretched over the audio's length; where it is below 0.5, the video's audio track is that audio, held clean on every step (as an audio guide) while the picture is generated with it. A clip shorter than the video generates the rest. |
+
+Values between 0 and 1 are rounded at 0.5: gufo has no partial strength yet.
+A silent or room-tone clip with the mask `[0, 0]` keeps the whole track
+quiet, the lever against invented speech in shots without dialogue.
+
+The ComfyUI adapter (`gufo router --comfy`) maps these nodes, also
+`EmptyMiniMaxH3LatentAV` with a `CLIPTextEncode` prompt, and lists their
+inputs in `/object_info` as ComfyUI does. The sampler's `cfg`, the negative
+conditioning and `denoise` have no effect on H3 (the weights are
+CFG-distilled); the adapter warns when they differ from 1. `sampler_name`
+and `scheduler` are not used: gufo samples with its own Euler steps on the
+shifted linear schedule.
