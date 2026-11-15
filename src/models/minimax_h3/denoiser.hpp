@@ -23,6 +23,33 @@ inline constexpr std::size_t kH3VideoPatchWidth = 96;
 inline constexpr std::size_t kH3AudioLatentChannels = 32;
 inline constexpr std::size_t kH3AudioTracks = 2;
 
+/// A MiniMax H3 Fun-ControlNet-Union patch (ComfyUI's
+/// MiniMaxH3FunControlNetApply): a control stream that starts from the
+/// packed sequence entering block 0, with the control rows projected in at
+/// the target video rows, runs through one control block per injection
+/// layer, and adds `strength` times each block's after_proj skip to the
+/// trunk after that layer, except on the audio rows. Active on the steps
+/// whose video sigma lies in [sigma_end, sigma_start].
+struct DenoiserControl {
+  const ModelInventory* inventory{nullptr};
+  // One row of `columns` floats per target video row (patchified like the
+  // target latent: channel-major within the 1x2x2 patch), zero-padded to
+  // the checkpoint's input width.
+  std::span<const float> rows;
+  std::size_t columns{0};
+  float strength{1.0F};
+  float sigma_start{1.0F};
+  float sigma_end{0.0F};
+};
+
+/// Injection layers of a Fun-ControlNet checkpoint with `blocks` control
+/// blocks, spread evenly over the 50 base blocks (v1: 5, every 10th; 2.0:
+/// 10, every 5th), as ComfyUI's model patch loader does.
+[[nodiscard]] std::vector<std::size_t> ControlInjectionLayers(
+    std::size_t blocks);
+/// Number of control blocks in a control checkpoint (0: none).
+[[nodiscard]] std::size_t CountControlBlocks(const ModelInventory& inventory);
+
 struct DenoiserOptions {
   GenerationGeometry geometry;
   int evaluations{0};
@@ -36,6 +63,9 @@ struct DenoiserOptions {
   // Flow shifts of the sigma schedules (MiniMaxH3SigmaShift).
   float video_sigma_shift{kH3VideoSigmaShift};
   float audio_sigma_shift{kH3AudioSigmaShift};
+  // Fun-ControlNet patch (needs all 50 blocks); must outlive Create and
+  // the session.
+  const DenoiserControl* control{nullptr};
 };
 
 /// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE
@@ -94,6 +124,10 @@ struct DenoiserTelemetry {
   double preview_ms{0.0};
   int previews{0};
   std::uint64_t core_weight_bytes{0};
+  // Fun-ControlNet: control blocks loaded and their weight bytes.
+  std::size_t control_blocks{0};
+  std::uint64_t control_weight_bytes{0};
+  double control_load_ms{0.0};
   std::uint64_t persistent_bytes{0};
   std::uint64_t scratch_bytes{0};
   std::uint64_t peak_live_bytes{0};

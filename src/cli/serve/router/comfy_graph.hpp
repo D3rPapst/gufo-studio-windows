@@ -362,6 +362,16 @@ struct VideoTask {
   std::optional<FileRef> audio_source;
   bool audio_source_from_video{false};
   std::vector<float> audio_mask;
+  /// H3 MiniMaxH3FunControlNetApply (Fun-ControlNet-Union) -> gufo.control:
+  /// the control video is `control_video`; the inpaint mask (a video read
+  /// through ImageToMask "red", white = regenerate) and the source video
+  /// behind it; strength and the start / end percent of the schedule.
+  bool h3_control{false};
+  std::optional<FileRef> h3_control_mask;
+  std::optional<FileRef> h3_control_source;
+  double h3_control_strength{1.0};
+  double h3_control_start{0.0};
+  double h3_control_end{1.0};
   /// Camera family: a preset move or a rendered guide video (LoadVideo),
   /// sent as gufo.camera.render_video by the executor.
   std::optional<CameraMove> camera;

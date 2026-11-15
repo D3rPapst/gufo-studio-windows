@@ -86,6 +86,14 @@ public:
       const std::filesystem::path& source_manifest,
       const InspectionOptions& options, std::string* error = nullptr);
 
+  /// A MiniMax H3 Fun-ControlNet-Union checkpoint (alibaba-pai, VideoX-Fun
+  /// layout: control_proj_in plus control_blocks.<i>), read from its
+  /// safetensors header alone. Its tensors are "transformer" tensors named
+  /// as in the file; the control blocks' adaln_proj land in the AdaLN
+  /// precompute phase like the base blocks'.
+  [[nodiscard]] static std::optional<ModelInventory> InspectControlPatch(
+      const std::filesystem::path& file, std::string* error = nullptr);
+
   [[nodiscard]] const std::filesystem::path& model_root() const noexcept {
     return model_root_;
   }

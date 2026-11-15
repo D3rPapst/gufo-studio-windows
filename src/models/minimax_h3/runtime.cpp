@@ -539,6 +539,50 @@ std::optional<ModelInventory> ModelInventory::Inspect(
   }
 }
 
+std::optional<ModelInventory> ModelInventory::InspectControlPatch(
+    const std::filesystem::path& file, std::string* error) {
+  try {
+    ModelInventory inventory;
+    const std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(file);
+    if (!std::filesystem::is_regular_file(canonical)) {
+      throw json::Error("control checkpoint is not a file");
+    }
+    inventory.model_root_ = canonical.parent_path();
+    const ParsedHeader header =
+        ParseSafetensorsHeader(canonical, &inventory.telemetry_);
+    inventory.tensors_.reserve(header.tensors.size());
+    for (const auto& [name, tensor] : header.tensors) {
+      TensorDescriptor descriptor;
+      descriptor.component = "transformer";
+      descriptor.name = name;
+      descriptor.dtype = tensor.dtype;
+      descriptor.shape = tensor.shape;
+      descriptor.shard = canonical.filename();
+      descriptor.file_offset = header.payload_offset + tensor.begin;
+      descriptor.payload_bytes = tensor.end - tensor.begin;
+      descriptor.phase = TensorPhase("transformer", name);
+      const std::size_t index = inventory.tensors_.size();
+      inventory.tensor_index_.emplace(name, index);
+      inventory.tensors_.push_back(std::move(descriptor));
+    }
+    inventory.shards_.push_back({canonical.filename(), header.file_bytes,
+                                 header.payload_offset,
+                                 header.tensors.size()});
+    const TensorDescriptor* input = inventory.FindTensor("control_proj_in.weight");
+    if (input == nullptr || input->dtype != DType::kFloat32 ||
+        input->shape.size() != 2 || input->shape[0] != 5376U) {
+      throw json::Error(
+          "not a MiniMax H3 Fun-ControlNet checkpoint (control_proj_in)");
+    }
+    return inventory;
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("MiniMax H3 control inspection failed: ") +
+                        exception.what());
+    return std::nullopt;
+  }
+}
+
 const TensorDescriptor* ModelInventory::FindTensor(
     std::string_view name) const noexcept {
   const auto iterator = tensor_index_.find(std::string(name));

@@ -640,6 +640,75 @@ bool IsFinite(std::span<const float> values, std::string_view name,
   return true;
 }
 
+// Fun-ControlNet: trunk += scale * skip (BF16, rounded once like
+// torch's add_(skip, alpha=scale)).
+static __global__ void ScaledAddBf16Kernel(std::uint16_t* values,
+                                           const std::uint16_t* skip,
+                                           float scale, std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    values[index] = dit_ops::FloatToBf16(
+        dit_ops::Bf16ToFloat(values[index]) +
+        scale * dit_ops::Bf16ToFloat(skip[index]));
+  }
+}
+
+void LaunchScaledAddBf16(std::uint16_t* values, const std::uint16_t* skip,
+                         float scale, std::size_t elements,
+                         hipStream_t stream) {
+  if (elements == 0) {
+    return;
+  }
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(ScaledAddBf16Kernel,
+                     dim3((elements + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, values, skip, scale, elements);
+}
+
+// GUFO_H3_CONTROL_DUMP=<directory>: raw device tensors of one forward
+// (GUFO_H3_CONTROL_DUMP_STEP, default 0) for the PyTorch oracle.
+bool DumpDevice(const char* name, const void* device, std::size_t bytes,
+                hipStream_t stream) {
+  const char* directory = std::getenv("GUFO_H3_CONTROL_DUMP");
+  if (directory == nullptr || *directory == '\0') {
+    return true;
+  }
+  std::vector<std::byte> host(bytes);
+  if (hipStreamSynchronize(stream) != hipSuccess ||
+      hipMemcpy(host.data(), device, bytes, hipMemcpyDeviceToHost) !=
+          hipSuccess) {
+    return false;
+  }
+  std::ofstream file(std::string(directory) + "/" + name + ".bin",
+                     std::ios::binary);
+  file.write(reinterpret_cast<const char*>(host.data()),
+             static_cast<std::streamsize>(bytes));
+  return static_cast<bool>(file);
+}
+
+template <typename T>
+bool DumpHost(const char* name, std::span<const T> values) {
+  const char* directory = std::getenv("GUFO_H3_CONTROL_DUMP");
+  if (directory == nullptr || *directory == '\0') {
+    return true;
+  }
+  std::ofstream file(std::string(directory) + "/" + name + ".bin",
+                     std::ios::binary);
+  file.write(reinterpret_cast<const char*>(values.data()),
+             static_cast<std::streamsize>(values.size_bytes()));
+  return static_cast<bool>(file);
+}
+
+int ControlDumpStep() {
+  const char* directory = std::getenv("GUFO_H3_CONTROL_DUMP");
+  if (directory == nullptr || *directory == '\0') {
+    return -1;
+  }
+  const char* step = std::getenv("GUFO_H3_CONTROL_DUMP_STEP");
+  return step == nullptr ? 0 : std::atoi(step);
+}
+
 }  // namespace
 
 struct DenoiserSession::Impl {
@@ -706,6 +775,315 @@ struct DenoiserSession::Impl {
   int active_blocks{static_cast<int>(kDitBlocks)};
   int reuse_interval{1};
   bool row_parallel_attention{true};
+
+  // Fun-ControlNet (ComfyUI MiniMaxH3FunControlNetApply).
+  const DenoiserControl* control{nullptr};
+  std::vector<std::size_t> control_layers;
+  std::vector<std::unique_ptr<DitBlockSession>> control_blocks;
+  std::vector<std::uint8_t> control_active;
+  std::unique_ptr<Bf16Gemm> control_gemm;
+  DeviceBuffer control_in_weight;
+  DeviceBuffer control_in_bias;
+  DeviceBuffer control_before_weight;
+  DeviceBuffer control_before_bias;
+  std::vector<DeviceBuffer> control_after_weight;
+  std::vector<DeviceBuffer> control_after_bias;
+  DeviceBuffer control_rows_device;
+  DeviceBuffer control_pristine;
+  DeviceBuffer control_stream;
+  DeviceBuffer control_skip;
+
+  bool LoadFrom(const ModelInventory& source, const TensorDescriptor& descriptor,
+                DeviceBuffer* output, const CancellationToken* cancellation,
+                std::string* error) {
+    if (!LoadTensor(source, descriptor, device, stream, staging,
+                    kWeightStagingBytes, cancellation, output, error)) {
+      return false;
+    }
+    base_telemetry.cumulative_allocation_bytes += descriptor.payload_bytes;
+    base_telemetry.control_weight_bytes += descriptor.payload_bytes;
+    return true;
+  }
+
+  bool LoadControl(DeviceBuffer& time_embedding,
+                   std::span<const std::uint16_t> rope_cos,
+                   std::span<const std::uint16_t> rope_sin,
+                   const std::shared_ptr<DitBlockWorkspace>& workspace,
+                   const CancellationToken* cancellation, std::string* error) {
+    if (control == nullptr) {
+      return true;
+    }
+    const auto begin = Clock::now();
+    if (control->inventory == nullptr) {
+      SetError(error, "MiniMax H3 control patch has no checkpoint");
+      return false;
+    }
+    const ModelInventory& patch = *control->inventory;
+    const std::size_t count = CountControlBlocks(patch);
+    control_layers = ControlInjectionLayers(count);
+    if (count == 0 || control_layers.size() != count) {
+      SetError(error, "MiniMax H3 control checkpoint has no usable blocks");
+      return false;
+    }
+    const std::size_t columns = control->columns;
+    if (columns == 0 ||
+        control->rows.size() != layout.video_target_rows * columns) {
+      SetError(error, "MiniMax H3 control rows differ from the layout");
+      return false;
+    }
+    const TensorDescriptor* in_weight =
+        RequireTensor(patch, "control_proj_in.weight", DType::kFloat32,
+                      {kDitHiddenSize, columns}, error);
+    const TensorDescriptor* in_bias =
+        RequireTensor(patch, "control_proj_in.bias", DType::kFloat32,
+                      {kDitHiddenSize}, error);
+    const TensorDescriptor* before_weight =
+        RequireTensor(patch, "control_blocks.0.before_proj.weight",
+                      DType::kBFloat16, {kDitHiddenSize, kDitHiddenSize}, error);
+    const TensorDescriptor* before_bias =
+        RequireTensor(patch, "control_blocks.0.before_proj.bias",
+                      DType::kBFloat16, {kDitHiddenSize}, error);
+    if (in_weight == nullptr || in_bias == nullptr ||
+        before_weight == nullptr || before_bias == nullptr ||
+        !LoadFrom(patch, *in_weight, &control_in_weight, cancellation, error) ||
+        !LoadFrom(patch, *in_bias, &control_in_bias, cancellation, error) ||
+        !LoadFrom(patch, *before_weight, &control_before_weight, cancellation,
+                  error) ||
+        !LoadFrom(patch, *before_bias, &control_before_bias, cancellation,
+                  error)) {
+      return false;
+    }
+    if (time_embedding.bytes() == 0 &&
+        !BuildTimeEmbedding(&time_embedding, cancellation, error)) {
+      return false;
+    }
+    control_after_weight.resize(count);
+    control_after_bias.resize(count);
+    const std::size_t modulation_rows =
+        static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::string prefix =
+          "control_blocks." + std::to_string(index) + ".";
+      const TensorDescriptor* after_weight =
+          RequireTensor(patch, prefix + "after_proj.weight", DType::kBFloat16,
+                        {kDitHiddenSize, kDitHiddenSize}, error);
+      const TensorDescriptor* after_bias =
+          RequireTensor(patch, prefix + "after_proj.bias", DType::kBFloat16,
+                        {kDitHiddenSize}, error);
+      if (after_weight == nullptr || after_bias == nullptr ||
+          !LoadFrom(patch, *after_weight, &control_after_weight[index],
+                    cancellation, error) ||
+          !LoadFrom(patch, *after_bias, &control_after_bias[index],
+                    cancellation, error)) {
+        return false;
+      }
+      std::vector<std::uint16_t> modulation;
+      // On an AdaLN cache hit the base blocks never selected this GEMM plan.
+      if (!ComputeModulation(prefix + "adaln_proj", kBlockModulationWidth,
+                             time_embedding, adaln_cache_hit && index == 0,
+                             cancellation, &modulation, error, &patch)) {
+        return false;
+      }
+      auto session = DitBlockSession::Create(
+          patch,
+          {.block_index = control_layers[index],
+           .rows = layout.rows(),
+           .modulation_rows = modulation_rows,
+           .row_parallel_attention = row_parallel_attention,
+           .validate_gemm_plans = false,
+           .lora = nullptr,
+           .control_index = static_cast<int>(index)},
+          workspace, cancellation, error);
+      if (session == nullptr ||
+          !session->PrepareConstants(modulation, rope_cos, rope_sin,
+                                     cancellation, error)) {
+        return false;
+      }
+      base_telemetry.control_weight_bytes += session->weight_bytes();
+      base_telemetry.scratch_bytes += session->activation_bytes();
+      base_telemetry.cumulative_allocation_bytes +=
+          session->weight_bytes() + session->activation_bytes();
+      control_blocks.push_back(std::move(session));
+    }
+    const std::size_t hidden_bytes =
+        layout.rows() * kDitHiddenSize * sizeof(std::uint16_t);
+    if (!control_rows_device.Allocate(control->rows.size_bytes(), error) ||
+        !control_pristine.Allocate(hidden_bytes, error) ||
+        !control_stream.Allocate(hidden_bytes, error) ||
+        !control_skip.Allocate(hidden_bytes, error) ||
+        !CopyAsync(control_rows_device.data(), control->rows.data(),
+                   control->rows.size_bytes(), hipMemcpyHostToDevice,
+                   "copy H3 control rows", error)) {
+      return false;
+    }
+    base_telemetry.persistent_bytes += control_rows_device.bytes();
+    base_telemetry.scratch_bytes += 3U * hidden_bytes;
+    // Fill the trunk-sized buffers before the deterministic GEMM check.
+    dit_ops::LaunchFillBf16Pattern(control_stream.As<std::uint16_t>(),
+                                   layout.rows() * kDitHiddenSize, 0x3C0001U,
+                                   stream);
+    DeviceBuffer reference;
+    DeviceBuffer mismatch;
+    if (!CheckLaunch("fill H3 control stream", error) ||
+        !(control_gemm = std::make_unique<Bf16Gemm>())->Select(
+                             control_before_weight.As<std::uint16_t>(),
+                             control_stream.As<std::uint16_t>(),
+                             control_skip.As<std::uint16_t>(), &reference,
+                             &mismatch, layout.rows(), kDitHiddenSize,
+                             kDitHiddenSize, stream, error)) {
+      return false;
+    }
+    control_active.assign(static_cast<std::size_t>(schedule.evaluations()), 0U);
+    for (int step = 0; step < schedule.evaluations(); ++step) {
+      const float sigma = schedule.video[static_cast<std::size_t>(step)];
+      control_active[static_cast<std::size_t>(step)] =
+          sigma >= control->sigma_end && sigma <= control->sigma_start ? 1U
+                                                                       : 0U;
+    }
+    const hipError_t status = hipStreamSynchronize(stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("load H3 control patch", status));
+      return false;
+    }
+    base_telemetry.control_blocks = count;
+    base_telemetry.control_load_ms = Milliseconds(begin, Clock::now());
+    return true;
+  }
+
+  bool DumpControlMeta(int step, std::string* error) {
+    const std::vector<std::int64_t> meta = {
+        static_cast<std::int64_t>(layout.rows()),
+        static_cast<std::int64_t>(layout.text_rows),
+        static_cast<std::int64_t>(layout.condition_rows),
+        static_cast<std::int64_t>(layout.audio_condition_rows),
+        static_cast<std::int64_t>(layout.audio_target_rows),
+        static_cast<std::int64_t>(layout.video_target_rows),
+        layout.video_latent_frames,
+        layout.latent_height,
+        layout.latent_width,
+        layout.audio_latent_frames,
+        static_cast<std::int64_t>(time_rows.time_rows),
+        step,
+        static_cast<std::int64_t>(control != nullptr ? control->columns : 0),
+        static_cast<std::int64_t>(control_layers.size())};
+    const std::vector<float> times = TimeValues();
+    const std::vector<float> control_values = {
+        control != nullptr ? control->strength : 0.0F,
+        control != nullptr ? control->sigma_start : 0.0F,
+        control != nullptr ? control->sigma_end : 0.0F,
+        schedule.video[static_cast<std::size_t>(step)],
+        schedule.audio[static_cast<std::size_t>(step)]};
+    if (!DumpHost<std::int64_t>("meta", meta) ||
+        !DumpHost<float>("time_values", times) ||
+        !DumpHost<float>("control_values", control_values) ||
+        !DumpHost<std::uint32_t>("row_map",
+                                 row_maps[static_cast<std::size_t>(step)]) ||
+        !DumpHost<Position3D>("positions", layout.positions) ||
+        !DumpHost<std::uint8_t>("text_tags", text_tags) ||
+        (control != nullptr && !DumpHost<float>("control_rows", control->rows))) {
+      SetError(error, "cannot dump H3 control metadata");
+      return false;
+    }
+    return true;
+  }
+
+  // Control block `index` after trunk block control_layers[index]: the
+  // first one builds the control stream from the trunk entering block 0
+  // (control_pristine), every one adds strength * after_proj(stream) to
+  // the trunk outside the audio rows.
+  bool RunControl(std::size_t index, std::uint16_t* trunk, bool dump,
+                  const CancellationToken* cancellation, std::string* error) {
+    const std::size_t rows = layout.rows();
+    const std::size_t condition_offset = layout.text_rows;
+    const std::size_t audio_begin = layout.text_rows + layout.condition_rows;
+    const std::size_t video_begin = audio_begin + layout.audio_condition_rows +
+                                    layout.audio_target_rows;
+    std::uint16_t* stream_rows = control_stream.As<std::uint16_t>();
+    std::uint16_t* skip = control_skip.As<std::uint16_t>();
+    if (index == 0) {
+      // c = h; c[image rows] = control_proj_in(rows): the image guide rows
+      // get a zero control row (the bias alone).
+      if (!CopyAsync(stream_rows, control_pristine.data(),
+                     control_pristine.bytes(), hipMemcpyDeviceToDevice,
+                     "copy H3 control stream", error)) {
+        return false;
+      }
+      if (layout.condition_rows != 0) {
+        if (hipMemsetAsync(projection_scratch_f32.data(), 0,
+                           layout.condition_rows * kDitHiddenSize *
+                               sizeof(float),
+                           stream) != hipSuccess) {
+          SetError(error, "cannot clear H3 control scratch");
+          return false;
+        }
+        dit_ops::LaunchAddBiasF32ToBf16(
+            projection_scratch_f32.As<float>(), control_in_bias.As<float>(),
+            stream_rows + condition_offset * kDitHiddenSize,
+            static_cast<std::uint32_t>(layout.condition_rows), kDitHiddenSize,
+            stream);
+      }
+      if (!projection_gemm.Run(control_in_weight.As<float>(),
+                               control_rows_device.As<float>(),
+                               projection_scratch_f32.As<float>(),
+                               layout.video_target_rows, kDitHiddenSize,
+                               control->columns, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), control_in_bias.As<float>(),
+          stream_rows + video_begin * kDitHiddenSize,
+          static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
+          stream);
+      if (!CheckLaunch("H3 control input projection", error) ||
+          (dump && !DumpDevice("control_c_input", stream_rows,
+                               control_stream.bytes(), stream)) ||
+          !control_gemm->Run(control_before_weight.As<std::uint16_t>(),
+                            stream_rows, skip, rows, kDitHiddenSize,
+                            kDitHiddenSize, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasBf16(skip, control_before_bias.As<std::uint16_t>(),
+                                 static_cast<std::uint32_t>(rows),
+                                 kDitHiddenSize, stream);
+      dit_ops::LaunchAddSubtract(skip, control_pristine.As<std::uint16_t>(),
+                                 stream_rows, rows * kDitHiddenSize, false,
+                                 stream);
+      if (!CheckLaunch("H3 control before_proj", error) ||
+          (dump && !DumpDevice("control_c_init", stream_rows,
+                               control_stream.bytes(), stream))) {
+        return false;
+      }
+    }
+    DitBlockTelemetry block_telemetry;
+    if (!control_blocks[index]->RunPreparedDevice(
+            stream_rows, block_row_map.As<std::uint32_t>(), stream_rows,
+            static_cast<void*>(stream), false, false, cancellation,
+            &block_telemetry, error) ||
+        !control_gemm->Run(control_after_weight[index].As<std::uint16_t>(),
+                          stream_rows, skip, rows, kDitHiddenSize,
+                          kDitHiddenSize, stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchAddBiasBf16(skip,
+                               control_after_bias[index].As<std::uint16_t>(),
+                               static_cast<std::uint32_t>(rows),
+                               kDitHiddenSize, stream);
+    if (dump && index == 0 &&
+        (!DumpDevice("control_c_block0", stream_rows, control_stream.bytes(),
+                     stream) ||
+         !DumpDevice("control_skip0", skip, control_skip.bytes(), stream))) {
+      SetError(error, "cannot dump H3 control tensors");
+      return false;
+    }
+    // The skips stay off the audio rows (control_apply_audio = false).
+    LaunchScaledAddBf16(trunk, skip, control->strength,
+                        audio_begin * kDitHiddenSize, stream);
+    LaunchScaledAddBf16(trunk + video_begin * kDitHiddenSize,
+                        skip + video_begin * kDitHiddenSize, control->strength,
+                        layout.video_target_rows * kDitHiddenSize, stream);
+    base_telemetry.dispatches += block_telemetry.dispatches + 4U;
+    return CheckLaunch("H3 control skip", error);
+  }
 
   ~Impl() {
     if (staging != nullptr) {
@@ -1200,12 +1578,14 @@ struct DenoiserSession::Impl {
                          const DeviceBuffer& time_embedding, bool select_plan,
                          const CancellationToken* cancellation,
                          std::vector<std::uint16_t>* host_output,
-                         std::string* error) {
+                         std::string* error,
+                         const ModelInventory* source = nullptr) {
+    const ModelInventory& weights = source != nullptr ? *source : *inventory;
     const TensorDescriptor* weight = RequireTensor(
-        *inventory, std::string(prefix) + ".linear.weight", DType::kBFloat16,
+        weights, std::string(prefix) + ".linear.weight", DType::kBFloat16,
         {output_width, kTimeOutputWidth}, error);
     const TensorDescriptor* bias =
-        RequireTensor(*inventory, std::string(prefix) + ".linear.bias",
+        RequireTensor(weights, std::string(prefix) + ".linear.bias",
                       DType::kBFloat16, {output_width}, error);
     if (weight == nullptr || bias == nullptr) {
       return false;
@@ -1215,8 +1595,11 @@ struct DenoiserSession::Impl {
     DeviceBuffer output;
     DeviceBuffer reference;
     DeviceBuffer mismatch;
-    if (!Load(*weight, &weight_device, cancellation, error) ||
-        !Load(*bias, &bias_device, cancellation, error) ||
+    if (!LoadTensor(weights, *weight, device, stream, staging,
+                    kWeightStagingBytes, cancellation, &weight_device,
+                    error) ||
+        !LoadTensor(weights, *bias, device, stream, staging,
+                    kWeightStagingBytes, cancellation, &bias_device, error) ||
         !output.Allocate(
             time_rows.time_rows * output_width * sizeof(std::uint16_t),
             error)) {
@@ -1498,7 +1881,8 @@ struct DenoiserSession::Impl {
         base_telemetry.core_load_ms +=
             Milliseconds(prepare_begin, Clock::now());
       }
-      return true;
+      return LoadControl(time_embedding, rope_cos, rope_sin, block_workspace,
+                         cancellation, error);
     }
 
     blocks.reserve(selected_blocks.size());
@@ -1881,21 +2265,70 @@ struct DenoiserSession::Impl {
     // A block consumes its input before producing the final gated residual;
     // carry the trunk in place instead of reserving a second full hidden state.
     std::uint16_t* hidden_input = hidden_device.As<std::uint16_t>();
+    const bool control_on =
+        control != nullptr && control_active[static_cast<std::size_t>(step)];
+    const bool dump = step == ControlDumpStep();
+    if (dump && !DumpControlMeta(step, error)) {
+      return false;
+    }
+    if (control_on && !CopyAsync(control_pristine.data(), hidden_input,
+                                 control_pristine.bytes(),
+                                 hipMemcpyDeviceToDevice,
+                                 "keep H3 control input", error)) {
+      return false;
+    }
+    if (dump && !DumpDevice("trunk_input", hidden_input,
+                            hidden_device.bytes(), stream)) {
+      SetError(error, "cannot dump H3 trunk input");
+      return false;
+    }
+    std::size_t next_control = 0;
+    bool injected = false;
     for (std::size_t block = 0; block < blocks.size(); ++block) {
       if (IsCancelled(cancellation)) {
         SetError(error, "MiniMax H3 denoiser cancelled after block " +
                             std::to_string(block));
         return false;
       }
+      // An injection changes the trunk after the block, so neither that
+      // block nor the next one may carry the fused RMS of the trunk.
+      const bool inject = control_on &&
+                          next_control < control_layers.size() &&
+                          control_layers[next_control] == block;
       DitBlockTelemetry block_telemetry;
       if (!blocks[block]->RunPreparedDevice(
               hidden_input, block_row_map.As<std::uint32_t>(), hidden_input,
-              static_cast<void*>(stream), block != 0,
-              block + 1U < blocks.size(), cancellation, &block_telemetry,
-              error)) {
+              static_cast<void*>(stream), block != 0 && !injected,
+              block + 1U < blocks.size() && !inject, cancellation,
+              &block_telemetry, error)) {
         return false;
       }
       block_dispatches += block_telemetry.dispatches;
+      if (dump && block == 0 &&
+          !DumpDevice("trunk_block0", hidden_input, hidden_device.bytes(),
+                      stream)) {
+        SetError(error, "cannot dump H3 trunk");
+        return false;
+      }
+      if (inject) {
+        if (!RunControl(next_control, hidden_input, dump, cancellation,
+                        error)) {
+          return false;
+        }
+        ++next_control;
+        if (dump && block == 0 &&
+            !DumpDevice("trunk_block0_control", hidden_input,
+                        hidden_device.bytes(), stream)) {
+          SetError(error, "cannot dump H3 trunk");
+          return false;
+        }
+      }
+      injected = inject;
+    }
+    if (dump && !DumpDevice("trunk_output", hidden_input,
+                            hidden_device.bytes(), stream)) {
+      SetError(error, "cannot dump H3 trunk output");
+      return false;
     }
 
     dit_ops::LaunchFinalAdaLn(
@@ -1936,6 +2369,14 @@ struct DenoiserSession::Impl {
       return false;
     }
     stage_profile::Mark("final_heads", stream);
+    if (dump &&
+        (!DumpDevice("video_velocity", video_velocity_f32.data(),
+                     video_velocity_f32.bytes(), stream) ||
+         !DumpDevice("audio_velocity", audio_velocity_f32.data(),
+                     audio_velocity_f32.bytes(), stream))) {
+      SetError(error, "cannot dump H3 velocity");
+      return false;
+    }
     if (read_velocity) {
       if (velocity == nullptr ||
           velocity->video.size() !=
@@ -2018,6 +2459,13 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     SetError(error, "invalid MiniMax H3 denoiser guide clip arguments");
     return nullptr;
   }
+  if (options.control != nullptr &&
+      options.active_blocks != static_cast<int>(kDitBlocks)) {
+    SetError(error,
+             "the MiniMax H3 Fun-ControlNet needs all 50 blocks (preset "
+             "exact or a step LoRA)");
+    return nullptr;
+  }
   std::vector<ImageGuidePlacement> image_placements;
   for (std::size_t index = 0; index < conditioning.keyframe_frames.size();
        ++index) {
@@ -2092,6 +2540,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   impl->row_parallel_attention = options.row_parallel_attention;
   impl->base_telemetry.row_parallel_attention = options.row_parallel_attention;
   impl->lora = options.lora;
+  impl->control = options.control;
   const std::size_t keyframe_elements =
       kH3VideoLatentChannels *
       static_cast<std::size_t>(options.geometry.latent_height) *
@@ -2249,6 +2698,30 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   impl->base_telemetry.swap_bytes = ReadSwapBytes();
   impl->PublishTelemetry(telemetry);
   return std::unique_ptr<DenoiserSession>(new DenoiserSession(std::move(impl)));
+}
+
+std::vector<std::size_t> ControlInjectionLayers(std::size_t blocks) {
+  std::vector<std::size_t> layers;
+  if (blocks == 0 || blocks > kDitBlocks) {
+    return layers;
+  }
+  const std::size_t stride = kDitBlocks / blocks;
+  for (std::size_t layer = 0; layer < kDitBlocks; layer += stride) {
+    layers.push_back(layer);
+  }
+  if (layers.size() != blocks) {
+    layers.clear();
+  }
+  return layers;
+}
+
+std::size_t CountControlBlocks(const ModelInventory& inventory) {
+  std::size_t blocks = 0;
+  while (inventory.FindTensor("control_blocks." + std::to_string(blocks) +
+                              ".after_proj.weight") != nullptr) {
+    ++blocks;
+  }
+  return blocks;
 }
 
 bool DenoiserSession::Forward(int step, std::span<const float> video_latent,

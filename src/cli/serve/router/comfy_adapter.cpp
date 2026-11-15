@@ -429,6 +429,10 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->talk_video);
       if (video->vace_mask)
         files->push_back(*video->vace_mask);
+      if (video->h3_control_mask)
+        files->push_back(*video->h3_control_mask);
+      if (video->h3_control_source)
+        files->push_back(*video->h3_control_source);
       files->insert(files->end(), video->reference_images.begin(),
                     video->reference_images.end());
     } else if (const auto* foley = std::get_if<FoleyTask>(&task.spec)) {
@@ -2383,6 +2387,20 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
   if (spec.source_video)
     body["source_video"] = "data:video/mp4;base64," +
                            Base64Encode(ReadFileRef(*spec.source_video));
+  if (spec.h3_control) {
+    // MiniMaxH3FunControlNetApply: gufo fits and encodes the videos itself.
+    json::Value& control = body["gufo"]["control"];
+    if (spec.control_video)
+      control["video"] = "data:video/mp4;base64," +
+                         Base64Encode(ReadFileRef(*spec.control_video));
+    if (spec.h3_control_mask)
+      control["mask"] = "data:video/mp4;base64," +
+                        Base64Encode(ReadFileRef(*spec.h3_control_mask));
+    if (spec.h3_control_source)
+      control["source_video"] =
+          "data:video/mp4;base64," +
+          Base64Encode(ReadFileRef(*spec.h3_control_source));
+  }
   if (spec.guide_video) {
     // MiniMaxH3AddGuide image from LoadVideo -> GetVideoComponents: gufo
     // decodes the clip and anchors its first 17k + 5 frames.
