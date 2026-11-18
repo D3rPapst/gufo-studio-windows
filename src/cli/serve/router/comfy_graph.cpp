@@ -2102,7 +2102,8 @@ constexpr int kMaxBatchFrames = 4096;
 bool IsFrameSource(std::string_view cls) {
   return cls == "EmptyImage" || cls == "LoadImage" ||
          cls == "LoadImageOutput" || cls == "ImageScale" ||
-         cls == "ImageBatch" || cls == "RepeatImageBatch";
+         cls == "ImageScaleBy" || cls == "ImageBatch" ||
+         cls == "RepeatImageBatch";
 }
 
 /// A whole number input in low..high.
@@ -2116,6 +2117,77 @@ int WholeInput(const Graph& graph, const std::string& id,
                           std::to_string(static_cast<long long>(low)) + ".." +
                           std::to_string(static_cast<long long>(high)));
   return static_cast<int>(value);
+}
+
+bool IsScaleNode(std::string_view cls) {
+  return cls == "ImageScale" || cls == "ImageScaleBy";
+}
+
+/// The resize step of an ImageScale / ImageScaleBy node; nullopt when it
+/// leaves the image unchanged (ImageScale 0 x 0, ImageScaleBy 1).
+std::optional<FrameFit> ScaleFitOf(const Graph& graph,
+                                   const std::string& node) {
+  FrameFit fit;
+  fit.method = graph.Str(node, "upscale_method", "nearest-exact");
+  if (fit.method != "nearest-exact" && fit.method != "bilinear" &&
+      fit.method != "area" && fit.method != "bicubic" &&
+      fit.method != "lanczos")
+    throw NodeFailure(node, "value_not_in_list",
+                      "upscale_method must be nearest-exact, bilinear, "
+                      "area, bicubic or lanczos");
+  if (graph.Class(node) == "ImageScaleBy") {
+    fit.scale_by = graph.Num(node, "scale_by", 1.0);
+    if (!(fit.scale_by >= 0.01 && fit.scale_by <= 8.0))
+      throw NodeFailure(node, "unsupported_value",
+                        "scale_by must be 0.01..8");
+    fit.crop = false;
+    if (fit.scale_by == 1.0)
+      return std::nullopt;
+    return fit;
+  }
+  fit.width = WholeInput(graph, node, "width", 512, 0, 16384);
+  fit.height = WholeInput(graph, node, "height", 512, 0, 16384);
+  const std::string crop = graph.Str(node, "crop", "disabled");
+  if (crop != "disabled" && crop != "center")
+    throw NodeFailure(node, "value_not_in_list",
+                      "crop must be disabled or center");
+  fit.crop = crop == "center";
+  if (fit.width == 0 && fit.height == 0)  // 0 x 0 = unchanged
+    return std::nullopt;
+  return fit;
+}
+
+/// Follows ImageScale / ImageScaleBy nodes from `link` down to the node
+/// that feeds them; their fits go to *fits in the order they apply (the
+/// one nearest the source first).
+Link SkipScaleNodes(const Graph& graph, Link link,
+                    std::vector<FrameFit>* fits) {
+  std::vector<FrameFit> reversed;
+  for (int guard = 0; IsScaleNode(graph.Class(link.node)); ++guard) {
+    if (guard > 64)
+      throw NodeFailure(link.node, "invalid_prompt", "image scale chain too long");
+    if (auto fit = ScaleFitOf(graph, link.node))
+      reversed.push_back(std::move(*fit));
+    link = graph.RequireLink(link.node, "image");
+  }
+  fits->assign(reversed.rbegin(), reversed.rend());
+  return link;
+}
+
+/// A still an IMAGE input receives: LoadImage, through ImageScale /
+/// ImageScaleBy (their fits in *fits, applied by the executor).
+FileRef ScaledImageFile(const Graph& graph, const std::string& id,
+                        const std::string& key, const Link& link,
+                        std::vector<FrameFit>* fits) {
+  const Link source = SkipScaleNodes(graph, link, fits);
+  const std::string cls = graph.Class(source.node);
+  if (cls != "LoadImage" && cls != "LoadImageOutput")
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key +
+                          "' must come from LoadImage (through ImageScale / "
+                          "ImageScaleBy), not " +
+                          cls);
+  return ImageFile(graph, id, key, source);
 }
 
 /// `runs` appended to `out`, their ImageBatch size references moved along.
@@ -2181,27 +2253,12 @@ std::vector<FrameRun> FrameRuns(const Graph& graph, const std::string& id,
         WholeInput(graph, node, "width", 512, 1, 16384),
         WholeInput(graph, node, "height", 512, 1, 16384),
         WholeInput(graph, node, "batch_size", 1, 1, kMaxBatchFrames)));
-  } else if (cls == "ImageScale") {
+  } else if (IsScaleNode(cls)) {
     runs = FrameRuns(graph, node, "image", graph.RequireLink(node, "image"),
                      depth + 1);
-    FrameFit fit;
-    fit.width = WholeInput(graph, node, "width", 512, 0, 16384);
-    fit.height = WholeInput(graph, node, "height", 512, 0, 16384);
-    const std::string crop = graph.Str(node, "crop", "disabled");
-    if (crop != "disabled" && crop != "center")
-      throw NodeFailure(node, "value_not_in_list",
-                        "crop must be disabled or center");
-    fit.crop = crop == "center";
-    fit.method = graph.Str(node, "upscale_method", "nearest-exact");
-    if (fit.method != "nearest-exact" && fit.method != "bilinear" &&
-        fit.method != "area" && fit.method != "bicubic" &&
-        fit.method != "lanczos")
-      throw NodeFailure(node, "value_not_in_list",
-                        "upscale_method must be nearest-exact, bilinear, "
-                        "area, bicubic or lanczos");
-    if (fit.width != 0 || fit.height != 0)  // 0 x 0 = unchanged
+    if (const auto fit = ScaleFitOf(graph, node))
       for (FrameRun& run : runs)
-        run.fits.push_back(fit);
+        run.fits.push_back(*fit);
   } else if (cls == "ImageBatch") {
     runs = FrameRuns(graph, node, "image1", graph.RequireLink(node, "image1"),
                      depth + 1);
@@ -2232,7 +2289,8 @@ std::vector<FrameRun> FrameRuns(const Graph& graph, const std::string& id,
     throw NodeFailure(id, "unsupported_link",
                       "input '" + key +
                           "' must come from LoadImage, EmptyImage, "
-                          "ImageScale, ImageBatch or RepeatImageBatch, not " +
+                          "ImageScale, ImageScaleBy, ImageBatch or "
+                          "RepeatImageBatch, not " +
                           cls);
   }
   if (FrameCount(runs) > kMaxBatchFrames)
@@ -2241,12 +2299,30 @@ std::vector<FrameRun> FrameRuns(const Graph& graph, const std::string& id,
   return runs;
 }
 
-/// A VACE IMAGE input: a loaded video, or frames the graph builds.
+/// A VACE IMAGE input: a loaded video, or frames the graph builds. With
+/// `video_fits`, ImageScale / ImageScaleBy may sit behind the loaded video
+/// (their fits go there; the executor scales the file).
 void VaceFrames(const Graph& graph, const std::string& id,
                 const std::string& key, const Link& link,
                 std::vector<std::string>* warnings,
-                std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
+                std::optional<FileRef>* file, std::vector<FrameRun>* runs,
+                std::vector<FrameFit>* video_fits = nullptr) {
   const std::string cls = graph.Class(link.node);
+  if (IsScaleNode(cls)) {
+    std::vector<FrameFit> fits;
+    const Link source = SkipScaleNodes(graph, link, &fits);
+    const std::string base = graph.Class(source.node);
+    if (base == "VHS_LoadVideo" || base == "GetVideoComponents") {
+      if (!video_fits)
+        throw NodeFailure(id, "unsupported_link",
+                          "input '" + key +
+                              "': ImageScale on a loaded video is not "
+                              "supported here by gufo");
+      *file = VideoFile(graph, id, key, source, warnings);
+      *video_fits = std::move(fits);
+      return;
+    }
+  }
   if (IsFrameSource(cls)) {
     *runs = FrameRuns(graph, id, key, link);
     return;
@@ -2564,8 +2640,9 @@ bool StillMask(const Graph& graph, Link link) {
 void AnimateFrames(const Graph& graph, const std::string& node,
                    const std::string& key, const Link& link, int offset,
                    const VideoTask& task, std::vector<std::string>* warnings,
-                   std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
-  VaceFrames(graph, node, key, link, warnings, file, runs);
+                   std::optional<FileRef>* file, std::vector<FrameRun>* runs,
+                   std::vector<FrameFit>* video_fits) {
+  VaceFrames(graph, node, key, link, warnings, file, runs, video_fits);
   if (!runs->empty()) {
     *runs = KeepFrames(std::move(*runs), offset, task.frames);
     if (FrameCount(*runs) == 0)
@@ -2635,7 +2712,8 @@ void AnimateControl(const Graph& graph, const std::string& node,
   const auto mask = graph.LinkOf(node, "character_mask");
   if (pose) {
     AnimateFrames(graph, node, "pose_video", *pose, offset, *task, warnings,
-                  &task->control_video, &task->control_runs);
+                  &task->control_video, &task->control_runs,
+                  &task->control_video_fits);
     // ComfyUI repeats the last pose frame up to length.
     const int missing = task->frames - FrameCount(task->control_runs);
     if (!task->control_runs.empty() && missing > 0)
@@ -2649,7 +2727,8 @@ void AnimateControl(const Graph& graph, const std::string& node,
       // Replacement: the pose inside the mask, the background outside.
       AnimateFrames(graph, node, "background_video", *background, offset,
                     *task, warnings, &task->animate_background,
-                    &task->animate_background_runs);
+                    &task->animate_background_runs,
+                    &task->animate_background_fits);
       AnimateMask(graph, node, *mask, offset, task, warnings);
     } else if (background || mask) {
       warnings->push_back(
@@ -2663,7 +2742,8 @@ void AnimateControl(const Graph& graph, const std::string& node,
   }
   if (background && mask) {
     AnimateFrames(graph, node, "background_video", *background, offset,
-                  *task, warnings, &task->control_video, &task->control_runs);
+                  *task, warnings, &task->control_video, &task->control_runs,
+                  &task->control_video_fits);
     AnimateMask(graph, node, *mask, offset, task, warnings);
     return;
   }
@@ -2729,13 +2809,14 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     AnimateControl(graph, vace, &task, warnings);
   if (auto control = graph.LinkOf(vace, "control_video"); control && !first_last)
     VaceFrames(graph, vace, "control_video", *control, warnings,
-               &task.control_video, &task.control_runs);
+               &task.control_video, &task.control_runs,
+               &task.control_video_fits);
   if (auto mask = graph.LinkOf(vace, "control_masks"); mask && !first_last)
     VaceMaskInput(graph, vace, "control_masks", *mask, false, &task,
                   warnings);
   if (auto reference = graph.LinkOf(vace, "reference_image"))
-    task.reference_images.push_back(
-        ImageFile(graph, vace, "reference_image", *reference));
+    task.reference_images.push_back(ScaledImageFile(
+        graph, vace, "reference_image", *reference, &task.reference_fits));
   // Prompts and sampling.
   const Conditioning positive = FollowConditioning(graph, sampler, "positive");
   if (positive.encoder.empty() ||
@@ -3086,7 +3167,8 @@ bool AnimateAvailable(const ModelIds& models) {
 /// whole by the executor; gufo seeks video_frame_offset itself).
 void AnimateVideo(const Graph& graph, const std::string& node,
                   const std::string& key, std::vector<std::string>* warnings,
-                  std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
+                  std::optional<FileRef>* file, std::vector<FrameRun>* runs,
+                  std::vector<FrameFit>* video_fits) {
   const auto link = graph.LinkOf(node, key);
   if (!link)
     return;
@@ -3099,7 +3181,7 @@ void AnimateVideo(const Graph& graph, const std::string& node,
                           "gufo; use one WanAnimateToVideo with the whole "
                           "length (gufo chains the chunks itself) or load "
                           "the frames to continue from as a video");
-  VaceFrames(graph, node, key, *link, warnings, file, runs);
+  VaceFrames(graph, node, key, *link, warnings, file, runs, video_fits);
 }
 
 /// Wan 2.2 Animate 14B (wan2.2-animate-14b, 16 fps): KSampler <-
@@ -3149,13 +3231,15 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
     throw NodeFailure(node, "unsupported_value",
                       "continue_motion_max_frames must be 4k+1");
   AnimateVideo(graph, node, "pose_video", warnings, &task.pose_video,
-               &task.pose_runs);
+               &task.pose_runs, &task.pose_video_fits);
   AnimateVideo(graph, node, "face_video", warnings, &task.face_video,
-               &task.face_runs);
+               &task.face_runs, &task.face_video_fits);
   AnimateVideo(graph, node, "background_video", warnings,
-               &task.background_video, &task.background_runs);
+               &task.background_video, &task.background_runs,
+               &task.background_video_fits);
   AnimateVideo(graph, node, "continue_motion", warnings,
-               &task.continue_motion, &task.continue_runs);
+               &task.continue_motion, &task.continue_runs,
+               &task.continue_motion_fits);
   // ImageFromBatch(batch_index = trim_image) behind the decode drops the
   // continue_motion frames; gufo does that itself.
   task.animate_trim_continue =
@@ -3180,8 +3264,8 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
                       "gufo wan2.2-animate-14b needs pose_video (animation) "
                       "or background_video + character_mask (replacement)");
   if (auto reference = graph.LinkOf(node, "reference_image"))
-    task.reference_images.push_back(
-        ImageFile(graph, node, "reference_image", *reference));
+    task.reference_images.push_back(ScaledImageFile(
+        graph, node, "reference_image", *reference, &task.reference_fits));
   if (!graph.LinkOf(node, "clip_vision_output"))
     warnings->push_back("node " + node +
                         ": gufo passes the reference image's CLIP vision "
@@ -3989,6 +4073,13 @@ std::optional<std::pair<int, int>> RunSizeAt(const std::vector<FrameRun>& runs,
         return std::nullopt;
       size = RunSizeAt(runs, static_cast<std::size_t>(fit.like_run),
                        static_cast<std::size_t>(fit.like_fits), probe);
+    } else if (fit.scale_by > 0) {
+      if (size)
+        size = std::pair<int, int>{
+            std::max(1, static_cast<int>(std::lround(size->first *
+                                                     fit.scale_by))),
+            std::max(1, static_cast<int>(std::lround(size->second *
+                                                     fit.scale_by)))};
     } else if (fit.width > 0 && fit.height > 0) {
       size = std::pair<int, int>{fit.width, fit.height};
     } else if (size) {
@@ -4065,6 +4156,47 @@ std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
   // WanVaceToVideo / WanFirstLastFrameToVideo: bilinear, centre crop.
   AppendFit(&chain, *size, {width, height}, true, "bilinear");
   return chain + "format=rgb24";
+}
+
+std::string FitFilter(const std::vector<FrameFit>& fits) {
+  // Number text for ffmpeg expressions (no locale, no exponent).
+  const auto number = [](double value) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "%.9g", value);
+    return std::string(text);
+  };
+  // RGB first: ComfyUI scales RGB pixels, and crop is exact there.
+  std::string chain = "format=rgb24";
+  for (const FrameFit& fit : fits) {
+    const std::string flags = ":flags=" + ScaleFlags(fit.method);
+    if (fit.scale_by > 0) {
+      const std::string s = number(fit.scale_by);
+      chain += ",scale=w=round(iw*" + s + "):h=round(ih*" + s + ")" + flags;
+      continue;
+    }
+    if (fit.like_run >= 0 || (fit.width == 0 && fit.height == 0))
+      continue;
+    if (fit.crop && fit.width > 0 && fit.height > 0) {
+      // common_upscale "center": cut to the target aspect around the
+      // centre; x = round(max(0, iw - ih * W / H) / 2), y alike (written
+      // with abs, ffmpeg expressions need no commas then).
+      const std::string w = std::to_string(fit.width);
+      const std::string h = std::to_string(fit.height);
+      const std::string dx = "iw-ih*" + w + "/" + h;
+      const std::string dy = "ih-iw*" + h + "/" + w;
+      const std::string x = "round((" + dx + "+abs(" + dx + "))/4)";
+      const std::string y = "round((" + dy + "+abs(" + dy + "))/4)";
+      chain += ",crop=w=iw-2*" + x + ":h=ih-2*" + y + ":x=" + x + ":y=" + y +
+               ":exact=1";
+    }
+    // One side 0: ComfyUI keeps the aspect ratio (ffmpeg -1 rounds alike).
+    chain += ",scale=w=" +
+             (fit.width > 0 ? std::to_string(fit.width) : std::string("-1")) +
+             ":h=" +
+             (fit.height > 0 ? std::to_string(fit.height) : std::string("-1")) +
+             flags;
+  }
+  return chain == "format=rgb24" ? chain : chain + ",format=rgb24";
 }
 
 std::string AnimateMergeFilter(int width, int height,

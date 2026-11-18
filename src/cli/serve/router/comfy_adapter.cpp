@@ -2564,8 +2564,11 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     // (gufo fits every input to the video size itself).
     json::Value& vace = body["gufo"]["vace"];
     if (spec.control_video)
-      vace["control_video"] = "data:video/mp4;base64," +
-                              Base64Encode(ReadFileRef(*spec.control_video));
+      vace["control_video"] =
+          "data:video/mp4;base64," +
+          Base64Encode(ScaledBytes(*spec.control_video,
+                                   spec.control_video_fits, true,
+                                   "control video"));
     // Control video / mask built from frames in the graph (EmptyImage,
     // LoadImage, ImageBatch ..., WanFirstLastFrameToVideo).
     if (!spec.control_runs.empty())
@@ -2590,8 +2593,13 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
           "data:video/mp4;base64," + Base64Encode(AnimateReplaceControl(spec));
     if (!spec.reference_images.empty()) {
       json::Value references = json::Value::array();
-      for (const FileRef& ref : spec.reference_images) {
-        const std::string bytes = ReadFileRef(ref);
+      for (std::size_t i = 0; i < spec.reference_images.size(); ++i) {
+        const FileRef& ref = spec.reference_images[i];
+        // reference_fits belong to the first reference (the node's input).
+        const std::string bytes =
+            i == 0 ? ScaledBytes(ref, spec.reference_fits, false,
+                                 "reference image")
+                   : ReadFileRef(ref);
         references.push_back("data:" + SniffImageType(bytes) + ";base64," +
                              Base64Encode(bytes));
       }
@@ -2604,24 +2612,26 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     // video_frame_offset itself; the face crops at 512x512).
     json::Value& animate = body["gufo"]["animate"];
     const auto video = [&](const char* key, const std::optional<FileRef>& file,
-                           const std::vector<FrameRun>& runs, int width,
+                           const std::vector<FrameRun>& runs,
+                           const std::vector<FrameFit>& fits, int width,
                            int height) {
       if (file)
-        animate[key] =
-            "data:video/mp4;base64," + Base64Encode(ReadFileRef(*file));
+        animate[key] = "data:video/mp4;base64," +
+                       Base64Encode(ScaledBytes(*file, fits, true, key));
       else if (!runs.empty())
         animate[key] = "data:video/mp4;base64," +
                        Base64Encode(RenderFrameRuns(runs, width, height,
                                                     FrameCount(runs), key));
     };
-    video("pose_video", spec.pose_video, spec.pose_runs, spec.width,
-          spec.height);
-    video("face_video", spec.face_video, spec.face_runs, 512, 512);
+    video("pose_video", spec.pose_video, spec.pose_runs, spec.pose_video_fits,
+          spec.width, spec.height);
+    video("face_video", spec.face_video, spec.face_runs, spec.face_video_fits,
+          512, 512);
     video("background_video", spec.background_video, spec.background_runs,
-          spec.width, spec.height);
+          spec.background_video_fits, spec.width, spec.height);
     video("continue_motion", spec.continue_motion, spec.continue_runs,
-          spec.width, spec.height);
-    video("character_mask", std::nullopt, spec.mask_runs, spec.width,
+          spec.continue_motion_fits, spec.width, spec.height);
+    video("character_mask", std::nullopt, spec.mask_runs, {}, spec.width,
           spec.height);
     if (spec.vace_mask) {
       const std::string bytes = ReadFileRef(*spec.vace_mask);
@@ -2631,7 +2641,9 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
           ";base64," + Base64Encode(bytes);
     }
     if (!spec.reference_images.empty()) {
-      const std::string bytes = ReadFileRef(spec.reference_images.front());
+      const std::string bytes =
+          ScaledBytes(spec.reference_images.front(), spec.reference_fits,
+                      false, "reference image");
       animate["reference_image"] =
           "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
     }
@@ -2968,6 +2980,45 @@ std::string Adapter::RenderFrameRuns(const std::vector<FrameRun>& runs,
   return bytes;
 }
 
+fs::path Adapter::ScaleToWorkFile(const FileRef& file,
+                                  const std::vector<FrameFit>& fits,
+                                  bool video, std::string_view what) {
+  if (options_.ffmpeg.empty())
+    throw std::runtime_error("the " + std::string(what) +
+                             " goes through ImageScale in the graph; start "
+                             "the router with --comfy-ffmpeg to scale it");
+  const fs::path out = WorkFile(video ? "mp4" : "png");
+  std::vector<fs::path> args{"-i", FilePath(file), "-vf", FitFilter(fits)};
+  if (video)
+    // Every frame as it is (the worker reads videos by index), no sound.
+    args.insert(args.end(), {"-an", "-fps_mode", "passthrough", "-c:v",
+                             "libx264rgb", "-qp", "0", "-pix_fmt", "rgb24"});
+  else
+    args.insert(args.end(), {"-frames:v", "1", "-pix_fmt", "rgb24"});
+  args.push_back(out);
+  std::string error;
+  if (!RunFfmpeg(args, &error) || !fs::exists(out)) {
+    std::error_code ignored;
+    fs::remove(out, ignored);
+    throw std::runtime_error("cannot scale " + file.name + " for the " +
+                             std::string(what) + " (ImageScale): " +
+                             (error.empty() ? "no output" : error));
+  }
+  return out;
+}
+
+std::string Adapter::ScaledBytes(const FileRef& file,
+                                 const std::vector<FrameFit>& fits, bool video,
+                                 std::string_view what) {
+  if (fits.empty())
+    return ReadFileRef(file);
+  const fs::path path = ScaleToWorkFile(file, fits, video, what);
+  std::string bytes = ReadAll(path);
+  std::error_code ignored;
+  fs::remove(path, ignored);
+  return bytes;
+}
+
 std::string Adapter::AnimateReplaceControl(const VideoTask& spec) {
   if (options_.ffmpeg.empty())
     throw std::runtime_error(
@@ -2986,6 +3037,7 @@ std::string Adapter::AnimateReplaceControl(const VideoTask& spec) {
   // A rendered or loaded input as a file ffmpeg reads.
   const auto input = [&](const std::optional<FileRef>& file,
                          const std::vector<FrameRun>& runs,
+                         const std::vector<FrameFit>& fits,
                          std::string_view what) -> fs::path {
     if (!runs.empty()) {
       const fs::path path = WorkFile("mp4");
@@ -2997,14 +3049,19 @@ std::string Adapter::AnimateReplaceControl(const VideoTask& spec) {
     if (!file)
       throw std::runtime_error("WanAnimateToVideo: the " + std::string(what) +
                                " is missing");
+    if (!fits.empty()) {
+      made.push_back(ScaleToWorkFile(*file, fits, true, what));
+      return made.back();
+    }
     return FilePath(*file);
   };
   const fs::path background = input(spec.animate_background,
                                     spec.animate_background_runs,
+                                    spec.animate_background_fits,
                                     "background video");
   const fs::path pose = input(spec.control_video, spec.control_runs,
-                              "pose video");
-  const fs::path mask = input(spec.vace_mask, spec.mask_runs, "mask");
+                              spec.control_video_fits, "pose video");
+  const fs::path mask = input(spec.vace_mask, spec.mask_runs, {}, "mask");
   // A still mask (LoadImageMask) stands for every frame.
   const bool still = spec.mask_runs.empty() && spec.vace_mask &&
                      ImageDimensions(ReadFileRef(*spec.vace_mask)).has_value();

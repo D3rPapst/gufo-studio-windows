@@ -362,8 +362,17 @@ struct FrameFit {
   /// (an earlier run of the same list) after its first `like_fits` fits.
   int like_run{-1};
   int like_fits{0};
+  /// > 0: ImageScaleBy, both sides times this (rounded), no crop; width
+  /// and height are unused then.
+  double scale_by{0};
   bool operator==(const FrameFit&) const = default;
 };
+
+/// The ffmpeg -vf chain of ImageScale / ImageScaleBy steps on a loaded
+/// video or still whose size is not known in advance (iw / ih expressions):
+/// rgb24 first, then per fit ComfyUI's common_upscale (centre crop to the
+/// target aspect when `crop`, scale with `method`). Empty fits = "format=rgb24".
+std::string FitFilter(const std::vector<FrameFit>& fits);
 
 /// `count` equal frames of an IMAGE batch the graph builds itself:
 /// a loaded still (LoadImage) or a solid colour (EmptyImage), resized by
@@ -498,6 +507,16 @@ struct VideoTask {
   std::string vace_mask_channel;  // "red", "green", "blue"
   bool vace_invert_mask{false};
   std::vector<FileRef> reference_images;
+  /// ImageScale / ImageScaleBy between the LoadImage and reference_image
+  /// (WanVaceToVideo, WanAnimateToVideo): applied to reference_images[0]
+  /// by the executor (ffmpeg, FitFilter) before it is sent.
+  std::vector<FrameFit> reference_fits;
+  /// ImageScale / ImageScaleBy between GetVideoComponents (or
+  /// VHS_LoadVideo) and a video input: the executor scales the loaded file
+  /// frame by frame (ffmpeg, FitFilter, lossless) before it is sent or
+  /// merged. control_video (VACE), animate_background (VACE replacement).
+  std::vector<FrameFit> control_video_fits;
+  std::vector<FrameFit> animate_background_fits;
   std::optional<double> vace_strength;
   std::string vace_sampler;  // "lcm" or "euler"; empty = bundle default
   std::optional<double> vace_shift;
@@ -547,6 +566,12 @@ struct VideoTask {
   std::vector<FrameRun> face_runs;
   std::vector<FrameRun> background_runs;
   std::vector<FrameRun> continue_runs;
+  /// ImageScale / ImageScaleBy on the loaded videos above (see
+  /// control_video_fits).
+  std::vector<FrameFit> pose_video_fits;
+  std::vector<FrameFit> face_video_fits;
+  std::vector<FrameFit> background_video_fits;
+  std::vector<FrameFit> continue_motion_fits;
   int animate_offset{0};               // video_frame_offset
   int continue_motion_max_frames{5};
   /// ImageFromBatch on trim_image drops the continue_motion frames.

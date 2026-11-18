@@ -250,6 +250,16 @@ private:
   /// libx264rgb); returns its bytes. Throws on errors.
   std::string RenderFrameRuns(const std::vector<FrameRun>& runs, int width,
                               int height, int frames, std::string_view what);
+  /// A loaded video or still with the graph's ImageScale / ImageScaleBy
+  /// steps applied (FitFilter, ffmpeg): a new work file the caller removes
+  /// (a lossless MP4 with every frame, or a PNG). Throws on errors.
+  std::filesystem::path ScaleToWorkFile(const FileRef& file,
+                                        const std::vector<FrameFit>& fits,
+                                        bool video, std::string_view what);
+  /// The bytes of `file`, scaled first when `fits` has steps.
+  std::string ScaledBytes(const FileRef& file,
+                          const std::vector<FrameFit>& fits, bool video,
+                          std::string_view what);
   /// WanAnimateToVideo replacement: the pose (control_video / control_runs)
   /// inside the mask, the background (animate_background[_runs]) outside,
   /// as a lossless 16 fps MP4 of the video size (AnimateMergeFilter,

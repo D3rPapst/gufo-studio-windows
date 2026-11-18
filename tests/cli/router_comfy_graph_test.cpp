@@ -2543,6 +2543,341 @@ void TestAnimate() {
              ->items()[0].str() == "MASK");
 }
 
+// The film's pose animation (18.11., 1:1 from
+// gufo-arbeit/comfy-knoten/pose_animation_api.json): ImageScale behind
+// GetVideoComponents on the pose video and in front of reference_image /
+// CLIPVisionEncode; the executor scales both before sending.
+constexpr const char* kPoseAnimation = R"json({
+ "clip": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "umt5_xxl_fp16.safetensors",
+   "type": "wan",
+   "device": "default"
+  }
+ },
+ "vae": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "wan_2.1_vae.safetensors"
+  }
+ },
+ "m": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_animate_14B_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "lora": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "m",
+    0
+   ],
+   "strength_model": 1.0,
+   "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"
+  }
+ },
+ "shift": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "lora",
+    0
+   ],
+   "shift": 8.0
+  }
+ },
+ "cv": {
+  "class_type": "CLIPVisionLoader",
+  "inputs": {
+   "clip_name": "clip_vision_h.safetensors"
+  }
+ },
+ "img": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "start_beispiel.png"
+  }
+ },
+ "lv": {
+  "class_type": "LoadVideo",
+  "inputs": {
+   "file": "pose_beispiel.mp4"
+  }
+ },
+ "tp": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "clip",
+    0
+   ],
+   "text": "A woman raises her right hand and waves."
+  }
+ },
+ "tn": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "clip",
+    0
+   ],
+   "text": "blurry"
+  }
+ },
+ "gv": {
+  "class_type": "GetVideoComponents",
+  "inputs": {
+   "video": [
+    "lv",
+    0
+   ]
+  }
+ },
+ "pose": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "gv",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "width": 896,
+   "height": 512,
+   "crop": "disabled"
+  }
+ },
+ "start": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "img",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "width": 896,
+   "height": 512,
+   "crop": "disabled"
+  }
+ },
+ "cve": {
+  "class_type": "CLIPVisionEncode",
+  "inputs": {
+   "clip_vision": [
+    "cv",
+    0
+   ],
+   "image": [
+    "start",
+    0
+   ],
+   "crop": "none"
+  }
+ },
+ "a0_anim": {
+  "class_type": "WanAnimateToVideo",
+  "inputs": {
+   "positive": [
+    "tp",
+    0
+   ],
+   "negative": [
+    "tn",
+    0
+   ],
+   "vae": [
+    "vae",
+    0
+   ],
+   "width": 896,
+   "height": 512,
+   "length": 49,
+   "batch_size": 1,
+   "continue_motion_max_frames": 5,
+   "video_frame_offset": 0,
+   "clip_vision_output": [
+    "cve",
+    0
+   ],
+   "reference_image": [
+    "start",
+    0
+   ],
+   "pose_video": [
+    "pose",
+    0
+   ]
+  }
+ },
+ "a0_k": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "shift",
+    0
+   ],
+   "seed": 7,
+   "steps": 6,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "a0_anim",
+    0
+   ],
+   "negative": [
+    "a0_anim",
+    1
+   ],
+   "latent_image": [
+    "a0_anim",
+    2
+   ],
+   "denoise": 1.0
+  }
+ },
+ "a0_trim": {
+  "class_type": "TrimVideoLatent",
+  "inputs": {
+   "samples": [
+    "a0_k",
+    0
+   ],
+   "trim_amount": [
+    "a0_anim",
+    3
+   ]
+  }
+ },
+ "a0_dec": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "a0_trim",
+    0
+   ],
+   "vae": [
+    "vae",
+    0
+   ]
+  }
+ },
+ "a0_cut": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "a0_dec",
+    0
+   ],
+   "batch_index": [
+    "a0_anim",
+    4
+   ],
+   "length": 4096
+  }
+ },
+ "genau": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "a0_cut",
+    0
+   ],
+   "batch_index": 0,
+   "length": 49
+  }
+ },
+ "save": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "genau",
+    0
+   ],
+   "filename_prefix": "test/pose_animation"
+  }
+ }
+})json";
+
+void TestPoseAnimationScaled() {
+  comfy::FrameFit fit;
+  fit.width = 896;
+  fit.height = 512;
+  fit.crop = false;
+  fit.method = "lanczos";
+  const std::vector<comfy::FrameFit> fits{fit};
+  // wan2.2-animate-14b served: pose video and reference with their fits.
+  comfy::ModelIds models;
+  models.available = {"wan2.1-vace-14b", "wan2.2-animate-14b"};
+  comfy::Plan plan;
+  comfy::PlanError error;
+  const bool ok =
+      comfy::BuildPlan(json::parse(kPoseAnimation), models, &plan, &error);
+  if (!ok)
+    std::cerr << "unexpected plan error: " << error.message << "\n";
+  assert(ok);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "a0_k");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kAnimate);
+  assert(video.width == 896 && video.height == 512 && video.frames == 49);
+  assert((video.pose_video == comfy::FileRef{"pose_beispiel.mp4", "input"}));
+  assert(video.pose_runs.empty() && video.pose_video_fits == fits);
+  assert(video.reference_images.size() == 1 &&
+         (video.reference_images[0] ==
+          comfy::FileRef{"start_beispiel.png", "input"}));
+  assert(video.reference_fits == fits);
+  assert(comfy::FitFilter(fits) ==
+         "format=rgb24,scale=w=896:h=512:flags=lanczos,format=rgb24");
+  assert(comfy::FitFilter({}) == "format=rgb24");
+
+  // Without the Animate model: the VACE fallback, the same fits.
+  const comfy::Plan vace_plan = PlanOf(kPoseAnimation);
+  const auto& vace = std::get<comfy::VideoTask>(vace_plan.tasks[0].spec);
+  assert(vace.family == comfy::VideoFamily::kVace);
+  assert((vace.control_video == comfy::FileRef{"pose_beispiel.mp4", "input"}));
+  assert(vace.control_runs.empty() && vace.control_video_fits == fits);
+  assert((vace.reference_images[0] ==
+          comfy::FileRef{"start_beispiel.png", "input"}));
+  assert(vace.reference_fits == fits);
+
+  // ImageScaleBy and a centre crop, chained: applied source first.
+  std::string chain = Replace(kPoseAnimation, "\"crop\": \"disabled\"",
+                              "\"crop\": \"center\"");
+  chain = Replace(chain, "[\n    \"gv\",", "[\n    \"half\",");
+  chain = Replace(chain, " \"pose\": {",
+                  " \"half\": {\"class_type\": \"ImageScaleBy\", \"inputs\": "
+                  "{\"image\": [\"gv\", 0], \"upscale_method\": \"area\", "
+                  "\"scale_by\": 0.5}},\n \"pose\": {");
+  const comfy::Plan chain_plan = PlanOf(chain.c_str());
+  const auto& chained = std::get<comfy::VideoTask>(chain_plan.tasks[0].spec);
+  assert(chained.control_video_fits.size() == 2);
+  assert(chained.control_video_fits[0].scale_by == 0.5);
+  assert(chained.control_video_fits[1].crop);
+  assert(comfy::FitFilter(chained.control_video_fits) ==
+         "format=rgb24,scale=w=round(iw*0.5):h=round(ih*0.5):flags=area,"
+         "crop=w=iw-2*round((iw-ih*896/512+abs(iw-ih*896/512))/4):"
+         "h=ih-2*round((ih-iw*512/896+abs(ih-iw*512/896))/4):"
+         "x=round((iw-ih*896/512+abs(iw-ih*896/512))/4):"
+         "y=round((ih-iw*512/896+abs(ih-iw*512/896))/4):exact=1,"
+         "scale=w=896:h=512:flags=lanczos,format=rgb24");
+  // An ImageScaleBy still: its size in a frame run.
+  std::vector<comfy::FrameRun> runs(1);
+  runs[0].width = 100;
+  runs[0].height = 50;
+  comfy::FrameFit by;
+  by.scale_by = 1.5;
+  by.crop = false;
+  runs[0].fits.push_back(by);
+  const auto scaled = comfy::FrameRunSize(runs, 0, 1, {});
+  assert(scaled && scaled->first == 150 && scaled->second == 75);
+  // A reference that is not a LoadImage behind the scale: rejected.
+  assert(ErrorOf(Replace(kPoseAnimation, "[\n    \"img\",", "[\n    \"gv\","))
+             .message.find("reference_image") != std::string::npos);
+}
+
 // The same templates when the router serves wan2.2-animate-14b (it is in
 // the preset): every WanAnimateToVideo input goes to gufo.animate.
 void TestAnimateNative() {
@@ -3440,6 +3775,7 @@ int main() {
   TestFirstLastFrame();
   TestAnimate();
   TestAnimateNative();
+  TestPoseAnimationScaled();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();
   TestDelivery();
