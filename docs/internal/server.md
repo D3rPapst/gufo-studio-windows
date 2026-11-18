@@ -1832,8 +1832,15 @@ pages need them); `pool` and `status` gate the pages of those names
 `nutzer` or `dienst` than to an admin or the machine itself (2.0.5):
 `GET /v1/models` leaves the worker command lines out (`status.args`,
 paths on this machine), and `GET /router/status` keeps in
-`pool_queue.pulling`, `pool_queue.pushed_active` and `remote.jobs` only
-the caller's own jobs (counts and everything else stay).
+`pool_queue.pulling`, `pool_queue.pushed_active`, `remote.jobs` and
+`async_jobs` only the caller's own jobs (counts and everything else stay).
+
+`GET /router/status` `"async_jobs"` (2.2.5): the worker jobs open on this
+machine (video, async music, 3D) as `{"<id>": {"model", "kind":
+"video"|"music"|"3d"}}`, whoever created them: a direct `POST /v1/videos`
+(ComfyUI adapter, pages), a pool relay from the partner, or the job API
+(then a `/v1/jobs` entry carries the same id as `video_id` / `music_id`).
+The pool page counts the ones no job lists.
 
 Jobs belong to a user: the job API stamps `metadata.nutzer` from
 `X-Gufo-User` (set by the gate on every request it lets through; a

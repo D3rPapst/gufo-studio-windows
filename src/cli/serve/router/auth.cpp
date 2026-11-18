@@ -3049,6 +3049,12 @@ void Gate::HideOthersJobs(const Identity& who, HttpResponse* response) {
           }
         }
         out.append_member(key, std::move(remote));
+      } else if (key == "async_jobs" && value.is_object()) {
+        json::Value jobs = json::Value::object();
+        for (const auto& [id, job] : value.members())
+          if (mine(id))
+            jobs.append_member(id, job);
+        out.append_member(key, std::move(jobs));
       } else {
         out.append_member(key, value);
       }

@@ -3836,6 +3836,24 @@ public:
         failed[id] = AutoloadFailureJson(failure);
     }
     body["autoload_failed"] = std::move(failed);
+    {
+      // Async worker jobs that run here (video, async music, 3D), however
+      // they came in: direct POST /v1/videos (ComfyUI adapter, pages), a
+      // pool relay from the partner, or the job API (then a /v1/jobs entry
+      // names the same id as video_id / music_id). The pool page counts
+      // the ones the job list does not show.
+      json::Value open = json::Value::object();
+      const std::lock_guard<std::mutex> lock(mutex);
+      for (const auto& [id, model] : registry.OpenJobs()) {
+        json::Value entry = json::Value::object();
+        entry["model"] = model;
+        entry["kind"] = id.starts_with("music_") ? "music"
+                        : id.starts_with("obj_") ? "3d"
+                                                 : "video";
+        open[id] = std::move(entry);
+      }
+      body["async_jobs"] = std::move(open);
+    }
     if (remotes != nullptr) {
       // Remote routers (cached probe) and, per remote model, whether a
       // relay or job of it is open here.
