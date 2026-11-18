@@ -9,6 +9,7 @@ gufo_extension_target(
     tokenizer.cpp
     scheduler.cpp
     vace_context.cpp
+    animate_context.cpp
     camera_path.cpp
     talk_audio.cpp
     request.cpp
@@ -112,6 +113,17 @@ gufo_extension_target(
 if(TARGET wan22_vace_context_test)
   add_test(NAME wan22_vace_context_test COMMAND wan22_vace_context_test)
   set_tests_properties(wan22_vace_context_test PROPERTIES
+    LABELS "cpu;models;wan22")
+endif()
+
+gufo_extension_target(
+  NAME wan22_animate_context_test
+  SOURCES ${PROJECT_SOURCE_DIR}/tests/models/wan22/animate_context_test.cpp
+  LINK_LIBRARIES gufo_wan22
+)
+if(TARGET wan22_animate_context_test)
+  add_test(NAME wan22_animate_context_test COMMAND wan22_animate_context_test)
+  set_tests_properties(wan22_animate_context_test PROPERTIES
     LABELS "cpu;models;wan22")
 endif()
 

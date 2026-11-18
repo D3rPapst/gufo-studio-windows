@@ -80,6 +80,10 @@
     "wan22_vace_context_test": {
       "requires": [],
       "role": "test"
+    },
+    "wan22_animate_context_test": {
+      "requires": [],
+      "role": "test"
     }
   },
   "packages": [
@@ -124,6 +128,12 @@
     {
       "target": "wan22_vace_context_test",
       "ctest": "wan22_vace_context_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "wan22_animate_context_test",
+      "ctest": "wan22_animate_context_test",
       "check_pr": true,
       "windows_build": true
     },
