@@ -53,6 +53,9 @@ bool Residency::Init(std::string* error) {
     if (hints.gpu_gb >= 0.0) {
       book_.SetEstimate(id, {FromGb(hints.gpu_gb),
                              hints.host_gb >= 0.0 ? FromGb(hints.host_gb) : 0});
+    } else if (const auto floor = BuiltInFloor(id)) {
+      // No router-gpu-gb in the preset: gufo's own lower bound.
+      book_.SetFloor(id, *floor);
     }
     if (hints.exclusive >= 0) {
       book_.SetExclusive(id, hints.exclusive == 1);

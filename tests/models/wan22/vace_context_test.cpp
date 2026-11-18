@@ -140,6 +140,29 @@ int main() {
              long_sigmas[switch_at - 1] >= 0.875 &&
              long_sigmas[switch_at] < 0.875,
          "switch at the boundary");
+
+  // Resident experts: both (2 x ~15 GB FP8 + ~3 GB VACE module) stay when
+  // they fit beside the per-job loads (umT5 + VAE) and the margin.
+  constexpr std::uint64_t kGb = std::uint64_t{1} << 30;
+  const std::uint64_t experts = 36 * kGb, job = 7 * kGb;
+  Expect(wan22::KeepVaceExpertsResident(true, 52 * kGb, experts, job),
+         "resident on the .198 (48 GB + shared)");
+  Expect(wan22::KeepVaceExpertsResident(
+             true, experts + job + wan22::kVaceExpertMarginBytes, experts, job),
+         "resident exactly at the limit");
+  Expect(!wan22::KeepVaceExpertsResident(
+             true, experts + job + wan22::kVaceExpertMarginBytes - 1, experts,
+             job),
+         "one byte short: one after the other");
+  Expect(!wan22::KeepVaceExpertsResident(true, 30 * kGb, experts, job),
+         "too little free memory: one after the other");
+  Expect(!wan22::KeepVaceExpertsResident(false, 200 * kGb, experts, job),
+         "experts_resident false: one after the other");
+  Expect(!wan22::KeepVaceExpertsResident(true, 200 * kGb, 0, job),
+         "unknown expert size: one after the other");
+  Expect(!wan22::KeepVaceExpertsResident(true, UINT64_MAX, UINT64_MAX - kGb,
+                                         2 * kGb),
+         "no overflow");
   if (failures == 0)
     std::cout << "wan22_vace_context_test passed\n";
   return failures == 0 ? 0 : 1;

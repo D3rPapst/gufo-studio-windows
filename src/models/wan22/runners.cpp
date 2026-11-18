@@ -338,6 +338,11 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
         static_cast<int>(options.member_double("switch_step", -1.0));
     job.high_guidance =
         static_cast<float>(options.member_double("high_guidance", 0.0));
+    // Both experts stay loaded over jobs unless the manifest says false
+    // (and the device has room, see GenerateVace21).
+    if (const json::Value* keep = manifest.find("experts_resident");
+        keep != nullptr && keep->is_bool())
+      job.experts_resident = keep->as_bool();
     if (job.dit_file.empty() || job.vace_file.empty() ||
         job.high_dit_file.empty() || job.high_vace_file.empty()) {
       SetError(error, "gufo-vace22.json needs dit_high, vace_high, dit_low "
@@ -463,6 +468,8 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
     if (fun22) {
       extra["switch_step"] = stages.switch_step;
       extra["dit_load_ms"] = stages.dit_load_ms;
+      extra["experts_resident"] = stages.experts_resident;
+      extra["experts_reused"] = stages.experts_reused;
     }
     extra["preview_ms"] = stages.preview_ms;
     extra["previews"] = stages.previews;

@@ -64,8 +64,11 @@ struct Vace21Request {
   /// its Fun VACE module, optional LoRA). Empty `high_dit_file`: one model
   /// (Wan 2.1 VACE). With it, dit_file / vace_file / lora_file are the
   /// low-noise expert. The high-noise expert runs steps [0, switch), the
-  /// low-noise one [switch, steps) (see VaceSwitchStep); only one is on the
-  /// device at a time (each ~18 GB with its VACE module).
+  /// low-noise one [switch, steps) (see VaceSwitchStep). With
+  /// `experts_resident` both load together and stay in the worker over jobs
+  /// (same files, LoRAs and strengths: no reload) when the device has room
+  /// (KeepVaceExpertsResident); otherwise one is on the device at a time
+  /// (each ~18 GB with its VACE module), loaded from disk every job.
   std::filesystem::path high_dit_file;
   std::filesystem::path high_vace_file;
   std::filesystem::path high_lora_file;
@@ -73,12 +76,17 @@ struct Vace21Request {
   float high_guidance{0.0F};  // 0: `guidance`
   double boundary{0.875};     // Wan 2.2 T2V A14B
   int switch_step{-1};        // -1: from boundary
+  bool experts_resident{true};  // gufo-vace22.json experts_resident
 };
 
 struct Vace21Telemetry {
   double text_ms{0}, condition_ms{0}, dit_load_ms{0}, context_ms{0};
   double decode_ms{0}, total_ms{0};
   int switch_step{0};  // Wan 2.2: first low-noise step
+  /// Wan 2.2: both experts were resident in this job; `experts_reused` they
+  /// already were before it (no load).
+  bool experts_resident{false};
+  bool experts_reused{false};
   std::vector<double> step_ms;
   double preview_ms{0};
   int previews{0};
@@ -91,6 +99,9 @@ bool GenerateVace21(const Vace21Request& request,
                     const I2V21Callbacks& callbacks,
                     std::vector<float>* final_latents, DecodedVideo* video,
                     Vace21Telemetry* telemetry, std::string* error);
+
+/// Frees resident Wan 2.2 Fun VACE experts (worker shutdown, tests).
+void ReleaseVaceExperts();
 
 }  // namespace gufo::models::wan22
 

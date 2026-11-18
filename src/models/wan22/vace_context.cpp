@@ -114,4 +114,13 @@ int VaceSwitchStep(const std::vector<double>& sigmas, double boundary,
   return steps;
 }
 
+bool KeepVaceExpertsResident(bool requested, std::uint64_t free_bytes,
+                             std::uint64_t expert_bytes,
+                             std::uint64_t job_bytes) {
+  if (!requested || expert_bytes == 0)
+    return false;
+  const std::uint64_t need = expert_bytes + job_bytes + kVaceExpertMarginBytes;
+  return need >= expert_bytes && need <= free_bytes;  // no overflow
+}
+
 }  // namespace gufo::models::wan22

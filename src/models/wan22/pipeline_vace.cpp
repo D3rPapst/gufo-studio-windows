@@ -6,9 +6,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
+#include <mutex>
+#include <system_error>
 #include <utility>
 
+#include "src/core/hip/admission_query.hpp"
+#include "src/core/logging/logging.hpp"
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/text_encoder.hpp"
 #include "src/models/wan22/tokenizer.hpp"
@@ -37,7 +43,111 @@ void TrackDevice(std::size_t* peak) {
     *peak = std::max(*peak, total - std::min(free, total));
 }
 
+/// One transformer + its VACE module (the VACE blocks run on the DiT's
+/// stream, so `vace` is destroyed first).
+struct Expert {
+  std::unique_ptr<Transformer21> dit;
+  std::unique_ptr<Vace> vace;
+};
+
+/// What an expert was loaded from (LoRAs are merged at load).
+struct ExpertKey {
+  std::filesystem::path dit, vace, lora;
+  float lora_strength{1.0F};
+  bool operator==(const ExpertKey&) const = default;
+};
+
+/// Wan 2.2 Fun VACE experts kept in the worker over jobs. Never destroyed at
+/// exit (the HIP runtime may be gone by then); ReleaseVaceExperts frees it.
+struct ResidentExperts {
+  bool loaded{false};
+  ExpertKey high_key, low_key;
+  Expert high, low;
+  void Reset() {
+    for (Expert* expert : {&high, &low}) {
+      expert->vace.reset();
+      expert->dit.reset();
+    }
+    high_key = {};
+    low_key = {};
+    loaded = false;
+  }
+};
+
+std::mutex& ResidentMutex() {
+  static std::mutex* mutex = new std::mutex;
+  return *mutex;
+}
+
+ResidentExperts& Resident() {
+  static ResidentExperts* experts = new ResidentExperts;
+  return *experts;
+}
+
+std::uint64_t FileBytes(const std::filesystem::path& file) {
+  std::error_code ec;
+  if (file.empty())
+    return 0;
+  const auto bytes = std::filesystem::file_size(file, ec);
+  return ec ? 0 : static_cast<std::uint64_t>(bytes);
+}
+
+std::uint64_t DirectoryBytes(const std::filesystem::path& directory) {
+  std::error_code ec;
+  std::uint64_t total = 0;
+  for (std::filesystem::recursive_directory_iterator it(directory, ec), end;
+       !ec && it != end; it.increment(ec))
+    if (it->is_regular_file(ec))
+      total += FileBytes(it->path());
+  return total;
+}
+
+/// What this process can still allocate on the device, as the admission
+/// check reads it (DXGI budget on a Windows iGPU, else hipMemGetInfo).
+std::uint64_t DeviceFreeBytes() {
+  if (const auto memory = gufo::hip::QueryAdmissionMemory())
+    return memory->free_bytes;
+  return 0;
+}
+
+std::string Gib(std::uint64_t bytes) {
+  char text[32];
+  std::snprintf(text, sizeof text, "%.1f",
+                static_cast<double>(bytes) / static_cast<double>(1ULL << 30));
+  return text;
+}
+
+void LogVace(const std::string& message) {
+  gufo::server::Logger::Info("video", "wan22-fun-vace " + message);
+}
+
+bool LoadExpert(const ExpertKey& key, Expert* expert, std::string* error) {
+  expert->vace.reset();
+  expert->dit.reset();
+  expert->dit =
+      Transformer21::Load(key.dit, key.lora, key.lora_strength, error);
+  if (!expert->dit)
+    return false;
+  if (!expert->dit->text_only()) {
+    SetError(error, "VACE needs a text-to-video 14B checkpoint, not " +
+                        key.dit.string());
+    expert->dit.reset();
+    return false;
+  }
+  expert->vace = Vace::Load(key.vace, expert->dit->stream(), error);
+  if (!expert->vace) {
+    expert->dit.reset();
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
+
+void ReleaseVaceExperts() {
+  const std::lock_guard<std::mutex> lock(ResidentMutex());
+  Resident().Reset();
+}
 
 bool GenerateVace21(const Vace21Request& request,
                     const I2V21Callbacks& callbacks,
@@ -209,62 +319,145 @@ bool GenerateVace21(const Vace21Request& request,
     return false;
 
   // 3. Transformer (T2V 14B; Wan 2.2: the high-noise expert first, then the
-  // low-noise one) + VACE blocks and sampling. One expert on the device at a
-  // time: the first is released before the second loads.
+  // low-noise one) + VACE blocks and sampling. Wan 2.2 with
+  // experts_resident and room on the device: both experts stay loaded over
+  // jobs; otherwise one expert on the device at a time, the first released
+  // before the second loads.
   std::vector<float> latents;
-  {
-    std::unique_ptr<Transformer21> dit;
-    std::unique_ptr<Vace> vace;
-    bool loaded_high = false;
+  std::unique_lock<std::mutex> resident_lock(ResidentMutex(),
+                                             std::defer_lock);
+  bool resident = false;
+  const auto sample = [&]() -> bool {
+    Expert sequential;
+    Expert* high_expert = nullptr;  // resident experts
+    Expert* low_expert = nullptr;
+    Transformer21* dit = nullptr;
+    Vace* vace = nullptr;
+    bool on_high = false;
     float guidance = request.guidance;
-    const auto load = [&](bool high) {
-      vace.reset();
-      dit.reset();
-      auto start = Clock::now();
-      const auto& dit_file = high ? request.high_dit_file : request.dit_file;
-      dit = Transformer21::Load(
-          dit_file, high ? request.high_lora_file : request.lora_file,
-          high ? request.high_lora_strength : request.lora_strength, error);
-      if (!dit)
-        return false;
-      if (!dit->text_only()) {
-        SetError(error, "VACE needs a text-to-video 14B checkpoint, not " +
-                            dit_file.string());
-        return false;
+    const ExpertKey high_key{request.high_dit_file, request.high_vace_file,
+                             request.high_lora_file,
+                             request.high_lora_strength};
+    const ExpertKey low_key{request.dit_file, request.vace_file,
+                            request.lora_file, request.lora_strength};
+    if (two_experts) {
+      resident_lock.lock();
+      ResidentExperts& kept = Resident();
+      if (kept.loaded && (!request.experts_resident ||
+                          !(kept.high_key == high_key &&
+                            kept.low_key == low_key))) {
+        kept.Reset();
+        LogVace("event=experts_released reason=" +
+                std::string(request.experts_resident ? "other_files"
+                                                     : "experts_resident_off"));
       }
-      vace = Vace::Load(high ? request.high_vace_file : request.vace_file,
-                        dit->stream(), error);
-      if (!vace || !vace->SetContext(context, frames, lh, lw, error))
+      tel.experts_reused = kept.loaded;
+      if (request.experts_resident && !kept.loaded) {
+        // LoRAs are merged into the DiT weights at load: no extra room.
+        const std::uint64_t expert_bytes =
+            FileBytes(high_key.dit) + FileBytes(high_key.vace) +
+            FileBytes(low_key.dit) + FileBytes(low_key.vace);
+        const std::uint64_t job_bytes =
+            DirectoryBytes(request.t5_root / "text_encoder") +
+            DirectoryBytes(request.vae_root / "vae");
+        const std::uint64_t free_bytes = DeviceFreeBytes();
+        const std::string numbers =
+            " free_gib=" + Gib(free_bytes) + " experts_gib=" +
+            Gib(expert_bytes) + " job_gib=" + Gib(job_bytes) +
+            " margin_gib=" + Gib(kVaceExpertMarginBytes);
+        if (KeepVaceExpertsResident(true, free_bytes, expert_bytes,
+                                    job_bytes)) {
+          const auto start = Clock::now();
+          std::string load_error;
+          if (LoadExpert(high_key, &kept.high, &load_error) &&
+              LoadExpert(low_key, &kept.low, &load_error)) {
+            kept.high_key = high_key;
+            kept.low_key = low_key;
+            kept.loaded = true;
+            tel.dit_load_ms += Ms(start);
+            TrackDevice(&tel.peak_device_bytes);
+            LogVace("event=experts_resident" + numbers);
+          } else {
+            kept.Reset();
+            LogVace("event=experts_sequential reason=load_failed" + numbers +
+                    " error=\"" + load_error + "\"");
+          }
+        } else {
+          LogVace("event=experts_sequential reason=low_memory" + numbers);
+        }
+      }
+      if (kept.loaded) {
+        resident = true;
+        high_expert = &kept.high;
+        low_expert = &kept.low;
+      } else {
+        resident_lock.unlock();
+      }
+    }
+    tel.experts_resident = resident;
+    // This job's VACE context and prompts on an expert.
+    const auto prepare = [&](Expert& expert, bool high) {
+      if (!expert.vace->SetContext(context, frames, lh, lw, error))
         return false;
-      vace->set_strength(request.strength);
-      tel.dit_load_ms += Ms(start);
-      TrackDevice(&tel.peak_device_bytes);
-      guidance = high ? high_guidance : request.guidance;
-      start = Clock::now();
-      if (!dit->PrepareContext(0, text, TextEncoder::kMaxTokens, {}, nullptr,
-                               nullptr, error) ||
-          (guidance > 1.0F &&
-           !dit->PrepareContext(1, negative, TextEncoder::kMaxTokens, {},
-                                nullptr, nullptr, error)))
+      expert.vace->set_strength(request.strength);
+      const float expert_guidance = high ? high_guidance : request.guidance;
+      const auto start = Clock::now();
+      if (!expert.dit->PrepareContext(0, text, TextEncoder::kMaxTokens, {},
+                                      nullptr, nullptr, error) ||
+          (expert_guidance > 1.0F &&
+           !expert.dit->PrepareContext(1, negative, TextEncoder::kMaxTokens,
+                                       {}, nullptr, nullptr, error)))
         return false;
       tel.context_ms += Ms(start);
-      loaded_high = high;
       return true;
     };
-    if (!load(switch_at > 0))
-      return false;
-    if (!two_experts || switch_at == 0 || switch_at >= request.steps)
-      std::vector<float>().swap(context);  // no second expert to set up
+    const auto use = [&](Expert& expert, bool high) {
+      dit = expert.dit.get();
+      vace = expert.vace.get();
+      guidance = high ? high_guidance : request.guidance;
+      on_high = high;
+    };
+    // Sequential: loads the high-noise expert or the low-noise / only model.
+    const auto load = [&](bool high) {
+      sequential.vace.reset();
+      sequential.dit.reset();
+      const auto start = Clock::now();
+      if (!LoadExpert(high ? high_key : low_key, &sequential, error))
+        return false;
+      tel.dit_load_ms += Ms(start);
+      TrackDevice(&tel.peak_device_bytes);
+      if (!prepare(sequential, high))
+        return false;
+      use(sequential, high);
+      return true;
+    };
+    if (resident) {
+      if (switch_at > 0 && !prepare(*high_expert, true))
+        return false;
+      if (switch_at < request.steps && !prepare(*low_expert, false))
+        return false;
+      use(switch_at > 0 ? *high_expert : *low_expert, switch_at > 0);
+      std::vector<float>().swap(context);
+    } else {
+      if (!load(switch_at > 0))
+        return false;
+      if (!two_experts || switch_at == 0 || switch_at >= request.steps)
+        std::vector<float>().swap(context);  // no second expert to set up
+    }
     latents = GaussianNoise(16 * frames * plane, request.seed);
     dump("noise0", latents, shape16(frames));
     std::vector<float> velocity, uncond;
     for (int step = 0; step < request.steps; ++step) {
       if (cancelled())
         return false;
-      if (loaded_high && step >= switch_at) {
-        if (!load(false))
-          return false;
-        std::vector<float>().swap(context);
+      if (on_high && step >= switch_at) {
+        if (resident) {
+          use(*low_expert, false);
+        } else {
+          if (!load(false))
+            return false;
+          std::vector<float>().swap(context);
+        }
       }
       const auto step_start = Clock::now();
       Transformer21Input in;
@@ -273,7 +466,7 @@ bool GenerateVace21(const Vace21Request& request,
       in.height = lh;
       in.width = lw;
       in.timestep = static_cast<float>(1000.0 * sigmas[step]);
-      in.hook = vace.get();
+      in.hook = vace;
       in.context_slot = 0;
       if (!dit->Forward(in, &velocity, nullptr, error))
         return false;
@@ -324,7 +517,19 @@ bool GenerateVace21(const Vace21Request& request,
       tel.step_ms.push_back(Ms(step_start));
       progress("denoiser", step + 1, request.steps);
     }
+    return true;
+  };
+  const bool sampled = sample();
+  if (resident) {
+    // A device error may leave the experts unusable: they load anew.
+    if (!sampled && (error == nullptr || *error != "cancelled")) {
+      Resident().Reset();
+      LogVace("event=experts_released reason=job_failed");
+    }
+    resident_lock.unlock();
   }
+  if (!sampled)
+    return false;
   // TrimVideoLatent: drop the reference frames.
   if (refs > 0) {
     std::vector<float> trimmed(16 * lf * plane);

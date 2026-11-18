@@ -62,6 +62,23 @@ void SplitVaceControl(std::span<const std::uint8_t> video, int video_frames,
 [[nodiscard]] int VaceSwitchStep(const std::vector<double>& sigmas,
                                  double boundary, int requested);
 
+/// Room a resident pair of Wan 2.2 Fun VACE experts leaves on top of the
+/// per-job loads (activations of both transformers, VAE tiles, HIP pools).
+inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
+                                                        << 30;
+
+/// Wan 2.2 Fun VACE A14B: whether both experts (DiT + VACE module each) are
+/// loaded together and stay in the worker over jobs. `requested`
+/// (gufo-vace22.json experts_resident, default true); `free_bytes` what the
+/// device can still give with nothing of this model loaded (the admission
+/// reading); `expert_bytes` the weights of both experts; `job_bytes` what
+/// every job loads beside them (umT5, VAE). False: the experts load one after
+/// the other per job (the high-noise one released before the low-noise one).
+[[nodiscard]] bool KeepVaceExpertsResident(bool requested,
+                                           std::uint64_t free_bytes,
+                                           std::uint64_t expert_bytes,
+                                           std::uint64_t job_bytes);
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_VACE_CONTEXT_HPP_

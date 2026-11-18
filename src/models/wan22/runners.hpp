@@ -43,8 +43,11 @@ struct JobCallbacks {
 /// Also Wan 2.2 Fun VACE A14B (job.family kWan22FunVace, 16 fps):
 /// gufo-vace22.json {"vae", "t5", "dit_high", "vace_high", "lora_high",
 /// "lora_high_strength", "dit_low", "vace_low", "lora_low",
-/// "lora_low_strength", "boundary", "shift", "sampler"}; the high-noise
-/// expert runs first, then is released for the low-noise one.
+/// "lora_low_strength", "boundary", "shift", "sampler", "experts_resident"};
+/// the high-noise expert runs first, then the low-noise one. Both stay
+/// loaded over jobs (experts_resident, default true) when the device has
+/// room; otherwise (or with false) the high-noise one is released for the
+/// low-noise one and both load from disk every job (logged).
 [[nodiscard]] bool RunWan21VaceJob(const JobRequest& job,
                                    const JobCallbacks& callbacks,
                                    ext::VideoTelemetry* telemetry,

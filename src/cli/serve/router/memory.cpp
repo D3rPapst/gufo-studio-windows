@@ -661,6 +661,20 @@ void MemoryBook::SetEstimate(std::string_view id, const MemoryNeed& estimate) {
   record.estimate = estimate;
 }
 
+std::optional<MemoryNeed> BuiltInFloor(std::string_view id) {
+  if (id == "wan2.2-fun-vace-a14b") {
+    return MemoryNeed{.gpu = FromGb(46.0), .host = FromGb(2.0)};
+  }
+  return std::nullopt;
+}
+
+void MemoryBook::SetFloor(std::string_view id, const MemoryNeed& floor) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Record& record = records_[std::string(id)];
+  record.has_floor = true;
+  record.floor = floor;
+}
+
 void MemoryBook::SetExclusive(std::string_view id, bool exclusive) {
   const std::lock_guard<std::mutex> lock(mutex_);
   records_[std::string(id)].exclusive = exclusive;
@@ -778,12 +792,22 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
   const auto it = records_.find(id);
   if (it == records_.end() ||
       (!it->second.has_estimate && !it->second.has_learned &&
-       it->second.other_layouts.empty())) {
+       it->second.other_layouts.empty() && !it->second.has_floor)) {
     *exclusive = true;
     return {};
   }
   const Record& record = it->second;
   *exclusive = record.exclusive;
+  const auto floored = [&record](MemoryNeed need) {
+    if (record.has_floor && need.gpu < record.floor.gpu) {
+      need.gpu = record.floor.gpu;
+      need.dedicated = 0;  // the measured split no longer holds
+    }
+    if (record.has_floor) {
+      need.host = std::max(need.host, record.floor.host);
+    }
+    return need;
+  };
   const auto scale = [](std::int64_t bytes, double by) {
     return static_cast<std::int64_t>(static_cast<double>(bytes) * by);
   };
@@ -802,7 +826,7 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
     need.host = scale(derived.host, learned_factor);
     need.shared = std::min(scale(derived.shared, learned_factor), need.gpu);
     if (!record.has_learned) {
-      return need;
+      return floored(need);
     }
   } else if (record.has_estimate && !complete) {
     need.gpu = scale(record.estimate.gpu, factor);
@@ -819,7 +843,7 @@ MemoryNeed MemoryBook::Need(std::string_view id, double factor,
           0, record.learned.gpu - record.learned.shared);
     }
   }
-  return need;
+  return floored(need);
 }
 
 MemoryBook::Record MemoryBook::Get(std::string_view id) const {

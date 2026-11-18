@@ -420,6 +420,35 @@ void TestFactors() {
         static_cast<std::int64_t>(static_cast<double>(Gb(1)) * 1.05));
 }
 
+void TestBuiltInFloor() {
+  // wan2.2-fun-vace-a14b keeps both experts resident: a smaller peak
+  // learned with one expert at a time (or nothing learned) never plans it
+  // below gufo's floor.
+  const auto floor = gufo::router::BuiltInFloor("wan2.2-fun-vace-a14b");
+  CHECK(floor.has_value() && floor->gpu >= Gb(44));
+  CHECK(!gufo::router::BuiltInFloor("wan2.1-vace-14b").has_value());
+  MemoryBook book({});
+  book.SetFloor("wan2.2-fun-vace-a14b", *floor);
+  bool exclusive = true;
+  MemoryNeed need = book.Need("wan2.2-fun-vace-a14b", 1.15, 1.05, &exclusive);
+  CHECK(!exclusive);  // a floor is a known need, not "unknown -> alone"
+  CHECK(need.gpu == floor->gpu && need.host == floor->host);
+  ProcessMemory usage;
+  usage.valid = true;
+  usage.gpu_dedicated = Gb(25);
+  usage.host_working_set = Gb(1);
+  book.Observe("wan2.2-fun-vace-a14b", usage);
+  book.MarkComplete("wan2.2-fun-vace-a14b");
+  need = book.Need("wan2.2-fun-vace-a14b", 1.15, 1.05, &exclusive);
+  CHECK(need.gpu == floor->gpu);
+  CHECK(need.dedicated == 0);  // the old split no longer holds
+  // A larger measured peak wins over the floor.
+  usage.gpu_dedicated = Gb(50);
+  book.Observe("wan2.2-fun-vace-a14b", usage);
+  need = book.Need("wan2.2-fun-vace-a14b", 1.0, 1.0, &exclusive);
+  CHECK(need.gpu == Gb(50));
+}
+
 void TestMemoryBook() {
   const auto file =
       std::filesystem::temp_directory_path() /
@@ -761,6 +790,7 @@ void TestLoadWaitBook() {
 
 int main() {
   TestEmptyFits();
+  TestBuiltInFloor();
   TestCoResidency();
   TestEvictsForLargeModel();
   TestLruOrder();

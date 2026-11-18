@@ -236,6 +236,13 @@ WatchdogAction PlanWatchdog(const SystemMemory& system,
                             const std::vector<std::string>& loading_order,
                             const MemoryPolicy& policy);
 
+/// A lower bound gufo knows for a model's need, applied over estimates and
+/// learned peaks so an old peak cannot plan it too small (nullopt: none).
+/// wan2.2-fun-vace-a14b keeps both experts loaded (2.2.6): 2 x (14 GB FP8
+/// DiT + 2.8 GB VACE module) + umT5 (10.6 GB) and the VAE during a job; a
+/// peak learned while it loaded one expert at a time is far smaller.
+[[nodiscard]] std::optional<MemoryNeed> BuiltInFloor(std::string_view id);
+
 /// Estimates (preset keys or the JSON file) and learned peaks per model,
 /// persisted as JSON. Thread-safe.
 class MemoryBook {
@@ -262,6 +269,9 @@ public:
     /// Peaks learned with other dedicated sizes, by GiB (0 = unknown). Kept
     /// when the BIOS split changes and restored when it changes back.
     std::map<int, Learned> other_layouts;
+    /// BuiltInFloor (not persisted): Need() is never below it.
+    bool has_floor{false};
+    MemoryNeed floor;
   };
 
   /// Empty path: nothing is read or written.
@@ -274,6 +284,8 @@ public:
 
   void SetEstimate(std::string_view id, const MemoryNeed& estimate);
   void SetExclusive(std::string_view id, bool exclusive);
+  /// The least Need() returns for `id`, whatever was estimated or learned.
+  void SetFloor(std::string_view id, const MemoryNeed& floor);
   /// Raises the learned peak; true when it grew by more than 256 MiB.
   bool Observe(std::string_view id, const ProcessMemory& usage);
   /// Raises the learned peak to at least `need` (watchdog abort).
@@ -289,7 +301,8 @@ public:
   /// before that max(estimate x factor, learned x learned_factor). Nothing
   /// learned with the current layout but with another: that peak x
   /// learned_factor, where a shared part that now fits into dedicated memory
-  /// no longer counts as host RAM. A model with neither is exclusive.
+  /// no longer counts as host RAM. A model with neither (and no floor) is
+  /// exclusive. Never below SetFloor's need (gpu, host).
   [[nodiscard]] MemoryNeed Need(std::string_view id, double factor,
                                 double learned_factor, bool* exclusive) const;
   [[nodiscard]] Record Get(std::string_view id) const;
