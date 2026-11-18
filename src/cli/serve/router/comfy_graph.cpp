@@ -2488,13 +2488,40 @@ void AnimateFrames(const Graph& graph, const std::string& node,
   }
 }
 
+/// WanAnimateToVideo character_mask -> the VACE mask: a one-frame mask
+/// stands for every frame (ComfyUI repeats it), frames built in the graph
+/// are cut at video_frame_offset.
+void AnimateMask(const Graph& graph, const std::string& node, const Link& mask,
+                 int offset, VideoTask* task,
+                 std::vector<std::string>* warnings) {
+  VaceMaskInput(graph, node, "character_mask", mask, true, task, warnings);
+  if (!task->mask_runs.empty()) {
+    if (FrameCount(task->mask_runs) == 1) {
+      for (FrameRun& run : task->mask_runs)
+        if (run.count > 0)
+          run.count = task->frames;
+    } else {
+      task->mask_runs =
+          KeepFrames(std::move(task->mask_runs), offset, task->frames);
+    }
+  } else if (offset > 0 && task->vace_mask && !StillMask(graph, mask)) {
+    throw NodeFailure(node, "unsupported_value",
+                      "video_frame_offset " + std::to_string(offset) +
+                          " with a loaded character_mask video is not "
+                          "supported by gufo");
+  }
+}
+
 /// Wan 2.2 Animate (WanAnimateToVideo) on VACE, as far as VACE can follow:
 ///  - pose_video -> control_video (ComfyUI repeats the last pose frame up
 ///    to length; done here for frames built in the graph), the whole
 ///    picture generated after it;
+///  - pose_video + background_video + character_mask (replacement): the
+///    control video is the pose inside the mask and the background outside
+///    (the executor merges them, AnimateMergeFilter), the mask is
+///    character_mask (1 = generate the character, 0 = keep the background);
 ///  - without pose_video, background_video + character_mask -> control
-///    video + mask (character replacement: 1 = generate the character,
-///    0 = keep the background, as both nodes read it);
+///    video + mask (the same replacement without a pose to follow);
 ///  - reference_image -> reference_images (BuildVace).
 /// face_video, clip_vision_output and continue_motion have no VACE input
 /// and are ignored with a warning.
@@ -2527,34 +2554,26 @@ void AnimateControl(const Graph& graph, const std::string& node,
           run->count += missing;
           break;
         }
-    if (background || mask)
+    if (background && mask) {
+      // Replacement: the pose inside the mask, the background outside.
+      AnimateFrames(graph, node, "background_video", *background, offset,
+                    *task, warnings, &task->animate_background,
+                    &task->animate_background_runs);
+      AnimateMask(graph, node, *mask, offset, task, warnings);
+    } else if (background || mask) {
       warnings->push_back(
-          "node " + node +
-          ": background_video / character_mask are ignored next to "
-          "pose_video (VACE takes one control video; gufo animates the "
-          "whole picture after the pose)");
+          "node " + node + ": " +
+          std::string(background ? "background_video" : "character_mask") +
+          " is ignored without " +
+          (background ? "character_mask" : "background_video") +
+          " (gufo animates the whole picture after the pose)");
+    }
     return;
   }
   if (background && mask) {
     AnimateFrames(graph, node, "background_video", *background, offset,
                   *task, warnings, &task->control_video, &task->control_runs);
-    VaceMaskInput(graph, node, "character_mask", *mask, true, task, warnings);
-    if (!task->mask_runs.empty()) {
-      if (FrameCount(task->mask_runs) == 1) {
-        // One mask frame stands for every frame (ComfyUI repeats it).
-        for (FrameRun& run : task->mask_runs)
-          if (run.count > 0)
-            run.count = task->frames;
-      } else {
-        task->mask_runs =
-            KeepFrames(std::move(task->mask_runs), offset, task->frames);
-      }
-    } else if (offset > 0 && task->vace_mask && !StillMask(graph, *mask)) {
-      throw NodeFailure(node, "unsupported_value",
-                        "video_frame_offset " + std::to_string(offset) +
-                            " with a loaded character_mask video is not "
-                            "supported by gufo");
-    }
+    AnimateMask(graph, node, *mask, offset, task, warnings);
     return;
   }
   if (background || mask)
@@ -3524,6 +3543,26 @@ std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
   // WanVaceToVideo / WanFirstLastFrameToVideo: bilinear, centre crop.
   AppendFit(&chain, *size, {width, height}, true, "bilinear");
   return chain + "format=rgb24";
+}
+
+std::string AnimateMergeFilter(int width, int height,
+                               const std::string& channel, bool invert) {
+  // Each input frame by frame (the worker reads VACE videos by index, not by
+  // time): fitted like the worker (bilinear, cover, centre crop), counted at
+  // 16 fps, its last frame repeated (the pose as ComfyUI pads it; -frames:v
+  // ends the output). maskedmerge needs one pixel format for all three.
+  const std::string w = std::to_string(width), h = std::to_string(height);
+  const std::string fit = "scale=" + w + ":" + h +
+                          ":force_original_aspect_ratio=increase:flags="
+                          "bilinear,crop=" +
+                          w + ":" + h +
+                          ",setsar=1,setpts=N/16/TB,format=gbrp,"
+                          "tpad=stop_mode=clone:stop=-1";
+  const char plane = channel == "green" ? 'g' : channel == "blue" ? 'b' : 'r';
+  return "[0:v]" + fit + "[bg];[1:v]" + fit + "[pose];[2:v]" + fit +
+         ",extractplanes=" + std::string(1, plane) +
+         (invert ? ",negate" : "") +
+         ",format=gbrp[mask];[bg][pose][mask]maskedmerge[out]";
 }
 
 int VideoFamilyFps(VideoFamily family) {

@@ -36,7 +36,9 @@
 //          frames with a keep mask, gufo has no FLF2V model); or KSampler
 //          <- WanAnimateToVideo (pose_video as control video, or
 //          background_video + character_mask as control video + mask,
-//          reference_image; gufo has no Wan 2.2 Animate model); a
+//          with all three the pose merged into the background inside the
+//          mask (ffmpeg) + the mask, reference_image; gufo has no Wan 2.2
+//          Animate model); a
 //          KSamplerAdvanced chain (Wan 2.2 high / low noise) runs as one
 //          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
@@ -367,6 +369,15 @@ std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
                                           int height,
                                           const ImageSizeProbe& probe);
 
+/// The ffmpeg -filter_complex of the WanAnimateToVideo replacement control
+/// video: inputs 0 = background, 1 = pose, 2 = mask (a video, or a still
+/// looped by -loop 1), each fitted to width x height and read frame by
+/// frame (last frame repeated); the mask `channel` ("red", "green",
+/// "blue"; `invert` after InvertMask) picks the pose (1) or the background
+/// (0) per pixel. Output label [out].
+std::string AnimateMergeFilter(int width, int height,
+                               const std::string& channel, bool invert);
+
 struct VideoTask {
   VideoFamily family{VideoFamily::kH3};
   std::string model;
@@ -446,6 +457,13 @@ struct VideoTask {
   /// `vace_mask_channel` (black = keep, white = generate, as in ComfyUI).
   std::vector<FrameRun> control_runs;
   std::vector<FrameRun> mask_runs;
+  /// WanAnimateToVideo replacement (pose_video + background_video +
+  /// character_mask): the background, a video or frames from the graph.
+  /// The executor merges the pose (control_video / control_runs) into it
+  /// where the mask generates (ffmpeg, AnimateMergeFilter) and sends the
+  /// result as control_video; the mask goes to VACE as it is.
+  std::optional<FileRef> animate_background;
+  std::vector<FrameRun> animate_background_runs;
   std::string vace_mask_channel;  // "red", "green", "blue"
   bool vace_invert_mask{false};
   std::vector<FileRef> reference_images;
