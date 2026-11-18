@@ -270,6 +270,14 @@ struct Options {
   Resolver resolve;
   Deliver deliver;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// 503 memory_busy from the router (2.2.3: the model could not load
+  /// because another, busy model holds the memory): the job goes back to
+  /// the front of the queue (status "queued", "memory_wait" in its view)
+  /// and is tried again after `memory_busy_retry`; other jobs may run
+  /// meanwhile. After `memory_busy_limit` of such waits in a row it fails
+  /// with memory_busy. Zero limit = no limit.
+  std::chrono::milliseconds memory_busy_retry{std::chrono::seconds(30)};
+  std::chrono::milliseconds memory_busy_limit{std::chrono::hours(6)};
   /// Whole-job limit of a 3D job's status polls (gufo serve objekt; up to
   /// ~2 min per object measured): past it the worker job is cancelled and
   /// the job fails with objekt_timeout. Zero = no limit.
@@ -568,6 +576,11 @@ private:
   /// held): after every job of the same or a higher priority, or (`front`,
   /// a requeued job) before every job of its priority.
   void InsertPendingLocked(const std::shared_ptr<Job>& job, bool front);
+  /// The first pending job whose memory_busy retry time has come (mutex
+  /// held); pending_.end() when every pending job waits for its retry.
+  std::deque<std::shared_ptr<Job>>::iterator FirstRunnableLocked();
+  /// The earliest retry time of the pending jobs (mutex held).
+  std::chrono::steady_clock::time_point NextRetryLocked() const;
   bool MatchesLocked(const Job& job, const Filter& filter) const;
 
   void RunnerMain();

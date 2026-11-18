@@ -202,6 +202,9 @@ struct FakeApi {
   int objekt_flaky = 0;
   std::vector<std::string> objekt_job_headers;
   int unreachable_calls{0};
+  /// "MEMBUSY<n>" prompts: the router's 503 memory_busy for the first n
+  /// calls ("MEMBUSY" alone: every call), counted per prompt.
+  std::map<std::string, int> membusy_calls;
   /// Music: the async job stays in_progress while set.
   std::atomic<bool> music_hold{false};
   bool music_async{false};
@@ -320,6 +323,23 @@ struct FakeApi {
           result.body =
               R"({"error":{"message":"remote model 'qwen-image' is )"
               R"(unreachable: connect","code":"remote_unavailable"}})";
+          return result;
+        }
+      }
+      if (const auto at = prompt.find("MEMBUSY"); at != std::string::npos) {
+        const std::lock_guard<std::mutex> lock(mutex);
+        const int calls = ++membusy_calls[prompt];
+        const std::string count = prompt.substr(at + 7, 1);
+        const int limit = !count.empty() && count[0] >= '0' && count[0] <= '9'
+                              ? count[0] - '0'
+                              : 1 << 30;
+        if (calls <= limit) {
+          result.status = 503;
+          result.body =
+              R"x({"error":{"message":"cannot load 'qwen-image' now: memory )x"
+              R"x(is in use by wan (busy); retry in 30 s","type":)x"
+              R"x("server_error","code":"memory_busy","retry_after_s":30,)x"
+              R"x("blocked_by":"wan (busy)","model":"qwen-image"}})x";
           return result;
         }
       }
@@ -520,6 +540,9 @@ struct Harness {
   std::function<bool(const std::string&, std::string*)> may_pull;
   /// Set before Open(true): the 3D poll limit (zero keeps the default).
   std::chrono::milliseconds objekt_deadline{0};
+  /// Set before Open(true): the memory_busy retry wait and limit.
+  std::chrono::milliseconds memory_busy_retry{30};
+  std::chrono::milliseconds memory_busy_limit{std::chrono::hours(6)};
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -569,6 +592,8 @@ struct Harness {
     options.may_pull = may_pull;
     if (objekt_deadline.count() > 0)
       options.objekt_deadline = objekt_deadline;
+    options.memory_busy_retry = memory_busy_retry;
+    options.memory_busy_limit = memory_busy_limit;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -723,6 +748,71 @@ void TestRequeueOnceWhenRemoteGone() {
           error->member_str("code") == "remote_unavailable");
     const std::lock_guard<std::mutex> lock(h.api->mutex);
     CHECK(h.api->unreachable_calls == 2);  // the first run and one requeue
+  }
+}
+
+void TestMemoryBusyStaysQueued() {
+  // 2.2.3: 503 memory_busy (another model busy) puts the job back into the
+  // queue, also more than once, until the model loads.
+  {
+    Harness h("membusy-retry", /*start=*/false);
+    h.memory_busy_retry = std::chrono::milliseconds(300);
+    h.Open(true);
+    const json::Value job = h.Submit(ImageJob("MEMBUSY2 a fox"));
+    const std::string id = job.member_str("id");
+    // While it waits for its retry it is queued and says why.
+    json::Value view;
+    for (int i = 0; i < 200; ++i) {
+      view = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+      if (view.find("memory_wait") != nullptr)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const json::Value* wait = view.find("memory_wait");
+    CHECK(view.member_str("status") == "queued");
+    CHECK(wait != nullptr && wait->member_str("code") == "memory_busy" &&
+          wait->member_str("message").find("wan (busy)") !=
+              std::string::npos);
+    const json::Value done = h.WaitFor(id, "completed");
+    CHECK(done.find("memory_wait") == nullptr);
+    CHECK(done.find("error") == nullptr || done.find("error")->is_null());
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(h.api->membusy_calls["MEMBUSY2 a fox"] == 3);
+  }
+  {
+    // A job behind the waiting one runs meanwhile.
+    Harness h("membusy-overtake", /*start=*/false);
+    h.memory_busy_retry = std::chrono::seconds(2);
+    h.Open(true);
+    const json::Value first = h.Submit(ImageJob("MEMBUSY1 first"));
+    for (int i = 0; i < 200; ++i) {
+      {
+        const std::lock_guard<std::mutex> lock(h.api->mutex);
+        if (h.api->membusy_calls["MEMBUSY1 first"] >= 1)
+          break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const json::Value second = h.Submit(ImageJob("second"));
+    h.WaitFor(second.member_str("id"), "completed");
+    const json::Value still =
+        json::parse(h.Call("GET", "/v1/jobs/" + first.member_str("id")).body);
+    CHECK(still.member_str("status") == "queued");
+    h.WaitFor(first.member_str("id"), "completed");
+  }
+  {
+    // Past the limit the job fails with memory_busy.
+    Harness h("membusy-limit", /*start=*/false);
+    h.memory_busy_retry = std::chrono::milliseconds(20);
+    h.memory_busy_limit = std::chrono::milliseconds(150);
+    h.Open(true);
+    const json::Value job = h.Submit(ImageJob("MEMBUSY forever"));
+    const json::Value done = h.WaitFor(job.member_str("id"), "failed");
+    const json::Value* error = done.find("error");
+    CHECK(error != nullptr && error->member_str("code") == "memory_busy" &&
+          error->member_double("status_code") == 503);
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(h.api->membusy_calls["MEMBUSY forever"] >= 3);
   }
 }
 
@@ -2941,6 +3031,7 @@ int main() {
   TestImageLifecycle();
   TestFailedJob();
   TestRequeueOnceWhenRemoteGone();
+  TestMemoryBusyStaysQueued();
   TestBinaryResult();
   TestSubmitRejections();
   TestCancel();

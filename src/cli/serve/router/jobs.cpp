@@ -71,6 +71,12 @@ struct JobQueue::Job {
   /// Ran once already and was put back after the router found no machine
   /// for it (remote_unavailable, pool_busy) before any result.
   bool requeued{false};
+  /// 503 memory_busy (2.2.3): not run again before retry_at; the waits in
+  /// a row began at memory_wait_began; the router's message for the view.
+  std::chrono::steady_clock::time_point retry_at{};
+  std::chrono::steady_clock::time_point memory_wait_began{};
+  long long memory_wait_since{0};
+  std::string memory_wait;
   /// PATCH {"keep": true}: the result files never expire.
   bool keep{false};
   /// When the result media were deleted (expiry); 0 = still there.
@@ -1934,6 +1940,22 @@ void JobQueue::InsertPendingLocked(const std::shared_ptr<Job>& job,
   pending_.insert(it, job);
 }
 
+std::deque<std::shared_ptr<JobQueue::Job>>::iterator
+JobQueue::FirstRunnableLocked() {
+  const auto now = std::chrono::steady_clock::now();
+  return std::find_if(pending_.begin(), pending_.end(),
+                      [now](const std::shared_ptr<Job>& job) {
+                        return job->retry_at <= now;
+                      });
+}
+
+std::chrono::steady_clock::time_point JobQueue::NextRetryLocked() const {
+  auto next = std::chrono::steady_clock::time_point::max();
+  for (const auto& job : pending_)
+    next = std::min(next, job->retry_at);
+  return next;
+}
+
 bool JobQueue::MatchesLocked(const Job& job, const Filter& filter) const {
   if (!filter.status.empty() && job.status != filter.status)
     return false;
@@ -2555,6 +2577,17 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   else
     view["running_on"] = "local";
   view["pool_wait"] = pool_state == "wait";
+  // Back in the queue after 503 memory_busy (2.2.3): why, and since when.
+  if (job.status == "queued" && !job.memory_wait.empty()) {
+    json::Value wait = json::Value::object();
+    wait["code"] = "memory_busy";
+    wait["message"] = job.memory_wait;
+    wait["since"] = job.memory_wait_since;
+    const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+        job.retry_at - std::chrono::steady_clock::now());
+    wait["retry_in_s"] = static_cast<long long>(std::max<long long>(0, left.count()));
+    view["memory_wait"] = std::move(wait);
+  }
   if (job.pin_local)
     view["pinned"] = "local";
   view["priority"] = static_cast<long long>(job.priority);
@@ -2810,9 +2843,24 @@ void JobQueue::RunnerMain() {
       if (stopping_)
         return;
       ReapPulledLocked();
-      if (!pending_.empty()) {
-        mine = pending_.front()->created_at;
-        mine_priority = pending_.front()->priority;
+      // Jobs back from a 503 memory_busy wait for their retry time; a job
+      // behind them may run meanwhile (2.2.3).
+      auto runnable = FirstRunnableLocked();
+      if (!pending_.empty() && runnable == pending_.end()) {
+        auto until = NextRetryLocked();
+        if (may_pull)
+          until = std::min(until,
+                           std::chrono::steady_clock::now() + options_.pull_poll);
+        wake_.wait_until(lock, until, [this] {
+          return stopping_ || FirstRunnableLocked() != pending_.end();
+        });
+        if (stopping_)
+          return;
+        runnable = FirstRunnableLocked();
+      }
+      if (runnable != pending_.end()) {
+        mine = (*runnable)->created_at;
+        mine_priority = (*runnable)->priority;
       }
     }
     // Global order: the partner's first queued job (priority, then age)
@@ -2823,10 +2871,11 @@ void JobQueue::RunnerMain() {
       const std::lock_guard<std::mutex> lock(mutex_);
       if (stopping_)
         return;
-      if (pending_.empty())
+      const auto runnable = FirstRunnableLocked();
+      if (runnable == pending_.end())
         continue;
-      job = pending_.front();
-      pending_.pop_front();
+      job = *runnable;
+      pending_.erase(runnable);
       job->status = "in_progress";
       job->started_at = NowSeconds();
       PersistLocked();
@@ -3515,6 +3564,47 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
       Finish(job, "cancelled", json::Value(), json::Value());
     }
   } catch (const JobFailure& failure) {
+    // 503 memory_busy (2.2.3): the model could not load because another
+    // model that is busy holds the memory. Nothing was started; the job
+    // waits in the queue (not in an open request) and is tried again after
+    // memory_busy_retry, for at most memory_busy_limit in a row.
+    if (failure.status == 503 && failure.code == "memory_busy" &&
+        job->upstream_id.empty()) {
+      bool requeued = false;
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (job->memory_wait_since == 0) {
+          job->memory_wait_since = NowSeconds();
+          job->memory_wait_began = now;
+        }
+        const bool within =
+            options_.memory_busy_limit.count() == 0 ||
+            now - job->memory_wait_began < options_.memory_busy_limit;
+        if (within && !stopping_ && !job->cancel.load()) {
+          job->status = "queued";
+          job->started_at = 0;
+          job->progress = -1;
+          job->preview_id.clear();
+          job->pulled_by.clear();
+          job->side = job->pin_local ? "local" : "";
+          job->retry_at = now + options_.memory_busy_retry;
+          job->memory_wait = failure.what();
+          InsertPendingLocked(job, /*front=*/true);
+          PersistLocked();
+          requeued = true;
+        }
+      }
+      if (requeued) {
+        Logger::Warn("jobs", "event=job_memory_wait id=" + job->id +
+                                 " retry_ms=" +
+                                 std::to_string(
+                                     options_.memory_busy_retry.count()) +
+                                 " error=\"" + failure.what() + "\"");
+        wake_.notify_all();
+        return;
+      }
+    }
     // The router had no machine for the request (the remote router went
     // away before it answered, or the pool found none free): no work was
     // started, so the job goes back to the front of the queue once.
@@ -4333,6 +4423,8 @@ void JobQueue::Finish(const std::shared_ptr<Job>& job, std::string status,
     job->result = std::move(result);
     job->error = std::move(error);
     job->preview_id.clear();
+    job->memory_wait.clear();
+    job->memory_wait_since = 0;
     if (job->status == "completed") {
       job->progress = 100;
       if (job->started_at > 0) {

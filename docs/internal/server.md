@@ -554,6 +554,10 @@ Memory:
                                 always kept free below the commit limit (default: 3)
   --memory-abort-commit-gb <GB>  Watchdog: stop the newest load below this free commit
                                 (Windows; default: 1)
+  --memory-wait-seconds <SEC>   With --memory-guard: how long a cold load waits for another
+                                model that is busy or loading and holds the memory, then
+                                answers 503 memory_busy with Retry-After (default: 60; 0 = wait
+                                until --load-timeout-seconds)
 
 Server:
   -i, --host <IP>               Bind address
@@ -1549,6 +1553,49 @@ work without touching the placement (which only an admin may change).
   pause, and leaves it to the restart otherwise. A router older than
   2.1.8 answers `404` to the POST; the script then waits as before.
 
+### Memory busy (2.2.3)
+
+With `--memory-guard` a cold load whose memory is held by another model
+of this router that is **busy** (a request, socket or video job in
+flight) or **loading** waits at most `--memory-wait-seconds` (default 60;
+0 = until `--load-timeout-seconds` as before). Then the request gets:
+
+- HTTP `503`, header `Retry-After: 30`, body
+  `{"error": {"code": "memory_busy", "type": "server_error", "message":
+  "cannot load 'X' now: memory is in use by Y (busy); retry in 30 s",
+  "retry_after_s": 30, "blocked_by": "Y (busy)", "model": "X"}}`;
+- the event `gave up loading X: memory busy, ...` in `/router/status`
+  and `event=memory_busy model=X blocked_by="..."` in the log.
+
+The busy model is never stopped. An **idle** holder is evicted as before
+(`evicted Y to fit X`); since 2.2.3 that also holds for an idle worker
+without a memory sample, which the planner used to credit with nothing
+and then waited for "memory held outside the router". Memory that really
+is held outside the router still ends in `507 insufficient_memory` after
+45 s, now also for `router-exclusive` models (they waited for the load
+timeout). The wait kinds and their bounds are `AdmissionPlan::Wait` and
+`MemoryWaitClock` in `memory.hpp`.
+
+Job API (`/v1/jobs`): a job whose request gets `503 memory_busy` is not
+failed. It goes back to the front of the queue (status `queued`, nothing
+was started) with `"memory_wait": {"code": "memory_busy", "message",
+"since", "retry_in_s"}` in its view, and is tried again after 30 s
+(`Options::memory_busy_retry`); jobs behind it that are ready may run
+meanwhile. Only after 6 hours of such waits in a row
+(`memory_busy_limit`) does it fail with `memory_busy`. Reason: a job is
+already asynchronous; failing it would only make every client re-submit,
+and holding its request open would block the runner and end in 504.
+
+ComfyUI adapter (`/prompt`):
+
+| When | What the client sees |
+| --- | --- |
+| `POST /prompt` while no prompt of the adapter runs or waits, and the router's plan for the prompt's first model waits for a busy or loading model (`RouterState::MemoryBusyFor`; not for loaded, remote or pool models) | HTTP `503`, `Retry-After: 30`, `{"error": {"type": "memory_busy", "code": "memory_busy", "message": "...", "retry_after_s": 30, "details": "", "extra_info": {}}, "node_errors": {}}`; nothing is queued |
+| A task's request gets `503 memory_busy` while the prompt runs (also a prompt accepted behind others) | `/history/<id>`: `status.status_str` `"error"`, message `execution_error` with `"exception_type": "GufoBusy"`, `"code": "memory_busy"`, `"retry_after_s": 30`, `"error": {"code": "memory_busy", "message", "retry_after_s"}`, `exception_message` = the router's message, `node_id` = the task's node; the same over `/ws` |
+
+Nothing of a GufoBusy prompt's failing task ran; outputs of earlier
+tasks of the same prompt are kept in the history entry as usual.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
@@ -1571,6 +1618,8 @@ router even after an unclean exit.
 | Worker dies mid-request | Streams close as with today's `serve` crash; model unloaded |
 | `--models-max` reached, nothing unloadable | New-model requests queued FIFO for the next freed slot |
 | Cold load (queue + spawn + readiness) exceeds `--load-timeout-seconds` | Held and queued requests 504 `load_timeout`, worker killed, model unloaded, next request retries |
+| `--memory-guard`: the load needs memory that another model holds while it is busy or loading, for `--memory-wait-seconds` (60) | 503 `memory_busy` with `Retry-After: 30`; `error.retry_after_s`, `error.blocked_by` ("id (busy)", comma separated) and `error.model`; the busy model is never stopped. An idle holder is evicted as before. Jobs and ComfyUI prompts: see [Memory busy](#memory-busy-223) |
+| `--memory-guard`: the memory is held outside the router for 45 s | 507 `insufficient_memory` (also for router-exclusive models since 2.2.3) |
 | Idle timeout / eviction | Drain-then-kill; no in-flight request is ever cut |
 | GPU `device_lost` in a worker | Existing worker exit path; the router treats it as death |
 
@@ -3263,6 +3312,10 @@ are from `src/cli/serve/router/{auth,router,jobs,remote}.cpp`:
 - `502` `upstream_unavailable`: the worker failed to spawn or start, or
   the router is shutting down; `partner_unreachable`: a job relay to the
   partner router failed.
+- `503` `memory_busy` (2.2.3): with `--memory-guard` the model could
+  not load within `--memory-wait-seconds` because another model that is
+  busy or loading holds the memory; `Retry-After` header and
+  `error.retry_after_s` (30), `error.blocked_by`, `error.model`.
 - `504` `load_timeout`: the worker did not load within
   `--load-timeout-seconds`; `objekt_timeout`: a 3D job exceeded its
   deadline.
