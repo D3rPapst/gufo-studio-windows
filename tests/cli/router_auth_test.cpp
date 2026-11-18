@@ -2873,6 +2873,11 @@ void TestStatusJobsHidden() {
     body["models_max"] = 2;
     body["pool_queue"] = std::move(queue);
     body["remote"] = std::move(remote);
+    // 2.2.5: open worker jobs (direct /v1/videos) are filtered alike.
+    json::Value open = json::Value::object();
+    open["j-tim"] = json::Value::object();
+    open["j-anna"] = json::Value::object();
+    body["async_jobs"] = std::move(open);
     return HttpResponse{.status = 200, .reason = "OK", .body = body.dump()};
   };
   const std::string tim = f.LoginCookie("tim", "tim-pw");
@@ -2893,12 +2898,15 @@ void TestStatusJobsHidden() {
   CHECK(remote->find("jobs")->find("j-tim") != nullptr);
   CHECK_EQ(remote->member_str("router_id"), std::string("r1"));
   CHECK_EQ(body.member_size("models_max"), std::size_t(2));
+  CHECK_EQ(body.find("async_jobs")->members().size(), std::size_t(1));
+  CHECK(body.find("async_jobs")->find("j-tim") != nullptr);
   const std::string admin = f.LoginCookie("fabian", "geheim123");
   r = f.Serve(Req("GET", "/router/status", "192.168.178.50", "",
                   {{"Cookie", admin}}));
   body = json::parse(r.body);
   CHECK_EQ(body.find("pool_queue")->find("pulling")->items().size(),
            std::size_t(3));
+  CHECK_EQ(body.find("async_jobs")->members().size(), std::size_t(2));
   CHECK_EQ(body.find("remote")->find("jobs")->members().size(),
            std::size_t(2));
   r = f.Serve(Req("GET", "/router/status", "127.0.0.1"));

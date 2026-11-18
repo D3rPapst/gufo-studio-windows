@@ -463,7 +463,10 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->talk_video);
       if (video->vace_mask)
         files->push_back(*video->vace_mask);
-      for (const auto* runs : {&video->control_runs, &video->mask_runs})
+      if (video->animate_background)
+        files->push_back(*video->animate_background);
+      for (const auto* runs : {&video->control_runs, &video->mask_runs,
+                               &video->animate_background_runs})
         for (const FrameRun& run : *runs)
           if (run.image)
             files->push_back(*run.image);
@@ -2489,6 +2492,9 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                                              : std::string("data:video/mp4")) +
                      ";base64," + Base64Encode(bytes);
     }
+    if (spec.animate_background || !spec.animate_background_runs.empty())
+      vace["control_video"] =
+          "data:video/mp4;base64," + Base64Encode(AnimateReplaceControl(spec));
     if (!spec.reference_images.empty()) {
       json::Value references = json::Value::array();
       for (const FileRef& ref : spec.reference_images) {
@@ -2829,6 +2835,72 @@ std::string Adapter::RenderFrameRuns(const std::vector<FrameRun>& runs,
     throw std::runtime_error("cannot encode the VACE " + std::string(what) +
                              ": " + error);
   return bytes;
+}
+
+std::string Adapter::AnimateReplaceControl(const VideoTask& spec) {
+  if (options_.ffmpeg.empty())
+    throw std::runtime_error(
+        "WanAnimateToVideo with pose_video, background_video and "
+        "character_mask merges the pose into the background; start the "
+        "router with --comfy-ffmpeg");
+  std::vector<fs::path> made;  // rendered inputs, removed at the end
+  struct RemoveFiles {
+    std::vector<fs::path>* files;
+    ~RemoveFiles() {
+      std::error_code ignored;
+      for (const fs::path& file : *files)
+        fs::remove(file, ignored);
+    }
+  } cleanup{&made};
+  // A rendered or loaded input as a file ffmpeg reads.
+  const auto input = [&](const std::optional<FileRef>& file,
+                         const std::vector<FrameRun>& runs,
+                         std::string_view what) -> fs::path {
+    if (!runs.empty()) {
+      const fs::path path = WorkFile("mp4");
+      WriteAll(path, RenderFrameRuns(runs, spec.width, spec.height,
+                                     spec.frames, what));
+      made.push_back(path);
+      return path;
+    }
+    if (!file)
+      throw std::runtime_error("WanAnimateToVideo: the " + std::string(what) +
+                               " is missing");
+    return FilePath(*file);
+  };
+  const fs::path background = input(spec.animate_background,
+                                    spec.animate_background_runs,
+                                    "background video");
+  const fs::path pose = input(spec.control_video, spec.control_runs,
+                              "pose video");
+  const fs::path mask = input(spec.vace_mask, spec.mask_runs, "mask");
+  // A still mask (LoadImageMask) stands for every frame.
+  const bool still = spec.mask_runs.empty() && spec.vace_mask &&
+                     ImageDimensions(ReadFileRef(*spec.vace_mask)).has_value();
+  std::vector<fs::path> args{"-i", background, "-i", pose};
+  if (still) {
+    args.emplace_back("-loop");
+    args.emplace_back("1");
+  }
+  args.insert(args.end(),
+              {"-i", mask, "-filter_complex",
+               AnimateMergeFilter(spec.width, spec.height,
+                                  spec.vace_mask_channel.empty()
+                                      ? std::string("red")
+                                      : spec.vace_mask_channel,
+                                  spec.vace_invert_mask),
+               "-map", "[out]", "-frames:v", std::to_string(spec.frames),
+               "-r", "16", "-c:v", "libx264rgb", "-qp", "0", "-pix_fmt",
+               "rgb24"});
+  const fs::path mp4 = WorkFile("mp4");
+  made.push_back(mp4);
+  args.push_back(mp4);
+  std::string error;
+  if (!RunFfmpeg(args, &error))
+    throw std::runtime_error(
+        "cannot merge the pose into the background video (WanAnimateToVideo): " +
+        error);
+  return ReadAll(mp4);
 }
 
 namespace {

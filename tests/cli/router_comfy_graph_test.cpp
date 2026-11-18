@@ -2229,6 +2229,58 @@ void TestAnimate() {
   assert((swap.vace_mask == comfy::FileRef{"figur_maske.png", "input"}));
   assert(swap.vace_mask_channel == "red" && !swap.vace_invert_mask);
   assert(!warned(swap_plan, "still mask"));  // Animate repeats it too
+  assert(!swap.animate_background && swap.animate_background_runs.empty());
+
+  // Replacement with a pose (18.11.): pose + background + mask. The control
+  // video is the pose inside the mask and the background outside (merged
+  // by the executor), the mask goes to VACE.
+  std::string both = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                             "\"pose_video\": [\"21\", 0], "
+                             "\"background_video\": [\"26\", 0], "
+                             "\"character_mask\": [\"40\", 0]");
+  both = Replace(both, " \"30\":",
+                 " \"25\": {\"class_type\": \"LoadVideo\", \"inputs\": "
+                 "{\"file\": \"buero_leer.mp4\"}},\n"
+                 " \"26\": {\"class_type\": \"GetVideoComponents\", "
+                 "\"inputs\": {\"video\": [\"25\", 0]}},\n"
+                 " \"40\": {\"class_type\": \"LoadImageMask\", \"inputs\": "
+                 "{\"image\": \"figur_maske.png\", \"channel\": \"green\"}},"
+                 "\n \"30\":");
+  const comfy::Plan both_plan = PlanOf(both.c_str());
+  const auto& merged = std::get<comfy::VideoTask>(both_plan.tasks[0].spec);
+  assert((merged.control_video == comfy::FileRef{"pose_tanz.mp4", "input"}));
+  assert((merged.animate_background ==
+          comfy::FileRef{"buero_leer.mp4", "input"}));
+  assert(merged.animate_background_runs.empty());
+  assert((merged.vace_mask == comfy::FileRef{"figur_maske.png", "input"}));
+  assert(merged.vace_mask_channel == "green" && !merged.vace_invert_mask);
+  assert(both_plan.warnings.size() == 5);  // the same five as above
+  assert(!warned(both_plan, "ignored next to"));
+  assert(!warned(both_plan, "is ignored without"));
+  const json::Value merged_body = comfy::VideoRequestBody(merged);
+  assert(merged_body.find("gufo")->find("vace")->member_str("mask_channel") ==
+         "green");
+  // The merge: background, pose and mask fitted alike, the green channel
+  // picks the pose; InvertMask negates it.
+  const std::string filter = comfy::AnimateMergeFilter(832, 480, "green", false);
+  assert(filter.find("[0:v]scale=832:480:force_original_aspect_ratio="
+                     "increase") == 0);
+  assert(filter.find("crop=832:480") != std::string::npos);
+  assert(filter.find("extractplanes=g,format=gbrp[mask]") !=
+         std::string::npos);
+  assert(filter.find("negate") == std::string::npos);
+  assert(filter.ends_with("[bg][pose][mask]maskedmerge[out]"));
+  assert(comfy::AnimateMergeFilter(832, 480, "red", true)
+             .find("extractplanes=r,negate,format=gbrp[mask]") !=
+         std::string::npos);
+  // Background next to the pose without a mask (or the other way round):
+  // ignored with a warning, the whole picture follows the pose.
+  const comfy::Plan half_plan = PlanOf(
+      Replace(both, ", \"character_mask\": [\"40\", 0]", "").c_str());
+  const auto& half = std::get<comfy::VideoTask>(half_plan.tasks[0].spec);
+  assert(!half.animate_background && !half.vace_mask);
+  assert(warned(half_plan, "background_video is ignored without "
+                           "character_mask"));
 
   // A pose built from frames with an offset: frames 10.. kept, the last
   // one repeated up to length (as ComfyUI pads the pose video).

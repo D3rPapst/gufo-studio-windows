@@ -225,6 +225,11 @@ private:
   /// libx264rgb); returns its bytes. Throws on errors.
   std::string RenderFrameRuns(const std::vector<FrameRun>& runs, int width,
                               int height, int frames, std::string_view what);
+  /// WanAnimateToVideo replacement: the pose (control_video / control_runs)
+  /// inside the mask, the background (animate_background[_runs]) outside,
+  /// as a lossless 16 fps MP4 of the video size (AnimateMergeFilter,
+  /// ffmpeg); returns its bytes. Throws on errors.
+  std::string AnimateReplaceControl(const VideoTask& spec);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string body,
                    std::string content_type,
