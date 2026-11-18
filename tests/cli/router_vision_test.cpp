@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -359,7 +360,8 @@ void TestErrors() {
   // Unknown task: 400 naming every task; no --vision-dir: 503 for each task.
   auto response = service.Handle(Post(Body("AAAA", {"cat"})));
   assert(response->status == 400);
-  assert(response->body.find("person, head, face, hand, pose, pose_wholebody, ocr, wd14_tags") != std::string::npos);
+  assert(response->body.find("person, head, face, hand, hand_fingers, pose, pose_wholebody, ocr, "
+                             "wd14_tags") != std::string::npos);
   for (const char* task : {"person", "ocr", "wd14_tags"}) {
     response = service.Handle(Post(Body("AAAA", {task})));
     assert(response->status == 503);
@@ -381,6 +383,10 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"pose"})));
   assert(response->status == 503);
   assert(response->body.find("rtdetr_r50vd_coco_o365.safetensors") != std::string::npos);
+  // hand_fingers needs the hand detector.
+  response = service_missing.Handle(Post(Body("AAAA", {"hand_fingers"})));
+  assert(response->status == 503);
+  assert(response->body.find("hand_detect_v1.0_s.safetensors") != std::string::npos);
 }
 
 HttpResponse JsonAnswer(int status, std::string body) {
@@ -389,6 +395,178 @@ HttpResponse JsonAnswer(int status, std::string body) {
   response.body = std::move(body);
   response.headers = {{"Content-Type", "application/json"}};
   return response;
+}
+
+/// A chat answer as the router's /v1/chat/completions gives it.
+std::string ChatAnswer(const std::string& content) {
+  json::Value message = json::Value::object();
+  message["role"] = "assistant";
+  message["content"] = content;
+  json::Value choice = json::Value::object();
+  choice["index"] = 0;
+  choice["message"] = std::move(message);
+  choice["finish_reason"] = "stop";
+  json::Value choices = json::Value::array();
+  choices.push_back(std::move(choice));
+  json::Value body = json::Value::object();
+  body["object"] = "chat.completion";
+  body["choices"] = std::move(choices);
+  return body.dump();
+}
+
+bool ParseFails(const std::string& body) {
+  try {
+    (void)vision::ParseFingerAnswer(body);
+  } catch (const std::runtime_error&) {
+    return true;
+  }
+  return false;
+}
+
+bool BadFingerOption(const char* key, json::Value value, std::vector<std::string> tasks) {
+  json::Value bad = Body("AAAA", std::move(tasks));
+  json::Value o = json::Value::object();
+  o[key] = std::move(value);
+  bad["hand_fingers_options"] = std::move(o);
+  return Throws([&] { (void)vision::ParseRequest(bad); });
+}
+
+/// "hand_fingers": options, the crop box, the chat body, the answer parsing
+/// and CountFingers with a scripted chat (no model).
+void TestHandFingers() {
+  // The task runs the hand detector too; defaults.
+  vision::Request r = vision::ParseRequest(Body("AAAA", {"hand_fingers"}));
+  assert(r.tasks.size() == 1 && r.tasks[0].task == "hand");
+  assert(r.hand_fingers.enabled && r.hand_fingers.model == "qwen3.8-27b");
+  assert(r.hand_fingers.max_hands == 6 && !r.hand_fingers.thinking);
+  assert(r.hand_fingers.timeout_seconds == 120 && r.hand_fingers.margin == 0.25);
+  assert(!vision::ParseRequest(Body("AAAA", {"hand"})).hand_fingers.enabled);
+  // With hand listed too, and options.
+  json::Value body = Body("AAAA", {"face", "hand", "hand_fingers"});
+  json::Value options = json::Value::object();
+  options["model"] = "qwen3.8-flash";
+  options["max_hands"] = 2;
+  options["thinking"] = true;
+  options["timeout_seconds"] = 30;
+  options["margin"] = 0.5;
+  options["max_tokens"] = 64;
+  body["hand_fingers_options"] = std::move(options);
+  r = vision::ParseRequest(body);
+  assert(r.tasks.size() == 2 && r.tasks[1].task == "hand");
+  assert(r.hand_fingers.model == "qwen3.8-flash" && r.hand_fingers.max_hands == 2);
+  assert(r.hand_fingers.thinking && r.hand_fingers.timeout_seconds == 30);
+  assert(r.hand_fingers.margin == 0.5 && r.hand_fingers.max_tokens == 64);
+  assert(BadFingerOption("max_hands", 0, {"hand_fingers"}));
+  assert(BadFingerOption("max_hands", 17, {"hand_fingers"}));
+  assert(BadFingerOption("max_hands", 2.5, {"hand_fingers"}));
+  assert(BadFingerOption("model", "", {"hand_fingers"}));
+  assert(BadFingerOption("thinking", "nein", {"hand_fingers"}));
+  assert(BadFingerOption("timeout_seconds", 1, {"hand_fingers"}));
+  assert(BadFingerOption("margin", 1.5, {"hand_fingers"}));
+  assert(BadFingerOption("farbe", 1, {"hand_fingers"}));
+  assert(BadFingerOption("model", "x", {"hand"}));  // options without the task
+
+  // Crop: 25 % of the side on every side, clipped.
+  auto crop = vision::FingerCropBox({100, 200, 140, 280}, 0.25, 1000, 1000);
+  assert((crop == std::array<int, 4>{90, 180, 150, 300}));
+  crop = vision::FingerCropBox({0, 0, 10, 10}, 0.25, 12, 11);
+  assert((crop == std::array<int, 4>{0, 0, 12, 11}));
+
+  // The chat body: model, image, schema, thinking off.
+  const vision::HandFingersRequest defaults;
+  const json::Value chat = vision::FingerChatBody(defaults, "data:image/png;base64,AAAA");
+  assert(chat.member_str("model") == "qwen3.8-27b");
+  const json::Value& part = chat.find("messages")->items()[0].find("content")->items()[0];
+  assert(part.member_str("type") == "image_url");
+  assert(chat.find("response_format")->member_str("type") == "json_schema");
+  assert(!chat.find("chat_template_kwargs")->find("enable_thinking")->as_bool());
+  const json::Value& schema = *chat.find("response_format")->find("json_schema")->find("schema");
+  assert(schema.find("properties")->find("fingers")->member_double("maximum") == 10);
+
+  // Parsing the answer: plain, fenced, after a think block; refusals.
+  auto count = vision::ParseFingerAnswer(
+      ChatAnswer("{\"fingers\": 5, \"sicher\": true, \"befund\": \"fünf Finger, normal\"}"));
+  assert(count.fingers == 5 && count.sicher && count.befund == "fünf Finger, normal");
+  count = vision::ParseFingerAnswer(
+      ChatAnswer("```json\n{\"fingers\": 6, \"sicher\": false, \"befund\": \"sechs Finger\"}\n```"));
+  assert(count.fingers == 6 && !count.sicher);
+  count = vision::ParseFingerAnswer(ChatAnswer(
+      "<think>{\"fingers\": 1}</think>\n"
+      "{\"fingers\": 0, \"sicher\": true, \"befund\": \"Arm ohne Hand\"}"));
+  assert(count.fingers == 0 && count.befund == "Arm ohne Hand");
+  assert(ParseFails("nicht json"));
+  assert(ParseFails("{\"choices\": []}"));
+  assert(ParseFails(ChatAnswer("")));
+  assert(ParseFails(ChatAnswer("fünf")));
+  assert(ParseFails(ChatAnswer("{\"fingers\": 11, \"sicher\": true, \"befund\": \"\"}")));
+  assert(ParseFails(ChatAnswer("{\"fingers\": 4.5, \"sicher\": true, \"befund\": \"\"}")));
+  assert(ParseFails(ChatAnswer("{\"fingers\": 5, \"sicher\": \"ja\", \"befund\": \"\"}")));
+  assert(ParseFails(ChatAnswer("{\"fingers\": 5, \"sicher\": true}")));
+  assert(ParseFails(ChatAnswer("{\"fingers\": 5, \"sicher\": true, \"befund\": \"x\"")));
+
+  // CountFingers with a scripted chat: an answer, a refusal, garbage, and
+  // a hand beyond max_hands. Every hand keeps its box; no exception.
+  gufo::models::ccip::RgbImage image;
+  image.width = 64;
+  image.height = 48;
+  image.rgb.assign(static_cast<std::size_t>(64) * 48 * 3, 200);
+  const std::vector<vision::HandBox> hands = {{{10, 10, 30, 30}, 0.9},
+                                              {{40, 5, 60, 25}, 0.8},
+                                              {{0, 30, 20, 48}, 0.7},
+                                              {{5, 5, 15, 15}, 0.6}};
+  vision::HandFingersRequest options3;
+  options3.max_hands = 3;
+  std::vector<HttpRequest> asked;
+  const std::function<HttpResponse(const HttpRequest&)> serve = [&asked](const HttpRequest& inner) {
+    asked.push_back(inner);
+    if (asked.size() == 1)
+      return JsonAnswer(
+          200, ChatAnswer("{\"fingers\": 4, \"sicher\": false, \"befund\": \"Daumen verdeckt\"}"));
+    if (asked.size() == 2)
+      return JsonAnswer(503, "{\"error\": {\"message\": \"model is loading\", \"code\": \"busy\"}}");
+    return JsonAnswer(200, ChatAnswer("kein JSON"));
+  };
+  HttpRequest outer = Post(Body("AAAA", {"hand_fingers"}));
+  outer.headers.emplace_back("Authorization", "Bearer user-token");
+  outer.headers.emplace_back("X-Other", "nicht weiter");
+  const json::Value list = vision::CountFingers(options3, image, hands, serve, outer);
+  assert(asked.size() == 3);
+  assert(asked[0].method == "POST" && asked[0].path == "/v1/chat/completions");
+  bool token = false;
+  bool other = false;
+  for (const auto& [name, value] : asked[0].headers) {
+    token = token || (name == "Authorization" && value == "Bearer user-token");
+    other = other || name == "X-Other";
+  }
+  assert(token && !other);
+  assert(asked[0].is_cancelled && !asked[0].is_cancelled());  // the per-hand deadline
+  const json::Value sent = json::parse(asked[0].body);
+  const std::string url = sent.find("messages")->items()[0].find("content")->items()[0]
+                              .find("image_url")->member_str("url");
+  assert(url.starts_with("data:image/png;base64,"));
+  assert(list.size() == 4);
+  const json::Value& first = list.items()[0];
+  assert(first.member_double("fingers") == 4 && !first.find("sicher")->as_bool());
+  assert(first.member_str("befund") == "Daumen verdeckt" && first.find("fehler") == nullptr);
+  assert(first.find("box")->items()[2].as_double() == 30);
+  assert(first.find("crop")->items()[0].as_double() == 5 && first.find("seconds") != nullptr);
+  assert(first.member_double("score") == 0.9);
+  const json::Value& second = list.items()[1];
+  assert(second.find("fingers") == nullptr);
+  assert(second.member_str("fehler").find("503") != std::string::npos);
+  assert(second.member_str("fehler").find("model is loading") != std::string::npos);
+  assert(list.items()[2].member_str("fehler").find("no JSON object") != std::string::npos);
+  assert(list.items()[3].member_str("fehler").find("max_hands") != std::string::npos);
+  // No chat available, and a cancelled caller: fehler per hand, no call.
+  const json::Value none = vision::CountFingers(options3, image, {hands[0]}, nullptr, outer);
+  assert(none.items()[0].member_str("fehler") == "no chat on this router");
+  HttpRequest gone = outer;
+  gone.is_cancelled = [] { return true; };
+  asked.clear();
+  const json::Value cancelled = vision::CountFingers(options3, image, {hands[0]}, serve, gone);
+  assert(asked.empty() && cancelled.items()[0].member_str("fehler") == "cancelled");
+  // models.hand_fingers names the model.
+  assert(vision::HandFingersModelInfo(defaults).member_str("model") == "qwen3.8-27b");
 }
 
 void TestPool() {
@@ -892,6 +1070,7 @@ int main() {
   TestPool();
   TestRequestBytes();
   TestAblageCookie();
+  TestHandFingers();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')

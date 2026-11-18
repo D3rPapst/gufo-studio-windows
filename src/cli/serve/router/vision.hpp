@@ -53,6 +53,12 @@
 //   RT-DETR: ViTPose / DWPose run in exactly these boxes, in this order
 //   (the film pipeline's mundmessung.py keeps the first frame's box for
 //   every frame); the poses then carry no "score".
+//   "hand_fingers" (vision_fingers.hpp): the "hand" boxes cut out and the
+//   visible fingers counted by a vision chat model (default qwen3.8-27b,
+//   "hand_fingers_options") through the router's own chat API:
+//   detections.hand_fingers = [{"box", "score", "crop", "fingers", "sicher",
+//   "befund", "seconds"} or {..., "fehler"}]; not relayed to the pool
+//   partner unless the models are missing here.
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -86,6 +92,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/cpu_pool.hpp"
+#include "src/cli/serve/router/vision_fingers.hpp"
 #include "src/cli/serve/router/vision_wd14.hpp"
 #include "src/core/json.hpp"
 
@@ -153,6 +160,9 @@ struct Request {
   int pose_max_persons{4};
   /// "pose_boxes": the persons' boxes given by the caller (RT-DETR skipped).
   std::vector<std::array<float, 4>> pose_boxes;
+  /// "hand_fingers" and "hand_fingers_options" (vision_fingers.hpp); the
+  /// "hand" detector then runs too.
+  HandFingersRequest hand_fingers;
 };
 /// Most "pose_boxes" per request.
 inline constexpr std::size_t kMaxPoseBoxes = 16;
@@ -176,8 +186,9 @@ struct Options {
   std::shared_ptr<cpu::CpuQueue> queue;
   /// The pool partner (cpu_pool.hpp); null: never relayed.
   cpu::Relay relay;
-  /// One request through the gate and the router (for Ablage paths), as
-  /// mcp::Options::serve. Null: Ablage paths are refused (400).
+  /// One request through the gate and the router (for Ablage paths and the
+  /// "hand_fingers" chats), as mcp::Options::serve. Null: Ablage paths are
+  /// refused (400), every hand_fingers hand answers "fehler".
   std::function<server::HttpResponse(const server::HttpRequest&)> serve;
 };
 

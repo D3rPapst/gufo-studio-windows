@@ -11,6 +11,7 @@
 #include <exception>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -415,18 +416,24 @@ Request ParseRequest(const json::Value& body) {
   for (const std::string& name : names) {
     const auto& known = DetectorTasks();
     const auto& poses = PoseTasks();
-    if (name != kWd14Task && name != kOcrTask &&
+    if (name != kWd14Task && name != kOcrTask && name != kHandFingersTask &&
         std::none_of(known.begin(), known.end(),
                      [&](const TaskSpec& spec) { return spec.task == name; }) &&
         std::find(poses.begin(), poses.end(), name) == poses.end())
       throw std::invalid_argument("unknown task " + name +
-                                  " (person, head, face, hand, pose, pose_wholebody, ocr, wd14_tags)");
+                                  " (person, head, face, hand, hand_fingers, pose, pose_wholebody, ocr, "
+                                  "wd14_tags)");
   }
   // wd14_tags options; regions "person" run the person detector too.
   request.wd14 =
       ParseWd14(body, std::find(names.begin(), names.end(), kWd14Task) != names.end());
   if (request.wd14.persons && std::find(names.begin(), names.end(), "person") == names.end())
     names.push_back("person");
+  // hand_fingers counts the fingers in the boxes of the hand detector.
+  request.hand_fingers = ParseHandFingers(
+      body, std::find(names.begin(), names.end(), kHandFingersTask) != names.end());
+  if (request.hand_fingers.enabled && std::find(names.begin(), names.end(), "hand") == names.end())
+    names.push_back("hand");
   // Answer order: the table order, whatever order the caller used.
   for (const TaskSpec& spec : DetectorTasks()) {
     if (std::find(names.begin(), names.end(), spec.task) != names.end())
@@ -746,7 +753,11 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   cpu::CpuQueue& queue = *options_.queue;
   const cpu::Route route = cpu::Decide(request, static_cast<bool>(options_.relay),
                                        !queue.Idle(), !missing.empty());
-  if (route == cpu::Route::kTryPartner || route == cpu::Route::kPartnerOnly) {
+  // hand_fingers stays here unless the models are missing: an older
+  // partner would refuse the task with a 400 that counts as its answer.
+  const bool try_partner =
+      route == cpu::Route::kTryPartner && !parsed.hand_fingers.enabled;
+  if (try_partner || route == cpu::Route::kPartnerOnly) {
     const bool force = route == cpu::Route::kPartnerOnly;
     std::optional<HttpResponse> answer;
     if (options_.relay)
@@ -775,7 +786,9 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     case cpu::CpuQueue::Result::kCancelled:
       return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
   }
-  const cpu::CpuQueue::Turn turn(queue);
+  // Released before the hand_fingers chats (GPU, possibly minutes).
+  std::optional<cpu::CpuQueue::Turn> turn;
+  turn.emplace(queue);
   const auto started = std::chrono::steady_clock::now();
   models::ccip::RgbImage image;
   std::vector<models::ccip::RgbImage> wd14_images;
@@ -833,6 +846,7 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   json::Value detections = json::Value::object();
   json::Value used = json::Value::object();
   std::vector<std::array<int, 4>> persons;  // for wd14_tags regions "person"
+  std::vector<HandBox> hands;                // for hand_fingers
   json::Value out_poses;
   try {
     models::ccip::SetCpuThreads(options_.threads);
@@ -851,6 +865,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
         list.push_back(std::move(entry));
         if (spec.task == "person")
           persons.push_back(d.box);
+        if (spec.task == "hand")
+          hands.push_back(HandBox{d.box, static_cast<double>(d.score)});
       }
       detections[spec.task] = std::move(list);
       json::Value model = json::Value::object();
@@ -990,6 +1006,17 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
                           std::chrono::steady_clock::time_point b) {
     return std::round(std::chrono::duration<double>(b - a).count() * 1000.0) / 1000.0;
   };
+  double fingers_seconds = 0;
+  if (parsed.hand_fingers.enabled) {
+    // The chats run on the GPU through the router: the CPU queue goes on.
+    turn.reset();
+    detections[kHandFingersTask] =
+        CountFingers(parsed.hand_fingers, image, hands, options_.serve, request);
+    used[kHandFingersTask] = HandFingersModelInfo(parsed.hand_fingers);
+    fingers_seconds = seconds(done, std::chrono::steady_clock::now());
+    if (request.is_cancelled && request.is_cancelled())
+      return Error(499, "Client Closed Request", "cancelled", "cancelled");
+  }
   json::Value out = json::Value::object();
   out["object"] = "vision.detection";
   out["width"] = image.width;
@@ -1002,6 +1029,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   out["models"] = std::move(used);
   out["seconds"] = seconds(started, done);
   out["queue_seconds"] = seconds(queued, started);
+  if (parsed.hand_fingers.enabled)
+    out["hand_fingers_seconds"] = fingers_seconds;
   return JsonResponse(200, "OK", out.dump());
 }
 

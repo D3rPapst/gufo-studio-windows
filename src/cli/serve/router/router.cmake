@@ -38,6 +38,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/router.cpp
   src/cli/serve/router/selbsttest.cpp
   src/cli/serve/router/vision.cpp
+  src/cli/serve/router/vision_fingers.cpp
   src/cli/serve/router/vision_wd14.cpp
   src/cli/serve/router/ws_relay.cpp
   src/cli/serve/serve_options.cpp
