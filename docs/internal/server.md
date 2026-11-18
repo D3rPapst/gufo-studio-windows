@@ -2643,6 +2643,9 @@ and supports `json`, `text`, and `verbose_json`. `stream=true` with JSON emits
 OpenAI transcript delta/done events. Long uploads are split within model
 capacity; `max_tokens` applies per chunk. Logprobs (`include[]`) requests are
 rejected; unknown fields are ignored.
+A `file` the model cannot decode returns 400 `invalid_audio_input` (an
+`invalid_audio_input` error event when streaming); other failures return 500
+`transcription_failed`.
 
 `timestamp_granularities[]` (one field per value, `word` and/or `segment`)
 needs `response_format=verbose_json`; other formats answer 400
