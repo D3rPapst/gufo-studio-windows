@@ -754,6 +754,12 @@ function(gufo_qwen_image_21_register_tests)
   target_link_libraries(qwen_image_21_control_test PRIVATE gufo_qwen_image_21)
   add_test(NAME qwen_image_21_control_test COMMAND qwen_image_21_control_test)
   set_tests_properties(qwen_image_21_control_test PROPERTIES LABELS "cpu;models;qwen-image")
+  # gufo.guidance_steps parsing in the provider's BuildRequest.
+  add_executable(qwen_image_21_guidance_steps_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/guidance_steps_test.cpp)
+  target_link_libraries(qwen_image_21_guidance_steps_test PRIVATE gufo_qwen_image_21)
+  add_test(NAME qwen_image_21_guidance_steps_test COMMAND qwen_image_21_guidance_steps_test)
+  set_tests_properties(qwen_image_21_guidance_steps_test PROPERTIES LABELS "cpu;models;qwen-image")
   # Image API contract of the extension fields (gufo.control_*, init_image,
   # mask) through the host's pass-through and the provider's BuildRequest.
   add_executable(qwen_image_21_control_api_test

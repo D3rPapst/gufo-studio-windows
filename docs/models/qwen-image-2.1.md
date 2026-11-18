@@ -55,6 +55,30 @@ Output is base64 PNG. URL output, separate masks, streaming and
 `input_fidelity` aren't supported. With the OpenAI SDK, pass `seed` and
 `steps` through `extra_body`.
 
+### Guidance
+
+True classifier-free guidance is off by default. The `gufo` extension object
+turns it on (JSON body `"gufo": {...}`, or form fields `gufo.<name>` on
+`/v1/images/edits`):
+
+| Field | Behavior |
+| --- | --- |
+| `gufo.guidance` | 0 to 20, default 1. Above 1 each guided step also runs the negative prompt and combines `negative + guidance × (positive − negative)`, which doubles the transformer work of that step. |
+| `gufo.negative_prompt` | Text for the negative pass; empty encodes like an empty prompt. |
+| `gufo.guidance_steps` | Whole number 0 to 100, default 0. With `guidance` above 1, only the first N steps are guided; the remaining steps run the positive pass alone, as at guidance 1. 0, or a value of at least `steps`, guides every step. Has no effect at guidance 1. Other values return HTTP 400. |
+
+Guiding only the early steps, where the layout is decided, trades some of
+the effect of full guidance for speed; for example `"guidance": 4, "guidance_steps": 12` with
+`"steps": 40` saves about 28 negative passes. The image differs from a fully
+guided one with the same seed.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/images/edits \
+  -F model=Qwen-Image-2.1 -F 'image[]=@room.png' \
+  -F 'prompt=Paint the walls blue' -F gufo.guidance=4 \
+  -F gufo.guidance_steps=12 -F 'gufo.negative_prompt=blurry' > response.json
+```
+
 The upstream project recommends 2048 × 2048; Gufo defaults to 1024 × 1024,
 like the pinned Diffusers version. Set `size` for larger images.
 

@@ -1367,7 +1367,11 @@ Result Model::Generate(const Request& request,
         rt.Observe(observer, "dit." + std::to_string(step) + ".regional",
                    velocity);
       }
-      if (guided) {
+      // gufo.guidance_steps: CFG on the first N steps, then positive only.
+      const bool guided_step =
+          guided &&
+          (request.guidance_steps <= 0 || step < request.guidance_steps);
+      if (guided_step) {
         const auto negative = Denoise(
             rt,
             control && !controlled ? *plain_negative_context

@@ -140,6 +140,20 @@ int main() {
                         R"("}})") == 400,
         "server without --controlnet rejects");
   Check(calls == before, "rejected requests never reach the model");
+  // gufo.guidance_steps (2.2.3): CFG on the first N steps only.
+  Check(post(service, R"({"prompt":"a","size":"256x256","gufo":{"guidance":4,"guidance_steps":5}})") ==
+                200 &&
+            seen.guidance_steps == 5 && seen.guidance == 4.0F,
+        "json guidance_steps");
+  Check(post(service, R"({"prompt":"a","size":"256x256","gufo":{"guidance":4}})") ==
+                200 &&
+            seen.guidance_steps == 0,
+        "json guidance_steps default");
+  for (const std::string body :
+       {std::string(R"({"prompt":"a","gufo":{"guidance_steps":-2}})"),
+        std::string(R"({"prompt":"a","gufo":{"guidance_steps":2.5}})"),
+        std::string(R"({"prompt":"a","gufo":{"guidance_steps":"x"}})")})
+    Check(post(service, body) == 400, "rejected: " + body);
 
   // Multipart edit: start image + mask + control_image file part, inpaint.
   // ("init_image": an OpenAI-style "image" would also stay a reference.)
@@ -215,6 +229,17 @@ int main() {
                                  {"gufo.control_image", pose_b64}})) == 200 &&
             seen.control && seen.strength == 0.5 && seen.images.empty(),
         "form field control_image with image to image");
+  // gufo.guidance_steps as a multipart form field (JSON number).
+  Check(post(service, multipart({{"image", start_png}},
+                                {{"prompt", "a"},
+                                 {"gufo.guidance", "3"},
+                                 {"gufo.guidance_steps", "4"}})) == 200 &&
+            seen.guidance_steps == 4 && seen.guidance == 3.0F,
+        "multipart guidance_steps");
+  Check(post(service, multipart({{"image", start_png}},
+                                {{"prompt", "a"},
+                                 {"gufo.guidance_steps", "-1"}})) == 400,
+        "multipart guidance_steps -1 rejected");
   if (failures) {
     std::cerr << failures << " failure(s)\n";
     return 1;

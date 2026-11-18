@@ -76,6 +76,7 @@ public:
     }
     std::ostringstream details;
     details << "event=generated_extension guidance=" << req.guidance
+            << " guidance_steps=" << req.guidance_steps
             << " strength=" << req.strength
             << " init_image=" << (req.init_image ? 1 : 0)
             << " mask=" << (req.mask ? 1 : 0);

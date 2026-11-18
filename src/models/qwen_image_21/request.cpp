@@ -22,8 +22,9 @@
 namespace gufo::models::qwen_image_21 {
 namespace {
 
-constexpr std::array<std::string_view, 17> kExtensionFields{
-    "negative_prompt",  "guidance",         "strength",      "init_image",
+constexpr std::array<std::string_view, 18> kExtensionFields{
+    "negative_prompt",  "guidance",         "guidance_steps", "strength",
+    "init_image",
     "preview",          "mask",             "mask_channel",  "mask_composite",
     "mask_feather",     "mask_blur",        "regions",       "base_strength",
     "control_image",    "control_strength", "control_start", "control_end",
@@ -295,6 +296,10 @@ Request BuildRequest(const ext::ImageRequest& in, const ProviderState& state) {
     generation.negative_prompt = String(*extension, "negative_prompt", "");
     generation.guidance =
         static_cast<float>(Real(*extension, "guidance", 1, 0, 20));
+    // CFG on the first N steps only (0 = every step), then the positive
+    // pass alone as at guidance 1.
+    generation.guidance_steps = static_cast<int>(
+        Number(*extension, "guidance_steps", 0, 0, 100));
     generation.strength = Real(*extension, "strength", 1, 0.01, 1);
     if (const auto* init = extension->find("init_image")) {
       if (init_image)

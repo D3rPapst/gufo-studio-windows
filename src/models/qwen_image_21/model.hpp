@@ -190,6 +190,10 @@ struct Request {
   /// unguided single-pass path.
   std::string negative_prompt;
   float guidance{1};
+  /// With guidance > 1: CFG (negative pass + combine) only on the first
+  /// `guidance_steps` steps, the rest run the positive pass alone as at
+  /// guidance 1. 0 (default) or at least `steps` guides every step.
+  int guidance_steps{0};
   /// Image to image (ComfyUI VAEEncode -> KSampler denoise). The image is
   /// resized to width x height and VAE-encoded; `strength` below 1 runs
   /// `steps` steps from the tail of an int(steps / strength) schedule,

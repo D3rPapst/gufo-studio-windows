@@ -457,6 +457,8 @@ void ValidateRequest(const Request& request) {
   if (!std::isfinite(request.guidance) || request.guidance < 0 ||
       request.guidance > 20)
     throw std::invalid_argument("guidance must be between 0 and 20");
+  if (request.guidance_steps < 0 || request.guidance_steps > 100)
+    throw std::invalid_argument("guidance steps must be between 0 and 100");
   if (!(request.strength >= 0.01 && request.strength <= 1))
     throw std::invalid_argument("strength must be between 0.01 and 1");
   if (request.strength <= kFullStrength && !request.init_image)
