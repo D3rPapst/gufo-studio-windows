@@ -96,6 +96,8 @@ constexpr std::string_view kPlumbing[] = {
     "EmptyImage",
     "RepeatImageBatch",
     "WanFirstLastFrameToVideo",
+    // Wan 2.2 Animate on VACE.
+    "WanAnimateToVideo",
     // Regional prompts (Qwen-Image): gufo.regions.
     "ConditioningCombine",
     "ConditioningSetMask",
@@ -489,7 +491,8 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
       cond.zeroed = true;
       link = graph.RequireLink(link->node, "conditioning");
     } else if (cls == "WanImageToVideo" || cls == "WanCameraImageToVideo" ||
-               cls == "WanVaceToVideo" || cls == "WanFirstLastFrameToVideo") {
+               cls == "WanVaceToVideo" || cls == "WanFirstLastFrameToVideo" ||
+               cls == "WanAnimateToVideo") {
       // Outputs (positive, negative, latent): follow the matching input.
       link = graph.RequireLink(link->node,
                                link->slot == 1 ? "negative" : "positive");
@@ -2389,7 +2392,8 @@ std::optional<std::vector<std::string>> VaceSamplerChain(
     } else {
       const std::string cls = graph.Class(latent->node);
       if (!head.empty() ||
-          (cls != "WanVaceToVideo" && cls != "WanFirstLastFrameToVideo"))
+          (cls != "WanVaceToVideo" && cls != "WanFirstLastFrameToVideo" &&
+           cls != "WanAnimateToVideo"))
         return std::nullopt;
       head = g;
     }
@@ -2408,9 +2412,164 @@ std::optional<std::vector<std::string>> VaceSamplerChain(
   return chain;
 }
 
+/// A VACE MASK input (control_masks, WanAnimateToVideo character_mask):
+/// ImageToMask on a video or on image frames, or LoadImageMask (a still for
+/// every frame; `still_for_all`: the node does the same, no warning),
+/// through InvertMask. 0 = keep, 1 = generate.
+void VaceMaskInput(const Graph& graph, const std::string& vace,
+                   const std::string& key, const Link& mask,
+                   bool still_for_all, VideoTask* task,
+                   std::vector<std::string>* warnings) {
+  Link link = mask;
+  for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
+       ++guard) {
+    task->vace_invert_mask = !task->vace_invert_mask;
+    link = graph.RequireLink(link.node, "mask");
+  }
+  const std::string source = graph.Class(link.node);
+  std::string channel;
+  if (source == "ImageToMask") {
+    // A mask video, or mask frames built in the graph (black = keep,
+    // white = generate; ComfyUI pads missing frames with 1).
+    channel = graph.Str(link.node, "channel", "red");
+    VaceFrames(graph, link.node, "image",
+               graph.RequireLink(link.node, "image"), warnings,
+               &task->vace_mask, &task->mask_runs);
+  } else if (source == "LoadImageMask") {
+    channel = graph.Str(link.node, "channel", "alpha");
+    task->vace_mask = ParseFileRef(graph.Str(link.node, "image"), "input");
+    if (!still_for_all)
+      warnings->push_back("node " + vace +
+                          ": gufo applies the still mask to every frame "
+                          "(ComfyUI masks only the first frame and pads "
+                          "the rest with 1)");
+  } else {
+    throw NodeFailure(vace, "unsupported_link",
+                      key +
+                          " must come from ImageToMask (on a loaded video or "
+                          "image frames), LoadImageMask or InvertMask, not " +
+                          source);
+  }
+  if (channel != "red" && channel != "green" && channel != "blue")
+    throw NodeFailure(link.node, "unsupported_value",
+                      "gufo reads VACE masks from the red, green or blue "
+                      "channel, not " +
+                          channel);
+  task->vace_mask_channel = channel;
+}
+
+/// True when a MASK input is a LoadImageMask still (through InvertMask).
+bool StillMask(const Graph& graph, Link link) {
+  for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
+       ++guard)
+    link = graph.RequireLink(link.node, "mask");
+  return graph.Class(link.node) == "LoadImageMask";
+}
+
+/// A video input of WanAnimateToVideo from frame `offset` on
+/// (video_frame_offset seeks in all of them; ComfyUI drops an input it
+/// skips entirely). Frames built in the graph are cut here; a loaded video
+/// only with offset 0.
+void AnimateFrames(const Graph& graph, const std::string& node,
+                   const std::string& key, const Link& link, int offset,
+                   const VideoTask& task, std::vector<std::string>* warnings,
+                   std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
+  VaceFrames(graph, node, key, link, warnings, file, runs);
+  if (!runs->empty()) {
+    *runs = KeepFrames(std::move(*runs), offset, task.frames);
+    if (FrameCount(*runs) == 0)
+      runs->clear();
+  } else if (offset > 0) {
+    throw NodeFailure(node, "unsupported_value",
+                      "video_frame_offset " + std::to_string(offset) +
+                          " with a loaded " + key +
+                          " is not supported by gufo; cut the video to the "
+                          "part or use offset 0");
+  }
+}
+
+/// Wan 2.2 Animate (WanAnimateToVideo) on VACE, as far as VACE can follow:
+///  - pose_video -> control_video (ComfyUI repeats the last pose frame up
+///    to length; done here for frames built in the graph), the whole
+///    picture generated after it;
+///  - without pose_video, background_video + character_mask -> control
+///    video + mask (character replacement: 1 = generate the character,
+///    0 = keep the background, as both nodes read it);
+///  - reference_image -> reference_images (BuildVace).
+/// face_video, clip_vision_output and continue_motion have no VACE input
+/// and are ignored with a warning.
+void AnimateControl(const Graph& graph, const std::string& node,
+                    VideoTask* task, std::vector<std::string>* warnings) {
+  warnings->push_back("node " + node +
+                      ": gufo has no Wan 2.2 Animate model; it runs on " +
+                      task->model +
+                      " (Wan 2.1 VACE): the motion follows pose_video, the "
+                      "facial expression does not follow face_video");
+  for (const char* unused :
+       {"face_video", "clip_vision_output", "continue_motion"})
+    if (graph.LinkOf(node, unused))
+      warnings->push_back("node " + node + ": " + unused +
+                          " is ignored (VACE has no such input)");
+  const int offset =
+      WholeInput(graph, node, "video_frame_offset", 0, 0, 16384);
+  const auto pose = graph.LinkOf(node, "pose_video");
+  const auto background = graph.LinkOf(node, "background_video");
+  const auto mask = graph.LinkOf(node, "character_mask");
+  if (pose) {
+    AnimateFrames(graph, node, "pose_video", *pose, offset, *task, warnings,
+                  &task->control_video, &task->control_runs);
+    // ComfyUI repeats the last pose frame up to length.
+    const int missing = task->frames - FrameCount(task->control_runs);
+    if (!task->control_runs.empty() && missing > 0)
+      for (auto run = task->control_runs.rbegin();
+           run != task->control_runs.rend(); ++run)
+        if (run->count > 0) {
+          run->count += missing;
+          break;
+        }
+    if (background || mask)
+      warnings->push_back(
+          "node " + node +
+          ": background_video / character_mask are ignored next to "
+          "pose_video (VACE takes one control video; gufo animates the "
+          "whole picture after the pose)");
+    return;
+  }
+  if (background && mask) {
+    AnimateFrames(graph, node, "background_video", *background, offset,
+                  *task, warnings, &task->control_video, &task->control_runs);
+    VaceMaskInput(graph, node, "character_mask", *mask, true, task, warnings);
+    if (!task->mask_runs.empty()) {
+      if (FrameCount(task->mask_runs) == 1) {
+        // One mask frame stands for every frame (ComfyUI repeats it).
+        for (FrameRun& run : task->mask_runs)
+          if (run.count > 0)
+            run.count = task->frames;
+      } else {
+        task->mask_runs =
+            KeepFrames(std::move(task->mask_runs), offset, task->frames);
+      }
+    } else if (offset > 0 && task->vace_mask && !StillMask(graph, *mask)) {
+      throw NodeFailure(node, "unsupported_value",
+                        "video_frame_offset " + std::to_string(offset) +
+                            " with a loaded character_mask video is not "
+                            "supported by gufo");
+    }
+    return;
+  }
+  if (background || mask)
+    warnings->push_back(
+        "node " + node + ": " +
+        std::string(background ? "background_video" : "character_mask") +
+        " is ignored without " +
+        (background ? "character_mask" : "background_video") +
+        " and pose_video");
+}
+
 /// Wan 2.1 VACE 14B (wan2.1-vace-14b, 16 fps): KSampler <- WanVaceToVideo,
 /// TrimVideoLatent behind the sampler (gufo always trims the reference
-/// frames); or KSampler <- WanFirstLastFrameToVideo on VACE. `stages`: a
+/// frames); or KSampler <- WanFirstLastFrameToVideo / WanAnimateToVideo on
+/// VACE. `stages`: a
 /// KSamplerAdvanced chain (first stage first), empty = `first` alone.
 VideoTask BuildVace(const Graph& graph, const std::string& first,
                     const ModelIds& models, const Link& latent,
@@ -2418,6 +2577,7 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
                     const std::vector<std::string>& stages = {}) {
   const std::string vace = latent.node;
   const bool first_last = graph.Class(vace) == "WanFirstLastFrameToVideo";
+  const bool animate = graph.Class(vace) == "WanAnimateToVideo";
   const std::string sampler = CheckSamplerStages(
       graph, stages.empty() ? std::vector<std::string>{first} : stages,
       warnings);
@@ -2451,46 +2611,14 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     task.vace_strength = strength;
   if (first_last)
     FirstLastControl(graph, vace, &task, warnings);
+  if (animate)
+    AnimateControl(graph, vace, &task, warnings);
   if (auto control = graph.LinkOf(vace, "control_video"); control && !first_last)
     VaceFrames(graph, vace, "control_video", *control, warnings,
                &task.control_video, &task.control_runs);
-  if (auto mask = graph.LinkOf(vace, "control_masks"); mask && !first_last) {
-    Link link = *mask;
-    for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
-         ++guard) {
-      task.vace_invert_mask = !task.vace_invert_mask;
-      link = graph.RequireLink(link.node, "mask");
-    }
-    const std::string source = graph.Class(link.node);
-    std::string channel;
-    if (source == "ImageToMask") {
-      // A mask video, or mask frames built in the graph (black = keep,
-      // white = generate; ComfyUI pads missing frames with 1).
-      channel = graph.Str(link.node, "channel", "red");
-      VaceFrames(graph, link.node, "image",
-                 graph.RequireLink(link.node, "image"), warnings,
-                 &task.vace_mask, &task.mask_runs);
-    } else if (source == "LoadImageMask") {
-      channel = graph.Str(link.node, "channel", "alpha");
-      task.vace_mask = ParseFileRef(graph.Str(link.node, "image"), "input");
-      warnings->push_back("node " + vace +
-                          ": gufo applies the still mask to every frame "
-                          "(ComfyUI masks only the first frame and pads "
-                          "the rest with 1)");
-    } else {
-      throw NodeFailure(vace, "unsupported_link",
-                        "control_masks must come from ImageToMask (on a "
-                        "loaded video or image frames), LoadImageMask or "
-                        "InvertMask, not " +
-                            source);
-    }
-    if (channel != "red" && channel != "green" && channel != "blue")
-      throw NodeFailure(link.node, "unsupported_value",
-                        "gufo reads VACE masks from the red, green or blue "
-                        "channel, not " +
-                            channel);
-    task.vace_mask_channel = channel;
-  }
+  if (auto mask = graph.LinkOf(vace, "control_masks"); mask && !first_last)
+    VaceMaskInput(graph, vace, "control_masks", *mask, false, &task,
+                  warnings);
   if (auto reference = graph.LinkOf(vace, "reference_image"))
     task.reference_images.push_back(
         ImageFile(graph, vace, "reference_image", *reference));
@@ -2536,11 +2664,18 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     const std::string lower = Lower(name);
     if (lower.find("lightx2v") == std::string::npos &&
         lower.find("distill") == std::string::npos &&
-        lower.find("causvid") == std::string::npos)
+        lower.find("causvid") == std::string::npos) {
+      // Wan 2.2 Animate LoRAs (e.g. relight) have no VACE counterpart.
+      if (animate) {
+        warnings->push_back("node " + sampler + ": LoRA " + name +
+                            " is ignored (no Wan 2.2 Animate model in gufo)");
+        continue;
+      }
       throw NodeFailure(sampler, "unsupported_value",
                         "gufo wan2.1-vace-14b has its step-distill LoRA "
                         "(lightx2v) built in and takes no other LoRA, not " +
                             name);
+    }
     if (lower.find("lightx2v") == std::string::npos || lora_strength != 1.0)
       warnings->push_back("node " + sampler + ": LoRA " + name +
                           " runs as gufo's built-in lightx2v T2V LoRA at "
@@ -4072,7 +4207,8 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
           else if (latent_class == "WanVaceToVideo" ||
-                   latent_class == "WanFirstLastFrameToVideo")
+                   latent_class == "WanFirstLastFrameToVideo" ||
+                   latent_class == "WanAnimateToVideo")
             task.spec = BuildVace(graph, generator, models, latent,
                                   &plan->warnings, stages_of[generator]);
           else if (latent_class == "WanInfiniteTalkToVideo" ||

@@ -33,7 +33,10 @@
 //          video or batch) / InvertMask or LoadImageMask, reference_image
 //          from LoadImage), TrimVideoLatent after it; or KSampler <-
 //          WanFirstLastFrameToVideo (start / end frames as VACE control
-//          frames with a keep mask, gufo has no FLF2V model); a
+//          frames with a keep mask, gufo has no FLF2V model); or KSampler
+//          <- WanAnimateToVideo (pose_video as control video, or
+//          background_video + character_mask as control video + mask,
+//          reference_image; gufo has no Wan 2.2 Animate model); a
 //          KSamplerAdvanced chain (Wan 2.2 high / low noise) runs as one
 //          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
