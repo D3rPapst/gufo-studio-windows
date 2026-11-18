@@ -28,6 +28,8 @@ bool Probe(std::string_view model_root) {
         return IsWan21VaceDirectory(root);
       case Family::kWan21Talk:
         return IsWan21TalkDirectory(root);
+      case Family::kWan22Animate:
+        return IsWan22AnimateDirectory(root);
     }
   } catch (...) {
   }
@@ -101,6 +103,8 @@ ext::VideoProvider MakeVideoProvider(Family family,
       return Make<Family::kWan21Uni3C>(create);
     case Family::kWan21Vace:
       return Make<Family::kWan21Vace>(create);
+    case Family::kWan22Animate:
+      return Make<Family::kWan22Animate>(create);
     case Family::kWan21Talk:
       break;
   }
@@ -112,7 +116,8 @@ ext::VideoProvider MakeVideoProvider(Family family,
 void wan22_register(gufo::ext::Registry& registry) {
   using gufo::models::wan22::Family;
   for (const Family family : {Family::kWan22, Family::kWan21Uni3C,
-                              Family::kWan21Vace, Family::kWan21Talk}) {
+                              Family::kWan21Vace, Family::kWan21Talk,
+                              Family::kWan22Animate}) {
     registry.AddVideoProvider(
         gufo::models::wan22::MakeVideoProvider(family, nullptr));
   }

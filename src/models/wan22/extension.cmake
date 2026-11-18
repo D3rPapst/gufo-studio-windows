@@ -45,6 +45,7 @@ gufo_extension_target(
     pipeline.cpp
     pipeline21.cpp
     pipeline_vace.cpp
+    pipeline_animate.cpp
     talk21.cpp
     ${gufo_wan22_video_io}
     runners.cpp

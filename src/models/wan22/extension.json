@@ -58,6 +58,18 @@
       ],
       "target": "gufo_wan22_hip",
       "entry": "wan21_talk_provider_register"
+    },
+    {
+      "id": "wan22-animate-14b",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan22Animate"
+      ],
+      "model_ids": [
+        "wan2.2-animate-14b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan22_animate_provider_register"
     }
   ],
   "targets": {

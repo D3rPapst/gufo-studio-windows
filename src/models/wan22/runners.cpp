@@ -17,7 +17,9 @@
 
 #include <gufo/ext/json.hpp>
 #include "src/models/wan22/pipeline.hpp"
+#include "src/models/wan22/animate_context.hpp"
 #include "src/models/wan22/pipeline21.hpp"
+#include "src/models/wan22/pipeline_animate.hpp"
 #include "src/models/wan22/pipeline_vace.hpp"
 #include "src/models/wan22/talk21.hpp"
 #include "src/models/wan22/video_io.hpp"
@@ -599,6 +601,176 @@ bool RunWan21TalkJob(const JobRequest& request, const JobCallbacks& callbacks,
     telemetry->prompt_ms = stages.text_ms;
     telemetry->denoise_ms =
         stages.dit_load_ms + stages.context_ms + stages.motion_ms + denoise;
+    telemetry->video_vae_ms = stages.decode_ms;
+    telemetry->media_ms = Since(media_start);
+    telemetry->total_ms = stages.total_ms + telemetry->media_ms;
+    extra["total_ms"] = telemetry->total_ms;
+    telemetry->extra_json = extra.dump();
+  }
+  return true;
+}
+
+bool RunWan22AnimateJob(const JobRequest& request,
+                        const JobCallbacks& callbacks,
+                        ext::VideoTelemetry* telemetry, std::string* error) {
+  json::Value manifest;
+  json::Value options = json::Value::object();
+  if (!ReadManifest(request, "gufo-animate.json", &manifest, error))
+    return false;
+  try {
+    if (!request.animate_json.empty())
+      options = json::parse(request.animate_json);
+  } catch (const std::exception& e) {
+    SetError(error, std::string("gufo.animate: ") + e.what());
+    return false;
+  }
+  const auto whole = [](const json::Value& object, const char* key,
+                        int fallback) {
+    return static_cast<int>(std::lround(object.member_double(key, fallback)));
+  };
+  Animate22Request job;
+  job.vae_root = Part(request, manifest, "vae");
+  job.clip_root = Part(request, manifest, "clip");
+  if (job.clip_root.empty())
+    job.clip_root = job.vae_root;
+  job.t5_root = Part(request, manifest, "t5");
+  job.dit_file = Part(request, manifest, "dit");
+  job.lora_file = Part(request, manifest, "lora");
+  job.lora_strength =
+      static_cast<float>(manifest.member_double("lora_strength", 1.0));
+  if (const json::Value* lora = options.find("lora");
+      lora != nullptr && lora->is_bool() && !lora->as_bool())
+    job.lora_file.clear();
+  job.shift = static_cast<float>(
+      options.member_double("shift", manifest.member_double("shift", 5.0)));
+  job.sampler =
+      options.member_str("sampler", manifest.member_str("sampler", "lcm"));
+  job.prompt = request.prompt;
+  job.negative_prompt = request.negative_prompt;
+  job.guidance = static_cast<float>(request.guidance);
+  job.width = request.width;
+  job.height = request.height;
+  job.frames = request.frames;
+  job.steps = request.steps;
+  job.seed = request.seed;
+  // Chunk length: the option, the bundle's, at most the video (4k + 1).
+  job.length = std::min(whole(options, "length", whole(manifest, "length", 77)),
+                        job.frames);
+  job.continue_frames = whole(options, "continue_frames",
+                              whole(manifest, "continue_frames", 5));
+  job.continue_motion_max_frames =
+      whole(options, "continue_motion_max_frames", 5);
+  job.video_frame_offset = whole(options, "video_frame_offset", 0);
+  const int w = job.width, h = job.height;
+  const std::size_t frame_pixels = static_cast<std::size_t>(w) * h;
+  // Enough frames for every chunk from the seek on.
+  const int needed = job.video_frame_offset + job.frames + job.length;
+
+  Report(callbacks, "inputs", 0, 1);
+  std::vector<std::uint8_t> reference;
+  if (!request.first_frame.rgb.empty()) {
+    reference = FitFirstFrame(request);
+    if (reference.size() != frame_pixels * 3) {
+      SetError(error, "invalid Animate reference image");
+      return false;
+    }
+    job.reference = reference;
+  }
+  std::vector<std::uint8_t> pose, face, background, previous;
+  if (!request.pose_video_path.empty()) {
+    if (!ReadFittedVideo(request.pose_video_path, w, h, needed, &pose,
+                         &job.pose_frames, error))
+      return false;
+    job.pose = pose;
+  }
+  if (!request.face_video_path.empty()) {
+    if (!ReadFittedVideo(request.face_video_path, kAnimateFaceSize,
+                         kAnimateFaceSize, needed, &face, &job.face_frames,
+                         error))
+      return false;
+    job.face = face;
+  }
+  if (!request.background_video_path.empty()) {
+    if (!ReadFittedVideo(request.background_video_path, w, h, needed,
+                         &background, &job.background_frames, error))
+      return false;
+    job.background = background;
+  }
+  if (!request.continue_video_path.empty()) {
+    // The node keeps the last continue_motion_max_frames frames.
+    if (!ReadFittedVideo(request.continue_video_path, w, h, 481, &previous,
+                         &job.continue_motion_frames, error))
+      return false;
+    job.continue_motion = previous;
+  }
+  std::vector<float> mask;
+  if (!request.mask_path.empty()) {
+    const std::string channel = options.member_str("mask_channel", "red");
+    const json::Value* invert_value = options.find("invert_mask");
+    const bool invert = invert_value != nullptr && invert_value->is_bool() &&
+                        invert_value->as_bool();
+    const auto value = [&](const std::uint8_t* rgb) {
+      float v;
+      if (channel == "green")
+        v = rgb[1];
+      else if (channel == "blue")
+        v = rgb[2];
+      else if (channel == "luma")
+        v = 0.299F * rgb[0] + 0.587F * rgb[1] + 0.114F * rgb[2];
+      else
+        v = rgb[0];
+      v /= 255.0F;
+      return invert ? 1.0F - v : v;
+    };
+    std::vector<std::uint8_t> rgb;
+    if (request.mask_path.extension() == ".ppm") {
+      // One still: the node repeats a one-frame mask for every frame.
+      int mw = 0, mh = 0;
+      std::vector<std::uint8_t> still;
+      if (!ReadPpm(request.mask_path, &still, &mw, &mh, error))
+        return false;
+      rgb = FitImage(still, mw, mh, w, h);
+      if (rgb.size() != frame_pixels * 3) {
+        SetError(error, "cannot scale the Animate character mask");
+        return false;
+      }
+      job.mask_frames = 1;
+    } else if (!ReadFittedVideo(request.mask_path, w, h, needed, &rgb,
+                                &job.mask_frames, error)) {
+      return false;
+    }
+    mask.resize(frame_pixels * job.mask_frames);
+    for (std::size_t p = 0; p < mask.size(); ++p)
+      mask[p] = value(rgb.data() + 3 * p);
+    job.mask = mask;
+  }
+  Report(callbacks, "inputs", 1, 1);
+
+  const I2V21Callbacks pipeline = Wan21Callbacks(request, callbacks);
+  DecodedVideo video;
+  Animate22Telemetry stages;
+  if (!GenerateAnimate22(job, pipeline, &video, &stages, error))
+    return false;
+  if (Cancelled(callbacks, error))
+    return false;
+  Report(callbacks, "media", 0, 1);
+  const auto media_start = Clock::now();
+  if (!WriteMp4(request.output_path, video, Fps(Family::kWan22Animate), error))
+    return false;
+  Report(callbacks, "media", 1, 1);
+  if (telemetry != nullptr) {
+    double denoise = 0;
+    for (double ms : stages.step_ms)
+      denoise += ms;
+    json::Value extra = json::Value::object();
+    extra["keyframe_ms"] = stages.clip_ms + stages.condition_ms;
+    extra["face_ms"] = stages.face_ms;
+    extra["chunks"] = stages.chunks;
+    extra["preview_ms"] = stages.preview_ms;
+    extra["previews"] = stages.previews;
+    telemetry->prompt_ms = stages.text_ms;
+    telemetry->denoise_ms = stages.dit_load_ms + stages.context_ms +
+                            stages.face_ms + denoise;
     telemetry->video_vae_ms = stages.decode_ms;
     telemetry->media_ms = Since(media_start);
     telemetry->total_ms = stages.total_ms + telemetry->media_ms;

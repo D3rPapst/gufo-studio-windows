@@ -55,6 +55,17 @@ struct JobCallbacks {
                                    ext::VideoTelemetry* telemetry,
                                    std::string* error);
 
+/// Wan 2.2 Animate 14B (16 fps). gufo-animate.json: {"vae", "clip", "t5",
+/// "dit", "lora", "lora_strength", "shift", "sampler", "length",
+/// "continue_frames"} ("vae" / "clip": Diffusers roots with vae/ and
+/// image_encoder/). Videos are read frame by frame (no frame-rate change):
+/// pose, background and mask fitted to the video size, face crops to
+/// 512x512.
+[[nodiscard]] bool RunWan22AnimateJob(const JobRequest& job,
+                                      const JobCallbacks& callbacks,
+                                      ext::VideoTelemetry* telemetry,
+                                      std::string* error);
+
 /// Up to `max_frames` frames of an MP4, each fitted to width x height like
 /// the first frame (cover, centre crop), RGB8 one after another; `count` is
 /// how many were read (at least one).
