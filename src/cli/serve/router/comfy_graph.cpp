@@ -193,6 +193,20 @@ class Graph {
 public:
   explicit Graph(const json::Value& prompt) : prompt_(prompt) {}
 
+  /// True when some node of class `cls` links input `key` to `source`.
+  bool Feeds(const std::string& cls, const std::string& key,
+             const Link& source) const {
+    for (const auto& [id, node] : prompt_.members()) {
+      (void)node;
+      if (Class(id) != cls)
+        continue;
+      const auto link = LinkOf(id, key);
+      if (link && link->node == source.node && link->slot == source.slot)
+        return true;
+    }
+    return false;
+  }
+
   const json::Value* Node(const std::string& id) const {
     return prompt_.find(id);
   }
@@ -2846,6 +2860,192 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
   return task;
 }
 
+/// True when the router serves the Wan 2.2 Animate model (it is in the
+/// preset): WanAnimateToVideo then runs on it instead of on VACE.
+bool AnimateAvailable(const ModelIds& models) {
+  return !models.animate.empty() &&
+         std::find(models.available.begin(), models.available.end(),
+                   models.animate) != models.available.end();
+}
+
+/// A video input of WanAnimateToVideo for wan2.2-animate-14b: a loaded
+/// video (LoadVideo / VHS_LoadVideo) or frames built in the graph (rendered
+/// whole by the executor; gufo seeks video_frame_offset itself).
+void AnimateVideo(const Graph& graph, const std::string& node,
+                  const std::string& key, std::vector<std::string>* warnings,
+                  std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
+  const auto link = graph.LinkOf(node, key);
+  if (!link)
+    return;
+  const std::string cls = graph.Class(link->node);
+  if (key == "continue_motion" && !IsFrameSource(cls) &&
+      cls != "VHS_LoadVideo" && cls != "GetVideoComponents")
+    throw NodeFailure(node, "unsupported_link",
+                      "continue_motion from " + cls +
+                          " (a chained WanAnimateToVideo) is not supported by "
+                          "gufo; use one WanAnimateToVideo with the whole "
+                          "length (gufo chains the chunks itself) or load "
+                          "the frames to continue from as a video");
+  VaceFrames(graph, node, key, *link, warnings, file, runs);
+}
+
+/// Wan 2.2 Animate 14B (wan2.2-animate-14b, 16 fps): KSampler <-
+/// WanAnimateToVideo with every input of the node (reference_image,
+/// pose_video, face_video, background_video + character_mask,
+/// continue_motion, continue_motion_max_frames, video_frame_offset) sent as
+/// gufo.animate; TrimVideoLatent behind the sampler is gufo's own trim of
+/// the reference latent; ImageFromBatch on trim_image stays the graph's.
+/// clip_vision_output: gufo always uses the CLIP-H states of the reference
+/// image (the model's image cross-attention needs them).
+VideoTask BuildAnimate(const Graph& graph, const std::string& first,
+                       const ModelIds& models, const Link& latent,
+                       std::vector<std::string>* warnings,
+                       const std::vector<std::string>& stages = {}) {
+  const std::string node = latent.node;
+  const std::string sampler = CheckSamplerStages(
+      graph, stages.empty() ? std::vector<std::string>{first} : stages,
+      warnings);
+  VideoTask task;
+  task.family = VideoFamily::kAnimate;
+  task.model = models.animate;
+  task.fps = 16;
+  task.width = static_cast<int>(graph.Num(node, "width", 832));
+  task.height = static_cast<int>(graph.Num(node, "height", 480));
+  if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 256 ||
+      task.height < 256 || task.width > 1280 || task.height > 1280 ||
+      task.width * task.height > 1280 * 720)
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo wan2.2-animate-14b needs width/height in "
+                      "multiples of 16, 256..1280 and at most 1280x720 "
+                      "pixels, not " +
+                          std::to_string(task.width) + "x" +
+                          std::to_string(task.height));
+  task.frames = static_cast<int>(graph.Num(node, "length", 77));
+  if (task.frames < 5 || task.frames > 81 || (task.frames - 1) % 4 != 0)
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo wan2.2-animate-14b length must be 4k+1 frames, "
+                      "5..81 (16 fps)");
+  if (graph.Num(node, "batch_size", 1) != 1)
+    throw NodeFailure(node, "unsupported_value",
+                      "gufo wan2.2-animate-14b renders batch_size 1");
+  task.animate_offset =
+      WholeInput(graph, node, "video_frame_offset", 0, 0, 100000);
+  task.continue_motion_max_frames =
+      WholeInput(graph, node, "continue_motion_max_frames", 5, 1, 81);
+  if ((task.continue_motion_max_frames - 1) % 4 != 0)
+    throw NodeFailure(node, "unsupported_value",
+                      "continue_motion_max_frames must be 4k+1");
+  AnimateVideo(graph, node, "pose_video", warnings, &task.pose_video,
+               &task.pose_runs);
+  AnimateVideo(graph, node, "face_video", warnings, &task.face_video,
+               &task.face_runs);
+  AnimateVideo(graph, node, "background_video", warnings,
+               &task.background_video, &task.background_runs);
+  AnimateVideo(graph, node, "continue_motion", warnings,
+               &task.continue_motion, &task.continue_runs);
+  // ImageFromBatch(batch_index = trim_image) behind the decode drops the
+  // continue_motion frames; gufo does that itself.
+  task.animate_trim_continue =
+      (task.continue_motion || !task.continue_runs.empty()) &&
+      graph.Feeds("ImageFromBatch", "batch_index", Link{node, 4});
+  const bool background = task.background_video || !task.background_runs.empty();
+  if (auto mask = graph.LinkOf(node, "character_mask")) {
+    if (!background)
+      warnings->push_back("node " + node +
+                          ": character_mask is ignored without "
+                          "background_video");
+    else
+      VaceMaskInput(graph, node, "character_mask", *mask, true, &task,
+                    warnings);
+  }
+  if (background && !task.vace_mask && task.mask_runs.empty())
+    throw NodeFailure(node, "missing_input",
+                      "background_video needs a character_mask in gufo "
+                      "(1 = the character to replace)");
+  if (!task.pose_video && task.pose_runs.empty() && !background)
+    throw NodeFailure(node, "missing_input",
+                      "gufo wan2.2-animate-14b needs pose_video (animation) "
+                      "or background_video + character_mask (replacement)");
+  if (auto reference = graph.LinkOf(node, "reference_image"))
+    task.reference_images.push_back(
+        ImageFile(graph, node, "reference_image", *reference));
+  if (!graph.LinkOf(node, "clip_vision_output"))
+    warnings->push_back("node " + node +
+                        ": gufo passes the reference image's CLIP vision "
+                        "states anyway (the Animate model reads them)");
+  // Prompts and sampling.
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "CLIPTextEncode")
+    throw NodeFailure(sampler, "unsupported_link",
+                      "Wan positive conditioning must come from "
+                      "CLIPTextEncode");
+  task.prompt = graph.Str(positive.encoder, "text");
+  task.negative_prompt =
+      ClipText(graph, FollowConditioning(graph, sampler, "negative"));
+  task.steps = static_cast<int>(graph.Num(sampler, "steps"));
+  if (task.steps < 1 || task.steps > 50)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.2-animate-14b takes 1..50 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  const double cfg = graph.Num(sampler, "cfg", 1.0);
+  if (cfg < 1.0 || cfg > 20.0)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.2-animate-14b takes cfg 1..20");
+  if (cfg != 1.0)
+    task.guidance = cfg;
+  const std::string sampler_name = graph.Str(sampler, "sampler_name", "lcm");
+  task.vace_sampler = sampler_name == "lcm" ? "lcm" : "euler";
+  if (sampler_name != "lcm" && sampler_name != "euler")
+    warnings->push_back("node " + sampler + ": sampler " + sampler_name +
+                        " runs as euler on gufo wan2.2-animate-14b");
+  const std::string scheduler = graph.Str(sampler, "scheduler", "simple");
+  if (scheduler != "simple" && scheduler != "normal")
+    warnings->push_back("node " + sampler + ": scheduler " + scheduler +
+                        " runs as gufo's shifted linear (simple) schedule");
+  if (graph.Num(sampler, "denoise", 1.0) != 1.0)
+    throw NodeFailure(sampler, "unsupported_value",
+                      "gufo wan2.2-animate-14b samples with denoise 1");
+  const ModelChain chain = FollowModel(graph, sampler);
+  if (!chain.uni3c.empty())
+    throw NodeFailure(chain.uni3c, "unsupported_link",
+                      "Uni3C does not combine with Wan 2.2 Animate in gufo");
+  task.vace_lora = false;
+  for (const auto& [name, lora_strength] : chain.loras) {
+    const std::string lower = Lower(name);
+    if (lower.find("lightx2v") != std::string::npos ||
+        lower.find("distill") != std::string::npos ||
+        lower.find("causvid") != std::string::npos) {
+      task.vace_lora = true;
+      if (lower.find("lightx2v") == std::string::npos || lora_strength != 1.0)
+        warnings->push_back("node " + sampler + ": LoRA " + name +
+                            " runs as gufo's built-in lightx2v I2V LoRA at "
+                            "strength 1");
+      continue;
+    }
+    // e.g. the relight LoRA: not in gufo yet.
+    warnings->push_back("node " + sampler + ": LoRA " + name +
+                        " is ignored (gufo wan2.2-animate-14b takes only its "
+                        "step-distill LoRA)");
+  }
+  // ModelSamplingSD3 shift on the model path -> gufo.animate.shift.
+  Link link = graph.RequireLink(sampler, "model");
+  for (int guard = 0; guard < 64; ++guard) {
+    const std::string cls = graph.Class(link.node);
+    if (cls == "ModelSamplingSD3") {
+      task.vace_shift = graph.Num(link.node, "shift", 8.0);
+      if (*task.vace_shift < 1.0 || *task.vace_shift > 20.0)
+        throw NodeFailure(link.node, "unsupported_value",
+                          "gufo wan2.2-animate-14b takes shift 1..20");
+      break;
+    }
+    if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple")
+      break;
+    link = graph.RequireLink(link.node, "model");
+  }
+  return task;
+}
+
 /// A DynamicCombo sub-input: ComfyUI names it "<combo>.<input>" in the API
 /// prompt; older exports use the bare name.
 std::optional<Link> ComboLink(const Graph& graph, const std::string& id,
@@ -3675,7 +3875,9 @@ std::string AnimateMergeFilter(int width, int height,
 }
 
 int VideoFamilyFps(VideoFamily family) {
-  return family == VideoFamily::kCamera || family == VideoFamily::kVace ? 16
+  return family == VideoFamily::kCamera || family == VideoFamily::kVace ||
+                 family == VideoFamily::kAnimate
+             ? 16
          : family == VideoFamily::kTalk                                   ? 25
                                                                           : 24;
 }
@@ -3771,6 +3973,38 @@ json::Value VideoRequestBody(const VideoTask& task) {
     if (task.vace_high_guidance)
       vace["high_guidance"] = *task.vace_high_guidance;
     gufo["vace"] = std::move(vace);
+  } else if (task.family == VideoFamily::kAnimate) {
+    // 16 fps, one chunk of the node's length. The executor adds the
+    // reference image and the videos to gufo.animate.
+    body["size"] =
+        std::to_string(task.width) + "x" + std::to_string(task.height);
+    body["seconds"] = (task.frames - 1) / 16.0;
+    gufo["frames"] = task.frames;
+    if (task.guidance)
+      gufo["guidance"] = *task.guidance;
+    if (!task.negative_prompt.empty())
+      gufo["negative_prompt"] = task.negative_prompt;
+    json::Value animate = json::Value::object();
+    animate["length"] = task.frames;
+    if (task.animate_offset != 0)
+      animate["video_frame_offset"] = task.animate_offset;
+    if (task.continue_motion || !task.continue_runs.empty()) {
+      animate["continue_motion_max_frames"] = task.continue_motion_max_frames;
+      if (task.animate_trim_continue)
+        animate["trim_continue"] = true;
+    }
+    if (task.vace_mask || !task.mask_runs.empty()) {
+      animate["mask_channel"] = task.vace_mask_channel;
+      if (task.vace_invert_mask)
+        animate["invert_mask"] = true;
+    }
+    if (!task.vace_sampler.empty())
+      animate["sampler"] = task.vace_sampler;
+    if (task.vace_shift)
+      animate["shift"] = *task.vace_shift;
+    if (!task.vace_lora)
+      animate["lora"] = false;
+    gufo["animate"] = std::move(animate);
   } else if (task.family == VideoFamily::kTalk) {
     // 25 fps: gufo maps seconds back to round(25 s) frames.
     body["size"] =
@@ -4359,6 +4593,10 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                    latent_class == "WanCameraImageToVideo")
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
+          else if (latent_class == "WanAnimateToVideo" &&
+                   AnimateAvailable(models))
+            task.spec = BuildAnimate(graph, generator, models, latent,
+                                     &plan->warnings, stages_of[generator]);
           else if (latent_class == "WanVaceToVideo" ||
                    latent_class == "WanFirstLastFrameToVideo" ||
                    latent_class == "WanAnimateToVideo")

@@ -27,6 +27,7 @@ enum class Family : std::uint8_t {
   kWan21Vace,   // Wan 2.1 T2V 14B + VACE, 16 fps
   kWan21Talk,   // Wan 2.1 I2V 14B + InfiniteTalk, 25 fps
   kWan22FunVace,  // Wan 2.2 T2V A14B (two experts) + Fun VACE, 16 fps
+  kWan22Animate,  // Wan 2.2 Animate 14B (pose / face / replacement), 16 fps
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
@@ -40,6 +41,8 @@ inline constexpr std::string_view kWan21TalkPreset = "wan21-talk";
 inline constexpr std::string_view kWan22FunVaceModelId =
     "wan2.2-fun-vace-a14b";
 inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
+inline constexpr std::string_view kWan22AnimateModelId = "wan2.2-animate-14b";
+inline constexpr std::string_view kWan22AnimatePreset = "wan22-animate";
 
 [[nodiscard]] std::string_view ModelId(Family family) noexcept;
 [[nodiscard]] std::string_view Preset(Family family) noexcept;
@@ -61,6 +64,8 @@ inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
 [[nodiscard]] constexpr bool IsVaceFamily(Family family) noexcept {
   return family == Family::kWan21Vace || family == Family::kWan22FunVace;
 }
+/// gufo-animate.json with `_class_name` GufoWan22Animate.
+[[nodiscard]] bool IsWan22AnimateDirectory(const std::filesystem::path& root);
 
 /// "WxH".
 [[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
@@ -72,7 +77,7 @@ inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
                                       std::string* error = nullptr);
 /// HTTP "seconds" to frames: Wan 2.2 24 fps 4k + 1 (0.2..5 s), Wan 2.1
 /// camera / VACE 16 fps 4k + 1 (0.25..5 s), InfiniteTalk round(s * 25)
-/// (0.04..60 s).
+/// (0.04..60 s), Animate 16 fps 4k + 1 (0.25..30 s, chained chunks).
 [[nodiscard]] std::optional<int> ResolveDurationFrames(
     Family family, std::string_view seconds, std::string* error = nullptr);
 
@@ -86,7 +91,9 @@ inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
 /// per-family formats). Decodes and checks every image and audio input; the
 /// encoded bytes travel as attachments (names: "first_frame",
 /// "guide_video", "mask", "reference_image_<n>", "audio_<n>",
-/// "speaker_mask_<n>"), the options as JSON.
+/// "speaker_mask_<n>"; Animate: "first_frame" (reference image),
+/// "pose_video", "face_video", "background_video", "mask",
+/// "continue_motion"), the options as JSON.
 [[nodiscard]] bool PrepareRequest(Family family,
                                   const ext::VideoRequestInput& input,
                                   ext::VideoPreparedRequest* prepared,
@@ -129,6 +136,14 @@ struct JobRequest {
   std::string talk_json;
   std::vector<AudioWaveform> speakers;
   std::vector<Image> speaker_masks;
+  // Animate: options JSON ("gufo.animate" without media), the reference in
+  // first_frame, the character mask in mask_path, the videos written next
+  // to the output (pose.mp4, face.mp4, background.mp4, continue.mp4).
+  std::string animate_json;
+  std::filesystem::path pose_video_path;
+  std::filesystem::path face_video_path;
+  std::filesystem::path background_video_path;
+  std::filesystem::path continue_video_path;
   // Live preview hook (unset: gufo 2.0 has no preview service yet).
   PreviewHook preview;
 };

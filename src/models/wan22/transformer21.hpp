@@ -26,8 +26,9 @@ namespace gufo::models::wan22 {
 struct Transformer21BlockState {
   int frames{0}, height{0}, width{0};  // latent grid (height, width even)
   int tokens{0};                       // frames * (height / 2) * (width / 2)
-  const float* hidden{nullptr};        // [tokens, 5120] after the patch
-                                       // embedding
+  float* hidden{nullptr};              // [tokens, 5120] after the patch
+                                       // embedding; BeginBlocks may add to
+                                       // it (Wan 2.2 Animate pose)
   const float* temb{nullptr};          // [5120]
   const float* modulation{nullptr};    // [6, 5120] time projection (e0)
   const float* rope{nullptr};          // (cos, sin) [tokens, 64, 2]

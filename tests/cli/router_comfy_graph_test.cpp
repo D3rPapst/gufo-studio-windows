@@ -2393,6 +2393,136 @@ void TestAnimate() {
              ->items()[0].str() == "MASK");
 }
 
+// The same templates when the router serves wan2.2-animate-14b (it is in
+// the preset): every WanAnimateToVideo input goes to gufo.animate.
+void TestAnimateNative() {
+  comfy::ModelIds models;
+  models.available = {"wan2.1-vace-14b", "wan2.2-animate-14b"};
+  const auto plan_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(json::parse(text), models, &plan, &error);
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return plan;
+  };
+  const auto error_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    assert(!comfy::BuildPlan(json::parse(text), models, &plan, &error));
+    return error;
+  };
+  const auto warned = [](const comfy::Plan& p, const std::string& text) {
+    return std::any_of(p.warnings.begin(), p.warnings.end(),
+                       [&](const std::string& w) {
+                         return w.find(text) != std::string::npos;
+                       });
+  };
+  const comfy::Plan plan = plan_of(kAnimate);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "31");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kAnimate);
+  assert(video.model == "wan2.2-animate-14b");
+  assert(video.prompt == "a woman dances in the office");
+  assert(video.negative_prompt == "blurry");
+  assert(video.width == 832 && video.height == 480 && video.frames == 77);
+  assert(video.fps == 16 && video.steps == 6 && video.seed == 7);
+  assert((video.pose_video == comfy::FileRef{"pose_tanz.mp4", "input"}));
+  assert((video.face_video == comfy::FileRef{"gesicht_tanz.mp4", "input"}));
+  assert(!video.background_video && !video.vace_mask && !video.control_video);
+  assert(video.reference_images.size() == 1 &&
+         (video.reference_images[0] ==
+          comfy::FileRef{"figur_anna.png", "input"}));
+  assert(video.vace_lora && video.vace_sampler == "euler");
+  assert(video.vace_shift && *video.vace_shift == 8.0);
+  assert(!video.animate_trim_continue && video.animate_offset == 0);
+  // Only the relight LoRA is left out; no VACE warnings.
+  assert(plan.warnings.size() == 1);
+  assert(warned(plan, "WanAnimate_relight_lora"));
+  assert(!warned(plan, "facial expression"));
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "wan2.2-animate-14b");
+  assert(body.member_str("size") == "832x480");
+  assert(body.find("seconds")->as_double() == 4.75);
+  const json::Value* animate = body.find("gufo")->find("animate");
+  assert(animate != nullptr && animate->find("length")->as_double() == 77);
+  assert(animate->member_str("sampler") == "euler" &&
+         animate->find("shift")->as_double() == 8.0);
+  assert(!animate->contains("lora") && !animate->contains("video_frame_offset"));
+  assert(body.find("gufo")->find("frames")->as_double() == 77);
+
+  // Without clip_vision_output: a note that gufo uses it anyway.
+  const comfy::Plan no_clip =
+      plan_of(Replace(kAnimate, "\"clip_vision_output\": [\"7\", 0], ", ""));
+  assert(warned(no_clip, "CLIP vision"));
+
+  // Character replacement: background video + still mask (no pose).
+  std::string replace = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                                "\"background_video\": [\"21\", 0], "
+                                "\"character_mask\": [\"40\", 0]");
+  replace = Replace(replace, " \"30\":",
+                    " \"40\": {\"class_type\": \"LoadImageMask\", \"inputs\": "
+                    "{\"image\": \"figur_maske.png\", \"channel\": \"red\"}},"
+                    "\n \"30\":");
+  const comfy::Plan swap_plan = plan_of(replace);
+  const auto& swap = std::get<comfy::VideoTask>(swap_plan.tasks[0].spec);
+  assert((swap.background_video == comfy::FileRef{"pose_tanz.mp4", "input"}));
+  assert(!swap.pose_video);
+  assert((swap.vace_mask == comfy::FileRef{"figur_maske.png", "input"}));
+  assert(swap.vace_mask_channel == "red");
+  assert(comfy::VideoRequestBody(swap).find("gufo")->find("animate")
+             ->member_str("mask_channel") == "red");
+
+  // A seek into loaded videos is gufo's own (gufo.animate.video_frame_offset).
+  const comfy::Plan seek = plan_of(Replace(
+      kAnimate, "\"video_frame_offset\": 0", "\"video_frame_offset\": 72"));
+  const auto& seeked = std::get<comfy::VideoTask>(seek.tasks[0].spec);
+  assert(seeked.animate_offset == 72);
+  assert(comfy::VideoRequestBody(seeked).find("gufo")->find("animate")
+             ->find("video_frame_offset")->as_double() == 72);
+
+  // continue_motion from a loaded video, ImageFromBatch on trim_image:
+  // gufo drops the continue frames itself (trim_continue).
+  std::string resume = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                               "\"pose_video\": [\"21\", 0], "
+                               "\"continue_motion\": [\"51\", 0]");
+  resume = Replace(resume, "\"video_frame_offset\": 0",
+                   "\"video_frame_offset\": 77");
+  resume = Replace(resume, " \"30\":",
+                   " \"50\": {\"class_type\": \"LoadVideo\", \"inputs\": "
+                   "{\"file\": \"tanz01.mp4\"}},\n"
+                   " \"51\": {\"class_type\": \"GetVideoComponents\", "
+                   "\"inputs\": {\"video\": [\"50\", 0]}},\n \"30\":");
+  const comfy::Plan resume_plan = plan_of(resume);
+  const auto& resumed = std::get<comfy::VideoTask>(resume_plan.tasks[0].spec);
+  assert((resumed.continue_motion == comfy::FileRef{"tanz01.mp4", "input"}));
+  assert(resumed.animate_trim_continue && resumed.animate_offset == 77);
+  const json::Value resumed_body = comfy::VideoRequestBody(resumed);
+  const json::Value* resumed_animate =
+      resumed_body.find("gufo")->find("animate");
+  assert(resumed_animate->find("trim_continue")->as_bool());
+  assert(resumed_animate->find("continue_motion_max_frames")->as_double() ==
+         5);
+
+  // Errors: continue_motion from frames picked in the graph (as a chained
+  // node's ImageFromBatch would), no pose and no background, a background
+  // without mask.
+  std::string chained = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                                "\"pose_video\": [\"21\", 0], "
+                                "\"continue_motion\": [\"52\", 0]");
+  chained = Replace(chained, " \"30\":",
+                    " \"52\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+                    "{\"image\": [\"21\", 0], \"batch_index\": 72, "
+                    "\"length\": 5}},\n \"30\":");
+  assert(error_of(chained).message.find("chained") != std::string::npos);
+  assert(error_of(Replace(kAnimate, ", \"pose_video\": [\"21\", 0]", ""))
+             .message.find("pose_video") != std::string::npos);
+  assert(error_of(Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                          "\"background_video\": [\"21\", 0]"))
+             .message.find("character_mask") != std::string::npos);
+}
+
 void TestInfiniteTalk() {
   const comfy::Plan plan = PlanOf(kTalk);
   assert(plan.tasks.size() == 1);
@@ -3158,6 +3288,7 @@ int main() {
   TestVaceKeyframes();
   TestFirstLastFrame();
   TestAnimate();
+  TestAnimateNative();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();
   TestDelivery();

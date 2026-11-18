@@ -130,8 +130,8 @@ constexpr Entry kEntries[] = {
  "display_name": "WanFirstLastFrameToVideo",
  "description": "gufo: runs on wan2.1-vace-14b: start_image in front, end_image at the end, grey frames between, kept by a VACE mask (0 on the given frames, 1 between).",
  "category": "conditioning/video_models"})"},
-    // comfy_extras/nodes_wan.py (experimental); gufo has no Wan 2.2 Animate
-    // model and runs it on VACE.
+    // comfy_extras/nodes_wan.py (experimental); on wan2.2-animate-14b when
+    // the router serves it, else on VACE.
     {"WanAnimateToVideo", "comfy_extras.nodes_wan", R"({
  "input": {"required": {
   "positive": ["CONDITIONING", {}],
@@ -141,20 +141,20 @@ constexpr Entry kEntries[] = {
   "height": ["INT", {"default": 480, "min": 16, "max": 16384, "step": 16}],
   "length": ["INT", {"default": 77, "min": 1, "max": 16384, "step": 4, "tooltip": "gufo: 4k+1 frames, 5..81 (16 fps)."}],
   "batch_size": ["INT", {"default": 1, "min": 1, "max": 4096, "tooltip": "gufo renders batch_size 1."}],
-  "continue_motion_max_frames": ["INT", {"default": 5, "min": 1, "max": 16384, "step": 4, "tooltip": "gufo: ignored."}],
-  "video_frame_offset": ["INT", {"default": 0, "min": 0, "max": 16384, "step": 1, "tooltip": "The amount of frames to seek in all the input videos. Used for generating longer videos by chunk. Connect to the video_frame_offset output of the previous node for extending a video. gufo: a value; above 0 only for frames built in the graph."}]},
+  "continue_motion_max_frames": ["INT", {"default": 5, "min": 1, "max": 16384, "step": 4, "tooltip": "gufo: 4k+1 on wan2.2-animate-14b; ignored on VACE."}],
+  "video_frame_offset": ["INT", {"default": 0, "min": 0, "max": 16384, "step": 1, "tooltip": "The amount of frames to seek in all the input videos. Used for generating longer videos by chunk. Connect to the video_frame_offset output of the previous node for extending a video. gufo: a value; on VACE above 0 only for frames built in the graph."}]},
   "optional": {
-  "clip_vision_output": ["CLIP_VISION_OUTPUT", {"tooltip": "gufo: ignored."}],
-  "reference_image": ["IMAGE", {"tooltip": "gufo: LoadImage, sent as a VACE reference image."}],
-  "face_video": ["IMAGE", {"tooltip": "gufo: ignored, the facial expression does not follow it."}],
-  "pose_video": ["IMAGE", {"tooltip": "gufo: the VACE control video (LoadVideo, VHS_LoadVideo or frames built in the graph)."}],
-  "background_video": ["IMAGE", {"tooltip": "gufo: with character_mask and without pose_video the VACE control video."}],
-  "character_mask": ["MASK", {"tooltip": "gufo: with background_video and without pose_video the VACE mask (1 = generate)."}],
-  "continue_motion": ["IMAGE", {"tooltip": "gufo: ignored."}]}},
+  "clip_vision_output": ["CLIP_VISION_OUTPUT", {"tooltip": "gufo: not needed (wan2.2-animate-14b always uses the reference image's CLIP vision states); ignored on VACE."}],
+  "reference_image": ["IMAGE", {"tooltip": "gufo: LoadImage; the character (on VACE a reference image)."}],
+  "face_video": ["IMAGE", {"tooltip": "gufo: face crops (LoadVideo, VHS_LoadVideo) drive the expression on wan2.2-animate-14b; ignored on VACE."}],
+  "pose_video": ["IMAGE", {"tooltip": "gufo: LoadVideo, VHS_LoadVideo or frames built in the graph (on VACE the control video)."}],
+  "background_video": ["IMAGE", {"tooltip": "gufo: with character_mask the video whose character is replaced (on VACE only without pose_video)."}],
+  "character_mask": ["MASK", {"tooltip": "gufo: with background_video, 1 = the character (generated)."}],
+  "continue_motion": ["IMAGE", {"tooltip": "gufo: a loaded video to continue from on wan2.2-animate-14b (chunks of one long video gufo chains itself); ignored on VACE."}]}},
  "input_order": {"required": ["positive", "negative", "vae", "width", "height", "length", "batch_size", "continue_motion_max_frames", "video_frame_offset"], "optional": ["clip_vision_output", "reference_image", "face_video", "pose_video", "background_video", "character_mask", "continue_motion"]},
  "output": ["CONDITIONING", "CONDITIONING", "LATENT", "INT", "INT", "INT"], "output_is_list": [false, false, false, false, false, false], "output_name": ["positive", "negative", "latent", "trim_latent", "trim_image", "video_frame_offset"],
  "display_name": "WanAnimateToVideo",
- "description": "gufo: runs on wan2.1-vace-14b (no Wan 2.2 Animate model): pose_video as the VACE control video and reference_image as a VACE reference; face_video, clip vision and continue_motion are ignored.",
+ "description": "gufo: runs on wan2.2-animate-14b when the router serves it (pose, face, replacement, continue_motion as in ComfyUI); otherwise on wan2.1-vace-14b with pose_video as the VACE control video and reference_image as a VACE reference (face_video, clip vision and continue_motion ignored).",
  "category": "model/conditioning/wan/animate"})"},
 };
 

@@ -70,6 +70,18 @@
       ],
       "target": "gufo_wan22_hip",
       "entry": "wan22_fun_vace_provider_register"
+    },
+    {
+      "id": "wan22-animate-14b",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan22Animate"
+      ],
+      "model_ids": [
+        "wan2.2-animate-14b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan22_animate_provider_register"
     }
   ],
   "targets": {
@@ -90,6 +102,10 @@
       "role": "test"
     },
     "wan22_vace_context_test": {
+      "requires": [],
+      "role": "test"
+    },
+    "wan22_animate_context_test": {
       "requires": [],
       "role": "test"
     }
@@ -136,6 +152,12 @@
     {
       "target": "wan22_vace_context_test",
       "ctest": "wan22_vace_context_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "wan22_animate_context_test",
+      "ctest": "wan22_animate_context_test",
       "check_pr": true,
       "windows_build": true
     },

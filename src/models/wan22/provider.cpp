@@ -49,6 +49,8 @@ public:
         return RunWan21VaceJob(job, callbacks, telemetry, error);
       case Family::kWan21Talk:
         return RunWan21TalkJob(job, callbacks, telemetry, error);
+      case Family::kWan22Animate:
+        return RunWan22AnimateJob(job, callbacks, telemetry, error);
     }
     if (error != nullptr)
       *error = "unknown Wan family";
@@ -96,6 +98,13 @@ void wan22_fun_vace_provider_register(gufo::ext::Registry& registry) {
   registry.AddVideoProvider(
       MakeVideoProvider(Family::kWan22FunVace,
                         &gufo::models::wan22::Create<Family::kWan22FunVace>));
+}
+
+void wan22_animate_provider_register(gufo::ext::Registry& registry) {
+  registry.AddProvider(generated::kProvider_wan22_animate_14b);
+  registry.AddVideoProvider(MakeVideoProvider(
+      Family::kWan22Animate,
+      &gufo::models::wan22::Create<Family::kWan22Animate>));
 }
 
 void wan21_talk_provider_register(gufo::ext::Registry& registry) {

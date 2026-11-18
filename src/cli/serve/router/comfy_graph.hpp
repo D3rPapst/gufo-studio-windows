@@ -34,15 +34,19 @@
 //          from LoadImage), TrimVideoLatent after it; or KSampler <-
 //          WanFirstLastFrameToVideo (start / end frames as VACE control
 //          frames with a keep mask, gufo has no FLF2V model); or KSampler
-//          <- WanAnimateToVideo (pose_video as control video, or
-//          background_video + character_mask as control video + mask,
-//          with all three the pose merged into the background inside the
-//          mask (ffmpeg) + the mask, reference_image; gufo has no Wan 2.2
-//          Animate model); a
+//          <- WanAnimateToVideo when the router has no animate model
+//          (pose_video as control video, or background_video +
+//          character_mask as control video + mask, with all three the pose
+//          merged into the background inside the mask (ffmpeg) + the mask,
+//          reference_image); a
 //          KSamplerAdvanced chain (Wan 2.2 high / low noise) runs as one
 //          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace), or, with
 //          two checkpoints and wan2.2-fun-vace-a14b served, as its two
 //          experts (gufo.vace.switch_step)
+//   animate KSampler <- WanAnimateToVideo when ModelIds::available has
+//          `animate`: every node input (reference, pose, face, background
+//          + character_mask, continue_motion, video_frame_offset)
+//          -> /v1/videos (wan2.2-animate-14b, gufo.animate, 16 fps)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
 //          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
 //          windows via previous_frames become one job; video to video:
@@ -498,6 +502,25 @@ struct VideoTask {
   std::optional<double> talk_denoise;
   double audio_scale{1.0};
   int motion_frames{9};
+  /// Animate family (wan2.2-animate-14b, gufo.animate; the executor adds
+  /// the media): pose / face / background / continue_motion videos as
+  /// loaded files or frames built in the graph (rendered whole; the face at
+  /// 512x512), the character mask in vace_mask / mask_runs with
+  /// vace_mask_channel / vace_invert_mask, the reference in
+  /// reference_images[0], sampler / shift / LoRA in vace_sampler /
+  /// vace_shift / vace_lora.
+  std::optional<FileRef> pose_video;
+  std::optional<FileRef> face_video;
+  std::optional<FileRef> background_video;
+  std::optional<FileRef> continue_motion;
+  std::vector<FrameRun> pose_runs;
+  std::vector<FrameRun> face_runs;
+  std::vector<FrameRun> background_runs;
+  std::vector<FrameRun> continue_runs;
+  int animate_offset{0};               // video_frame_offset
+  int continue_motion_max_frames{5};
+  /// ImageFromBatch on trim_image drops the continue_motion frames.
+  bool animate_trim_continue{false};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

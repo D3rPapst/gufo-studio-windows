@@ -375,6 +375,11 @@ bool CheckUploads(const Body& body, Family family,
                   name == "mask_1" || name == "mask_2" ||
                   name == "talk_video";
         break;
+      case Family::kWan22Animate:
+        allowed = name == "reference_image" || name == "pose_video" ||
+                  name == "face_video" || name == "background_video" ||
+                  name == "character_mask" || name == "continue_motion";
+        break;
     }
     if (!allowed)
       return Fail(error,
@@ -860,6 +865,279 @@ bool PrepareVace(Family family, const Body& body,
   return true;
 }
 
+// A mask still (PNG / JPEG / WebP) decoded and handed on as a binary PPM;
+// anything else is taken as an MP4. `format` becomes "ppm" or "mp4".
+bool MaskFile(std::vector<std::uint8_t>* file, std::string* format,
+              std::string* message) {
+  const auto starts = [&](std::string_view magic) {
+    if (file->size() < magic.size())
+      return false;
+    for (std::size_t i = 0; i < magic.size(); ++i)
+      if (static_cast<std::uint8_t>(magic[i]) != (*file)[i])
+        return false;
+    return true;
+  };
+  const bool still =
+      starts("\x89PNG") || starts("\xFF\xD8\xFF") ||
+      (starts("RIFF") && file->size() > 12 && (*file)[8] == 'W' &&
+       (*file)[9] == 'E' && (*file)[10] == 'B' && (*file)[11] == 'P');
+  if (!still) {
+    *format = "mp4";
+    return true;
+  }
+  try {
+    const core::Image image = Decode(*file);
+    const std::string header = "P6\n" + std::to_string(image.width) + " " +
+                               std::to_string(image.height) + "\n255\n";
+    file->assign(header.begin(), header.end());
+    file->insert(file->end(), image.pixels.begin(), image.pixels.end());
+    *format = "ppm";
+    return true;
+  } catch (const std::exception& exception) {
+    *message = exception.what();
+    return false;
+  }
+}
+
+// Wan 2.2 Animate 14B ("wan2.2-animate-14b"), ComfyUI's WanAnimateToVideo:
+// {"model", "prompt" (may be empty), "size" (default "832x480", multiples
+// of 16, at most 1280x720 pixels), "seconds" (0.25..30 at 16 fps, default
+// 4.75 = 77 frames; longer than the chunk length: chained chunks),
+// "gufo": {"seed", "steps" (default 4), "frames", "negative_prompt",
+// "guidance" (1..20, default 1), "preview", "animate": {"reference_image"
+// (image: data URL, base64 or HTTPS), "pose_video", "face_video" (face
+// crops, fitted to 512x512), "background_video" (MP4 data URLs or base64),
+// "character_mask" (MP4, or a still for every frame; white = the
+// character, generated), "mask_channel" ("red" | "green" | "blue" |
+// "luma"), "invert_mask", "continue_motion" (MP4: frames to continue
+// from), "continue_motion_max_frames" (4k + 1, default 5),
+// "video_frame_offset" (seek in all videos, default 0), "length" (frames
+// per chunk, 4k + 1, 5..81, default 77), "continue_frames" (overlap of
+// chained chunks, 4k + 1, default 5), "sampler" ("lcm" | "euler"), "shift"
+// (1..20), "lora" (false: without the bundle's step-distill LoRA),
+// "trim_continue" (true: drop the continue_motion frames from the result,
+// as ImageFromBatch on trim_image)}}}.
+// Multipart uploads may carry "reference_image", "pose_video",
+// "face_video", "background_video", "character_mask" and "continue_motion"
+// files instead.
+bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
+                    ext::VideoRequestError* error) {
+  if (!HasOnlyMembers(body.json, {"model", "prompt", "size", "seconds", "gufo"}))
+    return Fail(error, "unsupported_field",
+                "request contains an unsupported video field (Animate inputs "
+                "go into 'gufo.animate')");
+  if (!CheckUploads(body, Family::kWan22Animate, error))
+    return false;
+  Common common;
+  if (!ParseCommon(body, "832x480", false, &common, error))
+    return false;
+  const std::string seconds = SecondsText(body.json.find("seconds"), "4.75");
+  std::string duration_error;
+  const auto frames =
+      ResolveDurationFrames(Family::kWan22Animate, seconds, &duration_error);
+  if (!frames)
+    return Fail(error, "invalid_seconds", duration_error);
+  ext::VideoParameters parameters;
+  if (!InitParameters(Family::kWan22Animate, common, 4, &parameters, error))
+    return false;
+  parameters.frames = *frames;
+  std::uint64_t seed = 42;
+  json::Value options = json::Value::object();
+  options["guidance"] = 1.0;
+  json::Value animate_options = json::Value::object();
+  const json::Value* animate = nullptr;
+  if (const json::Value* extension = body.json.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension,
+                        {"seed", "steps", "frames", "negative_prompt",
+                         "guidance", "interpolate", "upscale", "preview",
+                         "animate"}))
+      return Fail(error, "invalid_strix_options",
+                  "'gufo' may contain only 'seed', 'steps', 'frames', "
+                  "'negative_prompt', 'guidance', 'interpolate', 'upscale', "
+                  "'preview' and 'animate'");
+    if (!CheckPostSteps(*extension, error) ||
+        !ReadNegativePrompt(*extension, &options, error))
+      return false;
+    if (const json::Value* value = extension->find("guidance")) {
+      const double guidance = value->is_number() ? value->as_double(-1.0) : -1;
+      if (!std::isfinite(guidance) || guidance < 1.0 || guidance > 20.0)
+        return Fail(error, "invalid_guidance",
+                    "'gufo.guidance' must be a number in 1..20 (1 = no "
+                    "classifier-free guidance)");
+      options["guidance"] = guidance;
+    }
+    if (!ParseSeedSteps(*extension, "1..50", &seed, &parameters, error) ||
+        !CheckFrames(*extension, *frames, error))
+      return false;
+    animate = extension->find("animate");
+  }
+  if (animate != nullptr &&
+      (!animate->is_object() ||
+       !HasOnlyMembers(*animate,
+                       {"reference_image", "pose_video", "face_video",
+                        "background_video", "character_mask", "mask_channel",
+                        "invert_mask", "continue_motion",
+                        "continue_motion_max_frames", "video_frame_offset",
+                        "length", "continue_frames", "sampler", "shift",
+                        "lora", "trim_continue"})))
+    return Fail(error, "invalid_animate",
+                "'gufo.animate' may contain only 'reference_image', "
+                "'pose_video', 'face_video', 'background_video', "
+                "'character_mask', 'mask_channel', 'invert_mask', "
+                "'continue_motion', 'continue_motion_max_frames', "
+                "'video_frame_offset', 'length', 'continue_frames', "
+                "'sampler', 'shift', 'lora' and 'trim_continue'");
+  const auto member = [&](const char* name) -> const json::Value* {
+    return animate == nullptr ? nullptr : animate->find(name);
+  };
+  // A video: an uploaded file, a data URL or raw base64.
+  const auto media = [&](const char* name, std::vector<std::uint8_t>* out,
+                         std::string* message) {
+    const json::Value* value = member(name);
+    if (const auto* upload = body.file(name)) {
+      if (value != nullptr) {
+        *message = std::string("'gufo.animate.") + name +
+                   "' and an uploaded '" + name + "' exclude each other";
+        return false;
+      }
+      *out = upload->bytes;
+      return true;
+    }
+    if (value == nullptr)
+      return true;
+    bool bad_data_url = false;
+    if (!value->is_string() ||
+        !DecodeMediaString(value->str(), 64, out, &bad_data_url)) {
+      *message = std::string("'gufo.animate.") + name +
+                 (bad_data_url ? "' data URL must be base64"
+                               : "' must be a data URL or base64 string");
+      return false;
+    }
+    return true;
+  };
+  std::vector<std::uint8_t> pose, face, background, mask_file, previous;
+  std::string media_error;
+  if (!media("pose_video", &pose, &media_error) ||
+      !media("face_video", &face, &media_error) ||
+      !media("background_video", &background, &media_error) ||
+      !media("character_mask", &mask_file, &media_error) ||
+      !media("continue_motion", &previous, &media_error))
+    return Fail(error, "invalid_animate", media_error);
+  if (pose.empty() && background.empty())
+    return Fail(error, "invalid_animate",
+                "'gufo.animate' needs a 'pose_video' (animation) or a "
+                "'background_video' with 'character_mask' (replacement)");
+  if (!background.empty() && mask_file.empty())
+    return Fail(error, "invalid_animate",
+                "'gufo.animate.background_video' needs a 'character_mask'");
+  std::string mask_format;
+  if (!mask_file.empty()) {
+    std::string mask_error;
+    if (!MaskFile(&mask_file, &mask_format, &mask_error))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.character_mask' " + mask_error);
+  }
+  std::vector<std::uint8_t> reference;
+  if (member("reference_image") != nullptr ||
+      body.file("reference_image") != nullptr) {
+    if (member("reference_image") != nullptr &&
+        body.file("reference_image") != nullptr)
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.reference_image' and an uploaded "
+                  "'reference_image' exclude each other");
+    core::ImageReadBudget budget;
+    std::string image_error;
+    if (!ReadImage(member("reference_image"), body.file("reference_image"),
+                   budget, &reference, &image_error))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.reference_image' " + image_error);
+  }
+  if (const json::Value* channel = member("mask_channel")) {
+    if (!channel->is_string() ||
+        (channel->str() != "red" && channel->str() != "green" &&
+         channel->str() != "blue" && channel->str() != "luma"))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.mask_channel' must be red, green, blue or "
+                  "luma");
+    animate_options["mask_channel"] = channel->str();
+  }
+  for (const char* flag : {"invert_mask", "lora", "trim_continue"})
+    if (const json::Value* value = member(flag)) {
+      if (!value->is_bool())
+        return Fail(error, "invalid_animate",
+                    std::string("'gufo.animate.") + flag +
+                        "' must be a boolean");
+      animate_options[flag] = value->as_bool();
+    }
+  // 4k + 1 frame counts and the seek.
+  const auto frame_count = [&](const char* name, int low, int high,
+                               bool four_k_plus_one) {
+    const json::Value* value = member(name);
+    if (value == nullptr)
+      return true;
+    const auto parsed = JsonFrame(value);
+    if (!parsed || *parsed < low || *parsed > high ||
+        (four_k_plus_one && (*parsed - 1) % 4 != 0))
+      return false;
+    animate_options[name] = *parsed;
+    return true;
+  };
+  if (!frame_count("continue_motion_max_frames", 1, 81, true) ||
+      !frame_count("length", 5, 81, true) ||
+      !frame_count("continue_frames", 1, 77, true) ||
+      !frame_count("video_frame_offset", 0, 100000, false))
+    return Fail(error, "invalid_animate",
+                "'gufo.animate' frame counts: 'length' 4k+1 in 5..81, "
+                "'continue_frames' and 'continue_motion_max_frames' 4k+1 "
+                "(continue_frames below length), 'video_frame_offset' "
+                "0..100000");
+  if (animate_options.member_double("continue_frames", 5) >=
+      animate_options.member_double("length", 77))
+    return Fail(error, "invalid_animate",
+                "'gufo.animate.continue_frames' must be below 'length'");
+  if (const json::Value* sampler = member("sampler")) {
+    if (!sampler->is_string() ||
+        (sampler->str() != "lcm" && sampler->str() != "euler"))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.sampler' must be lcm or euler");
+    animate_options["sampler"] = sampler->str();
+  }
+  if (const json::Value* shift = member("shift")) {
+    const double value = shift->is_number() ? shift->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 1.0 || value > 20.0)
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.shift' must be a number in 1..20");
+    animate_options["shift"] = value;
+  }
+  std::string parameter_error;
+  if (!ValidateParameters(Family::kWan22Animate, parameters, &parameter_error))
+    return Fail(error, "invalid_parameters", parameter_error);
+  if (!mask_file.empty())
+    options["mask_format"] = mask_format;
+  options["animate"] = std::move(animate_options);
+  if (!reference.empty())
+    prepared->attachments.push_back(
+        {.name = "first_frame", .bytes = std::move(reference)});
+  const std::pair<const char*, std::vector<std::uint8_t>*> videos[] = {
+      {"pose_video", &pose},
+      {"face_video", &face},
+      {"background_video", &background},
+      {"mask", &mask_file},
+      {"continue_motion", &previous}};
+  for (const auto& [name, bytes] : videos)
+    if (!bytes->empty())
+      prepared->attachments.push_back(
+          {.name = name, .bytes = std::move(*bytes)});
+  prepared->prompt = std::move(common.prompt);
+  prepared->size = std::move(common.size);
+  prepared->seconds = seconds;
+  prepared->seed = seed;
+  prepared->parameters = std::move(parameters);
+  prepared->options_json = options.dump();
+  return true;
+}
+
 // Wan 2.1 I2V 14B + InfiniteTalk ("wan2.1-infinitetalk-14b"): {"model",
 // "prompt", "size" (default "832x480", multiples of 16, at most 896x512
 // pixels), "seconds" (optional, 0.04..60 at 25 fps; default: the audio
@@ -1109,6 +1387,8 @@ std::string_view ModelId(Family family) noexcept {
       return kWan21TalkModelId;
     case Family::kWan22FunVace:
       return kWan22FunVaceModelId;
+    case Family::kWan22Animate:
+      return kWan22AnimateModelId;
   }
   return kWan22ModelId;
 }
@@ -1125,6 +1405,8 @@ std::string_view Preset(Family family) noexcept {
       return kWan21TalkPreset;
     case Family::kWan22FunVace:
       return kWan22FunVacePreset;
+    case Family::kWan22Animate:
+      return kWan22AnimatePreset;
   }
   return kWan22Preset;
 }
@@ -1176,6 +1458,10 @@ bool IsWan21TalkDirectory(const std::filesystem::path& root) {
 
 bool IsWan22FunVaceDirectory(const std::filesystem::path& root) {
   return ReadClassName(root / "gufo-vace22.json", "GufoWan22FunVace");
+}
+
+bool IsWan22AnimateDirectory(const std::filesystem::path& root) {
+  return ReadClassName(root / "gufo-animate.json", "GufoWan22Animate");
 }
 
 bool ParseVideoSize(std::string_view size, int* width, int* height) {
@@ -1243,6 +1529,17 @@ bool ValidateParameters(Family family, const ext::VideoParameters& p,
       if (p.evaluations < 1 || p.evaluations > 50)
         return fail("steps must be 1..50");
       return true;
+    case Family::kWan22Animate:
+      if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 16 != 0 ||
+          h % 16 != 0 || w * h > 1280 * 720)
+        return fail(
+            "size must be WxH with multiples of 16, 256..1280 per side and "
+            "at most 1280x720 pixels");
+      if (p.frames < 5 || p.frames > 481 || (p.frames - 1) % 4 != 0)
+        return fail("frames must be 4k + 1 between 5 and 481 (30 s)");
+      if (p.evaluations < 1 || p.evaluations > 50)
+        return fail("steps must be 1..50");
+      return true;
   }
   return fail("unknown Wan family");
 }
@@ -1276,6 +1573,14 @@ std::optional<int> ResolveDurationFrames(Family family,
         return std::nullopt;
       }
       return std::clamp(static_cast<int>(std::lround(*value * 25.0)), 1, 1500);
+    case Family::kWan22Animate: {
+      if (!value || *value < 0.25 || *value > 30.05) {
+        SetError(error, "'seconds' must be a number between 0.25 and 30");
+        return std::nullopt;
+      }
+      const int groups = std::max(1, static_cast<int>(std::lround(*value * 4)));
+      return std::min(4 * groups + 1, 481);
+    }
   }
   return std::nullopt;
 }
@@ -1385,6 +1690,8 @@ bool PrepareRequest(Family family, const ext::VideoRequestInput& input,
       return PrepareVace(family, body, prepared, error);
     case Family::kWan21Talk:
       return PrepareTalk(body, prepared, error);
+    case Family::kWan22Animate:
+      return PrepareAnimate(body, prepared, error);
   }
   return Fail(error, "invalid_model", "unknown Wan family");
 }
@@ -1430,7 +1737,8 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   job->steps = request.parameters.evaluations;
   job->negative_prompt = options.member_str("negative_prompt");
   job->guidance = options.member_double(
-      "guidance", IsVaceFamily(family) ? 1.0 : 5.0);
+      "guidance",
+      IsVaceFamily(family) || family == Family::kWan22Animate ? 1.0 : 5.0);
   if (const auto* first = attachment("first_frame");
       first != nullptr && !image(*first, &job->first_frame))
     return false;
@@ -1442,6 +1750,28 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   }
   if (const json::Value* camera = options.find("camera"))
     job->camera_json = camera->dump();
+  if (family == Family::kWan22Animate) {
+    const json::Value* animate = options.find("animate");
+    job->animate_json = animate != nullptr ? animate->dump() : "{}";
+    const std::pair<const char*, std::filesystem::path*> videos[] = {
+        {"pose_video", &job->pose_video_path},
+        {"face_video", &job->face_video_path},
+        {"background_video", &job->background_video_path},
+        {"continue_motion", &job->continue_video_path}};
+    for (const auto& [name, path] : videos)
+      if (const auto* video = attachment(name)) {
+        *path = directory / (std::string(name) + ".mp4");
+        if (!WriteFile(*path, video->bytes, error))
+          return false;
+      }
+    if (const auto* mask = attachment("mask")) {
+      job->mask_path = directory / (options.member_str("mask_format") == "ppm"
+                                        ? "mask.ppm"
+                                        : "mask.mp4");
+      if (!WriteFile(job->mask_path, mask->bytes, error))
+        return false;
+    }
+  }
   if (IsVaceFamily(family)) {
     const json::Value* vace = options.find("vace");
     job->vace_json = vace != nullptr ? vace->dump() : "{}";

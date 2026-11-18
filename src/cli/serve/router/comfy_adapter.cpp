@@ -467,8 +467,16 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->vace_mask);
       if (video->animate_background)
         files->push_back(*video->animate_background);
-      for (const auto* runs : {&video->control_runs, &video->mask_runs,
-                               &video->animate_background_runs})
+      for (const auto* animate :
+           {&video->pose_video, &video->face_video, &video->background_video,
+            &video->continue_motion})
+        if (*animate)
+          files->push_back(**animate);
+      for (const auto* runs :
+           {&video->control_runs, &video->mask_runs,
+            &video->animate_background_runs, &video->pose_runs,
+            &video->face_runs, &video->background_runs,
+            &video->continue_runs})
         for (const FrameRun& run : *runs)
           if (run.image)
             files->push_back(*run.image);
@@ -2588,6 +2596,44 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                              Base64Encode(bytes));
       }
       vace["reference_images"] = std::move(references);
+    }
+  }
+  if (spec.family == VideoFamily::kAnimate) {
+    // Wan 2.2 Animate media into gufo.animate: loaded videos as they are,
+    // frames built in the graph rendered whole (gufo seeks
+    // video_frame_offset itself; the face crops at 512x512).
+    json::Value& animate = body["gufo"]["animate"];
+    const auto video = [&](const char* key, const std::optional<FileRef>& file,
+                           const std::vector<FrameRun>& runs, int width,
+                           int height) {
+      if (file)
+        animate[key] =
+            "data:video/mp4;base64," + Base64Encode(ReadFileRef(*file));
+      else if (!runs.empty())
+        animate[key] = "data:video/mp4;base64," +
+                       Base64Encode(RenderFrameRuns(runs, width, height,
+                                                    FrameCount(runs), key));
+    };
+    video("pose_video", spec.pose_video, spec.pose_runs, spec.width,
+          spec.height);
+    video("face_video", spec.face_video, spec.face_runs, 512, 512);
+    video("background_video", spec.background_video, spec.background_runs,
+          spec.width, spec.height);
+    video("continue_motion", spec.continue_motion, spec.continue_runs,
+          spec.width, spec.height);
+    video("character_mask", std::nullopt, spec.mask_runs, spec.width,
+          spec.height);
+    if (spec.vace_mask) {
+      const std::string bytes = ReadFileRef(*spec.vace_mask);
+      animate["character_mask"] =
+          (ImageDimensions(bytes) ? "data:" + SniffImageType(bytes)
+                                  : std::string("data:video/mp4")) +
+          ";base64," + Base64Encode(bytes);
+    }
+    if (!spec.reference_images.empty()) {
+      const std::string bytes = ReadFileRef(spec.reference_images.front());
+      animate["reference_image"] =
+          "data:" + SniffImageType(bytes) + ";base64," + Base64Encode(bytes);
     }
   }
   if (spec.source_video)
