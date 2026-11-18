@@ -3180,7 +3180,13 @@ The official SDK supports typed parsing and streaming through
 
 Constraints apply before target sampling in AR, DFlash2, MTP and DSpark, including
 streaming, images and concurrent requests. Reasoning stays separate from JSON
-and counts toward the output budget. Changing the schema changes the cache prefix.
+and counts toward the output budget. The schema instruction ("Respond with a
+single JSON object matching this JSON Schema: ...", plus the optional
+description and the JSON tool-call note) is server framing at the end of the
+last user message (2.2.3; before, it led the system turn), so the system
+prompt and the history before that message stay in the prefix cache when the
+schema changes. A last user message with images, or a request without a user
+message, keeps the instruction in the leading system turn.
 
 Every schema and tool grammar uses one token vocabulary per loaded model.
 Gufo prepares it automatically while the model loads, before readiness, and

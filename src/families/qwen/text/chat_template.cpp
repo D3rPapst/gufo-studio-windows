@@ -180,6 +180,21 @@ bool AppendMessageContent(std::string& output, const ChatMessage& message,
                           std::vector<std::size_t>* image_offsets,
                           std::vector<ContentSpan>* content_spans) {
   if (message.images.empty()) {
+    if (!message.framing_suffix.empty()) {
+      // Server framing after the client's text (a response-format
+      // instruction on the last user message, 2.2.3): trimmed together like
+      // a system message's; only the client part is content.
+      const std::string untrimmed = message.content + message.framing_suffix;
+      const auto content = Trim(untrimmed);
+      const auto begin =
+          static_cast<std::size_t>(content.data() - untrimmed.data());
+      const auto client_end =
+          std::min(message.content.size(), begin + content.size());
+      const auto client_size = client_end > begin ? client_end - begin : 0;
+      AppendContent(output, content_spans, content.substr(0, client_size));
+      output.append(content.substr(client_size));
+      return !content.empty();
+    }
     const auto content = Trim(message.content);
     AppendContent(output, content_spans, content);
     return !content.empty();

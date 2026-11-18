@@ -924,13 +924,16 @@ void TestServerInstructionsAreFraming() {
                 format == gufo::sampling::JsonConstraint::ToolFormat::kJson &&
                 sampling.constraint,
             "the actual request path selects and binds the JSON fallback");
-        Expect(constrained->messages.front().content ==
-                   (role == ChatRole::kUser ? "" : client),
-               "server instructions do not mutate client system/developer "
-               "content");
+        Expect(constrained->messages.size() == request.messages.size() &&
+                   constrained->messages.front().content == client &&
+                   constrained->messages.front().framing_suffix.empty() ==
+                       (role != ChatRole::kUser),
+               "server instructions do not mutate client content; the "
+               "system/developer message stays as sent");
         Expect(request.messages.front().content == client,
                "constraint construction leaves the original request untouched");
-        const auto& instruction = constrained->messages.front().framing_suffix;
+        // 2.2.3: the instruction follows the last user message.
+        const auto& instruction = constrained->messages.back().framing_suffix;
         Expect(instruction.find("<tool_call>") != std::string::npos &&
                    instruction.find("</tool_call>") != std::string::npos,
                "JSON fallback uses the server framing field");
@@ -938,7 +941,7 @@ void TestServerInstructionsAreFraming() {
             *tokenizer, constrained->messages, constrained->tools, options, {},
             8192);
         auto without = constrained->messages;
-        without.front().framing_suffix.clear();
+        without.back().framing_suffix.clear();
         const auto baseline = QwenChatTemplate::RenderAndTokenize(
             *tokenizer, without, constrained->tools, options);
         Expect(baseline.has_value(), "client-only template encodes");
@@ -959,8 +962,8 @@ void TestServerInstructionsAreFraming() {
                  "client-supplied delimiter spellings remain ordinary text");
         if (!literal_client_tags) {
           auto legacy = constrained->messages;
-          legacy.front().content += legacy.front().framing_suffix;
-          legacy.front().framing_suffix.clear();
+          legacy.back().content += legacy.back().framing_suffix;
+          legacy.back().framing_suffix.clear();
           const auto rendered =
               QwenChatTemplate::Render(legacy, constrained->tools, options);
           TokenizerOptions framing;
@@ -994,7 +997,10 @@ void TestServerInstructionsAreFraming() {
     Expect(constrained &&
                constrained->messages.front().content ==
                    request.messages.front().content &&
-               constrained->messages.front().framing_suffix.find(
+               constrained->messages.front().framing_suffix.empty() &&
+               constrained->messages.back().content ==
+                   request.messages.back().content &&
+               constrained->messages.back().framing_suffix.find(
                    request.response_format_description + "\n\n" +
                    request.response_format->prompt()) != std::string::npos,
            "response formats and descriptions are separated from client "
@@ -1006,6 +1012,92 @@ void TestServerInstructionsAreFraming() {
                          (schema ? 2 : 1),
            "generated description/schema instruction tags retain framing token "
            "identity");
+  }
+  // 2.2.3: the schema instruction is the last thing before the answer. Two
+  // requests with the same history and different schemas render and
+  // tokenize identically up to the last user message, so the prefix cache
+  // restores the system prompt and the history. Before, the instruction was
+  // in the system turn and the prompts differed from its first line on.
+  for (const auto* constrainer : {&runner, &native_runner}) {
+    const auto with_schema = [&](const char* schema) {
+      ChatRequest request({{ChatRole::kSystem, "You extract data."},
+                           {ChatRole::kUser, "First file."},
+                           {ChatRole::kAssistant, "Done."},
+                           {ChatRole::kUser, "Now the second file."}});
+      request.reasoning.enabled = false;
+      request.response_format = gufo::sampling::JsonConstraint::Compile(
+          gufo::json::parse(schema), false);
+      gufo::sampling::SamplingConfig sampled;
+      auto constrained =
+          gufo::server::ConstrainChatRequest(request, *constrainer, &sampled);
+      Expect(constrained && sampled.constraint &&
+                 constrained->messages.size() == 4 &&
+                 constrained->messages[0].framing_suffix.empty() &&
+                 constrained->messages[2].framing_suffix.empty() &&
+                 constrained->messages[3].framing_suffix.find(
+                     request.response_format->prompt()) != std::string::npos,
+             "the schema instruction is framing on the last user message");
+      return *constrained;
+    };
+    const auto a = with_schema(
+        R"({"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false})");
+    const auto b = with_schema(
+        R"({"type":"object","properties":{"total":{"type":"integer"},"items":{"type":"array","items":{"type":"string"}}},"required":["total"],"additionalProperties":false})");
+    const auto text_a = QwenChatTemplate::Render(a.messages, {}, options);
+    const auto text_b = QwenChatTemplate::Render(b.messages, {}, options);
+    Expect(text_a && text_b, "both schema prompts render");
+    const std::string last_user =
+        std::string(kImStart) + "user\nNow the second file.";
+    const auto before = text_a ? text_a->rfind(last_user) : std::string::npos;
+    Expect(before != std::string::npos && text_b &&
+               text_b->rfind(last_user) == before,
+           "the last user message starts at the same offset");
+    std::size_t common = 0;
+    if (text_a && text_b)
+      while (common < text_a->size() && common < text_b->size() &&
+             (*text_a)[common] == (*text_b)[common])
+        ++common;
+    Expect(before != std::string::npos &&
+               common >= before + last_user.size(),
+           "the texts share everything up to the end of the client's last "
+           "user text");
+    // The same history without a schema has the same prefix: the system
+    // prompt is not touched.
+    auto plain = a.messages;
+    plain.back().framing_suffix.clear();
+    const auto text_plain = QwenChatTemplate::Render(plain, {}, options);
+    Expect(text_plain && before != std::string::npos &&
+               text_plain->compare(0, before, *text_a, 0, before) == 0,
+           "the prefix equals the unconstrained prompt's");
+    const auto tokens_a =
+        QwenChatTemplate::RenderAndTokenize(*tokenizer, a.messages, options);
+    const auto tokens_b =
+        QwenChatTemplate::RenderAndTokenize(*tokenizer, b.messages, options);
+    // Everything up to the end of the client's last user text, as tokens.
+    std::optional<std::vector<TokenId>> tokens_history;
+    if (text_a && before != std::string::npos) {
+      TokenizerOptions framing;
+      framing.parse_special_tokens = true;
+      tokens_history = tokenizer->Encode(
+          std::string_view(*text_a).substr(0, before + last_user.size()),
+          framing);
+    }
+    Expect(tokens_a && tokens_b && tokens_history &&
+               tokens_history->size() < tokens_a->size(),
+           "the token sequences encode");
+    if (tokens_a && tokens_b && tokens_history &&
+        tokens_history->size() < tokens_a->size()) {
+      const auto mismatch =
+          std::mismatch(tokens_a->begin(), tokens_a->end(), tokens_b->begin(),
+                        tokens_b->end());
+      const auto shared =
+          static_cast<std::size_t>(mismatch.first - tokens_a->begin());
+      Expect(shared >= tokens_history->size() &&
+                 std::equal(tokens_history->begin(), tokens_history->end(),
+                            tokens_a->begin()),
+             "the token sequences share every token up to the client's "
+             "last user text");
+    }
   }
   ChatRequest native({{ChatRole::kUser, "Call record."}});
   native.reasoning.enabled = false;

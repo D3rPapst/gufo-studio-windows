@@ -107,9 +107,28 @@ std::optional<ChatRequest> ConstrainChatRequest(
   }
   if (!request.response_format_description.empty())
     instruction.insert(0, request.response_format_description + "\n\n");
+  // The instruction goes to the end of the prompt (2.2.3): appended to the
+  // last user message as server framing, so the system prompt and the whole
+  // history before that message render exactly as without a schema and the
+  // prefix cache restores them across requests whose schemas differ. Not as
+  // a system message there: the Qwen template hoists every system message
+  // into the leading system turn, and Gemma and LFM render system text only
+  // at the start. A last user message with images (the Gemma renderer drops
+  // framing beside images) and a request without a user message keep the
+  // former place in the leading system turn.
+  std::size_t last_user = constrained.messages.size();
+  for (std::size_t i = constrained.messages.size(); i > 0; --i) {
+    if (constrained.messages[i - 1].role == tokenization::ChatRole::kUser) {
+      last_user = i - 1;
+      break;
+    }
+  }
   if (instruction.empty()) {
     // Native constraints follow the model's existing template. In particular
     // they do not change prompt tokens or invalidate continuation checkpoints.
+  } else if (last_user < constrained.messages.size() &&
+             constrained.messages[last_user].images.empty()) {
+    constrained.messages[last_user].framing_suffix += "\n\n" + instruction;
   } else if (!constrained.messages.empty() &&
              (constrained.messages.front().role ==
                   tokenization::ChatRole::kSystem ||
