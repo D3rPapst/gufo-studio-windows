@@ -28,6 +28,7 @@ enum class Family : std::uint8_t {
   kWan21Talk,   // Wan 2.1 I2V 14B + InfiniteTalk, 25 fps
   kWan22FunVace,  // Wan 2.2 T2V A14B (two experts) + Fun VACE, 16 fps
   kWan22Animate,  // Wan 2.2 Animate 14B (pose / face / replacement), 16 fps
+  kWan22I2V,      // Wan 2.2 I2V A14B (two experts, no CLIP), 16 fps
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
@@ -43,6 +44,8 @@ inline constexpr std::string_view kWan22FunVaceModelId =
 inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
 inline constexpr std::string_view kWan22AnimateModelId = "wan2.2-animate-14b";
 inline constexpr std::string_view kWan22AnimatePreset = "wan22-animate";
+inline constexpr std::string_view kWan22I2VModelId = "wan2.2-i2v-a14b";
+inline constexpr std::string_view kWan22I2VPreset = "wan22-i2v";
 
 [[nodiscard]] std::string_view ModelId(Family family) noexcept;
 [[nodiscard]] std::string_view Preset(Family family) noexcept;
@@ -66,6 +69,8 @@ inline constexpr std::string_view kWan22AnimatePreset = "wan22-animate";
 }
 /// gufo-animate.json with `_class_name` GufoWan22Animate.
 [[nodiscard]] bool IsWan22AnimateDirectory(const std::filesystem::path& root);
+/// gufo-i2v22.json with `_class_name` GufoWan22I2V.
+[[nodiscard]] bool IsWan22I2VDirectory(const std::filesystem::path& root);
 
 /// "WxH".
 [[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
@@ -76,7 +81,8 @@ inline constexpr std::string_view kWan22AnimatePreset = "wan22-animate";
                                       const ext::VideoParameters& parameters,
                                       std::string* error = nullptr);
 /// HTTP "seconds" to frames: Wan 2.2 24 fps 4k + 1 (0.2..5 s), Wan 2.1
-/// camera / VACE 16 fps 4k + 1 (0.25..5 s), InfiniteTalk round(s * 25)
+/// camera / VACE / Wan 2.2 I2V A14B 16 fps 4k + 1 (0.25..5 s), InfiniteTalk
+/// round(s * 25)
 /// (0.04..60 s), Animate 16 fps 4k + 1 (0.25..30 s, chained chunks).
 [[nodiscard]] std::optional<int> ResolveDurationFrames(
     Family family, std::string_view seconds, std::string* error = nullptr);
@@ -128,6 +134,9 @@ struct JobRequest {
   // Uni3C render video, VACE control video, InfiniteTalk input video.
   std::filesystem::path guide_video_path;
   // VACE (2.1 and 2.2 Fun): options JSON, mask file (".mp4" or ".ppm"), reference images.
+  // Wan 2.2 I2V A14B: "gufo.i2v" options as JSON (the start image in
+  // first_frame).
+  std::string i2v_json;
   std::string vace_json;
   std::filesystem::path mask_path;
   std::vector<Image> references;

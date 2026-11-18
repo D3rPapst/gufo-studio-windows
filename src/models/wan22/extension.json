@@ -82,6 +82,18 @@
       ],
       "target": "gufo_wan22_hip",
       "entry": "wan22_animate_provider_register"
+    },
+    {
+      "id": "wan22-i2v-a14b",
+      "capability": "video_generation",
+      "keys": [
+        "manifest:GufoWan22I2V"
+      ],
+      "model_ids": [
+        "wan2.2-i2v-a14b"
+      ],
+      "target": "gufo_wan22_hip",
+      "entry": "wan22_i2v_provider_register"
     }
   ],
   "targets": {
@@ -138,8 +150,8 @@
     ]
   },
   "docs": {
-    "title": "Wan 2.2 TI2V 5B, Wan 2.1 14B (Uni3C camera, VACE, InfiniteTalk) and Wan 2.2 Fun VACE A14B",
-    "inputs": "Diffusers Wan 2.2 directory or gufo-camera/vace/talk/vace22.json bundles; text, image, audio and video conditioning",
+    "title": "Wan 2.2 TI2V 5B, Wan 2.1 14B (Uni3C camera, VACE, InfiniteTalk), Wan 2.2 Fun VACE A14B, Animate 14B and I2V A14B",
+    "inputs": "Diffusers Wan 2.2 directory or gufo-camera/vace/talk/vace22/animate/i2v22.json bundles; text, image, audio and video conditioning",
     "guide": "../../src/models/wan22/extension.json"
   },
   "tests": [

@@ -126,7 +126,9 @@ struct Transformer21Probes {
 /// channels (patch embedding zero-padded to 36), text-only cross-attention.
 /// So do the Wan 2.2 T2V A14B experts (`Wan2_2-T2V-A14B_HIGH/-LOW_fp8_
 /// e4m3fn_scaled_KJ`, same layout, non-FP8 tensors F32), the base of Wan 2.2
-/// Fun VACE.
+/// Fun VACE. And the Wan 2.2 I2V A14B experts (`Wan2_2-I2V-A14B-HIGH/-LOW_
+/// fp8_e4m3fn_scaled_KJ`): 36 input channels like the Wan 2.1 I2V, but no
+/// img_emb / k_img / v_img (text_only(), no CLIP image states).
 class Transformer21 {
 public:
   static constexpr int kInChannels = 36;
@@ -166,6 +168,8 @@ public:
   [[nodiscard]] std::size_t activation_bytes() const;
   /// 36 (image-to-video) or 16 (text-to-video checkpoint).
   [[nodiscard]] int in_channels() const;
+  /// No image cross-attention (T2V 14B, Wan 2.2 T2V / I2V A14B):
+  /// PrepareContext takes no CLIP image states.
   [[nodiscard]] bool text_only() const;
   /// Milliseconds of the last Forward's blocks and of their self-attention
   /// kernels (device events).

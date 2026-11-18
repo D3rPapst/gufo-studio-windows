@@ -375,6 +375,9 @@ bool CheckUploads(const Body& body, Family family,
                   name == "mask_1" || name == "mask_2" ||
                   name == "talk_video";
         break;
+      case Family::kWan22I2V:
+        allowed = name == "input_reference" || name == "first_frame";
+        break;
       case Family::kWan22Animate:
         allowed = name == "reference_image" || name == "pose_video" ||
                   name == "face_video" || name == "background_video" ||
@@ -575,6 +578,141 @@ bool PrepareWan21(const Body& body, ext::VideoPreparedRequest* prepared,
   if (!guide_video.empty())
     prepared->attachments.push_back(
         {.name = "guide_video", .bytes = std::move(guide_video)});
+  prepared->prompt = std::move(common.prompt);
+  prepared->size = std::move(common.size);
+  prepared->seconds = seconds;
+  prepared->seed = seed;
+  prepared->parameters = std::move(parameters);
+  prepared->options_json = options.dump();
+  return true;
+}
+
+// Wan 2.2 I2V A14B ("wan2.2-i2v-a14b"): {"model", "prompt", "size" (default
+// "832x480", multiples of 16, at most 1280x720 pixels), "seconds" (0.25..5 at
+// 16 fps, default 5), "first_frame" or "input_reference" (required), "gufo":
+// {"seed", "steps" (default 4), "frames", "negative_prompt", "guidance"
+// (1..20, default 1 = no CFG; the low-noise expert's), "preview",
+// "interpolate", "upscale", "i2v": {"switch_step" (0..steps: the first step
+// of the low-noise expert, as ComfyUI's KSamplerAdvanced end_at_step;
+// default from the boundary), "boundary" (0..1, default the bundle's,
+// 0.900), "high_guidance" (1..20: CFG of the high-noise expert; default
+// "gufo.guidance"), "sampler" ("euler" | "lcm"), "shift" (1..20), "lora"
+// (false: without the bundle's step-distill LoRAs)}}}.
+bool PrepareI2V22(const Body& body, ext::VideoPreparedRequest* prepared,
+                  ext::VideoRequestError* error) {
+  constexpr Family family = Family::kWan22I2V;
+  if (body.has("last_frame") || body.json.contains("references"))
+    return Fail(error, "unsupported_input_reference",
+                "Wan 2.2 I2V A14B supports only a first frame ('first_frame' "
+                "or 'input_reference')");
+  if (!HasOnlyMembers(body.json, {"model", "prompt", "size", "seconds", "gufo",
+                                  "input_reference", "first_frame"}))
+    return Fail(error, "unsupported_field",
+                "request contains an unsupported video field");
+  if (!CheckUploads(body, family, error) ||
+      !ReadFirstFrame(body, true, prepared, error))
+    return false;
+  Common common;
+  if (!ParseCommon(body, "832x480", false, &common, error))
+    return false;
+  const std::string seconds = SecondsText(body.json.find("seconds"), "5");
+  std::string duration_error;
+  const auto frames = ResolveDurationFrames(family, seconds, &duration_error);
+  if (!frames)
+    return Fail(error, "invalid_seconds", duration_error);
+  ext::VideoParameters parameters;
+  if (!InitParameters(family, common, 4, &parameters, error))
+    return false;
+  parameters.frames = *frames;
+  std::uint64_t seed = 42;
+  json::Value options = json::Value::object();
+  options["guidance"] = 1.0;
+  json::Value i2v_options = json::Value::object();
+  const json::Value* i2v = nullptr;
+  if (const json::Value* extension = body.json.find("gufo")) {
+    if (!extension->is_object() ||
+        !HasOnlyMembers(*extension,
+                        {"seed", "steps", "frames", "negative_prompt",
+                         "guidance", "interpolate", "upscale", "preview",
+                         "i2v"}))
+      return Fail(error, "invalid_strix_options",
+                  "'gufo' may contain only 'seed', 'steps', 'frames', "
+                  "'negative_prompt', 'guidance', 'interpolate', 'upscale', "
+                  "'preview' and 'i2v'");
+    if (!CheckPostSteps(*extension, error) ||
+        !ReadNegativePrompt(*extension, &options, error))
+      return false;
+    if (const json::Value* value = extension->find("guidance")) {
+      const double guidance = value->is_number() ? value->as_double(-1.0) : -1;
+      if (!std::isfinite(guidance) || guidance < 1.0 || guidance > 20.0)
+        return Fail(error, "invalid_guidance",
+                    "'gufo.guidance' must be a number in 1..20 (1 = no "
+                    "classifier-free guidance)");
+      options["guidance"] = guidance;
+    }
+    if (!ParseSeedSteps(*extension, "1..50", &seed, &parameters, error) ||
+        !CheckFrames(*extension, *frames, error))
+      return false;
+    i2v = extension->find("i2v");
+  }
+  if (i2v != nullptr &&
+      (!i2v->is_object() ||
+       !HasOnlyMembers(*i2v, {"switch_step", "boundary", "high_guidance",
+                              "sampler", "shift", "lora"})))
+    return Fail(error, "invalid_i2v",
+                "'gufo.i2v' may contain only 'switch_step', 'boundary', "
+                "'high_guidance', 'sampler', 'shift' and 'lora'");
+  const auto member = [&](const char* name) -> const json::Value* {
+    return i2v == nullptr ? nullptr : i2v->find(name);
+  };
+  const auto number = [](const json::Value* value) {
+    return value->is_number() ? value->as_double(-1) : -1.0;
+  };
+  if (const json::Value* lora = member("lora")) {
+    if (!lora->is_bool())
+      return Fail(error, "invalid_i2v", "'gufo.i2v.lora' must be a boolean");
+    i2v_options["lora"] = lora->as_bool();
+  }
+  if (const json::Value* sampler = member("sampler")) {
+    if (!sampler->is_string() ||
+        (sampler->str() != "lcm" && sampler->str() != "euler"))
+      return Fail(error, "invalid_i2v",
+                  "'gufo.i2v.sampler' must be lcm or euler");
+    i2v_options["sampler"] = sampler->str();
+  }
+  if (const json::Value* shift = member("shift")) {
+    const double value = number(shift);
+    if (!std::isfinite(value) || value < 1.0 || value > 20.0)
+      return Fail(error, "invalid_i2v",
+                  "'gufo.i2v.shift' must be a number in 1..20");
+    i2v_options["shift"] = value;
+  }
+  if (const json::Value* step = member("switch_step")) {
+    const double value = number(step);
+    if (!std::isfinite(value) || value < 0.0 ||
+        value > parameters.evaluations || std::floor(value) != value)
+      return Fail(error, "invalid_i2v",
+                  "'gufo.i2v.switch_step' must be an integer in 0..steps");
+    i2v_options["switch_step"] = static_cast<int>(value);
+  }
+  if (const json::Value* boundary = member("boundary")) {
+    const double value = number(boundary);
+    if (!std::isfinite(value) || value < 0.0 || value > 1.0)
+      return Fail(error, "invalid_i2v",
+                  "'gufo.i2v.boundary' must be a number in 0..1");
+    i2v_options["boundary"] = value;
+  }
+  if (const json::Value* guidance = member("high_guidance")) {
+    const double value = number(guidance);
+    if (!std::isfinite(value) || value < 1.0 || value > 20.0)
+      return Fail(error, "invalid_i2v",
+                  "'gufo.i2v.high_guidance' must be a number in 1..20");
+    i2v_options["high_guidance"] = value;
+  }
+  std::string parameter_error;
+  if (!ValidateParameters(family, parameters, &parameter_error))
+    return Fail(error, "invalid_parameters", parameter_error);
+  options["i2v"] = std::move(i2v_options);
   prepared->prompt = std::move(common.prompt);
   prepared->size = std::move(common.size);
   prepared->seconds = seconds;
@@ -1389,6 +1527,8 @@ std::string_view ModelId(Family family) noexcept {
       return kWan22FunVaceModelId;
     case Family::kWan22Animate:
       return kWan22AnimateModelId;
+    case Family::kWan22I2V:
+      return kWan22I2VModelId;
   }
   return kWan22ModelId;
 }
@@ -1407,6 +1547,8 @@ std::string_view Preset(Family family) noexcept {
       return kWan22FunVacePreset;
     case Family::kWan22Animate:
       return kWan22AnimatePreset;
+    case Family::kWan22I2V:
+      return kWan22I2VPreset;
   }
   return kWan22Preset;
 }
@@ -1464,6 +1606,10 @@ bool IsWan22AnimateDirectory(const std::filesystem::path& root) {
   return ReadClassName(root / "gufo-animate.json", "GufoWan22Animate");
 }
 
+bool IsWan22I2VDirectory(const std::filesystem::path& root) {
+  return ReadClassName(root / "gufo-i2v22.json", "GufoWan22I2V");
+}
+
 bool ParseVideoSize(std::string_view size, int* width, int* height) {
   const auto x = size.find('x');
   if (x == std::string_view::npos || x == 0 || x + 1 >= size.size())
@@ -1519,6 +1665,7 @@ bool ValidateParameters(Family family, const ext::VideoParameters& p,
       return true;
     case Family::kWan21Vace:
     case Family::kWan22FunVace:
+    case Family::kWan22I2V:
       if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 16 != 0 ||
           h % 16 != 0 || w * h > 1280 * 720)
         return fail(
@@ -1559,7 +1706,8 @@ std::optional<int> ResolveDurationFrames(Family family,
     }
     case Family::kWan21Uni3C:
     case Family::kWan21Vace:
-    case Family::kWan22FunVace: {
+    case Family::kWan22FunVace:
+    case Family::kWan22I2V: {
       if (!value || *value < 0.25 || *value > 5.05) {
         SetError(error, "'seconds' must be a number between 0.25 and 5");
         return std::nullopt;
@@ -1692,6 +1840,8 @@ bool PrepareRequest(Family family, const ext::VideoRequestInput& input,
       return PrepareTalk(body, prepared, error);
     case Family::kWan22Animate:
       return PrepareAnimate(body, prepared, error);
+    case Family::kWan22I2V:
+      return PrepareI2V22(body, prepared, error);
   }
   return Fail(error, "invalid_model", "unknown Wan family");
 }
@@ -1738,7 +1888,10 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   job->negative_prompt = options.member_str("negative_prompt");
   job->guidance = options.member_double(
       "guidance",
-      IsVaceFamily(family) || family == Family::kWan22Animate ? 1.0 : 5.0);
+      IsVaceFamily(family) || family == Family::kWan22Animate ||
+              family == Family::kWan22I2V
+          ? 1.0
+          : 5.0);
   if (const auto* first = attachment("first_frame");
       first != nullptr && !image(*first, &job->first_frame))
     return false;
@@ -1771,6 +1924,10 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
       if (!WriteFile(job->mask_path, mask->bytes, error))
         return false;
     }
+  }
+  if (family == Family::kWan22I2V) {
+    const json::Value* i2v = options.find("i2v");
+    job->i2v_json = i2v != nullptr ? i2v->dump() : "{}";
   }
   if (IsVaceFamily(family)) {
     const json::Value* vace = options.find("vace");

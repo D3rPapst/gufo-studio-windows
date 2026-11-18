@@ -74,6 +74,19 @@ struct JobCallbacks {
                                       ext::VideoTelemetry* telemetry,
                                       std::string* error);
 
+/// Wan 2.2 I2V A14B (16 fps). gufo-i2v22.json: {"vae", "t5", "dit_high",
+/// "lora_high", "lora_high_strength", "dit_low", "lora_low",
+/// "lora_low_strength", "boundary" (default 0.900), "shift" (default 5),
+/// "sampler" (default "euler"), "experts_resident" (default true)} ("vae":
+/// a Diffusers root with vae/, the Wan 2.1 VAE; "t5": one with tokenizer/
+/// and text_encoder/). The start image is fitted to the video size (cover,
+/// centre crop); the high-noise expert runs first, then the low-noise one,
+/// both resident over jobs when the device has room.
+[[nodiscard]] bool RunWan22I2VJob(const JobRequest& job,
+                                  const JobCallbacks& callbacks,
+                                  ext::VideoTelemetry* telemetry,
+                                  std::string* error);
+
 /// Up to `max_frames` frames of an MP4, each fitted to width x height like
 /// the first frame (cover, centre crop), RGB8 one after another; `count` is
 /// how many were read (at least one).
