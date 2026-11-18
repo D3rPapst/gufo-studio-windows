@@ -2152,6 +2152,130 @@ void TestFirstLastFrame() {
                       ->items()[1].find("max")->as_double() == 16777215);
 }
 
+// Wan 2.2 Animate as ComfyUI's template wires it (pose and face video from
+// LoadVideo, reference image with CLIP vision, the lightx2v and relight
+// LoRAs, TrimVideoLatent and ImageFromBatch behind the decode); gufo runs
+// it on VACE.
+constexpr const char* kAnimate = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength_model": 1.0}},
+ "8": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["2", 0], "lora_name": "WanAnimate_relight_lora_fp16.safetensors", "strength_model": 1.0}},
+ "5": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["8", 0], "shift": 8.0}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "6": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+ "7": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["6", 0], "image": ["24", 0], "crop": "none"}},
+ "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "a woman dances in the office"}},
+ "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "blurry"}},
+ "20": {"class_type": "LoadVideo", "inputs": {"file": "pose_tanz.mp4"}},
+ "21": {"class_type": "GetVideoComponents", "inputs": {"video": ["20", 0]}},
+ "22": {"class_type": "LoadVideo", "inputs": {"file": "gesicht_tanz.mp4"}},
+ "23": {"class_type": "GetVideoComponents", "inputs": {"video": ["22", 0]}},
+ "24": {"class_type": "LoadImage", "inputs": {"image": "figur_anna.png"}},
+ "30": {"class_type": "WanAnimateToVideo", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": 77, "batch_size": 1, "continue_motion_max_frames": 5, "video_frame_offset": 0, "clip_vision_output": ["7", 0], "reference_image": ["24", 0], "face_video": ["23", 0], "pose_video": ["21", 0]}},
+ "31": {"class_type": "KSampler", "inputs": {"model": ["5", 0], "positive": ["30", 0], "negative": ["30", 1], "latent_image": ["30", 2], "seed": 7, "steps": 6, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "32": {"class_type": "TrimVideoLatent", "inputs": {"samples": ["31", 0], "trim_amount": ["30", 3]}},
+ "33": {"class_type": "VAEDecode", "inputs": {"samples": ["32", 0], "vae": ["4", 0]}},
+ "36": {"class_type": "ImageFromBatch", "inputs": {"image": ["33", 0], "batch_index": ["30", 4], "length": 4096}},
+ "34": {"class_type": "CreateVideo", "inputs": {"images": ["36", 0], "fps": 16}},
+ "35": {"class_type": "SaveVideo", "inputs": {"video": ["34", 0], "filename_prefix": "film/animate/tanz01", "format": "mp4", "codec": "h264"}}
+})";
+
+void TestAnimate() {
+  const comfy::Plan plan = PlanOf(kAnimate);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "31");
+  assert(plan.tasks[0].outputs.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kVace);
+  assert(video.model == "wan2.1-vace-14b");
+  assert(video.prompt == "a woman dances in the office");
+  assert(video.negative_prompt == "blurry");
+  assert(video.width == 832 && video.height == 480 && video.frames == 77);
+  assert(video.fps == 16 && video.steps == 6 && video.seed == 7);
+  assert((video.control_video == comfy::FileRef{"pose_tanz.mp4", "input"}));
+  assert(video.control_runs.empty() && video.mask_runs.empty());
+  assert(!video.vace_mask);  // the whole picture is generated
+  assert(video.reference_images.size() == 1);
+  assert((video.reference_images[0] ==
+          comfy::FileRef{"figur_anna.png", "input"}));
+  assert(video.vace_lora && video.vace_sampler == "euler");
+  assert(video.vace_shift && *video.vace_shift == 8.0);
+  // Warnings: Animate on VACE (face), face_video, clip_vision_output, the
+  // relight LoRA, the Animate checkpoint.
+  const auto warned = [&](const comfy::Plan& p, const std::string& text) {
+    return std::any_of(p.warnings.begin(), p.warnings.end(),
+                       [&](const std::string& w) {
+                         return w.find(text) != std::string::npos;
+                       });
+  };
+  assert(plan.warnings.size() == 5);
+  assert(warned(plan, "facial expression"));
+  assert(warned(plan, "face_video is ignored"));
+  assert(warned(plan, "clip_vision_output is ignored"));
+  assert(warned(plan, "WanAnimate_relight_lora"));
+  assert(warned(plan, "Wan2_2-Animate-14B"));
+
+  // Character replacement: background video + still mask, no pose.
+  std::string replace = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                                "\"background_video\": [\"21\", 0], "
+                                "\"character_mask\": [\"40\", 0]");
+  replace = Replace(replace, " \"30\":",
+                    " \"40\": {\"class_type\": \"LoadImageMask\", \"inputs\": "
+                    "{\"image\": \"figur_maske.png\", \"channel\": \"red\"}},"
+                    "\n \"30\":");
+  const comfy::Plan swap_plan = PlanOf(replace.c_str());
+  const auto& swap = std::get<comfy::VideoTask>(swap_plan.tasks[0].spec);
+  assert((swap.control_video == comfy::FileRef{"pose_tanz.mp4", "input"}));
+  assert((swap.vace_mask == comfy::FileRef{"figur_maske.png", "input"}));
+  assert(swap.vace_mask_channel == "red" && !swap.vace_invert_mask);
+  assert(!warned(swap_plan, "still mask"));  // Animate repeats it too
+
+  // A pose built from frames with an offset: frames 10.. kept, the last
+  // one repeated up to length (as ComfyUI pads the pose video).
+  std::string frames = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                               "\"pose_video\": [\"41\", 0]");
+  frames = Replace(frames, "\"video_frame_offset\": 0",
+                   "\"video_frame_offset\": 10");
+  frames = Replace(frames, ", \"face_video\": [\"23\", 0]", "");
+  frames = Replace(frames, " \"30\":",
+                   " \"41\": {\"class_type\": \"RepeatImageBatch\", "
+                   "\"inputs\": {\"image\": [\"42\", 0], \"amount\": 40}},\n"
+                   " \"42\": {\"class_type\": \"LoadImage\", \"inputs\": "
+                   "{\"image\": \"pose_stand.png\"}},\n \"30\":");
+  const comfy::Plan frame_plan = PlanOf(frames.c_str());
+  const auto& posed = std::get<comfy::VideoTask>(frame_plan.tasks[0].spec);
+  // RepeatImageBatch: 40 runs of one frame; 0..9 skipped (count 0), 10..39
+  // kept, the last one stretched by the 47 missing frames.
+  assert(!posed.control_video && posed.control_runs.size() == 40);
+  assert(comfy::FrameCount(posed.control_runs) == 77);
+  assert(posed.control_runs[9].count == 0 && posed.control_runs[10].count == 1);
+  assert(posed.control_runs[39].count == 48);
+  assert((posed.control_runs[39].image ==
+          comfy::FileRef{"pose_stand.png", "input"}));
+
+  // Errors: an offset into a loaded pose video, a wrong length, too large.
+  assert(ErrorOf(Replace(kAnimate, "\"video_frame_offset\": 0",
+                         "\"video_frame_offset\": 10"))
+             .message.find("video_frame_offset") != std::string::npos);
+  assert(ErrorOf(Replace(kAnimate, "\"length\": 77", "\"length\": 76"))
+             .message.find("4k+1") != std::string::npos);
+  assert(ErrorOf(Replace(kAnimate, "\"width\": 832", "\"width\": 1600"))
+             .message.find("1280x720") != std::string::npos);
+
+  // Known class with ComfyUI's outputs in order.
+  const auto& classes = comfy::SupportedClassTypes();
+  assert(std::find(classes.begin(), classes.end(), "WanAnimateToVideo") !=
+         classes.end());
+  const auto info = comfy::NodeInfo("WanAnimateToVideo");
+  assert(info && info->find("output")->size() == 6);
+  const json::Value* names = info->find("output_name");
+  assert(names->items()[3].str() == "trim_latent");
+  assert(names->items()[4].str() == "trim_image");
+  assert(names->items()[5].str() == "video_frame_offset");
+  assert(info->find("input")->find("optional")->find("character_mask")
+             ->items()[0].str() == "MASK");
+}
+
 void TestInfiniteTalk() {
   const comfy::Plan plan = PlanOf(kTalk);
   assert(plan.tasks.size() == 1);
@@ -2916,6 +3040,7 @@ int main() {
   TestVace();
   TestVaceKeyframes();
   TestFirstLastFrame();
+  TestAnimate();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();
   TestDelivery();
