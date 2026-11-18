@@ -671,6 +671,12 @@ Resolution ResolveModel(const HttpRequest& req) {
     resolution.model_id = req.query_param("model");
     return resolution;
   }
+  if (router::IsVoiceConvertRead(req.method, req.path)) {
+    // GET /v1/audio/convert/voices and the voice job reads have no body:
+    // ?model= or, without it, the only `serve voice` preset (handler).
+    resolution.model_id = req.query_param("model");
+    return resolution;
+  }
   return resolution;
 }
 
@@ -1331,6 +1337,26 @@ public:
           return Err(404, "Not Found", "unknown 3D job " + objekt_job,
                      "invalid_request_error", "not_found");
         }
+      }
+    }
+    if (resolved.model_id.empty() &&
+        router::IsVoiceConvertRead(req.method, req.path)) {
+      // Voice list / voice job reads without ?model=: the one preset that
+      // runs `serve voice`.
+      std::vector<const router::PresetModel*> presets;
+      for (const router::Registry::ModelStatus& status : registry.Statuses())
+        presets.push_back(status.preset);
+      std::size_t count = 0;
+      resolved.model_id =
+          router::SoleModelWithCapability(presets, "voice_convert", &count);
+      if (resolved.model_id.empty()) {
+        if (count == 0)
+          return Err(404, "Not Found",
+                     "no voice-convert model (serve voice) in the preset",
+                     "invalid_request_error", "model_not_found");
+        return Err(400, "Bad Request",
+                   "several voice-convert models: give ?model=",
+                   "invalid_request_error", "missing_model");
       }
     }
     if (resolved.model_id.empty()) {

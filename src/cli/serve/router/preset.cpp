@@ -693,6 +693,8 @@ std::string CapabilityOf(const PresetModel& preset) {
   for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
     if (preset.argv[i] == "serve" && preset.argv[i + 1] == "objekt")
       return "image_to_3d";
+    if (preset.argv[i] == "serve" && preset.argv[i + 1] == "voice")
+      return "voice_convert";
   }
   return "";
 }
@@ -714,6 +716,33 @@ std::string ReportedModality(const PresetModel& preset) {
   if (command.find("llama-server") != std::string::npos)
     return "llm";
   return "external";
+}
+
+bool IsVoiceConvertRead(std::string_view method, std::string_view path) {
+  if (method != "GET")
+    return false;
+  for (std::string_view prefix : {std::string_view("/v1/audio/convert/"),
+                                  std::string_view("/v1/audio/separate/")}) {
+    if (path.size() > prefix.size() && path.substr(0, prefix.size()) == prefix)
+      return true;
+  }
+  return false;
+}
+
+std::string SoleModelWithCapability(
+    const std::vector<const PresetModel*>& presets, std::string_view capability,
+    std::size_t* count) {
+  std::string id;
+  std::size_t found = 0;
+  for (const PresetModel* preset : presets) {
+    if (preset != nullptr && CapabilityOf(*preset) == capability) {
+      ++found;
+      id = preset->id;
+    }
+  }
+  if (count != nullptr)
+    *count = found;
+  return found == 1 ? id : std::string();
 }
 
 }  // namespace gufo::router

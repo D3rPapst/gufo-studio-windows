@@ -461,9 +461,59 @@ void TestReportedModality() {
   assert(gufo::router::ReportedModality(m) == "llm");
 }
 
+// GET /v1/audio/convert/voices and the voice job reads route by ?model= or
+// to the only `serve voice` preset (router.cpp ResolveModel).
+// AI-assisted (Claude Code), 2026-11-18.
+void TestVoiceConvertRouting() {
+  using gufo::router::CapabilityOf;
+  using gufo::router::IsVoiceConvertRead;
+  using gufo::router::SoleModelWithCapability;
+  assert(IsVoiceConvertRead("GET", "/v1/audio/convert/voices"));
+  assert(IsVoiceConvertRead("GET", "/v1/audio/convert/vc_3"));
+  assert(IsVoiceConvertRead("GET", "/v1/audio/convert/vc_3/content"));
+  assert(IsVoiceConvertRead("GET", "/v1/audio/separate/sep_1/vocals"));
+  assert(!IsVoiceConvertRead("POST", "/v1/audio/convert/voices"));
+  assert(!IsVoiceConvertRead("GET", "/v1/audio/convert"));
+  assert(!IsVoiceConvertRead("GET", "/v1/audio/convert/"));
+  assert(!IsVoiceConvertRead("GET", "/v1/audio/convertx/voices"));
+  assert(!IsVoiceConvertRead("GET", "/v1/audio/voices"));
+
+  PresetModel voice;
+  voice.modality = "external";
+  voice.id = "gufo-voice-convert";
+  voice.argv = {"serve", "voice", "--model", "D:/voiceconv"};
+  PresetModel objekt;
+  objekt.modality = "external";
+  objekt.id = "triposg";
+  objekt.argv = {"serve", "objekt", "--model", "D:/triposg"};
+  PresetModel llm;
+  llm.modality = "llm";
+  llm.id = "qwen";
+  llm.argv = {"--model", "D:/q.gguf"};
+  assert(CapabilityOf(voice) == "voice_convert");
+  assert(CapabilityOf(objekt) == "image_to_3d");
+  assert(CapabilityOf(llm).empty());
+
+  std::size_t count = 9;
+  assert(SoleModelWithCapability({&llm, &voice, &objekt}, "voice_convert",
+                                 &count) == "gufo-voice-convert");
+  assert(count == 1);
+  assert(SoleModelWithCapability({&llm, &objekt}, "voice_convert", &count)
+             .empty());
+  assert(count == 0);
+  PresetModel voice2 = voice;
+  voice2.id = "voice-b";
+  assert(SoleModelWithCapability({&voice, &voice2}, "voice_convert", &count)
+             .empty());
+  assert(count == 2);
+  assert(SoleModelWithCapability({nullptr, &voice}, "voice_convert") ==
+         "gufo-voice-convert");
+}
+
 int main() {
   gufo::cli::SetServeArgvValidator(&RejectBogus);
   TestReportedModality();
+  TestVoiceConvertRouting();
   TestServedNameAliases();
 #if !GUFO_ROUTER_FORK_SERVE
   TestLocalOmniRejected();

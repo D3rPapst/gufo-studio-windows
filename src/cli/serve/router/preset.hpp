@@ -96,7 +96,8 @@ struct PresetModel {
 };
 
 /// The worker capability of an external preset derived from its command line
-/// ("serve objekt" -> "image_to_3d"); "" when none is known.
+/// ("serve objekt" -> "image_to_3d", "serve voice" -> "voice_convert"); ""
+/// when none is known.
 std::string CapabilityOf(const PresetModel& preset);
 
 /// The modality `/v1/models` and `/router/capabilities` report (2.0.5): the
@@ -104,6 +105,20 @@ std::string CapabilityOf(const PresetModel& preset);
 /// `args = serve <modality>` names ("llm", "image", "tts", ...); "external"
 /// stays when the command line does not say.
 std::string ReportedModality(const PresetModel& preset);
+
+/// GET reads of `gufo serve voice` that carry no JSON body:
+/// /v1/audio/convert/voices and the async job reads
+/// /v1/audio/convert/<id>[/content] and /v1/audio/separate/<id>[/<part>].
+/// The router takes their model from ?model= or, without it, from the only
+/// preset whose CapabilityOf is "voice_convert" (SoleModelWithCapability).
+[[nodiscard]] bool IsVoiceConvertRead(std::string_view method,
+                                      std::string_view path);
+
+/// The id of the one preset with `capability`; "" when there is none or
+/// more than one (`count` receives how many there are).
+[[nodiscard]] std::string SoleModelWithCapability(
+    const std::vector<const PresetModel*>& presets, std::string_view capability,
+    std::size_t* count = nullptr);
 
 /// The optional `[router]` section (2.0.3): users and access control,
 /// see docs/internal/server.md "Users and access". Values are kept as

@@ -27,6 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 THIS = os.path.abspath(__file__)
 MODELS = ("llm", "emb", "tts", "img", "ace", "ace2")
+# A `gufo serve voice` stand-in: "serve voice" in its args gives it the
+# voice_convert capability the router routes body-less voice GETs by.
+VOICE_MODEL = "vc"
 
 
 def free_port():
@@ -130,6 +133,10 @@ class Router:
             for model in MODELS:
                 handle.write("[external/%s]\ncommand = %s\nargs = %s --fake-worker\n"
                              "served-model-name = %s\n\n" % (model, python, THIS, model))
+            handle.write("[external/%s]\ncommand = %s\n"
+                         "args = %s --fake-worker serve voice\n"
+                         "served-model-name = %s\n\n"
+                         % (VOICE_MODEL, python, THIS, VOICE_MODEL))
         env = {k: v for k, v in os.environ.items()
                if k not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
         args = [binary, "router", "--models-preset", preset, "--host", "127.0.0.1",
@@ -210,6 +217,25 @@ def check_get_routes(router):
         assert code == 400 and error_code(answer) == "missing_model", (path, answer)
         code, answer = router.json("GET", path + "?model=nope")
         assert code == 404 and error_code(answer) == "model_not_found", (path, answer)
+
+
+def check_voice_routes(router):
+    # GET /v1/audio/convert/voices used to answer 404 "no route for this
+    # path": ?model= picks the worker, without it the only voice model.
+    for path in ("/v1/audio/convert/voices", "/v1/audio/convert/vc_1",
+                 "/v1/audio/convert/vc_1/content",
+                 "/v1/audio/separate/sep_1/vocals"):
+        code, answer = router.json("GET", path + "?model=" + VOICE_MODEL)
+        assert code == 200, (path, code, answer)
+        assert answer["model"] == VOICE_MODEL and answer["path"] == path, (path, answer)
+        code, answer = router.json("GET", path)
+        assert code == 200 and answer["model"] == VOICE_MODEL, (path, code, answer)
+        assert answer["path"] == path, (path, answer)
+        code, answer = router.json("GET", path + "?model=nope")
+        assert code == 404 and error_code(answer) == "model_not_found", (path, answer)
+    # The POST still needs its JSON model.
+    code, answer = router.json("POST", "/v1/audio/convert", {"audio": "x"})
+    assert code == 400 and error_code(answer) == "missing_model", answer
 
 
 def check_unchanged(router):
@@ -312,6 +338,7 @@ def main():
     try:
         check_post_routes(router)
         check_get_routes(router)
+        check_voice_routes(router)
         check_unchanged(router)
         check_async_music(router)
     except BaseException:
