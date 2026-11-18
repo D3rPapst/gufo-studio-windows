@@ -9,7 +9,8 @@
 //
 // Rule, in this order (owner's rule, 08.11.2026):
 //  1. Warm and free: a machine that has the model loaded (or loading) and
-//     no request of it in flight -> there; this machine first.
+//     no request of it in flight (a text model: fewer than its sessions,
+//     2.2.7) -> there; this machine first.
 //  2. Cold, idle and empty: a machine with no work in flight and no other
 //     model loaded loads it without evicting anything.
 //  3. Cold and idle: a machine with no work in flight whose loaded models
@@ -55,7 +56,8 @@ inline constexpr const char* kOriginHeader = "X-Gufo-Origin";
 inline constexpr const char* kPreviewIdHeader = "X-Gufo-Preview-Id";
 
 /// One relay at a time per pool model to the remote router (its GPU runs
-/// one request of it at a time).
+/// one request of it at a time), unless the partner reports more sessions
+/// for a text model (2.2.7, PoolSessionsOf / RemotePoolSide).
 inline constexpr int kPoolRemoteCapacity = 1;
 /// After a machine held a pool model, the other machine loads it only once
 /// a request has waited this long (hysteresis against load ping-pong).
@@ -75,7 +77,8 @@ struct PoolSide {
   bool available{false};
   /// The model is loaded or loading there.
   bool warm{false};
-  /// No request of this model in flight there (ours or anyone's).
+  /// No request of this model in flight there (ours or anyone's); for a
+  /// text model with sessions = N (2.2.7): fewer than N in flight.
   bool free{false};
   /// GPU work runs there (ComfyUI queue, image/video/music model busy):
   /// never send a pool request there.
@@ -233,9 +236,56 @@ struct RemoteObservation {
   bool stale{false};
 };
 
+/// 2.2.7: the most requests of one pool model a machine runs at the same
+/// time. A text model (modality llm, or `args = serve llm`) runs up to its
+/// `sessions` (argv --sessions N, the worker's bounded execution session
+/// pool, which batches ready requests); everything else, and a text model
+/// without the key, one (image/video/music stay one GPU task). Clamped to
+/// 1..kPoolSessionsMax.
+inline constexpr int kPoolSessionsMax = 64;
+
+[[nodiscard]] inline int PoolSessionsOf(const PresetModel& preset) {
+  if (ReportedModality(preset) != "llm")
+    return 1;
+  int sessions = 1;
+  for (std::size_t i = 0; i + 1 < preset.argv.size(); ++i) {
+    if (preset.argv[i] != "--sessions")
+      continue;
+    const std::string& text = preset.argv[i + 1];
+    int value = 0;
+    bool digits = !text.empty() && text.size() <= 4;
+    for (const char c : text) {
+      if (c < '0' || c > '9') {
+        digits = false;
+        break;
+      }
+      value = value * 10 + (c - '0');
+    }
+    if (digits && value >= 1)
+      sessions = std::min(value, kPoolSessionsMax);
+  }
+  return sessions;
+}
+
+/// Whether a machine has room for one more request of a model that runs up
+/// to `sessions` at once: `in_flight` (its requests, sockets and jobs plus
+/// pool claims that are not counted as requests yet) below `sessions`.
+/// With sessions = 1 exactly the old rule "nothing of it in flight".
+[[nodiscard]] inline bool PoolSessionFree(std::size_t in_flight,
+                                          int sessions) {
+  return in_flight < static_cast<std::size_t>(std::max(1, sessions));
+}
+
 /// The partner's PoolSide (without `sticky`, which the router keeps).
 /// Only the partner's "busy" counts as occupied: its "waiting" requests
 /// wait for a machine and hold nothing.
+/// 2.2.7: a partner that reports "sessions" > 1 and "inflight" for a text
+/// model takes up to that many requests at once. Its count (from the last
+/// probe, which already saw our older relays) and our open relays overlap,
+/// so the larger of the two counts as occupied: a relay of ours newer than
+/// the probe beside the partner's own request may overshoot by one until
+/// the next probe, and the partner's worker queues it (as before with one
+/// session). A partner older than the fields counts as one session.
 [[nodiscard]] inline PoolSide RemotePoolSide(const RemoteObservation& in) {
   PoolSide side;
   const RemoteHub::ModelView& view = in.view;
@@ -243,11 +293,26 @@ struct RemoteObservation {
   side.available = view.served && in.reachable &&
                    !(view.has_activity && view.activity.draining);
   side.warm = view.status == "loaded" || view.status == "loading";
-  const bool theirs = view.has_activity && view.activity.busy && !in.stale;
-  side.free = in.ours < static_cast<std::size_t>(kPoolRemoteCapacity) &&
-              in.slot_idle && !theirs;
+  const int sessions = view.has_activity
+                           ? std::clamp(view.activity.sessions, 1,
+                                        kPoolSessionsMax)
+                           : kPoolRemoteCapacity;
+  std::size_t theirs = 0;
+  if (view.has_activity && !in.stale) {
+    if (view.activity.inflight > 0)
+      theirs = static_cast<std::size_t>(view.activity.inflight);
+    // "busy" without a count (older partner), or a claim it did not count:
+    // at least one; with one session that is the old "busy = occupied".
+    if (view.activity.busy)
+      theirs = std::max<std::size_t>(
+          theirs, view.activity.inflight < 0
+                      ? static_cast<std::size_t>(sessions)
+                      : std::size_t{1});
+  }
+  side.free = PoolSessionFree(std::max(in.ours, theirs), sessions) &&
+              in.slot_idle;
   side.gpu_busy = view.has_activity && view.activity.gpu_busy;
-  side.idle = side.free && in.ours == 0 &&
+  side.idle = side.free && in.ours == 0 && theirs == 0 &&
               !(view.has_activity && view.activity.others_busy);
   side.empty = !view.others_loaded;
   return side;

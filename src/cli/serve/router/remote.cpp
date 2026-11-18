@@ -269,12 +269,22 @@ void ParseRemoteModels(const std::string& body, RemoteProbe* probe) {
         return value != nullptr && value->as_bool();
       };
       const json::Value* waiting = activity->find("waiting");
+      const json::Value* inflight = activity->find("inflight");
+      const json::Value* sessions = activity->find("sessions");
       probe->activity[id->str()] = RemoteActivity{
           flag("busy"), flag("gpu_busy"), flag("others_busy"),
           waiting != nullptr && waiting->is_number()
               ? static_cast<long long>(waiting->as_double())
               : 0LL,
-          flag("draining")};
+          flag("draining"),
+          inflight != nullptr && inflight->is_number() &&
+                  inflight->as_double() >= 0
+              ? static_cast<long long>(inflight->as_double())
+              : -1LL,
+          sessions != nullptr && sessions->is_number() &&
+                  sessions->as_double() >= 1 && sessions->as_double() <= 64
+              ? static_cast<int>(sessions->as_double())
+              : 1};
     }
   }
 }
@@ -463,6 +473,8 @@ json::Value RemoteHub::Status() const {
       flags["gpu_busy"] = found->second.gpu_busy;
       flags["others_busy"] = found->second.others_busy;
       flags["waiting"] = found->second.waiting;
+      flags["inflight"] = found->second.inflight;
+      flags["sessions"] = static_cast<long long>(found->second.sessions);
       activity[id] = std::move(flags);
     }
     entry["activity"] = std::move(activity);

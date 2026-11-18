@@ -100,6 +100,9 @@ public:
   [[nodiscard]] bool RemoteBusy(std::string_view model_id) const;
   /// Local requests in flight (placement = pool status and decision).
   [[nodiscard]] std::size_t LocalRequests(std::string_view model_id) const;
+  /// Local requests, sockets and jobs in flight (2.2.7: the pool's session
+  /// count; > 0 exactly when Busy).
+  [[nodiscard]] std::size_t LocalWork(std::string_view model_id) const;
   /// Relays and jobs through the remote router that are still open.
   [[nodiscard]] std::size_t RemoteRequests(std::string_view model_id) const;
   /// When a relay to the remote router last ended (epoch when never): a

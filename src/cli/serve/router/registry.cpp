@@ -412,6 +412,13 @@ std::size_t Registry::LocalRequests(std::string_view model_id) const {
   return entry == nullptr ? 0 : entry->open_requests;
 }
 
+std::size_t Registry::LocalWork(std::string_view model_id) const {
+  const Entry* entry = Lookup(model_id);
+  return entry == nullptr
+             ? 0
+             : entry->open_requests + entry->open_sockets + entry->open_jobs;
+}
+
 std::size_t Registry::RemoteRequests(std::string_view model_id) const {
   const Entry* entry = Lookup(model_id);
   return entry == nullptr

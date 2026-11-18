@@ -1409,15 +1409,33 @@ public:
     return DispatchLocalLocked(req, model_id, *preset, music_job, lock);
   }
 
+  /// A pool request's local claim (PoolEntry::local_claims), dropped once
+  /// (state mutex held). 2.2.7: for a text model with several sessions the
+  /// claim ends as soon as the request's busy count is armed, so one
+  /// request never counts twice (claim + request) against the sessions.
+  struct PoolClaim {
+    int* claims{nullptr};
+    bool released{false};
+    void Release() {
+      if (claims != nullptr && !released) {
+        --*claims;
+        released = true;
+      }
+    }
+  };
+
   /// Serves a request on the local worker (state mutex held on entry;
   /// released on the relay paths, held on the early answers). With
-  /// `admission_failed`, a failed load or admission sets it to true.
+  /// `admission_failed`, a failed load or admission sets it to true. With
+  /// `early_claim`, its claim is released right after the busy count is
+  /// armed (mutex still held).
   HttpResponse DispatchLocalLocked(const HttpRequest& req,
                                    const std::string& model_id,
                                    const router::PresetModel& local_preset,
                                    const std::string& music_job,
                                    std::unique_lock<std::mutex>& lock,
-                                   bool* admission_failed = nullptr) {
+                                   bool* admission_failed = nullptr,
+                                   PoolClaim* early_claim = nullptr) {
     const router::PresetModel* preset = &local_preset;
     const bool ws_relay =
         IsWebSocketPath(req) && server::IsWebSocketUpgrade(req);
@@ -1488,9 +1506,13 @@ public:
       // unarmed guard (Release is a no-op), so no throw path can destroy an
       // armed guard and self-lock the still-held state mutex.
       sockets->Arm();
+      if (early_claim != nullptr)
+        early_claim->Release();
       return upgrade;
     }
     auto busy = std::make_shared<HeldBusy>(mutex, registry, model_id)->Arm();
+    if (early_claim != nullptr)
+      early_claim->Release();
     // The relay blocks while connecting and reading upstream headers, so it
     // runs with the lock free; the busy count keeps the worker resident.
     lock.unlock();
@@ -1708,10 +1730,17 @@ public:
     }
     out["busy"] = router::PoolActivityBusy(registry.Busy(model_id), claims);
     out["waiting"] = static_cast<long long>(waiting);
+    const router::PresetModel* preset = registry.Find(model_id);
+    // 2.2.7: how many requests of it run here and how many may (a text
+    // model's sessions): a partner of this version relays up to that many.
+    out["inflight"] =
+        static_cast<long long>(registry.LocalWork(model_id)) +
+        static_cast<long long>(std::max(0, claims));
+    out["sessions"] = static_cast<long long>(
+        preset != nullptr ? router::PoolSessionsOf(*preset) : 1);
     std::string reason;
     // A CPU-only model (router-gpu-gb = 0) is not held back by GPU work or
     // other models here: a partner older than 2.2.0 reads only these flags.
-    const router::PresetModel* preset = registry.Find(model_id);
     const bool cpu_model = preset != nullptr && router::IsCpuModel(*preset);
     const bool gpu_busy =
         !cpu_model && GpuBusyLocked(model_id, false, &reason);
@@ -1756,6 +1785,14 @@ public:
                (entry.local_claims > 0 ? " loading" : " waiting");
         return false;
       }
+      // 2.2.7: a text model with several sessions drops its claim once its
+      // request runs (PoolClaim); a running one still holds the pull back.
+      if (const router::PresetModel* preset = registry.Find(id);
+          preset != nullptr && router::PoolSessionsOf(*preset) > 1 &&
+          registry.Busy(id)) {
+        *why = "pool request of " + id + " running";
+        return false;
+      }
     }
     return true;
   }
@@ -1790,9 +1827,18 @@ public:
           now - pool.local_failed_at < router::kPoolLocalFailHold);
     local.warm = stopping.count(preset.id) == 0 &&
                  (status == "loaded" || status == "loading");
-    local.free = !registry.Busy(preset.id) && pool.local_claims == 0;
+    // 2.2.7: a text model takes up to its sessions at once (PoolSessionsOf;
+    // one for everything else, the old "nothing of it in flight"). GPU work
+    // of image/video models still keeps it off (gpu_busy), and its own
+    // running requests still keep a cold load of another model off this
+    // machine (OthersBusyLocked counts them).
+    const std::size_t in_flight =
+        registry.LocalWork(preset.id) +
+        static_cast<std::size_t>(std::max(0, pool.local_claims));
+    local.free =
+        router::PoolSessionFree(in_flight, router::PoolSessionsOf(preset));
     local.gpu_busy = GpuBusyLocked(preset.id, from_comfy, nullptr);
-    local.idle = local.free && stopping.empty() &&
+    local.idle = in_flight == 0 && stopping.empty() &&
                  !OthersBusyLocked(preset.id, from_comfy);
     local.empty = !others_loaded;
     const bool cpu_model = router::IsCpuModel(preset);
@@ -2128,23 +2174,27 @@ public:
         ++pool_[model_id].local_picks;
         // The claim keeps the local worker "taken" for other pool requests
         // until this one's busy count is armed (after a cold load).
+        // 2.2.7: with several sessions the claim ends once the busy count
+        // is armed (PoolClaim), so a running request counts once.
         struct Claim {
-          RouterState& state;
           std::unique_lock<std::mutex>& lock;
-          const std::string& id;
+          PoolClaim& claim;
           ~Claim() {
             if (!lock.owns_lock())
               lock.lock();
-            --state.pool_[id].local_claims;
+            claim.Release();
           }
         };
         ++pool_[model_id].local_claims;
+        PoolClaim pool_claim{&pool_[model_id].local_claims};
+        const bool early_release = router::PoolSessionsOf(preset) > 1;
         bool admission_failed = false;
         std::optional<HttpResponse> response;
         {
-          const Claim claim{*this, lock, model_id};
+          const Claim claim{lock, pool_claim};
           response = DispatchLocalLocked(req, model_id, preset, music_job, lock,
-                                         &admission_failed);
+                                         &admission_failed,
+                                         early_release ? &pool_claim : nullptr);
         }
         if (!admission_failed || forwarded)
           return std::move(*response);
@@ -2292,6 +2342,10 @@ public:
         static_cast<long long>(registry.LocalRequests(model_id));
     out["remote_inflight"] =
         static_cast<long long>(registry.RemoteRequests(model_id));
+    if (const router::PresetModel* preset = registry.Find(model_id);
+        preset != nullptr)
+      out["local_sessions"] =
+          static_cast<long long>(router::PoolSessionsOf(*preset));
     std::string reason;
     const bool gpu_busy = GpuBusyLocked(model_id, false, &reason);
     out["local_gpu_busy"] = gpu_busy;

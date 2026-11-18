@@ -94,6 +94,12 @@ struct RemoteActivity {
   /// The router there is draining (2.1.8, POST /router/pool/drain): it
   /// refuses new pool work, so the pool leaves it out.
   bool draining{false};
+  /// 2.2.7: requests of this model in flight there (requests, sockets,
+  /// jobs, pool claims); -1 from a router older than the field.
+  long long inflight{-1};
+  /// 2.2.7: how many of them it runs at once (a text model's sessions);
+  /// 1 from a router older than the field.
+  int sessions{1};
 };
 
 /// One GET /v1/models against a remote router.

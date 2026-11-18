@@ -1566,6 +1566,33 @@ requests as busy; the field is then missing and reads as 0.
 `/router/status` copies `waiting` into each remote router's
 `activity`.
 
+**Text models run up to `sessions` at once (2.2.7).** A pool model counted
+"free" on a machine only while nothing of it was in flight there, so a
+text model with `sessions = 2` still ran its requests strictly one after
+the other (Regie, .56, 18.11.: two 400-token requests of qwen3.8-27b with
+`X-Gufo-Pool: local` took 36.6 s together, 17.4/19.3 s alone, while
+`/router/placement` showed one running and three waiting). Now a text model
+(modality `llm`, or `args = serve llm`) is free on a machine while fewer
+than its `sessions` (the preset key, i.e. `--sessions N`; default 1)
+requests, sockets, jobs or pool claims of it are in flight there, and the
+worker's scheduler batches them. Everything else (image, video, music, 3D,
+TTS, ASR, a text model without the key) stays at one. A pool claim of such
+a model ends as soon as its request's busy count is armed, so one request
+never counts twice. Unchanged: GPU work of an image/video/music/3D model or
+the ComfyUI queue keeps text requests off the machine (`local_gpu_busy`
+counts only that GPU work, never text sessions), and a running text request
+still keeps a cold load of another model and a job pull off it (the machine
+is not idle). The `"activity"` of each model in `GET /v1/models` adds
+`"inflight"` (requests, sockets, jobs and claims of it here) and
+`"sessions"`; the partner relays up to `sessions` requests at once and
+counts the larger of its own open relays and the reported `inflight` as
+occupied (a relay newer than the last probe may overshoot by one until the
+next probe; the worker queues it). A partner older than the fields counts
+as one session (`busy` = occupied), as before. `/router/placement` shows
+`"local_sessions"` in the model's `pool` block, and `/router/status`
+copies `inflight` and `sessions` into each remote router's `activity`.
+Relayed requests (`X-Gufo-Forwarded`) are served here as before.
+
 **Pull only with a free GPU.** A free job runner pulls a partner job
 only when this machine's GPU can take it now: the job's model is not
 busy here, no other GPU work runs (ComfyUI queue, an image, video, music
