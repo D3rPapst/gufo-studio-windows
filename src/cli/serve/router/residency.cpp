@@ -145,6 +145,7 @@ AdmissionPlan Residency::PlanFor(
   if (const std::string waiting = PendingReleaseLocked(); !waiting.empty()) {
     AdmissionPlan plan;
     plan.action = AdmissionPlan::Action::kWait;
+    plan.wait = AdmissionPlan::Wait::kRelease;
     plan.reason = "waiting until " + waiting + " has returned its memory";
     return plan;
   }

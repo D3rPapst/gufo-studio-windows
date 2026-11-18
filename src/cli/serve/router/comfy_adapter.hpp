@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <stop_token>
@@ -64,6 +65,15 @@ struct AdapterOptions {
   Fetch fetch;
   /// POST /free: unloads idle workers. Optional.
   std::function<void()> unload;
+  /// Memory check before a prompt is accepted (2.2.3), asked only while
+  /// no prompt runs or waits here: the router's message when the model of
+  /// the prompt's first task cannot load now because another model that is
+  /// busy or loading holds the memory (its admission would end in 503
+  /// memory_busy), nullopt when it may load or the router cannot tell.
+  /// POST /prompt then answers 503 with Retry-After
+  /// (kMemoryBusyRetrySeconds) instead of queueing. Optional.
+  std::function<std::optional<std::string>(const std::string& model)>
+      memory_busy;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
   /// Preview poll interval while a /ws client watches.
   std::chrono::milliseconds preview_poll{std::chrono::milliseconds(400)};
@@ -74,6 +84,24 @@ struct AdapterOptions {
   /// busy with the first one.
   std::size_t parallel{1};
 };
+
+/// Seconds a client waits before it sends a prompt again after memory_busy
+/// (the router's Retry-After, router::kMemoryBusyRetryAfterSeconds).
+constexpr int kMemoryBusyRetrySeconds = 30;
+
+/// A task's request answered 503 memory_busy: another model that is busy
+/// holds the memory. The prompt ends with execution_error, exception_type
+/// "GufoBusy", "code": "memory_busy" and "retry_after_s" (2.2.3).
+struct MemoryBusyError : std::runtime_error {
+  MemoryBusyError(const std::string& message, int retry_after_s)
+      : std::runtime_error(message), retry_after_s(retry_after_s) {}
+  int retry_after_s;
+};
+
+/// The memory_busy error of a router answer (503, error.code memory_busy),
+/// nullopt for any other answer.
+[[nodiscard]] std::optional<MemoryBusyError> MemoryBusyOf(
+    const FetchResult& result);
 
 /// The user a request acts for when it may touch only that user's
 /// prompts: X-Gufo-User from the access gate, empty for an admin, the

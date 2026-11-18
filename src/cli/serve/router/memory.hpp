@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -116,11 +117,19 @@ struct ResidentView {
 
 struct AdmissionPlan {
   enum class Action { kSpawn, kEvict, kWait };
+  /// What a kWait plan waits for (2.2.3): another model of ours that is
+  /// busy or loading (kBusy), memory held outside the router (kOutside), or
+  /// a stopped worker returning its memory (kRelease).
+  enum class Wait { kNone, kBusy, kOutside, kRelease };
   Action action{Action::kWait};
   std::vector<std::string> evict;  // kEvict: stop these, then plan again
   bool alone{false};  // spawn although the estimate does not fit: no other
                       // worker is left that could be evicted
   std::string reason;
+  Wait wait{Wait::kNone};
+  /// kBusy: the models the load waits for, "id (busy)" / "id (loading)",
+  /// comma separated.
+  std::string blocked_by;
 };
 
 /// Pure admission decision for starting `id` (need already factored). Rules:
@@ -138,11 +147,47 @@ struct AdmissionPlan {
 ///  - when nothing of ours is left to evict and it still does not fit
 ///    (memory held by other processes, or not yet returned by a stopped
 ///    worker), wait; only a need larger than the whole machine starts
-///    alone.
+///    alone. An idle resident without a memory sample is evicted first
+///    instead (2.2.3): what it gives back is unknown, so its memory may be
+///    the missing part;
+///  - every kWait plan names its kind (AdmissionPlan::Wait) and, waiting
+///    for busy or loading models, those models (blocked_by).
 AdmissionPlan PlanAdmission(const SystemMemory& system,
                             const std::vector<ResidentView>& residents,
                             std::string_view id, const MemoryNeed& need,
                             bool exclusive, const MemoryPolicy& policy);
+
+/// Bounds of the memory waits of one cold load (2.2.3). 0 = no bound of
+/// its own (only the load timeout ends the wait).
+struct MemoryWaitLimits {
+  /// Waiting for another model that is busy or loading (Wait::kBusy):
+  /// answered 503 memory_busy with Retry-After (--memory-wait-seconds).
+  std::chrono::seconds busy{60};
+  /// Waiting for memory held outside the router (Wait::kOutside): answered
+  /// 507 insufficient_memory.
+  std::chrono::seconds outside{45};
+};
+
+enum class MemoryWaitVerdict { kContinue, kGiveUpBusy, kGiveUpOutside };
+
+/// Times the waits of one admission: each kind of wait counts from its
+/// first plan in a row; any other plan (another kind, evict, spawn) resets
+/// it. A release wait (a stopped worker returning memory, at most 30 s)
+/// resets neither, so a load waiting for a busy model and then for the
+/// memory of an evicted one is not bounded twice.
+class MemoryWaitClock {
+public:
+  using Clock = std::chrono::steady_clock;
+  MemoryWaitVerdict Next(const AdmissionPlan& plan, Clock::time_point now,
+                         const MemoryWaitLimits& limits);
+
+private:
+  std::optional<Clock::time_point> busy_since_;
+  std::optional<Clock::time_point> outside_since_;
+};
+
+/// Seconds a client should wait before it retries a memory_busy load.
+constexpr int kMemoryBusyRetryAfterSeconds = 30;
 
 /// Watchdog decision for one sample.
 struct WatchdogAction {

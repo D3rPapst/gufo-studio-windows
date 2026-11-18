@@ -145,6 +145,38 @@ HttpResponse ErrorResponse(int status, std::string_view type,
   return JsonResponse(status, body);
 }
 
+/// 503 memory_busy on POST /prompt (2.2.3): ComfyUI's error shape plus
+/// "code" and "retry_after_s", and a Retry-After header.
+HttpResponse MemoryBusyResponse(const std::string& message) {
+  json::Value error = json::Value::object();
+  error["type"] = "memory_busy";
+  error["code"] = "memory_busy";
+  error["message"] = message;
+  error["retry_after_s"] = kMemoryBusyRetrySeconds;
+  error["details"] = "";
+  error["extra_info"] = json::Value::object();
+  json::Value body = json::Value::object();
+  body["error"] = std::move(error);
+  body["node_errors"] = json::Value::object();
+  HttpResponse response = JsonResponse(503, body);
+  response.reason = "Service Unavailable";
+  response.headers.emplace_back("Retry-After",
+                                std::to_string(kMemoryBusyRetrySeconds));
+  return response;
+}
+
+/// The preset model a task's request names ("" when it names none).
+std::string TaskModel(const Task& task) {
+  return std::visit(
+      [](const auto& spec) -> std::string {
+        if constexpr (requires { spec.model; })
+          return spec.model;
+        else
+          return {};
+      },
+      task.spec);
+}
+
 HttpResponse EmptyOk() {
   return HttpResponse{.status = 200, .reason = "OK", .body = ""};
 }
@@ -653,6 +685,26 @@ std::optional<HttpResponse> Adapter::Handle(const HttpRequest& request) {
 // The caller the gate names (auth.hpp kUserHeader/kRightsHeader): empty
 // when it is no user (router, loopback, auth = off) or an admin; such a
 // caller may stop or remove any prompt, a user only its own.
+std::optional<MemoryBusyError> MemoryBusyOf(const FetchResult& result) {
+  if (result.status != 503)
+    return std::nullopt;
+  try {
+    const json::Value body = json::parse(result.body);
+    const json::Value* error = body.find("error");
+    if (error == nullptr || !error->is_object() ||
+        error->member_str("code") != "memory_busy")
+      return std::nullopt;
+    const double retry =
+        error->member_double("retry_after_s", kMemoryBusyRetrySeconds);
+    return MemoryBusyError(
+        error->member_str("message", "memory is in use by a busy model"),
+        retry >= 1 && retry <= 3600 ? static_cast<int>(retry)
+                                    : kMemoryBusyRetrySeconds);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
 std::string RestrictedUser(const HttpRequest& request) {
   const std::string user = request.header("X-Gufo-User");
   if (user.empty())
@@ -734,6 +786,22 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
                       return std::holds_alternative<ImageTask>(task.spec) ||
                              std::holds_alternative<VideoTask>(task.spec);
                     }) > 1;
+  // 2.2.3: with nothing of ours queued, a prompt whose first model cannot
+  // load now (another, busy model holds the memory) is refused with 503 and
+  // Retry-After instead of failing as GufoBusy a minute later. Behind other
+  // prompts it is queued as usual; that check comes when it runs.
+  if (options_.memory_busy && QueueRemaining() == 0 &&
+      !job->plan.tasks.empty()) {
+    const std::string model = TaskModel(job->plan.tasks.front());
+    if (!model.empty()) {
+      if (const auto busy = options_.memory_busy(model)) {
+        Logger::Warn("comfy", "event=prompt_memory_busy prompt_id=" + job->id +
+                                  " model=" + model + " at=submit error=\"" +
+                                  *busy + "\"");
+        return MemoryBusyResponse(*busy);
+      }
+    }
+  }
   if (!RegisterPreviews(job))
     return ErrorResponse(400, "invalid_prompt",
                          "extra_data.gufo_preview_id is in use by another "
@@ -1639,6 +1707,33 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
       Logger::Warn("comfy", "event=prompt_interrupted prompt_id=" + job->id);
       ok = false;
       break;
+    } catch (const MemoryBusyError& busy) {
+      // 2.2.3: a fixed mark a client can tell from a real failure: nothing
+      // ran, the same prompt may be sent again after retry_after_s.
+      json::Value data = json::Value::object();
+      data["node_id"] = task.node_id;
+      data["node_type"] = task.class_type;
+      data["executed"] = executed;
+      data["exception_message"] = std::string(busy.what());
+      data["exception_type"] = "GufoBusy";
+      data["code"] = "memory_busy";
+      data["retry_after_s"] = busy.retry_after_s;
+      json::Value error = json::Value::object();
+      error["code"] = "memory_busy";
+      error["message"] = std::string(busy.what());
+      error["retry_after_s"] = busy.retry_after_s;
+      data["error"] = std::move(error);
+      data["traceback"] = json::Value::array();
+      data["current_inputs"] = json::Value::object();
+      data["current_outputs"] = json::Value::object();
+      message("execution_error", std::move(data));
+      Logger::Warn("comfy", "event=prompt_memory_busy prompt_id=" + job->id +
+                                " node=" + task.node_id +
+                                " retry_after_s=" +
+                                std::to_string(busy.retry_after_s) +
+                                " error=\"" + busy.what() + "\"");
+      ok = false;
+      break;
     } catch (const std::exception& error) {
       json::Value data = json::Value::object();
       data["node_id"] = task.node_id;
@@ -1854,6 +1949,11 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
   FetchResult result = options_.fetch(request);
   if (job->cancel.load())
     throw Interrupted();
+  // The model could not load because another, busy model holds the memory
+  // (2.2.3): the prompt ends as GufoBusy, whatever the task would do with
+  // other errors.
+  if (auto busy = MemoryBusyOf(result))
+    throw *busy;
   return result;
 }
 

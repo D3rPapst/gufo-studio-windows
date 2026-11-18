@@ -968,6 +968,10 @@ public:
   std::map<std::string, std::shared_ptr<router::Worker>> workers;
   std::filesystem::path exe_path;
   std::filesystem::path pages_dir;
+  /// --memory-wait-seconds: how long a cold load waits for another model
+  /// that is busy (or loading) and holds the memory before it answers 503
+  /// memory_busy; 0 = until the load timeout (before 2.2.3).
+  std::chrono::seconds memory_wait_limit{60};
   std::atomic<bool> stop_requested{false};
   /// Memory probes, learned peaks and (with --memory-guard) admission by
   /// live free memory instead of a model count.
@@ -3072,6 +3076,35 @@ public:
   }
 
   /// Stops every loaded worker that serves no request (ComfyUI /free).
+  /// The ComfyUI adapter's check before it accepts a prompt (2.2.3): the
+  /// reason when `model` cannot load now because another model of ours that
+  /// is busy or loading holds the memory, so its admission would end in 503
+  /// memory_busy. nullopt without --memory-guard, for a loaded, remote or
+  /// pool model (the pool may place it on the partner) and whenever the
+  /// plan does not wait for a busy model.
+  std::optional<std::string> MemoryBusyFor(const std::string& model) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (residency == nullptr || !residency->enabled() ||
+        stop_requested.load())
+      return std::nullopt;
+    const std::string id = registry.CanonicalId(model);
+    const router::PresetModel* preset = id.empty() ? nullptr : registry.Find(id);
+    if (preset == nullptr || preset->remote.has_value() ||
+        registry.RoutesRemote(id) || LoadedLocked(id))
+      return std::nullopt;
+    for (const auto& entry : registry.Residents())
+      if (entry.id == id)
+        return std::nullopt;  // loading for another request: wait for it
+    const router::AdmissionPlan plan =
+        residency->PlanFor(id, registry.Residents(), PidsLocked());
+    if (plan.action != router::AdmissionPlan::Action::kWait ||
+        plan.wait != router::AdmissionPlan::Wait::kBusy)
+      return std::nullopt;
+    return "cannot load '" + id + "' now: memory is in use by " +
+           plan.blocked_by + "; retry in " +
+           std::to_string(router::kMemoryBusyRetryAfterSeconds) + " s";
+  }
+
   void UnloadIdle() {
     std::unique_lock<std::mutex> lock(mutex);
     // Loaded, not loading, not busy (requests, sockets, open video jobs).
@@ -3867,12 +3900,12 @@ private:
   /// Memory admission for a cold start of `model_id` (state mutex held; it
   /// is released while evicted workers stop and their memory returns).
   Gate MemoryGateLocked(const std::string& model_id, std::string* last_wait,
-                        std::string* wait_reason) {
+                        router::AdmissionPlan* planned) {
     const auto residents = registry.Residents();
     const router::AdmissionPlan plan =
         residency->PlanFor(model_id, residents, PidsLocked());
+    *planned = plan;
     if (plan.action == router::AdmissionPlan::Action::kWait) {
-      *wait_reason = plan.reason;
       // One event per kind of wait, not one per changed number.
       const std::string kind = plan.reason.substr(0, plan.reason.find(';'));
       if (kind != *last_wait) {
@@ -4141,7 +4174,13 @@ private:
     // the front tracks the outer bound itself.
     const auto began = std::chrono::steady_clock::now();
     std::string last_wait;
-    std::optional<std::chrono::steady_clock::time_point> outside_wait_since;
+    // Bounds the memory waits (2.2.3): a busy or loading model ends in 503
+    // memory_busy after --memory-wait-seconds, memory held outside the
+    // router in 507 after kMemoryWaitLimit.
+    router::MemoryWaitClock memory_wait;
+    router::MemoryWaitLimits wait_limits;
+    wait_limits.busy = memory_wait_limit;
+    wait_limits.outside = kMemoryWaitLimit;
     for (;;) {
       if (options.load_timeout > std::chrono::seconds(0) &&
           std::chrono::steady_clock::now() - began >= options.load_timeout) {
@@ -4167,27 +4206,37 @@ private:
             return Err(502, "Bad Gateway", "router is shutting down",
                        "server_error", "upstream_unavailable");
           }
-          std::string wait_reason;
-          const Gate gate = MemoryGateLocked(model_id, &last_wait, &wait_reason);
+          router::AdmissionPlan plan;
+          const Gate gate = MemoryGateLocked(model_id, &last_wait, &plan);
+          const router::MemoryWaitVerdict verdict = memory_wait.Next(
+              plan, std::chrono::steady_clock::now(), wait_limits);
           if (gate == Gate::kWait) {
             // Memory held outside the router (other programs, the OS) cannot
             // be freed by evicting workers. Waiting for it only ends in a
             // client timeout, so after kMemoryWaitLimit answer with the
             // reason (how much is needed and how much is free) instead.
-            if (wait_reason.rfind("not enough free memory", 0) == 0) {
-              const auto now = std::chrono::steady_clock::now();
-              if (!outside_wait_since) {
-                outside_wait_since = now;
-              } else if (now - *outside_wait_since >= kMemoryWaitLimit) {
-                registry.MarkUnloaded(model_id);
-                residency->Event("gave up loading " + model_id + ": " +
-                                 wait_reason);
-                return Err(507, "Insufficient Storage",
-                           "cannot load '" + model_id + "': " + wait_reason,
-                           "server_error", "insufficient_memory");
-              }
-            } else {
-              outside_wait_since.reset();
+            if (verdict == router::MemoryWaitVerdict::kGiveUpOutside) {
+              registry.MarkUnloaded(model_id);
+              residency->Event("gave up loading " + model_id + ": " +
+                               plan.reason);
+              return Err(507, "Insufficient Storage",
+                         "cannot load '" + model_id + "': " + plan.reason,
+                         "server_error", "insufficient_memory");
+            }
+            // Another model of ours is busy (or loading) and holds the
+            // memory: it is never stopped mid-request, and how long it runs
+            // is unknown (a video: many minutes). Instead of holding the
+            // request until the load timeout (504), answer 503 memory_busy
+            // with Retry-After so the client (the job queue, the ComfyUI
+            // adapter, a pipeline) retries later.
+            if (verdict == router::MemoryWaitVerdict::kGiveUpBusy) {
+              registry.MarkUnloaded(model_id);
+              residency->Event("gave up loading " + model_id +
+                               ": memory busy, " + plan.reason);
+              Logger::Warn("router", "event=memory_busy model=" + model_id +
+                                         " blocked_by=\"" + plan.blocked_by +
+                                         "\"");
+              return MemoryBusyErr(model_id, plan.blocked_by);
             }
             mutex.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -4283,6 +4332,30 @@ private:
     mutex.lock();
   }
 
+  /// 503 memory_busy (2.2.3): `model_id` cannot load while `blocked_by`
+  /// (another model, busy or loading) holds the memory. Retry-After and
+  /// error.retry_after_s say when to try again; error.blocked_by names the
+  /// models.
+  static HttpResponse MemoryBusyErr(const std::string& model_id,
+                                    const std::string& blocked_by) {
+    const int retry = router::kMemoryBusyRetryAfterSeconds;
+    json::Value detail = json::Value::object();
+    detail["message"] = "cannot load '" + model_id +
+                        "' now: memory is in use by " + blocked_by +
+                        "; retry in " + std::to_string(retry) + " s";
+    detail["type"] = "server_error";
+    detail["code"] = "memory_busy";
+    detail["retry_after_s"] = retry;
+    detail["blocked_by"] = blocked_by;
+    detail["model"] = model_id;
+    json::Value body = json::Value::object();
+    body["error"] = std::move(detail);
+    return HttpResponse{.status = 503,
+                        .reason = "Service Unavailable",
+                        .body = body.dump(),
+                        .headers = {{"Retry-After", std::to_string(retry)}}};
+  }
+
   /// Turns an expired load deadline into the 504 the held request receives,
   /// killing the wedged worker first.
   HttpResponse LoadTimeoutLocked(const std::string& model_id) {
@@ -4370,6 +4443,7 @@ int RunRouter(std::span<const char* const> args) {
   std::size_t models_max = 2;
   std::size_t sleep_idle_seconds = 900;
   std::size_t load_timeout_seconds = 600;
+  std::size_t memory_wait_seconds = 60;
   bool autoload = false;
   std::string autoload_retry = "30,60,120,300";
   bool memory_guard = false;
@@ -4562,6 +4636,12 @@ int RunRouter(std::span<const char* const> args) {
                    "Watchdog: stop the newest load below this free commit "
                    "(Windows; default: 1)",
                    "Memory", &abort_commit_gb);
+  parser.AddOption("", "--memory-wait-seconds", "SEC",
+                   "With --memory-guard: how long a cold load waits for "
+                   "another model that is busy or loading and holds the "
+                   "memory, then answers 503 memory_busy with Retry-After "
+                   "(default: 60; 0 = wait until --load-timeout-seconds)",
+                   "Memory", &memory_wait_seconds);
   AddServerOptions(parser, &host, &port, nullptr, &max_connections,
                    &max_request_body_bytes, &log_options);
 
@@ -4711,6 +4791,7 @@ int RunRouter(std::span<const char* const> args) {
   if (auto hub = std::make_unique<router::RemoteHub>(models); !hub->empty())
     state->remotes = std::move(hub);
   state->pages_dir = pages_dir;
+  state->memory_wait_limit = std::chrono::seconds(memory_wait_seconds);
   {
     router::ResidencyOptions residency_options;
     residency_options.enabled = memory_guard;
@@ -4994,6 +5075,9 @@ int RunRouter(std::span<const char* const> args) {
       comfy_options.models.available.push_back(model.id);
     comfy_options.fetch = self_fetch;
     comfy_options.unload = [raw] { raw->UnloadIdle(); };
+    comfy_options.memory_busy = [raw](const std::string& model) {
+      return raw->MemoryBusyFor(model);
+    };
     comfy_options.parallel = comfy_parallel > 0
                                  ? comfy_parallel
                                  : std::max<std::size_t>(1, jobs_parallel);

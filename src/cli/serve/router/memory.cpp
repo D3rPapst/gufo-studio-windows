@@ -187,7 +187,75 @@ std::string NowText() {
   return text;
 }
 
+/// "a (busy), b (loading)" for the residents a load waits for.
+std::string BlockerList(const std::vector<const ResidentView*>& views) {
+  std::string text;
+  for (const ResidentView* view : views) {
+    text += (text.empty() ? "" : ", ") + view->id +
+            (view->loading ? " (loading)" : " (busy)");
+  }
+  return text;
+}
+
+/// Turns `plan` into the eviction of the idle residents in `evict` that
+/// have no memory sample (Project credits them nothing). False when every
+/// one of them was measured.
+bool EvictUnmeasured(const std::vector<const ResidentView*>& evict,
+                     const Room& room, AdmissionPlan* plan) {
+  std::vector<std::string> ids;
+  for (const ResidentView* view : evict) {
+    if (!view->current.valid) {
+      ids.push_back(view->id);
+    }
+  }
+  if (ids.empty()) {
+    return false;
+  }
+  plan->action = AdmissionPlan::Action::kEvict;
+  std::string names;
+  for (const auto& id : ids) {
+    names += (names.empty() ? "" : ", ") + id;
+  }
+  plan->evict = std::move(ids);
+  plan->reason = "evicting idle " + names +
+                 " (no memory sample, what it frees is unknown); " +
+                 RoomText(room);
+  return true;
+}
+
 }  // namespace
+
+MemoryWaitVerdict MemoryWaitClock::Next(const AdmissionPlan& plan,
+                                        Clock::time_point now,
+                                        const MemoryWaitLimits& limits) {
+  using Wait = AdmissionPlan::Wait;
+  const Wait wait = plan.action == AdmissionPlan::Action::kWait
+                        ? plan.wait
+                        : Wait::kNone;
+  if (wait == Wait::kRelease) {
+    return MemoryWaitVerdict::kContinue;
+  }
+  if (wait != Wait::kBusy) {
+    busy_since_.reset();
+  }
+  if (wait != Wait::kOutside) {
+    outside_since_.reset();
+  }
+  const auto expired = [now](std::optional<Clock::time_point>& since,
+                             std::chrono::seconds limit) {
+    if (!since) {
+      since = now;
+    }
+    return limit > std::chrono::seconds(0) && now - *since >= limit;
+  };
+  if (wait == Wait::kBusy && expired(busy_since_, limits.busy)) {
+    return MemoryWaitVerdict::kGiveUpBusy;
+  }
+  if (wait == Wait::kOutside && expired(outside_since_, limits.outside)) {
+    return MemoryWaitVerdict::kGiveUpOutside;
+  }
+  return MemoryWaitVerdict::kContinue;
+}
 
 std::int64_t SystemMemory::DedicatedFree() const {
   return std::max<std::int64_t>(0, gpu_dedicated_total - gpu_dedicated_used);
@@ -232,15 +300,20 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     }
     if (!blockers.empty()) {
       plan.action = AdmissionPlan::Action::kWait;
-      plan.reason = "exclusive, waiting for " + blockers.front()->id +
-                    (blockers.front()->loading ? " (loading)" : " (busy)");
+      plan.wait = AdmissionPlan::Wait::kBusy;
+      plan.blocked_by = BlockerList(blockers);
+      plan.reason = "exclusive, waiting for " + plan.blocked_by;
       return plan;
     }
     // Free memory once every other worker is gone.
     const Room room = Project(system, {}, evict);
     const bool fits = Fits(room, need, policy);
     if (!fits && !NeverFits(system, need, policy)) {
+      if (EvictUnmeasured(evict, room, &plan)) {
+        return plan;
+      }
       plan.action = AdmissionPlan::Action::kWait;
+      plan.wait = AdmissionPlan::Wait::kOutside;
       plan.reason =
           "exclusive, not enough free memory yet (held outside "
           "the router or still being released); " +
@@ -269,7 +342,9 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     if (view->exclusive) {
       if (!evictable(view)) {
         plan.action = AdmissionPlan::Action::kWait;
-        plan.reason = "waiting for exclusive " + view->id;
+        plan.wait = AdmissionPlan::Wait::kBusy;
+        plan.blocked_by = BlockerList({view});
+        plan.reason = "waiting for exclusive " + plan.blocked_by;
         return plan;
       }
       evict.push_back(view);
@@ -300,16 +375,25 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     // Only busy or loading residents are left: evicting the idle ones would
     // not make room yet, so keep them and wait for the busy ones.
     plan.action = AdmissionPlan::Action::kWait;
-    plan.reason = "waiting for " + kept.front()->id + "; need " + Gb(need.gpu) +
-                  " GB gpu, " + RoomText(room);
+    plan.wait = AdmissionPlan::Wait::kBusy;
+    plan.blocked_by = BlockerList(kept);
+    plan.reason = "waiting for " + plan.blocked_by + "; need " +
+                  Gb(need.gpu) + " GB gpu, " + RoomText(room);
     return plan;
   }
   if (!fits && !NeverFits(system, need, policy)) {
+    // An idle resident without a sample was credited nothing: its memory
+    // may be what is missing, so it goes first and the next plan sees the
+    // real numbers.
+    if (EvictUnmeasured(evict, room, &plan)) {
+      return plan;
+    }
     // Even with every worker of ours gone it would not fit: the memory is
     // held by other processes or a stopped worker has not returned it yet.
     // Evict nothing (that would only cost the residents) and wait; the
-    // request's load timeout bounds this.
+    // router bounds this wait (MemoryWaitLimits::outside).
     plan.action = AdmissionPlan::Action::kWait;
+    plan.wait = AdmissionPlan::Wait::kOutside;
     plan.reason =
         "not enough free memory yet (held outside the router or "
         "still being released); need " +

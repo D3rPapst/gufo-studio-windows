@@ -23,6 +23,9 @@ using gufo::router::kGiB;
 using gufo::router::MemoryBook;
 using gufo::router::MemoryNeed;
 using gufo::router::MemoryPolicy;
+using gufo::router::MemoryWaitClock;
+using gufo::router::MemoryWaitLimits;
+using gufo::router::MemoryWaitVerdict;
 using gufo::router::PlanAdmission;
 using gufo::router::PlanWatchdog;
 using gufo::router::ProcessMemory;
@@ -580,6 +583,125 @@ void TestPresetHintsAndIdleOverride() {
 
 }  // namespace
 
+void TestWaitKinds() {
+  // 2.2.3: every wait names its kind; busy and loading blockers by name.
+  using Wait = AdmissionPlan::Wait;
+  const std::vector<ResidentView> busy = {
+      Resident("27b", 20, 20, 10, /*busy=*/true)};
+  auto plan = PlanAdmission(Machine(22, 1, 20), busy, "image", Need(34.5),
+                            false, MemoryPolicy{});
+  CHECK(plan.action == Action::kWait && plan.wait == Wait::kBusy);
+  CHECK(plan.blocked_by == "27b (busy)");
+  CHECK(plan.reason.find("27b (busy)") != std::string::npos);
+  // Busy and loading together: both named, the idle one is kept.
+  const std::vector<ResidentView> mixed = {
+      Resident("chat", 10, 10, 10, true), Resident("idle", 5, 5, 1),
+      Resident("tts", 10, 4, 5, false, /*loading=*/true)};
+  plan = PlanAdmission(Machine(26, 5, 20), mixed, "big", Need(30), false,
+                       MemoryPolicy{});
+  CHECK(plan.action == Action::kWait && plan.wait == Wait::kBusy);
+  CHECK(plan.blocked_by.find("chat (busy)") != std::string::npos);
+  CHECK(plan.blocked_by.find("tts (loading)") != std::string::npos);
+  CHECK(plan.blocked_by.find("idle") == std::string::npos);
+  CHECK(plan.evict.empty());
+  // Idle blocker: evicted as before, no wait.
+  plan = PlanAdmission(Machine(22, 1, 20), {Resident("27b", 20, 20, 10)},
+                       "image", Need(34.5), false, MemoryPolicy{});
+  CHECK(plan.action == Action::kEvict && plan.wait == Wait::kNone);
+  // Exclusive candidate behind a busy model, and a busy exclusive resident.
+  plan = PlanAdmission(Machine(12, 1, 20),
+                       {Resident("a", 5, 5, 1), Resident("b", 5, 5, 2, true)},
+                       "h3", Need(45), true, MemoryPolicy{});
+  CHECK(plan.wait == Wait::kBusy && plan.blocked_by == "b (busy)");
+  ResidentView h3 = Resident("h3", 45, 30, 1, true);
+  h3.exclusive = true;
+  plan = PlanAdmission(Machine(32, 13, 10), {h3}, "tts", Need(1), false,
+                       MemoryPolicy{});
+  CHECK(plan.wait == Wait::kBusy && plan.blocked_by == "h3 (busy)");
+  // Memory held outside the router, also for an exclusive candidate.
+  plan = PlanAdmission(Machine(20, 10, 10), {}, "image", Need(30), false,
+                       MemoryPolicy{});
+  CHECK(plan.wait == Wait::kOutside && plan.blocked_by.empty());
+  plan = PlanAdmission(Machine(20, 10, 10), {}, "h3", Need(30), true,
+                       MemoryPolicy{});
+  CHECK(plan.wait == Wait::kOutside);
+}
+
+void TestUnmeasuredIdleEvictedInsteadOfOutsideWait() {
+  // An idle resident without a sample is credited nothing: before 2.2.3 the
+  // load waited for "memory held outside the router" (507 after 45 s)
+  // while our own idle worker held it. Now it is evicted first.
+  ResidentView unknown = Resident("old", 20, 0, 10);
+  unknown.current.valid = false;
+  auto plan = PlanAdmission(Machine(30, 10, 10), {unknown}, "image", Need(30),
+                            false, MemoryPolicy{});
+  CHECK(plan.action == Action::kEvict);
+  CHECK(plan.evict.size() == 1 && plan.evict[0] == "old");
+  CHECK(plan.reason.find("no memory sample") != std::string::npos);
+  plan = PlanAdmission(Machine(30, 10, 10), {unknown}, "h3", Need(30), true,
+                       MemoryPolicy{});
+  CHECK(plan.action == Action::kEvict && plan.evict[0] == "old");
+  // A measured idle resident whose memory would not be enough stays.
+  plan = PlanAdmission(Machine(30, 10, 10), {Resident("small", 2, 2, 10)},
+                       "image", Need(30), false, MemoryPolicy{});
+  CHECK(plan.action == Action::kWait &&
+        plan.wait == AdmissionPlan::Wait::kOutside && plan.evict.empty());
+}
+
+void TestMemoryWaitClock() {
+  using Wait = AdmissionPlan::Wait;
+  const auto t0 = Clock::time_point{} + std::chrono::hours(1);
+  const auto at = [t0](int s) { return t0 + std::chrono::seconds(s); };
+  AdmissionPlan busy;
+  busy.action = Action::kWait;
+  busy.wait = Wait::kBusy;
+  busy.blocked_by = "27b (busy)";
+  AdmissionPlan outside = busy;
+  outside.wait = Wait::kOutside;
+  outside.blocked_by.clear();
+  AdmissionPlan release = busy;
+  release.wait = Wait::kRelease;
+  AdmissionPlan evict;
+  evict.action = Action::kEvict;
+  const MemoryWaitLimits limits;  // busy 60 s, outside 45 s
+  {
+    MemoryWaitClock clock;
+    CHECK(clock.Next(busy, at(0), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(59), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(60), limits) == MemoryWaitVerdict::kGiveUpBusy);
+  }
+  {
+    // Progress (an eviction) restarts the busy bound; a release wait
+    // neither counts nor resets.
+    MemoryWaitClock clock;
+    CHECK(clock.Next(busy, at(0), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(evict, at(50), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(55), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(release, at(100), limits) ==
+          MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(114), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(115), limits) == MemoryWaitVerdict::kGiveUpBusy);
+  }
+  {
+    // Outside memory keeps its own (45 s) bound and 507.
+    MemoryWaitClock clock;
+    CHECK(clock.Next(outside, at(0), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(10), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(outside, at(20), limits) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(outside, at(65), limits) ==
+          MemoryWaitVerdict::kGiveUpOutside);
+  }
+  {
+    // --memory-wait-seconds 0: busy waits only end at the load timeout.
+    MemoryWaitLimits unbounded;
+    unbounded.busy = std::chrono::seconds(0);
+    MemoryWaitClock clock;
+    CHECK(clock.Next(busy, at(0), unbounded) == MemoryWaitVerdict::kContinue);
+    CHECK(clock.Next(busy, at(3600), unbounded) ==
+          MemoryWaitVerdict::kContinue);
+  }
+}
+
 int main() {
   TestEmptyFits();
   TestCoResidency();
@@ -603,6 +725,9 @@ int main() {
   TestMemoryBook();
   TestLayoutChange();
   TestPresetHintsAndIdleOverride();
+  TestWaitKinds();
+  TestUnmeasuredIdleEvictedInsteadOfOutsideWait();
+  TestMemoryWaitClock();
   if (failures != 0) {
     std::cerr << failures << " router memory checks failed.\n";
     return 1;
