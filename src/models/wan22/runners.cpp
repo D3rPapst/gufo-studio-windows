@@ -661,6 +661,9 @@ bool RunWan22AnimateJob(const JobRequest& request,
   job.continue_motion_max_frames =
       whole(options, "continue_motion_max_frames", 5);
   job.video_frame_offset = whole(options, "video_frame_offset", 0);
+  if (const json::Value* trim = options.find("trim_continue");
+      trim != nullptr && trim->is_bool())
+    job.trim_continue = trim->as_bool();
   const int w = job.width, h = job.height;
   const std::size_t frame_pixels = static_cast<std::size_t>(w) * h;
   // Enough frames for every chunk from the seek on.

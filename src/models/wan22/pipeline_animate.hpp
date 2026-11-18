@@ -69,6 +69,9 @@ struct Animate22Request {
   int continue_motion_frames{0};
   int continue_motion_max_frames{5};
   int video_frame_offset{0};
+  /// Drop the first chunk's trim_image frames (its continue_motion frames)
+  /// from the result, as ImageFromBatch(batch_index = trim_image) does.
+  bool trim_continue{false};
 };
 
 struct Animate22Telemetry {

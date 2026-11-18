@@ -402,7 +402,8 @@ bool GenerateAnimate22(const Animate22Request& request,
       SetError(error, "Wan 2.2 Animate: unexpected decoded frame count");
       return false;
     }
-    const int keep_from = chained && k > 0 ? plan.trim_image : 0;
+    const int keep_from =
+        (k > 0 || request.trim_continue) ? plan.trim_image : 0;
     const int take = std::min(n - keep_from, request.frames - kept);
     if (video != nullptr && take > 0) {
       video->rgb8.insert(video->rgb8.end(),

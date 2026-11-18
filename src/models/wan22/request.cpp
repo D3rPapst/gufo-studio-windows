@@ -872,7 +872,9 @@ bool MaskFile(std::vector<std::uint8_t>* file, std::string* format,
 // "video_frame_offset" (seek in all videos, default 0), "length" (frames
 // per chunk, 4k + 1, 5..81, default 77), "continue_frames" (overlap of
 // chained chunks, 4k + 1, default 5), "sampler" ("lcm" | "euler"), "shift"
-// (1..20), "lora" (false: without the bundle's step-distill LoRA)}}}.
+// (1..20), "lora" (false: without the bundle's step-distill LoRA),
+// "trim_continue" (true: drop the continue_motion frames from the result,
+// as ImageFromBatch on trim_image)}}}.
 // Multipart uploads may carry "reference_image", "pose_video",
 // "face_video", "background_video", "character_mask" and "continue_motion"
 // files instead.
@@ -936,14 +938,14 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                         "invert_mask", "continue_motion",
                         "continue_motion_max_frames", "video_frame_offset",
                         "length", "continue_frames", "sampler", "shift",
-                        "lora"})))
+                        "lora", "trim_continue"})))
     return Fail(error, "invalid_animate",
                 "'gufo.animate' may contain only 'reference_image', "
                 "'pose_video', 'face_video', 'background_video', "
                 "'character_mask', 'mask_channel', 'invert_mask', "
                 "'continue_motion', 'continue_motion_max_frames', "
                 "'video_frame_offset', 'length', 'continue_frames', "
-                "'sampler', 'shift' and 'lora'");
+                "'sampler', 'shift', 'lora' and 'trim_continue'");
   const auto member = [&](const char* name) -> const json::Value* {
     return animate == nullptr ? nullptr : animate->find(name);
   };
@@ -1018,7 +1020,7 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                   "luma");
     animate_options["mask_channel"] = channel->str();
   }
-  for (const char* flag : {"invert_mask", "lora"})
+  for (const char* flag : {"invert_mask", "lora", "trim_continue"})
     if (const json::Value* value = member(flag)) {
       if (!value->is_bool())
         return Fail(error, "invalid_animate",
