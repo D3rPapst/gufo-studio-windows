@@ -87,45 +87,67 @@ pixels of the original image, also with `brighten_dark`. `"pose_boxes": [[x0, y0
 (up to 16) skips RT-DETR: the poses are made in exactly these boxes, in your order, without
 `score` (the film pipeline keeps the first frame's box for a whole shot).
 
-## Finger count
+## Hand check
 
-`hand_fingers` checks every hand for the film direction (arm without a hand, wrong number of
-fingers). It runs the `hand` detector (also answered), cuts out each hand box with 25 % margin
-on every side (at least 224 px on the short side) and asks a vision chat model on this router
-how many fingers it sees:
+`hand_fingers` checks every hand for the film direction: is this hand possible? It is an
+anatomy check, not a finger count. A thumb hidden behind the other fingers, fingers behind an
+object, in a fist or outside the frame are no error; only clearly impossible things are
+reported. It runs the `hand` detector (also answered), cuts out each hand box with 25 % margin
+on every side (at least 224 px on the short side) and asks a vision chat model on this router,
+one hand after the other:
 
 ```json
 {"image": "...", "tasks": ["hand_fingers"],
- "hand_fingers_options": {"model": "qwen3.8-27b", "max_hands": 6, "thinking": false,
-                          "timeout_seconds": 120, "margin": 0.25, "max_tokens": 256}}
+ "hand_fingers_options": {"model": "qwen3.8-27b", "max_hands": 6, "thinking": true,
+                          "timeout_seconds": 300, "wait_seconds": 600, "margin": 0.25,
+                          "max_tokens": 4096}}
 ```
 
 All options are optional (the values above are the defaults; `max_hands` 1 to 16,
-`timeout_seconds` per hand 5 to 600, `margin` 0 to 1). The answer has one entry per hand box,
-in score order:
+`timeout_seconds` 5 to 600, `wait_seconds` 0 to 3600, `margin` 0 to 1, `max_tokens` 32 to
+8192, thinking included). The answer has one
+entry per hand box, in score order:
 
 ```json
 "hand_fingers": [
   {"box": [812, 488, 884, 538], "score": 0.81, "crop": [794, 476, 902, 551],
-   "fingers": 4, "sicher": false, "befund": "Daumen verdeckt", "seconds": 6.2},
+   "plausibel": true, "sicher": false, "fingers_sichtbar": 4, "verdeckt": ["daumen"],
+   "befunde": [], "befund": "Hand normal, Daumen verdeckt", "seconds": 6.2,
+   "waited_seconds": 1.1},
+  {"box": [1210, 400, 1290, 520], "score": 0.62, "crop": [1190, 370, 1310, 550],
+   "plausibel": false, "sicher": true, "fingers_sichtbar": 5, "verdeckt": [],
+   "befunde": [{"art": "zweite_hand_am_arm", "stelle": "rechts, durchscheinender Arm"}],
+   "befund": "durchscheinender zweiter Arm rechts", "seconds": 74.7, "waited_seconds": 0.9},
   {"box": [320, 590, 420, 705], "score": 0.74, "crop": [295, 561, 445, 734],
    "fehler": "chat 507: cannot load 'qwen3.8-27b': ...", "seconds": 0.1}
 ]
 ```
 
-- `fingers` (0 to 10) counts only visible fingers, the thumb included; `0` means no hand is
-  visible in the box. `sicher` is `false` for a fist, a covered, blurred or cut-off hand.
-  `befund` is one short German sentence.
+- `plausibel` is `false` only when `befunde` lists something impossible. Each finding has an
+  `art` (`daumen_falsche_seite`, `daumen_aus_handflaeche`, `finger_verschmolzen`,
+  `finger_verknotet`, `zu_viele_finger`, `zu_wenige_finger_unerklaert`,
+  `gelenk_falsche_richtung`, `hand_passt_nicht_zum_arm`, `zweite_hand_am_arm`,
+  `arm_ohne_hand`, `handflaeche_widerspricht_arm`, `sonstiges`) and a `stelle` (where).
+- `fingers_sichtbar` (0 to 10) counts only visible fingers, the thumb included; `verdeckt`
+  names the fingers that are hidden (no error). `sicher` is `false` for hidden fingers, a
+  fist, overlapping hands, a blurred or very small hand. `befund` is one short German
+  sentence.
+- `timeout_seconds` counts from the first generated token. Before that a hand may wait
+  `wait_seconds` for the model (queue, loading; a `503 memory_busy` while another model holds
+  the GPU is asked again after its `Retry-After`). When a hand did not get the model in that
+  time, the later hands of the image are not asked (`fehler`: `not checked: ...`).
+  `waited_seconds` is that wait, `seconds` the hand's whole time.
 - A hand whose question failed (model refused or not loadable, timeout, no valid JSON) gets
   `fehler` instead; the other hands and tasks are answered normally. Hands beyond
   `max_hands` get `fehler` too.
 - `models.hand_fingers.model` names the model asked; `hand_fingers_seconds` is the time of
   the questions. The questions run after the CPU part and don't hold the CPU queue.
 - The questions are ordinary chats under your own token: you need the `text` area too, they
-  count like other chats, and the router loads the model if needed (that can take minutes or
-  fail when the memory is taken).
-- The model counts; it does not measure. Treat `sicher: false` and small hands as "look at
-  it", not as a finding.
+  count like other chats, and the router loads the model if needed.
+- `thinking` is on by default: in the prompt test only the 27B with thinking had no finding
+  on the four good hands and found the see-through ghost arm (40 to 170 s per hand). Without
+  thinking (5 s per hand) it missed the ghost arm and once reported six fingers on a good
+  hand. LFM3-VL-2B (1 s) answers the schema but sees almost nothing (see the prompt test). Treat `sicher: false` and small hands as "look at it", not as a finding.
 
 ## Models
 

@@ -53,11 +53,12 @@
 //   RT-DETR: ViTPose / DWPose run in exactly these boxes, in this order
 //   (the film pipeline's mundmessung.py keeps the first frame's box for
 //   every frame); the poses then carry no "score".
-//   "hand_fingers" (vision_fingers.hpp): the "hand" boxes cut out and the
-//   visible fingers counted by a vision chat model (default qwen3.8-27b,
-//   "hand_fingers_options") through the router's own chat API:
-//   detections.hand_fingers = [{"box", "score", "crop", "fingers", "sicher",
-//   "befund", "seconds"} or {..., "fehler"}]; not relayed to the pool
+//   "hand_fingers" (vision_fingers.hpp): the "hand" boxes cut out and each
+//   hand checked for impossible anatomy by a vision chat model (default
+//   qwen3.8-27b, "hand_fingers_options") through the router's own chat API:
+//   detections.hand_fingers = [{"box", "score", "crop", "plausibel",
+//   "sicher", "fingers_sichtbar", "verdeckt", "befunde", "befund",
+//   "seconds", "waited_seconds"} or {..., "fehler"}]; not relayed to the pool
 //   partner unless the models are missing here.
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from

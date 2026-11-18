@@ -1075,40 +1075,69 @@ Those poses carry no `score`; `models.pose_detector` is
 reference boxes) and `router_vision_test` (the RT-DETR boxes given back as
 `pose_boxes` give the same points).
 
-#### Finger count (`hand_fingers`)
+#### Hand check (`hand_fingers`)
 
-For the film direction's hand check (an arm without a hand, a wrong number of
-fingers). `hand_fingers` adds the `hand` task (same thresholds, also answered)
-and, after the CPU part, releases the CPU turn and asks a vision chat model
-once per hand box, in score order, at most `max_hands`: the box plus
-`margin` x its width left and right and x its height above and below
-(floor / ceil, clipped; `FingerCropBox`), from the original pixels (never the
-brightened copy), enlarged with LANCZOS to at least 224 px on the short side
-(at most 1024 px on the long side), PNG data URL. The chat goes through the
-gate and `Dispatch` (`vision::Options::serve`, as the Ablage reads) as
+For the film direction's hand check. Since 2.2.6 it is an anatomy check per
+hand ("Ist diese Hand so möglich?"), not a finger count: a thumb hidden behind
+the other fingers, fingers behind an object or outside the frame are no error
+(Fabian: "einfach nur Finger zählen ist auch nicht die Lösung"). `hand_fingers`
+adds the `hand` task (same thresholds, also answered) and, after the CPU part,
+releases the CPU turn and asks a vision chat model once per hand box, in score
+order, one hand after the other, at most `max_hands`: the box plus `margin` x
+its width left and right and x its height above and below (floor / ceil,
+clipped; `FingerCropBox`), from the original pixels (never the brightened
+copy), enlarged with LANCZOS to at least 224 px on the short side (at most
+1024 px on the long side), PNG data URL. The chat goes through the gate and
+`Dispatch` (`vision::Options::serve`, as the Ablage reads) as
 `POST /v1/chat/completions` under the caller's own `Authorization` / cookie:
 the caller needs the `text` area and the chat counts like any other. Body:
-`model` (default `qwen3.8-27b`), the image and a German/English prompt
-("count the visible fingers, the thumb counts, hidden ones not; no hand
-visible: 0"), `temperature` 0, `max_tokens`, `chat_template_kwargs.enable_thinking`
-= `thinking` (default false) and `response_format` `json_schema`
-`{fingers: integer 0-10, sicher: boolean, befund: string}` (strict).
-`ParseFingerAnswer` takes the message content (tolerates a `<think>` block,
-code fences, text around the object) and checks the three fields. Each hand
-has its own deadline (`timeout_seconds`, polled through the inner request's
-`is_cancelled`, so the proxy drops the generation); a refused chat (its
-`error.message` is kept), a timeout, a cut answer or bad JSON give that hand
-`"fehler"` instead of the verdict, never a 500. Hands beyond `max_hands`
-answer `"fehler": "not checked: ..."`; a caller that disconnects ends the
-request with 499. `hand_fingers_seconds` is the chat time, `models.hand_fingers`
+`model` (default `qwen3.8-27b`), the image and the prompt `kFingerPrompt`
+(hidden or cut-off fingers are no error; only clearly impossible things are
+findings; in doubt none; `sicher` false for hidden fingers, a fist, blur, a
+small hand), `temperature` 0, `max_tokens` (4096, thinking included), `stream` true,
+`chat_template_kwargs.enable_thinking` = `thinking` (default true) and
+`response_format` `json_schema` (strict) `{fingers_sichtbar: integer 0-10,
+verdeckt: [daumen|zeigefinger|mittelfinger|ringfinger|kleiner_finger],
+befunde: [{art: kBefundArten, stelle: string}], plausibel: boolean, sicher:
+boolean, befund: string}` (the order is the order the model writes).
+`ParseFingerAnswer` joins the streamed deltas (or takes a plain answer's
+message content; tolerates a `<think>` block, code fences, text around the
+object) and checks every field and enum.
+
+Two clocks per hand (the first 2.2.5 run lost its hands with "timeout after
+120 s": the 27B was waiting to load behind an exclusive minimax-h3 video,
+the router answered 503 `memory_busy` after `--memory-wait-seconds`, the
+hands themselves were already asked one after the other): until the first
+streamed `data:` chunk (queue, load, prefill) the hand may wait
+`wait_seconds` (600); a 503 `memory_busy` is asked again after its
+`Retry-After` (1-30 s) while that clock allows. From the first chunk on the
+generation has `timeout_seconds` (300). Both are polled through the inner
+request's `is_cancelled` (the proxy drops the generation) and the stream
+writer. A hand that did not get the model within `wait_seconds` ends the
+asking: the later hands answer `"fehler": "not checked: model ... not free
+..."` instead of waiting again. A refused chat (its `error.message` is kept),
+a timeout, a cut answer or bad JSON give that hand `"fehler"` instead of the
+verdict, never a 500. Hands beyond `max_hands` answer `"fehler": "not
+checked: ..."`; a caller that disconnects ends the request with 499.
+`seconds` is the hand's whole time, `waited_seconds` the part before the
+first chunk; `hand_fingers_seconds` is the chat time, `models.hand_fingers`
 `{"model", "detector": "hand", "thinking", "max_hands", "margin",
-"timeout_seconds"}`. Pool: such a request is relayed only when the models are
-missing here (`kPartnerOnly`); a busy CPU here does not send it to the partner,
-whose older build would answer the unknown task with a 400 that counts as
-its answer. Code: `src/cli/serve/router/vision_fingers.{hpp,cpp}`. Test:
-`router_vision_test` (`TestHandFingers`: options, crop, chat body, answer
-parsing, `CountFingers` with a scripted chat: verdict, 503, no JSON,
-`max_hands`, no chat, cancelled caller, token passed on).
+"timeout_seconds", "wait_seconds"}`. Prompt test (2.2.6, 27B, the
+direction's 12 cut-outs in `D:\claude\gufo-arbeit\finger-test`,
+`prompt-test.md`): only with `thinking` (default since 2.2.6) the four good
+hands had no finding and the see-through ghost arm (fehler_07) was found,
+40-170 s per hand; without thinking (5 s) the ghost arm was missed and a good
+hand got "zu_viele_finger". The border cases were `sicher` false either way.
+LFM3-VL-2B (1 s, 7.7 GB) keeps the schema but found nothing and said
+`sicher` true on most border cases: no use as a pre-filter. Pool: such a request is relayed only when the
+models are missing here (`kPartnerOnly`); a busy CPU here does not send it to
+the partner, whose older build would answer the unknown task with a 400 that
+counts as its answer. Code: `src/cli/serve/router/vision_fingers.{hpp,cpp}`.
+Test: `router_vision_test` (`TestHandFingers`: options, crop, chat body and
+schema, answer parsing plain and streamed, `CountFingers` with a scripted
+chat: streamed verdict, 503, no JSON, `max_hands`, no chat, cancelled caller,
+token passed on, 503 `memory_busy` retried, wait clock spent, generation
+timeout).
 
 ### CPU queue and pool for the router services
 
