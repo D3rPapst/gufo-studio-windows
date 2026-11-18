@@ -4,7 +4,8 @@
 // ComfyUI-compatible front for the router (`gufo router --comfy-dir DIR`):
 // POST /prompt takes an API-format workflow, comfy_graph maps it to gufo
 // endpoints, and `AdapterOptions::parallel` worker threads run the jobs in
-// order (up to that many at once, 2.1) through the router's own
+// order (up to that many at once, 2.1; plus the pool partner's free share,
+// AdapterOptions::partner_comfy, 2.2.6) through the router's own
 // OpenAI-style API, so with placement = pool two prompts can compute on
 // both machines at the same time. Results are served the ComfyUI way:
 // /history/{id}, /view?filename=.., /queue, /upload/image, /free,
@@ -38,6 +39,7 @@
 
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/comfy_parallel.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::router::comfy {
@@ -83,6 +85,15 @@ struct AdapterOptions {
   /// other, so they compute on the partner while this machine's GPU is
   /// busy with the first one.
   std::size_t parallel{1};
+  /// The pool partner's ComfyUI numbers (GET /router/capabilities, 2.2.6):
+  /// nullopt without a partner, while it cannot be reached or when it is
+  /// older and sends no "comfy_parallel". With it, up to
+  /// ComfyParallelLimit(parallel, partner) prompts run at once (the extra
+  /// ones compute on the partner through the pool). Blocking; asked every
+  /// `partner_poll` from the adapter's own thread, never under its mutex.
+  /// Optional (unset = `parallel` alone).
+  std::function<std::optional<PartnerComfy>()> partner_comfy;
+  std::chrono::milliseconds partner_poll{std::chrono::seconds(5)};
 };
 
 /// Seconds a client waits before it sends a prompt again after memory_busy
@@ -135,6 +146,13 @@ public:
   /// the router may read it with its state mutex held (placement = pool:
   /// a non-empty queue keeps pool LLM requests off this machine).
   [[nodiscard]] int QueueRemaining() const { return queue_remaining_.load(); }
+
+  /// Prompts that may run at the same time now (own parallel + the
+  /// partner's free share, 2.2.6) and the partner's share in it; lock-free.
+  [[nodiscard]] std::size_t ParallelLimit() const { return limit_.load(); }
+  [[nodiscard]] std::size_t PartnerShare() const {
+    return partner_share_.load();
+  }
 
   /// The finished prompt whose outputs list this file, as `/view` names it
   /// (type "" = output); nullopt when no history entry does (an upload, a
@@ -265,8 +283,16 @@ private:
   std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<std::shared_ptr<Job>> pending_;
-  /// Running prompts, oldest start first (at most options_.parallel).
+  /// Running prompts, oldest start first (at most limit_ when they started).
   std::vector<std::shared_ptr<Job>> running_;
+  /// ComfyParallelLimit of the last partner poll; written under mutex_.
+  std::atomic<std::size_t> limit_{1};
+  std::atomic<std::size_t> partner_share_{0};
+  /// Polls AdapterOptions::partner_comfy and adds workers when the limit
+  /// grows (they are never removed: spare ones wait).
+  std::thread limit_thread_;
+  std::condition_variable limit_wake_;
+  void LimitMain();
   /// QueueRemainingLocked() as of the last EmitStatusLocked().
   std::atomic<int> queue_remaining_{0};
   std::map<std::string, json::Value> history_;

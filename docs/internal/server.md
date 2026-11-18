@@ -491,8 +491,8 @@ Router:
   --comfy-ffmpeg <FILE>         ffmpeg for the ComfyUI API: FLAC audio, PNG frames from videos,
                                 non-WAV voice references; also POST /v1/videos/concat
                                 (ffprobe is expected next to it)
-  --comfy-parallel <N>          ComfyUI prompts running at the same time (default: --jobs-parallel);
-                                with placement = pool the second one's requests can run on the partner
+  --comfy-parallel <N>          ComfyUI prompts running at the same time (default: --jobs-parallel)
+                                on this machine; a reachable pool partner adds its own free number
   --names-file <FILE>           Serve GET /v1/names and /v1/names/origins from FILE
                                 (UTF-8 lines kind<TAB>name<TAB>origin<TAB>gender, kind nach|vor)
   --ccip-model-dir <DIR>        CCIP character fingerprints for POST /v1/figuren "verfahren": "ccip"
@@ -831,6 +831,37 @@ oldest running prompt (or the one `?prompt_id=` names) and adds
 `"running"`: the same fields for each running prompt; `GET
 /filmstudio/preview?prompt_id=` answers that prompt's newest preview
 (204 while it has none).
+
+**Parallel per machine (2.2.6).** `--comfy-parallel` counts per machine
+(Fabian 18.11.: "wenn wir je Rechner parallel 2 haben, dann sollen 4
+laufen"). The adapter runs up to *own + the partner's free share* prompts
+at once (`comfy_parallel.hpp`, `ComfyParallelLimit`): the share is the
+partner's `comfy_parallel` minus its `comfy_queue_remaining` (its own
+prompts make it GPU-busy for the pool, so a slot it uses itself is none
+of ours), 0 while it drains. Both numbers come from the partner's
+`GET /router/capabilities` (new fields `comfy_parallel` and
+`comfy_queue_remaining`, only with `--comfy-dir`), read through the
+router's capabilities cache (30 s, 3 s limit); the adapter asks every 5 s
+on its own thread. No partner, an unreachable one or an older one
+without the field: own number only. When the limit grows the adapter
+adds worker threads; when it sinks (partner gone) running prompts go on
+and spare workers start nothing until the running count is below the
+limit. Each change logs `event=comfy_parallel limit=<n> own=<a>
+partner=<b> partner_parallel=<p> partner_queue=<q>`; `/router/status`
+shows `"comfy_parallel": {"own", "partner", "limit"}`.
+The prompts beyond the own number are not sent anywhere themselves: their
+requests go through the pool like any other (`X-Gufo-Origin: comfy`), so
+they compute wherever the pool decision puts them. The pool runs one
+request per model per machine (`kPoolRemoteCapacity`) and keeps GPU work
+off a machine that has other GPU work, so with four image/video prompts
+two compute (one per machine) and two wait **in the pool** (`both busy`,
+not in the adapter queue) and take whichever machine frees first. Such a
+wait counts against the remote section's `queue-timeout-seconds`
+(default 900 s, then 503 `remote_busy`, the task fails): with long video
+prompts on both machines set it higher or keep `--comfy-parallel 1`.
+`/v1/jobs` needs no such change: with the shared queue (1.4.20) a free
+runner of the partner pulls this router's queued and pool-waiting jobs,
+so `--jobs-parallel 2` on both machines already runs up to four jobs.
 
 The prompts' requests go through the router like any client (origin
 `comfy`), so with placement = pool each request is placed on its own:
@@ -1303,7 +1334,9 @@ job only goes to a machine that can run it.
 **Capabilities.** `GET /router/capabilities` answers what this router
 can run: `{"router_id", "self", "partner", "models": {"<id>":
 {"modality", "placement": "local|remote|pool", "switchable", "status",
-"loaded", "loras": ["winkel", ...]}}}`. The LoRA names come from the
+"loaded", "loras": ["winkel", ...]}}, "draining", "comfy_parallel",
+"comfy_queue_remaining"}` (the last two only with `--comfy-dir`, 2.2.6:
+the partner's ComfyUI adapter adds the free share to its limit). The LoRA names come from the
 preset: every `lora =` line of the section, split at `;` (`lora =
 a=p1;b=p2`, the one-line form gufo 2.0's image worker needs), the name
 before `=` of each entry. The placement follows `POST /router/placement`. A job needs its model and the LoRA

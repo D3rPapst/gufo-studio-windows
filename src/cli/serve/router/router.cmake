@@ -138,6 +138,18 @@ if (BUILD_TESTING)
       TIMEOUT 30)
   endforeach()
 
+  # The ComfyUI prompt limit (own + partner, 2.2.6): header only.
+  add_executable(router_comfy_parallel_test
+    tests/cli/router_comfy_parallel_test.cpp)
+  target_include_directories(router_comfy_parallel_test PRIVATE
+    ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_comfy_parallel_test PRIVATE cxx_std_20)
+  target_compile_options(router_comfy_parallel_test PRIVATE
+    ${gufo_router_test_undebug})
+  add_test(NAME router_comfy_parallel_test COMMAND router_comfy_parallel_test)
+  set_tests_properties(router_comfy_parallel_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 30)
+
   # POSIX sockets, fork and signals: Linux only.
   if (NOT WIN32)
     foreach (router_test IN ITEMS router_proxy_test router_workers_test

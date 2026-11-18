@@ -986,6 +986,10 @@ public:
   std::map<std::string, int> job_silent_sweeps;
   /// ComfyUI-compatible front (--comfy-dir); null when disabled.
   std::unique_ptr<router::comfy::Adapter> comfy;
+  /// This router's own ComfyUI prompts at once (--comfy-parallel, else
+  /// --jobs-parallel, at least 1); GET /router/capabilities tells it the
+  /// partner, whose adapter adds it to its limit (2.2.6).
+  std::size_t comfy_parallel_own{1};
   /// Background jobs with webhooks (--jobs-dir); null when disabled.
   std::unique_ptr<router::jobs::JobQueue> jobs;
   /// Random person names from a word list (--names-file); null when disabled.
@@ -3749,7 +3753,37 @@ public:
                                           : json::Value(partner_name);
     out["models"] = std::move(models);
     out["draining"] = draining_.load();
+    // 2.2.6: the partner's adapter runs its own number plus our free share
+    // (comfy_parallel.hpp); only with --comfy-dir.
+    if (comfy != nullptr) {
+      out["comfy_parallel"] = static_cast<long long>(comfy_parallel_own);
+      out["comfy_queue_remaining"] =
+          static_cast<long long>(std::max(0, comfy->QueueRemaining()));
+    }
     return out;
+  }
+
+  /// The partner's ComfyUI numbers from its (cached) capabilities, for the
+  /// adapter's limit; nullopt without partner, unreachable, or an older
+  /// partner without "comfy_parallel". Blocking like PartnerCapabilities.
+  std::optional<router::comfy::PartnerComfy> PartnerComfy() {
+    const std::optional<json::Value> caps = PartnerCapabilities();
+    if (!caps.has_value())
+      return std::nullopt;
+    const json::Value* parallel = caps->find("comfy_parallel");
+    if (parallel == nullptr || !parallel->is_number() ||
+        !(parallel->as_double() >= 1))
+      return std::nullopt;
+    router::comfy::PartnerComfy partner;
+    partner.parallel = static_cast<std::size_t>(
+        std::min(parallel->as_double(), 64.0));
+    const double queued = caps->member_double("comfy_queue_remaining", 0);
+    partner.queue_remaining =
+        queued > 0 ? static_cast<std::size_t>(std::min(queued, 1e6)) : 0;
+    const json::Value* draining = caps->find("draining");
+    partner.draining = draining != nullptr && draining->is_bool() &&
+                       draining->as_bool();
+    return partner;
   }
 
   static HttpResponse JsonOk(const json::Value& body) {
@@ -3907,6 +3941,14 @@ public:
       body["pool_queue"] = jobs->PoolQueueStatus();
     }
     body["pool_drain"] = DrainJson();
+    if (comfy != nullptr) {
+      // 2.2.6: prompts at once = own + the partner's free share.
+      json::Value parallel = json::Value::object();
+      parallel["own"] = static_cast<long long>(comfy_parallel_own);
+      parallel["partner"] = static_cast<long long>(comfy->PartnerShare());
+      parallel["limit"] = static_cast<long long>(comfy->ParallelLimit());
+      body["comfy_parallel"] = std::move(parallel);
+    }
     return HttpResponse{.status = 200,
                         .reason = "OK",
                         .body = body.dump(),
@@ -4580,8 +4622,8 @@ int RunRouter(std::span<const char* const> args) {
                    "Router", &comfy_ffmpeg);
   parser.AddOption("", "--comfy-parallel", "N",
                    "ComfyUI prompts running at the same time (default: "
-                   "--jobs-parallel); with placement = pool the second one's "
-                   "requests can run on the partner",
+                   "--jobs-parallel) on this machine; a reachable pool "
+                   "partner adds its own free number",
                    "Router", &comfy_parallel);
   parser.AddOption("", "--jobs-dir", "DIR",
                    "Serve the job API (/v1/jobs): wrapped image, video, "
@@ -5163,6 +5205,10 @@ int RunRouter(std::span<const char* const> args) {
     comfy_options.parallel = comfy_parallel > 0
                                  ? comfy_parallel
                                  : std::max<std::size_t>(1, jobs_parallel);
+    state->comfy_parallel_own = comfy_options.parallel;
+    // 2.2.6: plus the pool partner's free share (its capabilities). The
+    // router's partner is set below; without one this answers nullopt.
+    comfy_options.partner_comfy = [raw] { return raw->PartnerComfy(); };
     try {
       state->comfy =
           std::make_unique<router::comfy::Adapter>(std::move(comfy_options));

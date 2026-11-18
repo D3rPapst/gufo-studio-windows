@@ -495,8 +495,50 @@ Adapter::~Adapter() {
 
 void Adapter::Start() {
   const std::size_t threads = std::max<std::size_t>(1, options_.parallel);
-  for (std::size_t i = 0; i < threads; ++i)
-    workers_.emplace_back([this] { WorkerMain(); });
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    limit_.store(threads);
+    for (std::size_t i = 0; i < threads; ++i)
+      workers_.emplace_back([this] { WorkerMain(); });
+  }
+  if (options_.partner_comfy)
+    limit_thread_ = std::thread([this] { LimitMain(); });
+}
+
+void Adapter::LimitMain() {
+  const std::size_t own = std::max<std::size_t>(1, options_.parallel);
+  for (;;) {
+    // Blocking HTTP (cached by the router): outside the mutex.
+    const std::optional<PartnerComfy> partner = options_.partner_comfy();
+    const std::size_t share = PartnerComfyShare(partner);
+    const std::size_t limit = ComfyParallelLimit(own, partner);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (stopping_)
+      return;
+    if (limit != limit_.load() || share != partner_share_.load()) {
+      limit_.store(limit);
+      partner_share_.store(share);
+      while (workers_.size() < limit)
+        workers_.emplace_back([this] { WorkerMain(); });
+      Logger::Info("comfy",
+                   "event=comfy_parallel limit=" + std::to_string(limit) +
+                       " own=" + std::to_string(own) +
+                       " partner=" + std::to_string(share) +
+                       (partner.has_value()
+                            ? " partner_parallel=" +
+                                  std::to_string(partner->parallel) +
+                                  " partner_queue=" +
+                                  std::to_string(partner->queue_remaining) +
+                                  (partner->draining ? " partner_draining=1"
+                                                     : "")
+                            : std::string(" partner_parallel=none")));
+      wake_.notify_all();
+    }
+    limit_wake_.wait_for(lock, options_.partner_poll,
+                         [this] { return stopping_; });
+    if (stopping_)
+      return;
+  }
 }
 
 void Adapter::Stop() {
@@ -507,6 +549,10 @@ void Adapter::Stop() {
       job->cancel.store(true);
   }
   wake_.notify_all();
+  limit_wake_.notify_all();
+  // The limit thread adds workers: it ends before they are joined.
+  if (limit_thread_.joinable())
+    limit_thread_.join();
   for (std::thread& worker : workers_)
     if (worker.joinable())
       worker.join();
@@ -1608,7 +1654,12 @@ void Adapter::WorkerMain() {
     std::shared_ptr<Job> job;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      wake_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+      // limit_ (2.2.6) may sit below the worker count after the partner
+      // left: spare workers wait until a running prompt ends.
+      wake_.wait(lock, [this] {
+        return stopping_ ||
+               (!pending_.empty() && running_.size() < limit_.load());
+      });
       if (stopping_)
         return;
       job = pending_.front();
@@ -1625,6 +1676,8 @@ void Adapter::WorkerMain() {
       prompt_previews_.erase(job->id);
       EmitStatusLocked();
     }
+    // A slot freed: a spare worker may take the next prompt.
+    wake_.notify_one();
   }
 }
 
