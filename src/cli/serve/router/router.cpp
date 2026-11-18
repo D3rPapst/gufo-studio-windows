@@ -1605,6 +1605,9 @@ public:
     std::string remote_failed_detail;
     long long local_picks{0};
     long long remote_picks{0};
+    // 18.11. (Regie #56-1100): remote_picks counts attempts; remote_done only
+    // the answers the partner actually served (no local retry afterwards).
+    long long remote_done{0};
     long long retried_local{0};
     /// Requests that fell back to this machine (B5: partner gone, failed,
     /// or waited on longer than pool-wait-seconds).
@@ -2166,6 +2169,7 @@ public:
           lock.lock();
           continue;
         }
+        ++pool_[model_id].remote_done;
         return response;
       }
       // The local load failed (e.g. 507: memory held outside the router).
@@ -2236,6 +2240,7 @@ public:
       out["local_claims"] = static_cast<long long>(pool.local_claims);
       out["local_picks"] = pool.local_picks;
       out["remote_picks"] = pool.remote_picks;
+      out["remote_done"] = pool.remote_done;
       out["retried_local"] = pool.retried_local;
       out["fallbacks"] = pool.fallbacks;
       out["last"] = pool.last;
@@ -2256,6 +2261,7 @@ public:
       out["waiting"] = 0LL;
       out["local_picks"] = 0LL;
       out["remote_picks"] = 0LL;
+      out["remote_done"] = 0LL;
       out["fallbacks"] = 0LL;
     }
     return out;
