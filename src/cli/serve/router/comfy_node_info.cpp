@@ -88,6 +88,48 @@ constexpr Entry kEntries[] = {
  "description": "gufo: the source audio of an H3 audio noise mask (LTXVConcatAVLatent).",
  "category": "model/latent",
  "search_aliases": ["audio to latent"]})"},
+    // nodes.py EmptyImage: solid frames, e.g. the grey filler and the
+    // black / white mask frames of a VACE control video built in the graph.
+    {"EmptyImage", "nodes", R"({
+ "input": {"required": {
+  "width": ["INT", {"default": 512, "min": 1, "max": 16384, "step": 1}],
+  "height": ["INT", {"default": 512, "min": 1, "max": 16384, "step": 1}],
+  "batch_size": ["INT", {"default": 1, "min": 1, "max": 4096, "tooltip": "gufo: at most 4096 frames per image batch."}],
+  "color": ["INT", {"default": 0, "min": 0, "max": 16777215, "step": 1, "display": "color", "tooltip": "0xRRGGBB. gufo: for VACE masks black = keep, white = generate."}]}},
+ "input_order": {"required": ["width", "height", "batch_size", "color"]},
+ "output": ["IMAGE"], "output_is_list": [false], "output_name": ["IMAGE"],
+ "display_name": "EmptyImage",
+ "description": "gufo: solid frames for a VACE control_video or (through ImageToMask) control_masks, joined with LoadImage frames by ImageBatch / RepeatImageBatch.",
+ "category": "image"})"},
+    {"RepeatImageBatch", "comfy_extras.nodes_images", R"({
+ "input": {"required": {
+  "image": ["IMAGE", {}],
+  "amount": ["INT", {"default": 1, "min": 1, "max": 4096}]}},
+ "input_order": {"required": ["image", "amount"]},
+ "output": ["IMAGE"], "output_is_list": [false], "output_name": ["IMAGE"],
+ "display_name": "RepeatImageBatch",
+ "description": "gufo: repeats the whole batch, for VACE control videos and masks built in the graph.",
+ "category": "image/batch"})"},
+    // comfy_extras/nodes_wan.py; gufo has no FLF2V model and runs it on VACE.
+    {"WanFirstLastFrameToVideo", "comfy_extras.nodes_wan", R"({
+ "input": {"required": {
+  "positive": ["CONDITIONING", {}],
+  "negative": ["CONDITIONING", {}],
+  "vae": ["VAE", {}],
+  "width": ["INT", {"default": 832, "min": 16, "max": 16384, "step": 16, "tooltip": "gufo: multiples of 16, 256..1280, at most 1280x720 pixels."}],
+  "height": ["INT", {"default": 480, "min": 16, "max": 16384, "step": 16}],
+  "length": ["INT", {"default": 81, "min": 1, "max": 16384, "step": 4, "tooltip": "gufo: 4k+1 frames, 5..81 (16 fps)."}],
+  "batch_size": ["INT", {"default": 1, "min": 1, "max": 4096, "tooltip": "gufo renders batch_size 1."}]},
+  "optional": {
+  "clip_vision_start_image": ["CLIP_VISION_OUTPUT", {"tooltip": "gufo: ignored (VACE takes no CLIP vision)."}],
+  "clip_vision_end_image": ["CLIP_VISION_OUTPUT", {"tooltip": "gufo: ignored (VACE takes no CLIP vision)."}],
+  "start_image": ["IMAGE", {}],
+  "end_image": ["IMAGE", {}]}},
+ "input_order": {"required": ["positive", "negative", "vae", "width", "height", "length", "batch_size"], "optional": ["clip_vision_start_image", "clip_vision_end_image", "start_image", "end_image"]},
+ "output": ["CONDITIONING", "CONDITIONING", "LATENT"], "output_is_list": [false, false, false], "output_name": ["positive", "negative", "latent"],
+ "display_name": "WanFirstLastFrameToVideo",
+ "description": "gufo: runs on wan2.1-vace-14b: start_image in front, end_image at the end, grey frames between, kept by a VACE mask (0 on the given frames, 1 between).",
+ "category": "conditioning/video_models"})"},
 };
 
 }  // namespace

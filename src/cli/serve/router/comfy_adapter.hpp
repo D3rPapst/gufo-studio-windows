@@ -192,6 +192,11 @@ private:
   std::filesystem::path WorkFile(std::string_view extension);
   bool RunFfmpeg(const std::vector<std::filesystem::path>& args,
                  std::string* error);
+  /// Frames built in the graph (VideoTask::control_runs / mask_runs) as a
+  /// lossless 16 fps MP4 of width x height, at most `frames` frames (ffmpeg,
+  /// libx264rgb); returns its bytes. Throws on errors.
+  std::string RenderFrameRuns(const std::vector<FrameRun>& runs, int width,
+                              int height, int frames, std::string_view what);
   FetchResult Call(const std::shared_ptr<Job>& job, std::string method,
                    std::string path, std::string body,
                    std::string content_type,

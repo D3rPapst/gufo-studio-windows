@@ -7,12 +7,16 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/comfy_node_info.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/core/json.hpp"
 
@@ -210,6 +214,388 @@ constexpr const char* kVace = R"({
  "34": {"class_type": "CreateVideo", "inputs": {"images": ["33", 0], "fps": 16}},
  "35": {"class_type": "SaveVideo", "inputs": {"video": ["34", 0], "filename_prefix": "film/vace/shot03", "format": "mp4", "codec": "h264"}}
 })";
+
+// The film workflow that stopped at "EmptyImage" (VACE keyframes, ComfyUI
+// API format, 31 nodes) 1:1: control video = ImageBatch chain of
+// LoadImage -> ImageScale keyframes and grey EmptyImage frames, mask =
+// ImageBatch chain of black / white EmptyImage frames -> ImageToMask, two
+// KSamplerAdvanced stages on the Wan 2.2 Fun VACE high / low noise models.
+constexpr const char* kVaceKeyframes = R"json({
+ "clip": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "umt5_xxl_fp16.safetensors",
+   "type": "wan",
+   "device": "default"
+  }
+ },
+ "tp": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "clip",
+    0
+   ],
+   "text": "the camera stays static. A woman walks forward."
+  }
+ },
+ "tn": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "clip",
+    0
+   ],
+   "text": "blurry"
+  }
+ },
+ "vae": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "wan_2.1_vae.safetensors"
+  }
+ },
+ "kf0": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "kf0_beispiel.png"
+  }
+ },
+ "kfs0": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "kf0",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "width": 896,
+   "height": 512,
+   "crop": "center"
+  }
+ },
+ "grau0": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 23,
+   "color": 8355711
+  }
+ },
+ "kf1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "kf1_beispiel.png"
+  }
+ },
+ "kfs1": {
+  "class_type": "ImageScale",
+  "inputs": {
+   "image": [
+    "kf1",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "width": 896,
+   "height": 512,
+   "crop": "center"
+  }
+ },
+ "grau1": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 24,
+   "color": 8355711
+  }
+ },
+ "cb10": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "kfs0",
+    0
+   ],
+   "image2": [
+    "grau0",
+    0
+   ]
+  }
+ },
+ "cb11": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "cb10",
+    0
+   ],
+   "image2": [
+    "kfs1",
+    0
+   ]
+  }
+ },
+ "cb12": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "cb11",
+    0
+   ],
+   "image2": [
+    "grau1",
+    0
+   ]
+  }
+ },
+ "m0": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 1,
+   "color": 0
+  }
+ },
+ "m1": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 23,
+   "color": 16777215
+  }
+ },
+ "m2": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 1,
+   "color": 0
+  }
+ },
+ "m3": {
+  "class_type": "EmptyImage",
+  "inputs": {
+   "width": 896,
+   "height": 512,
+   "batch_size": 24,
+   "color": 16777215
+  }
+ },
+ "mb17": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "m0",
+    0
+   ],
+   "image2": [
+    "m1",
+    0
+   ]
+  }
+ },
+ "mb18": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "mb17",
+    0
+   ],
+   "image2": [
+    "m2",
+    0
+   ]
+  }
+ },
+ "mb19": {
+  "class_type": "ImageBatch",
+  "inputs": {
+   "image1": [
+    "mb18",
+    0
+   ],
+   "image2": [
+    "m3",
+    0
+   ]
+  }
+ },
+ "mask": {
+  "class_type": "ImageToMask",
+  "inputs": {
+   "image": [
+    "mb19",
+    0
+   ],
+   "channel": "red"
+  }
+ },
+ "vace": {
+  "class_type": "WanVaceToVideo",
+  "inputs": {
+   "positive": [
+    "tp",
+    0
+   ],
+   "negative": [
+    "tn",
+    0
+   ],
+   "vae": [
+    "vae",
+    0
+   ],
+   "width": 896,
+   "height": 512,
+   "length": 49,
+   "batch_size": 1,
+   "strength": 1.0,
+   "control_video": [
+    "cb12",
+    0
+   ],
+   "control_masks": [
+    "mask",
+    0
+   ]
+  }
+ },
+ "mh": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_fun_vace_high_noise_14B_fp8_scaled.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "ml": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_fun_vace_low_noise_14B_fp8_scaled.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "sh": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "mh",
+    0
+   ],
+   "shift": 8.0
+  }
+ },
+ "sl": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "ml",
+    0
+   ],
+   "shift": 8.0
+  }
+ },
+ "k1": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "steps": 20,
+   "cfg": 3.5,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "vace",
+    0
+   ],
+   "negative": [
+    "vace",
+    1
+   ],
+   "model": [
+    "sh",
+    0
+   ],
+   "add_noise": "enable",
+   "noise_seed": 533302944,
+   "latent_image": [
+    "vace",
+    2
+   ],
+   "start_at_step": 0,
+   "end_at_step": 10,
+   "return_with_leftover_noise": "enable"
+  }
+ },
+ "k2": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "steps": 20,
+   "cfg": 3.5,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "vace",
+    0
+   ],
+   "negative": [
+    "vace",
+    1
+   ],
+   "model": [
+    "sl",
+    0
+   ],
+   "add_noise": "disable",
+   "noise_seed": 0,
+   "latent_image": [
+    "k1",
+    0
+   ],
+   "start_at_step": 10,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable"
+  }
+ },
+ "trim": {
+  "class_type": "TrimVideoLatent",
+  "inputs": {
+   "samples": [
+    "k2",
+    0
+   ],
+   "trim_amount": [
+    "vace",
+    3
+   ]
+  }
+ },
+ "dec": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "trim",
+    0
+   ],
+   "vae": [
+    "vae",
+    0
+   ]
+  }
+ },
+ "save": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "dec",
+    0
+   ],
+   "filename_prefix": "test/vace_schluessel"
+  }
+ }
+})json";
 
 // InfiniteTalk as ComfyUI's template wires it (WanInfiniteTalkToVideo with
 // a DynamicCombo "mode"; its sub-inputs are named "mode.<input>").
@@ -1518,10 +1904,21 @@ void TestVace() {
   assert(still_plan.warnings.size() == 1 &&
          still_plan.warnings[0].find("every frame") != std::string::npos);
 
-  // Errors: a preprocessor in front of the control video, an alpha mask, a
-  // foreign LoRA, a wrong length, too large, denoise < 1.
+  // A loaded still as the control video is a one-frame batch (ComfyUI pads
+  // it with grey).
+  const comfy::Plan one_plan = PlanOf(Replace(kVace, "\"control_video\": [\"21\", 0]",
+                                              "\"control_video\": [\"24\", 0]")
+                                          .c_str());
+  const auto& one = std::get<comfy::VideoTask>(one_plan.tasks[0].spec);
+  assert(!one.control_video && one.control_runs.size() == 1);
+  assert((one.control_runs[0].image ==
+          comfy::FileRef{"figur_anna.png", "input"}));
+
+  // Errors: a node other than a video or frames in front of the control
+  // video, an alpha mask, a foreign LoRA, a wrong length, too large,
+  // denoise < 1.
   assert(ErrorOf(Replace(kVace, "\"control_video\": [\"21\", 0]",
-                         "\"control_video\": [\"24\", 0]"))
+                         "\"control_video\": [\"12\", 0]"))
              .message.find("LoadVideo") != std::string::npos);
   assert(ErrorOf(Replace(kVace, "\"channel\": \"red\", \"image\": [\"22\", 0]",
                          "\"channel\": \"alpha\", \"image\": [\"22\", 0]"))
@@ -1546,6 +1943,213 @@ void TestVace() {
     assert(std::find(classes.begin(), classes.end(), name) != classes.end());
   assert(std::is_sorted(classes.begin(), classes.end()));
   assert(std::adjacent_find(classes.begin(), classes.end()) == classes.end());
+}
+
+bool SolidRunIs(const comfy::FrameRun& run, std::uint32_t color, int width,
+                int height, int count) {
+  return !run.image && run.color == color && run.width == width &&
+         run.height == height && run.count == count && run.fits.empty();
+}
+
+void TestVaceKeyframes() {
+  // The film workflow 1:1: frames built in the graph become control_runs /
+  // mask_runs, the two KSamplerAdvanced stages one 20-step sampling.
+  const comfy::Plan plan = PlanOf(kVaceKeyframes);
+  assert(plan.tasks.size() == 1);
+  assert(plan.tasks[0].node_id == "k1");
+  assert(plan.tasks[0].outputs.size() == 1);
+  assert(plan.tasks[0].outputs[0].kind == comfy::OutputKind::kImage);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kVace);
+  assert(video.model == "wan2.1-vace-14b");
+  assert(video.prompt == "the camera stays static. A woman walks forward.");
+  assert(video.negative_prompt == "blurry");
+  assert(video.width == 896 && video.height == 512 && video.frames == 49);
+  assert(video.steps == 20 && video.seed == 533302944);
+  assert(video.guidance && *video.guidance == 3.5);
+  assert(video.vace_sampler == "euler" && !video.vace_lora);
+  assert(video.vace_shift && *video.vace_shift == 8.0);
+  assert(!video.vace_strength);
+  assert(!video.control_video && !video.vace_mask);
+  // Control: keyframe, 23 grey, keyframe, 24 grey.
+  assert(video.control_runs.size() == 4);
+  comfy::FrameFit lanczos;
+  lanczos.width = 896;
+  lanczos.height = 512;
+  lanczos.crop = true;
+  lanczos.method = "lanczos";
+  for (int i : {0, 2}) {
+    const comfy::FrameRun& key = video.control_runs[i];
+    assert(key.count == 1 && key.fits.size() == 1 && key.fits[0] == lanczos);
+  }
+  assert((video.control_runs[0].image ==
+          comfy::FileRef{"kf0_beispiel.png", "input"}));
+  assert((video.control_runs[2].image ==
+          comfy::FileRef{"kf1_beispiel.png", "input"}));
+  assert(SolidRunIs(video.control_runs[1], 8355711, 896, 512, 23));
+  assert(SolidRunIs(video.control_runs[3], 8355711, 896, 512, 24));
+  assert(comfy::FrameCount(video.control_runs) == 49);
+  // Mask: black (keep) on the keyframes, white (generate) between.
+  assert(video.mask_runs.size() == 4);
+  assert(SolidRunIs(video.mask_runs[0], 0, 896, 512, 1));
+  assert(SolidRunIs(video.mask_runs[1], 0xFFFFFF, 896, 512, 23));
+  assert(SolidRunIs(video.mask_runs[2], 0, 896, 512, 1));
+  assert(SolidRunIs(video.mask_runs[3], 0xFFFFFF, 896, 512, 24));
+  assert(video.vace_mask_channel == "red" && !video.vace_invert_mask);
+  // Warnings: the split sampling and the two Wan 2.2 checkpoints.
+  assert(plan.warnings.size() == 3);
+  const auto warned = [&](const std::string& text) {
+    return std::any_of(plan.warnings.begin(), plan.warnings.end(),
+                       [&](const std::string& w) {
+                         return w.find(text) != std::string::npos;
+                       });
+  };
+  assert(warned("k1, k2") && warned("node mh:") && warned("node ml:"));
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("size") == "896x512");
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("frames")->as_double() == 49);
+  assert(gufo->find("steps")->as_double() == 20);
+  assert(gufo->find("guidance")->as_double() == 3.5);
+  const json::Value* vace = gufo->find("vace");
+  assert(vace->member_str("mask_channel") == "red");
+  assert(vace->member_str("sampler") == "euler");
+  assert(!vace->find("lora")->as_bool());
+  assert(vace->find("control_video") == nullptr);  // the executor's
+  // The executor's ffmpeg filter for a 1024x1024 keyframe: ImageScale's
+  // centre crop + lanczos, already at the video size.
+  const comfy::ImageSizeProbe square = [](const comfy::FileRef&) {
+    return std::optional<std::pair<int, int>>({1024, 1024});
+  };
+  assert(comfy::FrameRunFilter(video.control_runs, 0, 896, 512, square) ==
+         "crop=1024:586:0:219,scale=896:512:flags=lanczos,format=rgb24");
+  assert(!comfy::FrameRunFilter(video.control_runs, 1, 896, 512, square));
+  assert(!comfy::FrameRunFilter(video.control_runs, 0, 896, 512, {}));
+
+  // RepeatImageBatch of smaller grey frames: ImageBatch fits them to the
+  // first frame's size (896x512).
+  const std::string repeated = Replace(
+      kVaceKeyframes,
+      "\"grau1\": {\n  \"class_type\": \"EmptyImage\",\n  \"inputs\": {\n"
+      "   \"width\": 896,\n   \"height\": 512,\n   \"batch_size\": 24,",
+      "\"grau1\": {\n  \"class_type\": \"RepeatImageBatch\",\n  \"inputs\": "
+      "{\n   \"image\": [\"grau1e\", 0],\n   \"amount\": 4\n  }\n },\n "
+      "\"grau1e\": {\n  \"class_type\": \"EmptyImage\",\n  \"inputs\": {\n"
+      "   \"width\": 448,\n   \"height\": 256,\n   \"batch_size\": 6,");
+  const comfy::Plan repeat_plan = PlanOf(repeated.c_str());
+  const auto& repeat = std::get<comfy::VideoTask>(repeat_plan.tasks[0].spec);
+  assert(repeat.control_runs.size() == 7);
+  assert(comfy::FrameCount(repeat.control_runs) == 49);
+  for (std::size_t i = 3; i < 7; ++i) {
+    const comfy::FrameRun& run = repeat.control_runs[i];
+    assert(run.count == 6 && run.width == 448 && run.fits.size() == 1);
+    assert(run.fits[0].like_run == 0 && run.fits[0].like_fits == 1);
+    assert((comfy::FrameRunSize(repeat.control_runs, i, 1, {}) ==
+            std::pair<int, int>{896, 512}));
+  }
+
+  // Errors: a gap between the stages, a colour out of range.
+  assert(ErrorOf(Replace(kVaceKeyframes, "\"start_at_step\": 10,",
+                         "\"start_at_step\": 12,"))
+             .message.find("continue") != std::string::npos);
+  assert(ErrorOf(Replace(kVaceKeyframes, "\"color\": 16777215",
+                         "\"color\": 16777216"))
+             .message.find("color") != std::string::npos);
+}
+
+// Wan 2.1 FLF2V as ComfyUI's template wires it (CLIP vision of the start
+// image); gufo runs it on VACE.
+constexpr const char* kFirstLast = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.1_flf2v_720p_14B_fp16.safetensors", "weight_dtype": "default"}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "5": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["1", 0], "shift": 8.0}},
+ "6": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+ "10": {"class_type": "LoadImage", "inputs": {"image": "start.png"}},
+ "11": {"class_type": "LoadImage", "inputs": {"image": "ende.png [output]"}},
+ "7": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["6", 0], "image": ["10", 0], "crop": "none"}},
+ "12": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "a door opens slowly"}},
+ "13": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "blurry"}},
+ "20": {"class_type": "WanFirstLastFrameToVideo", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["4", 0], "width": 832, "height": 480, "length": 33, "batch_size": 1, "clip_vision_start_image": ["7", 0], "start_image": ["10", 0], "end_image": ["11", 0]}},
+ "31": {"class_type": "KSampler", "inputs": {"model": ["5", 0], "positive": ["20", 0], "negative": ["20", 1], "latent_image": ["20", 2], "seed": 11, "steps": 20, "cfg": 5.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "33": {"class_type": "VAEDecode", "inputs": {"samples": ["31", 0], "vae": ["4", 0]}},
+ "34": {"class_type": "CreateVideo", "inputs": {"images": ["33", 0], "fps": 16}},
+ "35": {"class_type": "SaveVideo", "inputs": {"video": ["34", 0], "filename_prefix": "film/flf/shot01", "format": "mp4", "codec": "h264"}}
+})";
+
+void TestFirstLastFrame() {
+  const comfy::Plan plan = PlanOf(kFirstLast);
+  assert(plan.tasks.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kVace);
+  assert(video.model == "wan2.1-vace-14b");
+  assert(video.prompt == "a door opens slowly");
+  assert(video.width == 832 && video.height == 480 && video.frames == 33);
+  assert(video.steps == 20 && video.seed == 11);
+  assert(video.guidance && *video.guidance == 5.0 && !video.vace_lora);
+  // Start frame, 31 grey frames, end frame; mask keeps the two.
+  assert(video.control_runs.size() == 3);
+  assert((video.control_runs[0].image == comfy::FileRef{"start.png", "input"}));
+  assert(video.control_runs[0].fits.empty() && video.control_runs[0].count == 1);
+  assert(SolidRunIs(video.control_runs[1], 0x808080, 832, 480, 31));
+  assert((video.control_runs[2].image == comfy::FileRef{"ende.png", "output"}));
+  assert(video.mask_runs.size() == 3);
+  assert(SolidRunIs(video.mask_runs[0], 0, 832, 480, 1));
+  assert(SolidRunIs(video.mask_runs[1], 0xFFFFFF, 832, 480, 31));
+  assert(SolidRunIs(video.mask_runs[2], 0, 832, 480, 1));
+  assert(video.vace_mask_channel == "red");
+  // Warnings: FLF on VACE, the ignored CLIP vision, the FLF2V checkpoint.
+  assert(plan.warnings.size() == 3);
+  assert(plan.warnings[0].find("FLF2V") != std::string::npos);
+  assert(plan.warnings[1].find("clip_vision_start_image") != std::string::npos);
+  assert(plan.warnings[2].find("flf2v") != std::string::npos);
+  assert(comfy::VideoRequestBody(video).find("gufo")->find("vace")
+             ->member_str("mask_channel") == "red");
+  // The executor fits a 1280x720 start image like the node (bilinear,
+  // centre crop).
+  const comfy::ImageSizeProbe hd = [](const comfy::FileRef&) {
+    return std::optional<std::pair<int, int>>({1280, 720});
+  };
+  assert(comfy::FrameRunFilter(video.control_runs, 0, 832, 480, hd) ==
+         "crop=1248:720:16:0,scale=832:480:flags=bilinear,format=rgb24");
+
+  // Only a start image: start frame, then 32 frames to generate.
+  const comfy::Plan start_plan =
+      PlanOf(Replace(kFirstLast, ", \"end_image\": [\"11\", 0]", "").c_str());
+  const auto& start = std::get<comfy::VideoTask>(start_plan.tasks[0].spec);
+  assert(start.control_runs.size() == 2 && start.mask_runs.size() == 2);
+  assert(SolidRunIs(start.control_runs[1], 0x808080, 832, 480, 32));
+  assert(SolidRunIs(start.mask_runs[1], 0xFFFFFF, 832, 480, 32));
+
+  // Errors: more start and end frames than the length, a wrong length.
+  std::string crowded = Replace(
+      kFirstLast, "\"start_image\": [\"10\", 0], \"end_image\": [\"11\", 0]",
+      "\"start_image\": [\"40\", 0], \"end_image\": [\"41\", 0]");
+  crowded = Replace(
+      crowded, " \"12\":",
+      " \"40\": {\"class_type\": \"RepeatImageBatch\", \"inputs\": {\"image\": "
+      "[\"10\", 0], \"amount\": 20}},\n \"41\": {\"class_type\": "
+      "\"RepeatImageBatch\", \"inputs\": {\"image\": [\"11\", 0], \"amount\": "
+      "20}},\n \"12\":");
+  assert(ErrorOf(crowded).message.find("more than length 33") !=
+         std::string::npos);
+  assert(ErrorOf(Replace(kFirstLast, "\"length\": 33", "\"length\": 32"))
+             .message.find("4k+1") != std::string::npos);
+
+  // Known classes with ComfyUI's signatures.
+  const auto& classes = comfy::SupportedClassTypes();
+  for (const char* name :
+       {"EmptyImage", "RepeatImageBatch", "WanFirstLastFrameToVideo"})
+    assert(std::find(classes.begin(), classes.end(), name) != classes.end());
+  const auto flf = comfy::NodeInfo("WanFirstLastFrameToVideo");
+  assert(flf && flf->find("output")->size() == 3);
+  const json::Value* optional = flf->find("input")->find("optional");
+  for (const char* key : {"clip_vision_start_image", "clip_vision_end_image",
+                          "start_image", "end_image"})
+    assert(optional->find(key) != nullptr);
+  const auto empty = comfy::NodeInfo("EmptyImage");
+  assert(empty && empty->find("input")->find("required")->find("color")
+                      ->items()[1].find("max")->as_double() == 16777215);
 }
 
 void TestInfiniteTalk() {
@@ -2310,6 +2914,8 @@ int main() {
   TestUni3C();
   TestWanFunCamera();
   TestVace();
+  TestVaceKeyframes();
+  TestFirstLastFrame();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();
   TestDelivery();

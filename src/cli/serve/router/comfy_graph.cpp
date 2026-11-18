@@ -91,6 +91,11 @@ constexpr std::string_view kPlumbing[] = {
     "TrimVideoLatent",
     "ImageToMask",
     "InvertMask",
+    // VACE control videos / masks built from frames, first / last frame
+    // to video on VACE.
+    "EmptyImage",
+    "RepeatImageBatch",
+    "WanFirstLastFrameToVideo",
     // Regional prompts (Qwen-Image): gufo.regions.
     "ConditioningCombine",
     "ConditioningSetMask",
@@ -484,7 +489,7 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
       cond.zeroed = true;
       link = graph.RequireLink(link->node, "conditioning");
     } else if (cls == "WanImageToVideo" || cls == "WanCameraImageToVideo" ||
-               cls == "WanVaceToVideo") {
+               cls == "WanVaceToVideo" || cls == "WanFirstLastFrameToVideo") {
       // Outputs (positive, negative, latent): follow the matching input.
       link = graph.RequireLink(link->node,
                                link->slot == 1 ? "negative" : "positive");
@@ -2074,13 +2079,348 @@ FileRef VideoFile(const Graph& graph, const std::string& id,
                         "result as a video)");
 }
 
+// IMAGE batches built in the graph (VACE control videos and masks).
+constexpr int kMaxBatchFrames = 4096;
+
+bool IsFrameSource(std::string_view cls) {
+  return cls == "EmptyImage" || cls == "LoadImage" ||
+         cls == "LoadImageOutput" || cls == "ImageScale" ||
+         cls == "ImageBatch" || cls == "RepeatImageBatch";
+}
+
+/// A whole number input in low..high.
+int WholeInput(const Graph& graph, const std::string& id,
+               const std::string& key, double fallback, double low,
+               double high) {
+  const double value = graph.Num(id, key, fallback);
+  if (value != std::floor(value) || value < low || value > high)
+    throw NodeFailure(id, "unsupported_value",
+                      key + " must be a whole number in " +
+                          std::to_string(static_cast<long long>(low)) + ".." +
+                          std::to_string(static_cast<long long>(high)));
+  return static_cast<int>(value);
+}
+
+/// `runs` appended to `out`, their ImageBatch size references moved along.
+void AppendRuns(std::vector<FrameRun>* out, std::vector<FrameRun> runs) {
+  const int offset = static_cast<int>(out->size());
+  for (FrameRun& run : runs) {
+    for (FrameFit& fit : run.fits)
+      if (fit.like_run >= 0)
+        fit.like_run += offset;
+    out->push_back(std::move(run));
+  }
+}
+
+FrameRun SolidRun(std::uint32_t color, int width, int height, int count) {
+  FrameRun run;
+  run.color = color;
+  run.width = width;
+  run.height = height;
+  run.count = count;
+  return run;
+}
+
+/// Keeps frames [first, first + count) of `runs`; runs outside keep their
+/// place with count 0 (later runs may take their size).
+std::vector<FrameRun> KeepFrames(std::vector<FrameRun> runs, int first,
+                                 int count) {
+  int position = 0;
+  for (FrameRun& run : runs) {
+    const int start = position;
+    const int end = position + run.count;
+    position = end;
+    run.count = std::max(0, std::min(end, first + count) -
+                                std::max(start, first));
+  }
+  return runs;
+}
+
+/// The frames an IMAGE input receives when the graph builds them itself:
+/// LoadImage (one frame), EmptyImage (batch_size solid frames, color
+/// 0xRRGGBB), ImageScale, ImageBatch (image2 fitted to image1's size,
+/// bilinear centre crop, as ComfyUI does) and RepeatImageBatch (the whole
+/// batch `amount` times).
+std::vector<FrameRun> FrameRuns(const Graph& graph, const std::string& id,
+                                const std::string& key, const Link& link,
+                                int depth = 0) {
+  if (depth > 64)
+    throw NodeFailure(id, "invalid_prompt", "image batch chain too long");
+  const std::string node = link.node;
+  const std::string cls = graph.Class(node);
+  std::vector<FrameRun> runs;
+  if (cls == "LoadImage" || cls == "LoadImageOutput") {
+    if (link.slot != 0)
+      throw NodeFailure(id, "unsupported_link",
+                        "input '" + key + "' must read the IMAGE output of " +
+                            cls);
+    FrameRun run;
+    run.image = ImageFile(graph, id, key, link);
+    runs.push_back(std::move(run));
+  } else if (cls == "EmptyImage") {
+    runs.push_back(SolidRun(
+        static_cast<std::uint32_t>(
+            WholeInput(graph, node, "color", 0, 0, 0xFFFFFF)),
+        WholeInput(graph, node, "width", 512, 1, 16384),
+        WholeInput(graph, node, "height", 512, 1, 16384),
+        WholeInput(graph, node, "batch_size", 1, 1, kMaxBatchFrames)));
+  } else if (cls == "ImageScale") {
+    runs = FrameRuns(graph, node, "image", graph.RequireLink(node, "image"),
+                     depth + 1);
+    FrameFit fit;
+    fit.width = WholeInput(graph, node, "width", 512, 0, 16384);
+    fit.height = WholeInput(graph, node, "height", 512, 0, 16384);
+    const std::string crop = graph.Str(node, "crop", "disabled");
+    if (crop != "disabled" && crop != "center")
+      throw NodeFailure(node, "value_not_in_list",
+                        "crop must be disabled or center");
+    fit.crop = crop == "center";
+    fit.method = graph.Str(node, "upscale_method", "nearest-exact");
+    if (fit.method != "nearest-exact" && fit.method != "bilinear" &&
+        fit.method != "area" && fit.method != "bicubic" &&
+        fit.method != "lanczos")
+      throw NodeFailure(node, "value_not_in_list",
+                        "upscale_method must be nearest-exact, bilinear, "
+                        "area, bicubic or lanczos");
+    if (fit.width != 0 || fit.height != 0)  // 0 x 0 = unchanged
+      for (FrameRun& run : runs)
+        run.fits.push_back(fit);
+  } else if (cls == "ImageBatch") {
+    runs = FrameRuns(graph, node, "image1", graph.RequireLink(node, "image1"),
+                     depth + 1);
+    const std::size_t offset = runs.size();
+    AppendRuns(&runs, FrameRuns(graph, node, "image2",
+                                graph.RequireLink(node, "image2"), depth + 1));
+    // ComfyUI resizes image2 only when its size differs from image1's.
+    FrameFit like;
+    like.like_run = 0;
+    like.like_fits = static_cast<int>(runs[0].fits.size());
+    const auto first = FrameRunSize(runs, 0, runs[0].fits.size(), {});
+    for (std::size_t i = offset; i < runs.size(); ++i) {
+      const auto size = FrameRunSize(runs, i, runs[i].fits.size(), {});
+      if (!first || !size || *first != *size)
+        runs[i].fits.push_back(like);
+    }
+  } else if (cls == "RepeatImageBatch") {
+    const std::vector<FrameRun> once = FrameRuns(
+        graph, node, "image", graph.RequireLink(node, "image"), depth + 1);
+    const int amount =
+        WholeInput(graph, node, "amount", 1, 1, kMaxBatchFrames);
+    if (static_cast<long long>(FrameCount(once)) * amount > kMaxBatchFrames)
+      throw NodeFailure(node, "unsupported_value",
+                        "an image batch has at most 4096 frames in gufo");
+    for (int i = 0; i < amount; ++i)
+      AppendRuns(&runs, once);
+  } else {
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key +
+                          "' must come from LoadImage, EmptyImage, "
+                          "ImageScale, ImageBatch or RepeatImageBatch, not " +
+                          cls);
+  }
+  if (FrameCount(runs) > kMaxBatchFrames)
+    throw NodeFailure(node, "unsupported_value",
+                      "an image batch has at most 4096 frames in gufo");
+  return runs;
+}
+
+/// A VACE IMAGE input: a loaded video, or frames the graph builds.
+void VaceFrames(const Graph& graph, const std::string& id,
+                const std::string& key, const Link& link,
+                std::vector<std::string>* warnings,
+                std::optional<FileRef>* file, std::vector<FrameRun>* runs) {
+  const std::string cls = graph.Class(link.node);
+  if (IsFrameSource(cls)) {
+    *runs = FrameRuns(graph, id, key, link);
+    return;
+  }
+  if (cls == "VHS_LoadVideo" || cls == "GetVideoComponents") {
+    *file = VideoFile(graph, id, key, link, warnings);
+    return;
+  }
+  throw NodeFailure(id, "unsupported_link",
+                    "input '" + key +
+                        "' must come from LoadVideo (GetVideoComponents), "
+                        "VHS_LoadVideo or frames from EmptyImage / LoadImage "
+                        "/ ImageScale / ImageBatch / RepeatImageBatch, not " +
+                        cls +
+                        " (run preprocessors in ComfyUI and load their "
+                        "result as a video)");
+}
+
+/// WanFirstLastFrameToVideo on VACE: start_image[:length] in front,
+/// end_image[-length:] at the end, grey between; mask 0 (keep) on the given
+/// frames, 1 (generate) between. Both images are fitted to the video size
+/// by the executor (bilinear, centre crop, as the node does).
+void FirstLastControl(const Graph& graph, const std::string& node,
+                      VideoTask* task, std::vector<std::string>* warnings) {
+  warnings->push_back("node " + node +
+                      ": gufo has no FLF2V model; start / end frames run "
+                      "as VACE control frames on " +
+                      task->model);
+  for (const char* clip : {"clip_vision_start_image", "clip_vision_end_image"})
+    if (graph.LinkOf(node, clip))
+      warnings->push_back("node " + node + ": " + clip +
+                          " is ignored (VACE takes no CLIP vision)");
+  std::vector<FrameRun> start;
+  std::vector<FrameRun> end;
+  if (auto link = graph.LinkOf(node, "start_image"))
+    start = KeepFrames(FrameRuns(graph, node, "start_image", *link), 0,
+                       task->frames);
+  if (auto link = graph.LinkOf(node, "end_image")) {
+    end = FrameRuns(graph, node, "end_image", *link);
+    const int total = FrameCount(end);
+    end = KeepFrames(std::move(end), std::max(0, total - task->frames),
+                     task->frames);
+  }
+  const int head = FrameCount(start);
+  const int tail = FrameCount(end);
+  if (head + tail > task->frames)
+    throw NodeFailure(node, "unsupported_value",
+                      "start_image and end_image have " +
+                          std::to_string(head + tail) +
+                          " frames together, more than length " +
+                          std::to_string(task->frames));
+  if (head == 0 && tail == 0)
+    return;  // plain text to video
+  const int middle = task->frames - head - tail;
+  const int w = task->width;
+  const int h = task->height;
+  AppendRuns(&task->control_runs, std::move(start));
+  if (middle > 0)
+    task->control_runs.push_back(SolidRun(0x808080, w, h, middle));
+  AppendRuns(&task->control_runs, std::move(end));
+  if (head > 0)
+    task->mask_runs.push_back(SolidRun(0x000000, w, h, head));
+  if (middle > 0)
+    task->mask_runs.push_back(SolidRun(0xFFFFFF, w, h, middle));
+  if (tail > 0)
+    task->mask_runs.push_back(SolidRun(0x000000, w, h, tail));
+  task->vace_mask_channel = "red";
+}
+
+/// The samplers of a VACE job: one KSampler / KSamplerAdvanced, or a
+/// KSamplerAdvanced chain splitting one schedule (Wan 2.2 high / low noise
+/// experts: start_at_step / end_at_step 0..k, k..steps), first stage
+/// first. Checks the split and returns the first stage.
+std::string CheckSamplerStages(const Graph& graph,
+                               const std::vector<std::string>& stages,
+                               std::vector<std::string>* warnings) {
+  const std::string& head = stages.front();
+  const bool split = stages.size() > 1;
+  const int steps = static_cast<int>(graph.Num(head, "steps"));
+  int expected = 0;
+  for (std::size_t i = 0; i < stages.size(); ++i) {
+    const std::string& stage = stages[i];
+    const bool advanced = graph.Class(stage) == "KSamplerAdvanced";
+    if (!advanced) {
+      if (split)
+        throw NodeFailure(stage, "unsupported_link",
+                          "a split VACE sampling must use KSamplerAdvanced "
+                          "nodes");
+      break;
+    }
+    if (static_cast<int>(graph.Num(stage, "steps")) != steps)
+      throw NodeFailure(stage, "unsupported_value",
+                        "the KSamplerAdvanced stages of one VACE video must "
+                        "have the same steps");
+    const int start = static_cast<int>(graph.Num(stage, "start_at_step", 0));
+    const int end = static_cast<int>(graph.Num(stage, "end_at_step", 10000));
+    if (start != expected || end <= start)
+      throw NodeFailure(stage, "unsupported_value",
+                        "gufo samples VACE from step 0 to the end: the "
+                        "KSamplerAdvanced stages must continue each other "
+                        "(start_at_step " +
+                            std::to_string(expected) + ")");
+    const std::string noise = graph.Str(stage, "add_noise", "enable");
+    if (i == 0 && noise != "enable")
+      throw NodeFailure(stage, "unsupported_value",
+                        "the first KSamplerAdvanced stage needs add_noise "
+                        "enable");
+    if (i > 0 && noise != "disable")
+      warnings->push_back("node " + stage +
+                          ": add_noise is ignored, gufo samples the stages "
+                          "as one schedule");
+    expected = end;
+    if (i + 1 == stages.size() && end < steps)
+      throw NodeFailure(stage, "unsupported_value",
+                        "the last KSamplerAdvanced stage must run to the end "
+                        "(end_at_step >= steps)");
+  }
+  if (split) {
+    std::string names;
+    for (const std::string& stage : stages)
+      names += (names.empty() ? "" : ", ") + stage;
+    warnings->push_back("node " + head + ": the KSamplerAdvanced stages (" +
+                        names + ") run as one sampling of " +
+                        std::to_string(steps) +
+                        " steps on one model; settings from node " + head);
+    for (std::size_t i = 1; i < stages.size(); ++i)
+      for (const char* key : {"cfg", "sampler_name", "scheduler"}) {
+        const json::Value* a = graph.Literal(head, key);
+        const json::Value* b = graph.Literal(stages[i], key);
+        if ((a == nullptr) != (b == nullptr) ||
+            (a != nullptr && a->dump() != b->dump()))
+          warnings->push_back("node " + stages[i] + ": " + key +
+                              " differs from node " + head +
+                              ", gufo uses node " + head + "'s");
+      }
+  }
+  return head;
+}
+
+/// `generators` as one linear sampler chain (each stage's latent_image is
+/// the stage before) that starts at WanVaceToVideo /
+/// WanFirstLastFrameToVideo, first stage first; nullopt otherwise.
+std::optional<std::vector<std::string>> VaceSamplerChain(
+    const Graph& graph, const std::vector<std::string>& generators) {
+  std::map<std::string, std::string> next;  // stage -> the stage after it
+  std::string head;
+  for (const std::string& g : generators) {
+    if (!IsSampler(graph.Class(g)))
+      return std::nullopt;
+    const auto latent = graph.LinkOf(g, "latent_image");
+    if (!latent)
+      return std::nullopt;
+    if (std::find(generators.begin(), generators.end(), latent->node) !=
+        generators.end()) {
+      if (!next.emplace(latent->node, g).second)
+        return std::nullopt;  // two stages continue one
+    } else {
+      const std::string cls = graph.Class(latent->node);
+      if (!head.empty() ||
+          (cls != "WanVaceToVideo" && cls != "WanFirstLastFrameToVideo"))
+        return std::nullopt;
+      head = g;
+    }
+  }
+  if (head.empty())
+    return std::nullopt;
+  std::vector<std::string> chain{head};
+  while (chain.size() <= generators.size()) {
+    const auto found = next.find(chain.back());
+    if (found == next.end())
+      break;
+    chain.push_back(found->second);
+  }
+  if (chain.size() != generators.size())
+    return std::nullopt;
+  return chain;
+}
+
 /// Wan 2.1 VACE 14B (wan2.1-vace-14b, 16 fps): KSampler <- WanVaceToVideo,
 /// TrimVideoLatent behind the sampler (gufo always trims the reference
-/// frames).
-VideoTask BuildVace(const Graph& graph, const std::string& sampler,
+/// frames); or KSampler <- WanFirstLastFrameToVideo on VACE. `stages`: a
+/// KSamplerAdvanced chain (first stage first), empty = `first` alone.
+VideoTask BuildVace(const Graph& graph, const std::string& first,
                     const ModelIds& models, const Link& latent,
-                    std::vector<std::string>* warnings) {
+                    std::vector<std::string>* warnings,
+                    const std::vector<std::string>& stages = {}) {
   const std::string vace = latent.node;
+  const bool first_last = graph.Class(vace) == "WanFirstLastFrameToVideo";
+  const std::string sampler = CheckSamplerStages(
+      graph, stages.empty() ? std::vector<std::string>{first} : stages,
+      warnings);
   VideoTask task;
   task.family = VideoFamily::kVace;
   task.model = models.vace;
@@ -2109,10 +2449,12 @@ VideoTask BuildVace(const Graph& graph, const std::string& sampler,
                       "strength must be 0..1000");
   if (strength != 1.0)
     task.vace_strength = strength;
-  if (auto control = graph.LinkOf(vace, "control_video"))
-    task.control_video =
-        VideoFile(graph, vace, "control_video", *control, warnings);
-  if (auto mask = graph.LinkOf(vace, "control_masks")) {
+  if (first_last)
+    FirstLastControl(graph, vace, &task, warnings);
+  if (auto control = graph.LinkOf(vace, "control_video"); control && !first_last)
+    VaceFrames(graph, vace, "control_video", *control, warnings,
+               &task.control_video, &task.control_runs);
+  if (auto mask = graph.LinkOf(vace, "control_masks"); mask && !first_last) {
     Link link = *mask;
     for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
          ++guard) {
@@ -2122,10 +2464,12 @@ VideoTask BuildVace(const Graph& graph, const std::string& sampler,
     const std::string source = graph.Class(link.node);
     std::string channel;
     if (source == "ImageToMask") {
+      // A mask video, or mask frames built in the graph (black = keep,
+      // white = generate; ComfyUI pads missing frames with 1).
       channel = graph.Str(link.node, "channel", "red");
-      task.vace_mask =
-          VideoFile(graph, link.node, "image",
-                    graph.RequireLink(link.node, "image"), warnings);
+      VaceFrames(graph, link.node, "image",
+                 graph.RequireLink(link.node, "image"), warnings,
+                 &task.vace_mask, &task.mask_runs);
     } else if (source == "LoadImageMask") {
       channel = graph.Str(link.node, "channel", "alpha");
       task.vace_mask = ParseFileRef(graph.Str(link.node, "image"), "input");
@@ -2136,7 +2480,8 @@ VideoTask BuildVace(const Graph& graph, const std::string& sampler,
     } else {
       throw NodeFailure(vace, "unsupported_link",
                         "control_masks must come from ImageToMask (on a "
-                        "loaded video), LoadImageMask or InvertMask, not " +
+                        "loaded video or image frames), LoadImageMask or "
+                        "InvertMask, not " +
                             source);
     }
     if (channel != "red" && channel != "green" && channel != "blue")
@@ -2200,6 +2545,25 @@ VideoTask BuildVace(const Graph& graph, const std::string& sampler,
       warnings->push_back("node " + sampler + ": LoRA " + name +
                           " runs as gufo's built-in lightx2v T2V LoRA at "
                           "strength 1");
+  }
+  // Other checkpoints (Wan 2.2 Fun VACE high / low noise, Wan 2.1 FLF2V)
+  // run as the one VACE model gufo has.
+  for (const std::string& stage :
+       stages.empty() ? std::vector<std::string>{sampler} : stages) {
+    const ModelChain stage_chain = FollowModel(graph, stage);
+    const std::string file = Lower(stage_chain.loader);
+    if (!file.empty() && (file.find("vace") == std::string::npos ||
+                          file.find("2.2") != std::string::npos ||
+                          file.find("2_2") != std::string::npos ||
+                          file.find("wan22") != std::string::npos ||
+                          file.find("fun") != std::string::npos))
+      warnings->push_back("node " + stage_chain.loader_node + ": " +
+                          stage_chain.loader + " runs as gufo " + models.vace +
+                          " (Wan 2.1 VACE 14B)");
+    if (stage != sampler && stage_chain.loras.empty() != chain.loras.empty())
+      warnings->push_back("node " + stage +
+                          ": LoRAs differ from node " + sampler +
+                          ", gufo uses node " + sampler + "'s");
   }
   // ModelSamplingSD3 shift on the model path -> gufo.vace.shift.
   Link link = graph.RequireLink(sampler, "model");
@@ -2906,6 +3270,127 @@ bool IsOutputClass(std::string_view class_type) {
   return Contains(kOutputs, class_type);
 }
 
+int FrameCount(const std::vector<FrameRun>& runs) {
+  int total = 0;
+  for (const FrameRun& run : runs)
+    total += run.count;
+  return total;
+}
+
+namespace {
+
+/// ImageScale with one side 0: ComfyUI keeps the aspect ratio.
+std::pair<int, int> KeepAspect(std::pair<int, int> size, const FrameFit& fit) {
+  if (fit.width == 0)
+    return {std::max(1, static_cast<int>(std::lround(
+                            static_cast<double>(size.first) * fit.height /
+                            size.second))),
+            fit.height};
+  return {fit.width,
+          std::max(1, static_cast<int>(std::lround(
+                          static_cast<double>(size.second) * fit.width /
+                          size.first)))};
+}
+
+std::optional<std::pair<int, int>> RunSizeAt(const std::vector<FrameRun>& runs,
+                                             std::size_t index,
+                                             std::size_t fits,
+                                             const ImageSizeProbe& probe) {
+  if (index >= runs.size())
+    return std::nullopt;
+  const FrameRun& run = runs[index];
+  std::optional<std::pair<int, int>> size;
+  if (!run.image)
+    size = std::pair<int, int>{run.width, run.height};
+  else if (probe)
+    size = probe(*run.image);
+  const std::size_t n = std::min(fits, run.fits.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    const FrameFit& fit = run.fits[i];
+    if (fit.like_run >= 0) {
+      // Always an earlier run, so this ends.
+      if (static_cast<std::size_t>(fit.like_run) >= index)
+        return std::nullopt;
+      size = RunSizeAt(runs, static_cast<std::size_t>(fit.like_run),
+                       static_cast<std::size_t>(fit.like_fits), probe);
+    } else if (fit.width > 0 && fit.height > 0) {
+      size = std::pair<int, int>{fit.width, fit.height};
+    } else if (size) {
+      size = KeepAspect(*size, fit);
+    }
+  }
+  return size;
+}
+
+std::string ScaleFlags(std::string_view method) {
+  if (method == "nearest-exact")
+    return "neighbor";
+  if (method == "area" || method == "bicubic" || method == "lanczos")
+    return std::string(method);
+  return "bilinear";
+}
+
+/// One common_upscale step: centre crop to the target aspect (crop), then
+/// scale; nothing when the size already matches.
+void AppendFit(std::string* chain, std::pair<int, int> from,
+               std::pair<int, int> to, bool crop, std::string_view method) {
+  if (from == to)
+    return;
+  if (crop) {
+    const double old_aspect = static_cast<double>(from.first) / from.second;
+    const double new_aspect = static_cast<double>(to.first) / to.second;
+    int x = 0;
+    int y = 0;
+    if (old_aspect > new_aspect)
+      x = static_cast<int>(std::lround(
+          (from.first - from.first * (new_aspect / old_aspect)) / 2));
+    else if (old_aspect < new_aspect)
+      y = static_cast<int>(std::lround(
+          (from.second - from.second * (old_aspect / new_aspect)) / 2));
+    if (x > 0 || y > 0)
+      *chain += "crop=" + std::to_string(from.first - 2 * x) + ":" +
+                std::to_string(from.second - 2 * y) + ":" + std::to_string(x) +
+                ":" + std::to_string(y) + ",";
+  }
+  *chain += "scale=" + std::to_string(to.first) + ":" +
+            std::to_string(to.second) + ":flags=" + ScaleFlags(method) + ",";
+}
+
+}  // namespace
+
+std::optional<std::pair<int, int>> FrameRunSize(
+    const std::vector<FrameRun>& runs, std::size_t index, std::size_t fits,
+    const ImageSizeProbe& probe) {
+  return RunSizeAt(runs, index, fits, probe);
+}
+
+std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
+                                          std::size_t index, int width,
+                                          int height,
+                                          const ImageSizeProbe& probe) {
+  if (index >= runs.size() || !runs[index].image)
+    return std::nullopt;
+  auto size = RunSizeAt(runs, index, 0, probe);
+  if (!size)
+    return std::nullopt;
+  std::string chain;
+  const FrameRun& run = runs[index];
+  for (std::size_t i = 0; i < run.fits.size(); ++i) {
+    const FrameFit& fit = run.fits[i];
+    const auto target = RunSizeAt(runs, index, i + 1, probe);
+    if (!target)
+      return std::nullopt;
+    // ImageBatch fits bilinear with a centre crop; ImageScale as set.
+    const bool batch = fit.like_run >= 0;
+    AppendFit(&chain, *size, *target, batch || fit.crop,
+              batch ? "bilinear" : fit.method);
+    size = target;
+  }
+  // WanVaceToVideo / WanFirstLastFrameToVideo: bilinear, centre crop.
+  AppendFit(&chain, *size, {width, height}, true, "bilinear");
+  return chain + "format=rgb24";
+}
+
 int VideoFamilyFps(VideoFamily family) {
   return family == VideoFamily::kCamera || family == VideoFamily::kVace ? 16
          : family == VideoFamily::kTalk                                   ? 25
@@ -2986,7 +3471,7 @@ json::Value VideoRequestBody(const VideoTask& task) {
     json::Value vace = json::Value::object();
     if (task.vace_strength)
       vace["strength"] = *task.vace_strength;
-    if (task.vace_mask) {
+    if (task.vace_mask || !task.mask_runs.empty()) {
       vace["mask_channel"] = task.vace_mask_channel;
       if (task.vace_invert_mask)
         vace["invert_mask"] = true;
@@ -3466,6 +3951,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
   // 2. Each output node is fed by exactly one generator.
   std::map<std::string, std::size_t> task_of;
   std::map<std::size_t, std::optional<Delivery>> delivery_of;
+  std::map<std::string, std::vector<std::string>> stages_of;
   bool any_output = false;
   try {
     for (const auto& [id, node] : prompt.members()) {
@@ -3511,6 +3997,14 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                               return other == g || before.contains(other);
                             }))
               last = g;
+          }
+        }
+        if (last.empty()) {
+          // A VACE schedule split over KSamplerAdvanced stages (Wan 2.2
+          // high / low noise): the first stage stands for the chain.
+          if (auto stages = VaceSamplerChain(graph, generators)) {
+            last = stages->front();
+            stages_of[last] = std::move(*stages);
           }
         }
         if (last.empty())
@@ -3577,9 +4071,10 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                    latent_class == "WanCameraImageToVideo")
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
-          else if (latent_class == "WanVaceToVideo")
+          else if (latent_class == "WanVaceToVideo" ||
+                   latent_class == "WanFirstLastFrameToVideo")
             task.spec = BuildVace(graph, generator, models, latent,
-                                  &plan->warnings);
+                                  &plan->warnings, stages_of[generator]);
           else if (latent_class == "WanInfiniteTalkToVideo" ||
                    (latent_class == "VAEEncode" &&
                     graph.LinkOf(generator, "positive") &&
@@ -3627,8 +4122,14 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
       // count.
       auto* video = std::get_if<VideoTask>(&task.spec);
       if (video == nullptr || target.kind != OutputKind::kAudio) {
+        // Only nodes behind the generator deliver; an ImageScale in front
+        // of it (e.g. a VACE keyframe) is an input.
+        std::set<std::string> behind = upstream;
+        if (video != nullptr)
+          for (const std::string& before : graph.Ancestors(generator))
+            behind.erase(before);
         const Delivery delivery =
-            DeliveryOf(graph, id, upstream, video, &plan->warnings);
+            DeliveryOf(graph, id, behind, video, &plan->warnings);
         if (video != nullptr) {
           auto& seen = delivery_of[found->second];
           if (seen) {

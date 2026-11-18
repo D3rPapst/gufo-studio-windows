@@ -18,12 +18,14 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -429,6 +431,10 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
         files->push_back(*video->talk_video);
       if (video->vace_mask)
         files->push_back(*video->vace_mask);
+      for (const auto* runs : {&video->control_runs, &video->mask_runs})
+        for (const FrameRun& run : *runs)
+          if (run.image)
+            files->push_back(*run.image);
       files->insert(files->end(), video->reference_images.begin(),
                     video->reference_images.end());
     } else if (const auto* foley = std::get_if<FoleyTask>(&task.spec)) {
@@ -2364,6 +2370,19 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     if (spec.control_video)
       vace["control_video"] = "data:video/mp4;base64," +
                               Base64Encode(ReadFileRef(*spec.control_video));
+    // Control video / mask built from frames in the graph (EmptyImage,
+    // LoadImage, ImageBatch ..., WanFirstLastFrameToVideo).
+    if (!spec.control_runs.empty())
+      vace["control_video"] =
+          "data:video/mp4;base64," +
+          Base64Encode(RenderFrameRuns(spec.control_runs, spec.width,
+                                       spec.height, spec.frames,
+                                       "control video"));
+    if (!spec.mask_runs.empty())
+      vace["mask"] = "data:video/mp4;base64," +
+                     Base64Encode(RenderFrameRuns(spec.mask_runs, spec.width,
+                                                  spec.height, spec.frames,
+                                                  "mask"));
     if (spec.vace_mask) {
       const std::string bytes = ReadFileRef(*spec.vace_mask);
       vace["mask"] = (ImageDimensions(bytes) ? "data:" + SniffImageType(bytes)
@@ -2622,6 +2641,94 @@ bool Adapter::RunFfmpeg(const std::vector<fs::path>& args, std::string* error) {
   if (code != 0 && error->empty())
     *error = "ffmpeg exited with " + std::to_string(code);
   return code == 0;
+}
+
+std::string Adapter::RenderFrameRuns(const std::vector<FrameRun>& runs,
+                                     int width, int height, int frames,
+                                     std::string_view what) {
+  if (options_.ffmpeg.empty())
+    throw std::runtime_error(
+        "the VACE " + std::string(what) +
+        " is built from images in the graph; start the router with "
+        "--comfy-ffmpeg to render it");
+  const fs::path dir = WorkFile("frames");
+  fs::create_directories(dir);
+  struct RemoveDir {
+    fs::path dir;
+    ~RemoveDir() {
+      std::error_code ignored;
+      fs::remove_all(dir, ignored);
+    }
+  } cleanup{dir};
+  std::map<std::string, std::optional<std::pair<int, int>>> sizes;
+  const ImageSizeProbe probe =
+      [&](const FileRef& ref) -> std::optional<std::pair<int, int>> {
+    const std::string key = ref.folder + "/" + ref.name;
+    auto found = sizes.find(key);
+    if (found == sizes.end())
+      found = sizes.emplace(key, ImageDimensions(ReadFileRef(ref))).first;
+    return found->second;
+  };
+  // One PPM per run at the video size, hard-linked (or copied) once per
+  // frame; image2 then encodes the numbered frames losslessly (exact mask
+  // values, no chroma subsampling).
+  int written = 0;
+  for (std::size_t i = 0; i < runs.size() && written < frames; ++i) {
+    const FrameRun& run = runs[i];
+    if (run.count <= 0)
+      continue;
+    const fs::path still = dir / U8Path("run_" + std::to_string(i) + ".ppm");
+    if (run.image) {
+      const auto filter = FrameRunFilter(runs, i, width, height, probe);
+      if (!filter)
+        throw std::runtime_error("cannot read the size of " +
+                                 run.image->name +
+                                 " (PNG or JPEG) for the VACE " +
+                                 std::string(what));
+      std::string error;
+      if (!RunFfmpeg({"-i", FilePath(*run.image), "-vf", *filter,
+                      "-frames:v", "1", "-pix_fmt", "rgb24", still},
+                     &error))
+        throw std::runtime_error("cannot fit " + run.image->name +
+                                 " for the VACE " + std::string(what) + ": " +
+                                 error);
+    } else {
+      std::string ppm = "P6\n" + std::to_string(width) + " " +
+                        std::to_string(height) + "\n255\n";
+      const std::size_t header = ppm.size();
+      ppm.resize(header + static_cast<std::size_t>(width) * height * 3);
+      const char rgb[3] = {static_cast<char>((run.color >> 16) & 0xFF),
+                           static_cast<char>((run.color >> 8) & 0xFF),
+                           static_cast<char>(run.color & 0xFF)};
+      for (std::size_t p = header; p < ppm.size(); p += 3)
+        std::copy_n(rgb, 3, ppm.begin() + static_cast<std::ptrdiff_t>(p));
+      WriteAll(still, ppm);
+    }
+    for (int n = 0; n < run.count && written < frames; ++n) {
+      char name[32];
+      std::snprintf(name, sizeof(name), "f_%05d.ppm", ++written);
+      std::error_code ec;
+      fs::create_hard_link(still, dir / name, ec);
+      if (ec)
+        fs::copy_file(still, dir / name, fs::copy_options::overwrite_existing);
+    }
+  }
+  if (written == 0)
+    throw std::runtime_error("the VACE " + std::string(what) +
+                             " has no frames");
+  const fs::path mp4 = WorkFile("mp4");
+  std::string error;
+  const bool ok = RunFfmpeg({"-framerate", "16", "-start_number", "1", "-i",
+                             dir / "f_%05d.ppm", "-c:v", "libx264rgb", "-qp",
+                             "0", "-pix_fmt", "rgb24", mp4},
+                            &error);
+  std::string bytes = ok ? ReadAll(mp4) : std::string();
+  std::error_code ignored;
+  fs::remove(mp4, ignored);
+  if (!ok)
+    throw std::runtime_error("cannot encode the VACE " + std::string(what) +
+                             ": " + error);
+  return bytes;
 }
 
 namespace {

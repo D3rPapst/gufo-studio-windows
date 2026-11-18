@@ -27,9 +27,15 @@
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
 //   vace   KSampler <- WanVaceToVideo (control_video from LoadVideo /
-//          VHS_LoadVideo, control_masks through ImageToMask / InvertMask or
-//          LoadImageMask, reference_image from LoadImage), TrimVideoLatent
-//          after it -> /v1/videos (wan2.1-vace-14b, gufo.vace)
+//          VHS_LoadVideo or a frame batch built in the graph from
+//          EmptyImage / LoadImage / ImageScale / ImageBatch /
+//          RepeatImageBatch, control_masks through ImageToMask (on such a
+//          video or batch) / InvertMask or LoadImageMask, reference_image
+//          from LoadImage), TrimVideoLatent after it; or KSampler <-
+//          WanFirstLastFrameToVideo (start / end frames as VACE control
+//          frames with a keep mask, gufo has no FLF2V model); a
+//          KSamplerAdvanced chain (Wan 2.2 high / low noise) runs as one
+//          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
 //          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
 //          windows via previous_frames become one job; video to video:
@@ -306,6 +312,58 @@ struct CameraMove {
   std::string ease{"linear"};
 };
 
+/// One resize step of a FrameRun, as ComfyUI's common_upscale does it:
+/// with `crop` the source is first cut to the target aspect around its
+/// centre, then scaled to width x height with `method`.
+struct FrameFit {
+  /// ImageScale size; one of them 0 = keep the aspect ratio (ComfyUI
+  /// rounds the other side).
+  int width{0};
+  int height{0};
+  bool crop{true};                 // false: ImageScale crop "disabled"
+  std::string method{"bilinear"};  // ImageScale upscale_method
+  /// >= 0: ImageBatch fits image2 to image1: the size of run `like_run`
+  /// (an earlier run of the same list) after its first `like_fits` fits.
+  int like_run{-1};
+  int like_fits{0};
+  bool operator==(const FrameFit&) const = default;
+};
+
+/// `count` equal frames of an IMAGE batch the graph builds itself:
+/// a loaded still (LoadImage) or a solid colour (EmptyImage), resized by
+/// ImageScale / ImageBatch on the way. count 0 = a run that only lends its
+/// size to a later ImageBatch fit (cut away by WanFirstLastFrameToVideo).
+struct FrameRun {
+  std::optional<FileRef> image;  // a loaded still, else the solid `color`
+  std::uint32_t color{0};        // 0xRRGGBB (EmptyImage color)
+  int width{0};                  // EmptyImage size (solid runs)
+  int height{0};
+  std::vector<FrameFit> fits;
+  int count{1};
+  bool operator==(const FrameRun&) const = default;
+};
+
+/// Frames of a run list.
+int FrameCount(const std::vector<FrameRun>& runs);
+
+/// Width and height of a loaded still; nullopt = unknown.
+using ImageSizeProbe =
+    std::function<std::optional<std::pair<int, int>>(const FileRef& file)>;
+
+/// The size of runs[index] after its first `fits` fits (all when larger);
+/// nullopt when it depends on an image the probe cannot measure.
+std::optional<std::pair<int, int>> FrameRunSize(
+    const std::vector<FrameRun>& runs, std::size_t index, std::size_t fits,
+    const ImageSizeProbe& probe);
+
+/// The ffmpeg -vf chain that turns the still of runs[index] into one frame
+/// of width x height: its fits, then WanVaceToVideo's bilinear centre-crop
+/// fit to the video size, ending in rgb24. nullopt when a size is unknown.
+std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
+                                          std::size_t index, int width,
+                                          int height,
+                                          const ImageSizeProbe& probe);
+
 struct VideoTask {
   VideoFamily family{VideoFamily::kH3};
   std::string model;
@@ -377,6 +435,14 @@ struct VideoTask {
   /// step-distill LoRA applies (false: the graph has no LoRA).
   std::optional<FileRef> control_video;
   std::optional<FileRef> vace_mask;
+  /// A control video / mask built in the graph from frames (EmptyImage,
+  /// LoadImage, ImageScale, ImageBatch, RepeatImageBatch; or
+  /// WanFirstLastFrameToVideo's start, grey and end frames): the executor
+  /// renders the runs into a lossless MP4 of width x height (--comfy-ffmpeg)
+  /// and sends it as control_video / mask. Mask frames are read through
+  /// `vace_mask_channel` (black = keep, white = generate, as in ComfyUI).
+  std::vector<FrameRun> control_runs;
+  std::vector<FrameRun> mask_runs;
   std::string vace_mask_channel;  // "red", "green", "blue"
   bool vace_invert_mask{false};
   std::vector<FileRef> reference_images;
