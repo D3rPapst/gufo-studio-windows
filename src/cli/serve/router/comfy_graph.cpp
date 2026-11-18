@@ -2325,7 +2325,8 @@ void FirstLastControl(const Graph& graph, const std::string& node,
 std::string CheckSamplerStages(const Graph& graph,
                                const std::vector<std::string>& stages,
                                std::vector<std::string>* warnings,
-                               std::size_t experts = 0) {
+                               std::size_t experts = 0,
+                               const std::string& what = "VACE") {
   const std::string& head = stages.front();
   const bool split = stages.size() > 1;
   const int steps = static_cast<int>(graph.Num(head, "steps"));
@@ -2336,21 +2337,21 @@ std::string CheckSamplerStages(const Graph& graph,
     if (!advanced) {
       if (split)
         throw NodeFailure(stage, "unsupported_link",
-                          "a split VACE sampling must use KSamplerAdvanced "
-                          "nodes");
+                          "a split " + what +
+                              " sampling must use KSamplerAdvanced nodes");
       break;
     }
     if (static_cast<int>(graph.Num(stage, "steps")) != steps)
       throw NodeFailure(stage, "unsupported_value",
-                        "the KSamplerAdvanced stages of one VACE video must "
-                        "have the same steps");
+                        "the KSamplerAdvanced stages of one " + what +
+                            " video must have the same steps");
     const int start = static_cast<int>(graph.Num(stage, "start_at_step", 0));
     const int end = static_cast<int>(graph.Num(stage, "end_at_step", 10000));
     if (start != expected || end <= start)
       throw NodeFailure(stage, "unsupported_value",
-                        "gufo samples VACE from step 0 to the end: the "
-                        "KSamplerAdvanced stages must continue each other "
-                        "(start_at_step " +
+                        "gufo samples " + what +
+                            " from step 0 to the end: the KSamplerAdvanced "
+                            "stages must continue each other (start_at_step " +
                             std::to_string(expected) + ")");
     const std::string noise = graph.Str(stage, "add_noise", "enable");
     if (i == 0 && noise != "enable")
@@ -2404,17 +2405,14 @@ std::string CheckSamplerStages(const Graph& graph,
   return head;
 }
 
-/// Wan 2.2 Fun VACE A14B: the index of the first low-noise stage when
-/// `stages` run two different checkpoints in two consecutive groups (high
-/// noise first, as ComfyUI samples them) and `models.vace22` is served; 0
-/// otherwise (one VACE model).
-std::size_t VaceExpertSplit(const Graph& graph,
-                            const std::vector<std::string>& stages,
-                            const ModelIds& models,
-                            std::vector<std::string>* warnings) {
-  if (stages.size() < 2 || models.vace22.empty() ||
-      std::find(models.available.begin(), models.available.end(),
-                models.vace22) == models.available.end())
+/// The index of the first low-noise stage when `stages` run two different
+/// checkpoints in two consecutive groups (high noise first, as ComfyUI
+/// samples Wan 2.2 A14B); 0 otherwise (one checkpoint, three groups or a
+/// stage without a loader).
+std::size_t ExpertSplit(const Graph& graph,
+                        const std::vector<std::string>& stages,
+                        std::vector<std::string>* warnings) {
+  if (stages.size() < 2)
     return 0;
   std::vector<std::string> files;
   for (const std::string& stage : stages) {
@@ -2441,11 +2439,27 @@ std::size_t VaceExpertSplit(const Graph& graph,
   return split;
 }
 
+/// Wan 2.2 Fun VACE A14B: the index of the first low-noise stage when
+/// `stages` run two different checkpoints in two consecutive groups (high
+/// noise first, as ComfyUI samples them) and `models.vace22` is served; 0
+/// otherwise (one VACE model).
+std::size_t VaceExpertSplit(const Graph& graph,
+                            const std::vector<std::string>& stages,
+                            const ModelIds& models,
+                            std::vector<std::string>* warnings) {
+  if (stages.size() < 2 || models.vace22.empty() ||
+      std::find(models.available.begin(), models.available.end(),
+                models.vace22) == models.available.end())
+    return 0;
+  return ExpertSplit(graph, stages, warnings);
+}
+
 /// `generators` as one linear sampler chain (each stage's latent_image is
-/// the stage before) that starts at WanVaceToVideo /
-/// WanFirstLastFrameToVideo, first stage first; nullopt otherwise.
-std::optional<std::vector<std::string>> VaceSamplerChain(
-    const Graph& graph, const std::vector<std::string>& generators) {
+/// the stage before) whose first stage's latent comes from a node of one of
+/// `heads`, first stage first; nullopt otherwise.
+std::optional<std::vector<std::string>> SamplerChain(
+    const Graph& graph, const std::vector<std::string>& generators,
+    const std::vector<std::string_view>& heads) {
   std::map<std::string, std::string> next;  // stage -> the stage after it
   std::string head;
   for (const std::string& g : generators) {
@@ -2461,8 +2475,7 @@ std::optional<std::vector<std::string>> VaceSamplerChain(
     } else {
       const std::string cls = graph.Class(latent->node);
       if (!head.empty() ||
-          (cls != "WanVaceToVideo" && cls != "WanFirstLastFrameToVideo" &&
-           cls != "WanAnimateToVideo"))
+          std::find(heads.begin(), heads.end(), cls) == heads.end())
         return std::nullopt;
       head = g;
     }
@@ -2479,6 +2492,15 @@ std::optional<std::vector<std::string>> VaceSamplerChain(
   if (chain.size() != generators.size())
     return std::nullopt;
   return chain;
+}
+
+/// SamplerChain from WanVaceToVideo / WanFirstLastFrameToVideo /
+/// WanAnimateToVideo.
+std::optional<std::vector<std::string>> VaceSamplerChain(
+    const Graph& graph, const std::vector<std::string>& generators) {
+  return SamplerChain(
+      graph, generators,
+      {"WanVaceToVideo", "WanFirstLastFrameToVideo", "WanAnimateToVideo"});
 }
 
 /// A VACE MASK input (control_masks, WanAnimateToVideo character_mask):
@@ -2857,6 +2879,197 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     warnings->push_back("node " + low +
                         ": shift differs from node " + sampler +
                         ", gufo uses node " + sampler + "'s");
+  return task;
+}
+
+/// True when the router serves the Wan 2.2 I2V A14B model (it is in the
+/// preset).
+bool I2V22Available(const ModelIds& models) {
+  return !models.i2v22.empty() &&
+         std::find(models.available.begin(), models.available.end(),
+                   models.i2v22) != models.available.end();
+}
+
+/// A Wan 2.2 I2V A14B checkpoint name ("Wan2_2-I2V-A14B-HIGH_...",
+/// "wan2.2_i2v_low_noise_14B_fp8_scaled", ...).
+bool IsWan22I2VFile(const std::string& file) {
+  const std::string lower = Lower(file);
+  return lower.find("i2v") != std::string::npos &&
+         (lower.find("2.2") != std::string::npos ||
+          lower.find("2_2") != std::string::npos ||
+          lower.find("wan22") != std::string::npos);
+}
+
+/// Wan 2.2 I2V A14B (wan2.2-i2v-a14b, 16 fps): WanImageToVideo -> a
+/// KSamplerAdvanced chain over the high- and low-noise checkpoints (the
+/// first low-noise stage's start_at_step -> gufo.i2v.switch_step, its cfg
+/// -> gufo.guidance, the high-noise cfg -> gufo.i2v.high_guidance), or one
+/// sampler (gufo switches at its boundary). The experts have no image
+/// cross-attention: clip_vision_output changes nothing (as in ComfyUI).
+VideoTask BuildI2V22(const Graph& graph, const std::string& first,
+                     const ModelIds& models, const Link& latent,
+                     std::vector<std::string>* warnings,
+                     const std::vector<std::string>& stages = {}) {
+  const std::string video = latent.node;
+  const std::vector<std::string> all_stages =
+      stages.empty() ? std::vector<std::string>{first} : stages;
+  const std::size_t experts = ExpertSplit(graph, all_stages, warnings);
+  // The low-noise group starts at the first stage with another checkpoint;
+  // a chain on one checkpoint switches where its second stage starts.
+  const std::size_t low_index =
+      experts > 0 ? experts : (all_stages.size() > 1 ? 1 : 0);
+  const std::string sampler =
+      CheckSamplerStages(graph, all_stages, warnings, low_index,
+                         "Wan 2.2 I2V A14B");
+  VideoTask task;
+  task.family = VideoFamily::kI2V22;
+  task.model = models.i2v22;
+  const std::string gufo_model = "gufo " + task.model;
+  task.fps = 16;
+  task.width = static_cast<int>(graph.Num(video, "width", 832));
+  task.height = static_cast<int>(graph.Num(video, "height", 480));
+  if (task.width % 16 != 0 || task.height % 16 != 0 || task.width < 256 ||
+      task.height < 256 || task.width > 1280 || task.height > 1280 ||
+      task.width * task.height > 1280 * 720)
+    throw NodeFailure(video, "unsupported_value",
+                      gufo_model + " needs width/height in multiples of 16, "
+                      "256..1280 and at most 1280x720 pixels, not " +
+                          std::to_string(task.width) + "x" +
+                          std::to_string(task.height));
+  task.frames = static_cast<int>(graph.Num(video, "length", 81));
+  if (task.frames < 5 || task.frames > 81 || (task.frames - 1) % 4 != 0)
+    throw NodeFailure(video, "unsupported_value",
+                      gufo_model + " length must be 4k+1 frames, 5..81 "
+                      "(16 fps)");
+  if (graph.Num(video, "batch_size", 1) != 1)
+    throw NodeFailure(video, "unsupported_value",
+                      gufo_model + " renders batch_size 1");
+  const auto start = graph.LinkOf(video, "start_image");
+  if (!start)
+    throw NodeFailure(video, "required_input_missing",
+                      gufo_model + " needs a start_image");
+  task.first_frame = ImageFile(graph, video, "start_image", *start);
+  if (graph.LinkOf(video, "ref_pad_image"))
+    warnings->push_back("node " + video +
+                        ": ref_pad_image is not applied (gufo pads the "
+                        "image conditioning with grey)");
+  // Prompts and sampling.
+  const Conditioning positive = FollowConditioning(graph, sampler, "positive");
+  if (positive.encoder.empty() ||
+      graph.Class(positive.encoder) != "CLIPTextEncode")
+    throw NodeFailure(sampler, "unsupported_link",
+                      "Wan positive conditioning must come from "
+                      "CLIPTextEncode");
+  task.prompt = graph.Str(positive.encoder, "text");
+  task.negative_prompt =
+      ClipText(graph, FollowConditioning(graph, sampler, "negative"));
+  task.steps = static_cast<int>(graph.Num(sampler, "steps"));
+  if (task.steps < 1 || task.steps > 50)
+    throw NodeFailure(sampler, "unsupported_value",
+                      gufo_model + " takes 1..50 steps");
+  task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
+  const auto read_cfg = [&](const std::string& stage) {
+    const double value = graph.Num(stage, "cfg", 1.0);
+    if (value < 1.0 || value > 20.0)
+      throw NodeFailure(stage, "unsupported_value",
+                        gufo_model + " takes cfg 1..20");
+    return value;
+  };
+  const std::string low = all_stages[low_index];
+  const double cfg = read_cfg(low);
+  if (cfg != 1.0)
+    task.guidance = cfg;
+  if (low_index > 0) {
+    task.i2v_switch_step =
+        static_cast<int>(graph.Num(low, "start_at_step", 0));
+    const double high_cfg = read_cfg(sampler);
+    if (high_cfg != cfg)
+      task.i2v_high_guidance = high_cfg;
+  }
+  const std::string sampler_name = graph.Str(sampler, "sampler_name", "euler");
+  task.i2v_sampler = sampler_name == "lcm" ? "lcm" : "euler";
+  if (sampler_name != "lcm" && sampler_name != "euler")
+    warnings->push_back("node " + sampler + ": sampler " + sampler_name +
+                        " runs as euler on " + gufo_model);
+  if (low != sampler &&
+      graph.Str(low, "sampler_name", "euler") != sampler_name)
+    warnings->push_back("node " + low + ": sampler_name differs from node " +
+                        sampler + ", gufo uses node " + sampler + "'s");
+  const std::string scheduler = graph.Str(sampler, "scheduler", "simple");
+  if (scheduler != "simple" && scheduler != "normal")
+    warnings->push_back("node " + sampler + ": scheduler " + scheduler +
+                        " runs as gufo's shifted linear (simple) schedule");
+  if (graph.Num(sampler, "denoise", 1.0) != 1.0)
+    throw NodeFailure(sampler, "unsupported_value",
+                      gufo_model + " samples with denoise 1");
+  // LoRAs: gufo's bundle carries the step-distill LoRAs (lightx2v /
+  // Lightning I2V) for both experts; no others.
+  bool any_lora = false;
+  for (std::size_t index = 0; index < all_stages.size(); ++index) {
+    const std::string& stage = all_stages[index];
+    const ModelChain chain = FollowModel(graph, stage);
+    if (!chain.uni3c.empty())
+      throw NodeFailure(chain.uni3c, "unsupported_link",
+                        "Uni3C needs gufo wan2.1-uni3c, not " + task.model);
+    any_lora = any_lora || !chain.loras.empty();
+    for (const auto& [name, strength] : chain.loras) {
+      const std::string lower = Lower(name);
+      if (lower.find("lightx2v") == std::string::npos &&
+          lower.find("lightning") == std::string::npos &&
+          lower.find("distill") == std::string::npos)
+        throw NodeFailure(stage, "unsupported_value",
+                          gufo_model +
+                              " has its step-distill LoRAs (lightx2v) built "
+                              "in and takes no other LoRA, not " +
+                              name);
+      if (strength != 1.0 || lower.find("i2v") == std::string::npos)
+        warnings->push_back("node " + stage + ": LoRA " + name +
+                            " runs as gufo's built-in Wan 2.2 I2V "
+                            "step-distill LoRA at strength 1");
+    }
+    const bool expert_head = index == 0 || index == low_index;
+    if (expert_head && !chain.loader.empty() && !IsWan22I2VFile(chain.loader))
+      warnings->push_back("node " + chain.loader_node + ": " + chain.loader +
+                          " runs as " + gufo_model + " (Wan 2.2 I2V A14B, " +
+                          (index == 0 && low_index > 0 ? "high" : "low") +
+                          " noise)");
+  }
+  task.i2v_lora = any_lora;
+  // Two checkpoints: ExpertSplit warned about a low / high mix-up already.
+  if (experts == 0 && all_stages.size() > 1) {
+    warnings->push_back("node " + sampler +
+                        ": the KSamplerAdvanced stages run one checkpoint; "
+                        "gufo runs its high-noise expert before step " +
+                        std::to_string(*task.i2v_switch_step) +
+                        " and its low-noise expert after it");
+  } else if (experts == 0) {
+    warnings->push_back("node " + sampler + ": one sampler runs as " +
+                        gufo_model +
+                        "'s two experts, switching at its boundary (0.900)");
+  }
+  // ModelSamplingSD3 shift on the high-noise model path -> gufo.i2v.shift.
+  const auto shift_of = [&](const std::string& stage) {
+    std::optional<double> shift;
+    Link link = graph.RequireLink(stage, "model");
+    for (int guard = 0; guard < 64; ++guard) {
+      const std::string cls = graph.Class(link.node);
+      if (cls == "ModelSamplingSD3") {
+        shift = graph.Num(link.node, "shift", 8.0);
+        if (*shift < 1.0 || *shift > 20.0)
+          throw NodeFailure(link.node, "unsupported_value",
+                            gufo_model + " takes shift 1..20");
+        break;
+      }
+      if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple")
+        break;
+      link = graph.RequireLink(link.node, "model");
+    }
+    return shift;
+  };
+  task.i2v_shift = shift_of(sampler);
+  if (low != sampler && shift_of(low) != task.i2v_shift)
+    warnings->push_back("node " + low + ": shift differs from node " +
+                        sampler + ", gufo uses node " + sampler + "'s");
   return task;
 }
 
@@ -3876,7 +4089,8 @@ std::string AnimateMergeFilter(int width, int height,
 
 int VideoFamilyFps(VideoFamily family) {
   return family == VideoFamily::kCamera || family == VideoFamily::kVace ||
-                 family == VideoFamily::kAnimate
+                 family == VideoFamily::kAnimate ||
+                 family == VideoFamily::kI2V22
              ? 16
          : family == VideoFamily::kTalk                                   ? 25
                                                                           : 24;
@@ -3973,6 +4187,28 @@ json::Value VideoRequestBody(const VideoTask& task) {
     if (task.vace_high_guidance)
       vace["high_guidance"] = *task.vace_high_guidance;
     gufo["vace"] = std::move(vace);
+  } else if (task.family == VideoFamily::kI2V22) {
+    // 16 fps like the camera family; the executor adds first_frame.
+    body["size"] =
+        std::to_string(task.width) + "x" + std::to_string(task.height);
+    body["seconds"] = (task.frames - 1) / 16.0;
+    gufo["frames"] = task.frames;
+    if (task.guidance)
+      gufo["guidance"] = *task.guidance;
+    if (!task.negative_prompt.empty())
+      gufo["negative_prompt"] = task.negative_prompt;
+    json::Value i2v = json::Value::object();
+    if (task.i2v_switch_step)
+      i2v["switch_step"] = *task.i2v_switch_step;
+    if (task.i2v_high_guidance)
+      i2v["high_guidance"] = *task.i2v_high_guidance;
+    if (!task.i2v_sampler.empty())
+      i2v["sampler"] = task.i2v_sampler;
+    if (task.i2v_shift)
+      i2v["shift"] = *task.i2v_shift;
+    if (!task.i2v_lora)
+      i2v["lora"] = false;
+    gufo["i2v"] = std::move(i2v);
   } else if (task.family == VideoFamily::kAnimate) {
     // 16 fps, one chunk of the node's length. The executor adds the
     // reference image and the videos to gufo.animate.
@@ -4529,6 +4765,25 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
             stages_of[last] = std::move(*stages);
           }
         }
+        if (last.empty()) {
+          // Wan 2.2 I2V A14B: WanImageToVideo -> KSamplerAdvanced high ->
+          // KSamplerAdvanced low, one two-expert job when served.
+          if (auto stages =
+                  SamplerChain(graph, generators, {"WanImageToVideo"})) {
+            if (!I2V22Available(models))
+              throw NodeFailure(
+                  id, "unsupported_link",
+                  "output depends on a KSamplerAdvanced chain after "
+                  "WanImageToVideo (Wan 2.2 I2V A14B high / low noise); "
+                  "gufo runs it only on " +
+                      (models.i2v22.empty() ? std::string("wan2.2-i2v-a14b")
+                                            : models.i2v22) +
+                      ", which this router does not serve (add it to the "
+                      "preset); other chained generators are not supported");
+            last = stages->front();
+            stages_of[last] = std::move(*stages);
+          }
+        }
         if (last.empty())
           throw NodeFailure(id, "unsupported_link",
                             "output depends on more than one generating "
@@ -4589,6 +4844,17 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                 BuildH3(graph, generator, models, latent, &plan->warnings);
           else if (latent_class == "Wan22ImageToVideoLatent")
             task.spec = BuildWan(graph, generator, models, latent);
+          else if (latent_class == "WanImageToVideo" &&
+                   !stages_of[generator].empty())
+            task.spec = BuildI2V22(graph, generator, models, latent,
+                                   &plan->warnings, stages_of[generator]);
+          else if (latent_class == "WanImageToVideo" &&
+                   I2V22Available(models) &&
+                   FollowModel(graph, generator).uni3c.empty() &&
+                   IsWan22I2VFile(FollowModel(graph, generator).loader))
+            // One sampler on a Wan 2.2 I2V A14B checkpoint.
+            task.spec = BuildI2V22(graph, generator, models, latent,
+                                   &plan->warnings);
           else if (latent_class == "WanImageToVideo" ||
                    latent_class == "WanCameraImageToVideo")
             task.spec = BuildCamera(graph, generator, models, latent,

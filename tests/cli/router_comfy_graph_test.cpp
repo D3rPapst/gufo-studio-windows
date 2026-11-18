@@ -2122,6 +2122,156 @@ void TestVaceKeyframes() {
              .message.find("color") != std::string::npos);
 }
 
+// Wan 2.2 I2V A14B as ComfyUI's video_wan2_2_14B_i2v template wires it with
+// the lightx2v 4-step LoRAs: WanImageToVideo (no CLIP vision) ->
+// KSamplerAdvanced on the high-noise model (steps 0..2, leftover noise) ->
+// KSamplerAdvanced on the low-noise model (2..end).
+constexpr const char* kWan22I2V = R"({
+ "37": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+ "56": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors", "weight_dtype": "default"}},
+ "91": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["37", 0], "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", "strength_model": 1.0}},
+ "92": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["56", 0], "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", "strength_model": 1.0}},
+ "54": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["91", 0], "shift": 5.0}},
+ "55": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["92", 0], "shift": 5.0}},
+ "38": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+ "39": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+ "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["38", 0], "text": "the woman turns her head and smiles"}},
+ "7": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["38", 0], "text": "blurry, static"}},
+ "52": {"class_type": "LoadImage", "inputs": {"image": "shot03_start.png [output]"}},
+ "50": {"class_type": "WanImageToVideo", "inputs": {"positive": ["6", 0], "negative": ["7", 0], "vae": ["39", 0], "width": 832, "height": 480, "length": 81, "batch_size": 1, "start_image": ["52", 0]}},
+ "57": {"class_type": "KSamplerAdvanced", "inputs": {"model": ["54", 0], "add_noise": "enable", "noise_seed": 778899, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "positive": ["50", 0], "negative": ["50", 1], "latent_image": ["50", 2], "start_at_step": 0, "end_at_step": 2, "return_with_leftover_noise": "enable"}},
+ "58": {"class_type": "KSamplerAdvanced", "inputs": {"model": ["55", 0], "add_noise": "disable", "noise_seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "positive": ["50", 0], "negative": ["50", 1], "latent_image": ["57", 0], "start_at_step": 2, "end_at_step": 10000, "return_with_leftover_noise": "disable"}},
+ "8": {"class_type": "VAEDecode", "inputs": {"samples": ["58", 0], "vae": ["39", 0]}},
+ "60": {"class_type": "CreateVideo", "inputs": {"images": ["8", 0], "fps": 16}},
+ "61": {"class_type": "SaveVideo", "inputs": {"video": ["60", 0], "filename_prefix": "film/i2v/shot03", "format": "auto", "codec": "auto"}}
+})";
+
+void TestWan22I2V() {
+  // Without wan2.2-i2v-a14b in the preset the chain is refused with a
+  // message naming the model.
+  const comfy::PlanError missing = ErrorOf(kWan22I2V);
+  assert(missing.message.find("wan2.2-i2v-a14b") != std::string::npos);
+  assert(missing.message.find("does not serve") != std::string::npos);
+
+  comfy::ModelIds served;
+  served.available = {"wan2.1-uni3c", "wan2.2-i2v-a14b"};
+  const auto plan_with = [&](const std::string& text) {
+    comfy::Plan out;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(json::parse(text), served, &out, &error);
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return out;
+  };
+  // Served: one two-expert job, high noise steps 0..1 (57), low 2..3 (58).
+  const comfy::Plan plan = plan_with(kWan22I2V);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "57");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kI2V22);
+  assert(video.model == "wan2.2-i2v-a14b" && video.fps == 16);
+  assert(video.width == 832 && video.height == 480 && video.frames == 81);
+  assert(video.steps == 4 && video.seed == 778899);
+  assert(video.first_frame &&
+         video.first_frame->name == "shot03_start.png" &&
+         video.first_frame->folder == "output");
+  assert(video.prompt == "the woman turns her head and smiles");
+  assert(video.negative_prompt == "blurry, static");
+  assert(!video.guidance && !video.i2v_high_guidance);
+  assert(video.i2v_switch_step && *video.i2v_switch_step == 2);
+  assert(video.i2v_sampler == "euler");
+  assert(video.i2v_shift && *video.i2v_shift == 5.0);
+  assert(video.i2v_lora);
+  for (const std::string& warning : plan.warnings)
+    std::cerr << "unexpected warning: " << warning << "\n";
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.member_str("model") == "wan2.2-i2v-a14b");
+  assert(body.member_str("size") == "832x480");
+  assert(body.find("seconds")->as_double() == 5.0);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("frames")->as_double() == 81);
+  assert(gufo->find("guidance") == nullptr);
+  const json::Value* i2v = gufo->find("i2v");
+  assert(i2v != nullptr && i2v->find("switch_step")->as_double() == 2);
+  assert(i2v->member_str("sampler") == "euler");
+  assert(i2v->find("shift")->as_double() == 5.0);
+  assert(i2v->find("lora") == nullptr && i2v->find("high_guidance") == nullptr);
+
+  // Per-expert cfg (high 3.5, low 1): guidance stays 1, high_guidance 3.5.
+  const comfy::Plan cfg = plan_with(Replace(
+      kWan22I2V, "\"steps\": 4, \"cfg\": 1.0, \"sampler_name\": \"euler\", "
+                 "\"scheduler\": \"simple\", \"positive\": [\"50\", 0], "
+                 "\"negative\": [\"50\", 1], \"latent_image\": [\"50\", 2]",
+      "\"steps\": 4, \"cfg\": 3.5, \"sampler_name\": \"euler\", "
+      "\"scheduler\": \"simple\", \"positive\": [\"50\", 0], "
+      "\"negative\": [\"50\", 1], \"latent_image\": [\"50\", 2]"));
+  const auto& cfg_video = std::get<comfy::VideoTask>(cfg.tasks[0].spec);
+  assert(!cfg_video.guidance && cfg_video.i2v_high_guidance &&
+         *cfg_video.i2v_high_guidance == 3.5);
+  assert(cfg.warnings.empty());
+
+  // One KSampler on the high-noise file: both experts, gufo's boundary.
+  std::string single = Replace(kWan22I2V, "\"latent_image\": [\"57\", 0]",
+                               "\"latent_image\": [\"50\", 2]");
+  single = Replace(single, "\"samples\": [\"58\", 0]", "\"samples\": [\"57\", 0]");
+  single = Replace(single, "\"end_at_step\": 2,", "\"end_at_step\": 10000,");
+  const std::string one_sampler = Replace(
+      single,
+      " \"58\": {\"class_type\": \"KSamplerAdvanced\"",
+      " \"x58\": {\"class_type\": \"KSamplerAdvanced\"");
+  // "x58" is not upstream of any output any more: only 57 generates.
+  const comfy::Plan one = plan_with(one_sampler);
+  assert(one.tasks.size() == 1);
+  const auto& one_video = std::get<comfy::VideoTask>(one.tasks[0].spec);
+  assert(one_video.family == comfy::VideoFamily::kI2V22 &&
+         !one_video.i2v_switch_step);
+  assert(one.warnings.size() == 1 &&
+         one.warnings[0].find("boundary") != std::string::npos);
+
+  // Without the LoRAs: gufo.i2v.lora false.
+  std::string plain = Replace(kWan22I2V, "\"model\": [\"91\", 0], \"shift\"",
+                              "\"model\": [\"37\", 0], \"shift\"");
+  plain = Replace(plain, "\"model\": [\"92\", 0], \"shift\"",
+                  "\"model\": [\"56\", 0], \"shift\"");
+  const comfy::Plan no_lora = plan_with(plain);
+  const auto& no_lora_video =
+      std::get<comfy::VideoTask>(no_lora.tasks[0].spec);
+  assert(!no_lora_video.i2v_lora);
+  assert(comfy::VideoRequestBody(no_lora_video)
+             .find("gufo")
+             ->find("i2v")
+             ->find("lora")
+             ->as_bool() == false);
+
+  // Errors: another LoRA, no start image, a gap between the stages.
+  comfy::Plan out;
+  comfy::PlanError error;
+  assert(!comfy::BuildPlan(
+      json::parse(Replace(kWan22I2V,
+                          "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise",
+                          "my_style_lora")),
+      served, &out, &error));
+  assert(error.message.find("takes no other LoRA") != std::string::npos);
+  assert(!comfy::BuildPlan(
+      json::parse(Replace(kWan22I2V, ", \"start_image\": [\"52\", 0]", "")),
+      served, &out, &error));
+  assert(error.message.find("start_image") != std::string::npos);
+  assert(!comfy::BuildPlan(
+      json::parse(Replace(kWan22I2V, "\"start_at_step\": 2,",
+                          "\"start_at_step\": 3,")),
+      served, &out, &error));
+  assert(error.message.find("continue") != std::string::npos);
+
+  // A single sampler on a Wan 2.1 I2V file stays on the camera family.
+  const std::string wan21 = Replace(
+      one_sampler, "wan2.2_i2v_high_noise_14B_fp8_scaled",
+      "wan2.1_i2v_480p_14B_fp8_scaled");
+  const comfy::Plan camera = plan_with(wan21);
+  assert(std::get<comfy::VideoTask>(camera.tasks[0].spec).family ==
+         comfy::VideoFamily::kCamera);
+}
+
 // Wan 2.1 FLF2V as ComfyUI's template wires it (CLIP vision of the start
 // image); gufo runs it on VACE.
 constexpr const char* kFirstLast = R"({
@@ -3286,6 +3436,7 @@ int main() {
   TestWanFunCamera();
   TestVace();
   TestVaceKeyframes();
+  TestWan22I2V();
   TestFirstLastFrame();
   TestAnimate();
   TestAnimateNative();

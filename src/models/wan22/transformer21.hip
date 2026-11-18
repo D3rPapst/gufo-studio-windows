@@ -941,7 +941,7 @@ bool Transformer21::Impl::Unpack(const Fp8Linear& linear,
 // kw); a text-to-video checkpoint's 16 channels are zero-padded to 36.
 bool Transformer21::Impl::LoadPatch(std::string* error) {
   constexpr std::size_t W = kWidth;
-  if (!text_only)
+  if (in_channels == kInChannels)
     return LoadDense(patch_weight, "patch_embedding", W, kPatchIn, true,
                      error);
   const std::size_t columns = static_cast<std::size_t>(in_channels) * 4;
@@ -1042,10 +1042,14 @@ std::unique_ptr<Transformer21> Transformer21::Load(
   const TensorLocation* patch = m.Find("patch_embedding.weight");
   if (patch != nullptr && patch->shape.size() == 5)
     m.in_channels = static_cast<int>(patch->shape[1]);
+  // Wan 2.1 I2V: 36 channels + image cross-attention; T2V: 16 channels,
+  // text only; Wan 2.2 I2V A14B: 36 channels, text only (no CLIP).
   if (m.Find("blocks.39.ffn.2.scale_weight") == nullptr ||
       m.Find("blocks.40.ffn.0.weight") != nullptr ||
-      m.in_channels != (m.text_only ? 16 : kInChannels)) {
-    SetError(error, "not a Wan 2.1 I2V or T2V 14B FP8 (scaled) checkpoint");
+      !(m.in_channels == kInChannels ||
+        (m.text_only && m.in_channels == 16))) {
+    SetError(error, "not a Wan 2.1 I2V / T2V 14B or Wan 2.2 A14B FP8 "
+                    "(scaled) checkpoint");
     return nullptr;
   }
   if (!Check(hipStreamCreateWithFlags(&m.stream, hipStreamNonBlocking),

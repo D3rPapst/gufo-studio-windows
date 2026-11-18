@@ -128,7 +128,8 @@ bool LoadExpert(const ExpertKey& key, Expert* expert, std::string* error) {
       Transformer21::Load(key.dit, key.lora, key.lora_strength, error);
   if (!expert->dit)
     return false;
-  if (!expert->dit->text_only()) {
+  if (!expert->dit->text_only() ||
+      expert->dit->in_channels() != 16) {  // not the Wan 2.2 I2V A14B
     SetError(error, "VACE needs a text-to-video 14B checkpoint, not " +
                         key.dit.string());
     expert->dit.reset();

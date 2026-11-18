@@ -1,8 +1,10 @@
 // Written with AI assistance (Claude Code).
 // Host-side VACE conditioning against ComfyUI's WanVaceToVideo /
 // WAN21_Vace.extra_conds layout (tools/models/vace/vace_reference.py
-// --context prints the same numbers from the Python formulas).
+// --context prints the same numbers from the Python formulas), and the Wan
+// 2.2 I2V A14B conditioning channels / expert switch (i2v22_context).
 #include "src/models/wan22/vace_context.hpp"
+#include "src/models/wan22/i2v22_context.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -163,6 +165,50 @@ int main() {
   Expect(!wan22::KeepVaceExpertsResident(true, UINT64_MAX, UINT64_MAX - kGb,
                                          2 * kGb),
          "no overflow");
+  // Wan 2.2 I2V A14B: boundary 0.900 (t >= 900 runs the high-noise
+  // expert). 8 steps at shift 5: sigmas 1, .972, .9375, .893, ... -> the
+  // low-noise expert from step 3 (with T2V's 0.875 it would be step 4).
+  const std::vector<double> i2v_sigmas =
+      wan22::VaceSigmas(8, wan22::kI2V22Shift);
+  Expect(wan22::VaceSwitchStep(i2v_sigmas, wan22::kI2V22Boundary, -1) == 3,
+         "I2V A14B switch at 0.900");
+  Expect(wan22::VaceSwitchStep(i2v_sigmas, 0.875, -1) == 4,
+         "T2V boundary switches later");
+  Expect(wan22::VaceSwitchStep(wan22::VaceSigmas(4, 5.0), 0.9, -1) == 2,
+         "I2V A14B 4 steps: two per expert");
+
+  // WanImageToVideo + WAN21.concat_cond: 4 mask channels, 1 on the first
+  // latent frame, then the 16 condition channels.
+  {
+    constexpr int kF = 3, kY = 2, kX = 2;
+    constexpr std::size_t kP = kF * kY * kX, kFrame = kY * kX;
+    std::vector<float> condition(16 * kP);
+    for (std::size_t i = 0; i < condition.size(); ++i)
+      condition[i] = static_cast<float>(i) * 0.5F;
+    const std::vector<float> channels =
+        wan22::I2VConditionChannels(condition, kF, kY, kX);
+    Expect(channels.size() == 20 * kP, "I2V condition: 20 channels");
+    bool mask_ok = channels.size() == 20 * kP;
+    for (std::size_t c = 0; mask_ok && c < 4; ++c)
+      for (std::size_t i = 0; i < kP; ++i)
+        mask_ok =
+            mask_ok && channels[c * kP + i] == (i < kFrame ? 1.0F : 0.0F);
+    Expect(mask_ok, "I2V condition: mask 1 on the first latent frame only");
+    bool copy_ok = channels.size() == 20 * kP;
+    for (std::size_t i = 0; copy_ok && i < condition.size(); ++i)
+      copy_ok = channels[4 * kP + i] == condition[i];
+    Expect(copy_ok, "I2V condition: VAE latent behind the mask");
+    Expect(wan22::I2VConditionChannels(condition, kF, kY, 3).empty(),
+           "I2V condition: size mismatch");
+    std::vector<float> latents(16 * kP, -1.0F), input;
+    Expect(wan22::I2VModelInput(latents, channels, &input) &&
+               input.size() == 36 * kP && input[0] == -1.0F &&
+               input[16 * kP] == 1.0F && input[20 * kP + 1] == condition[1],
+           "I2V model input: [16 noisy | 4 mask | 16 condition]");
+    Expect(!wan22::I2VModelInput(latents, condition, &input),
+           "I2V model input: size mismatch");
+  }
+
   if (failures == 0)
     std::cout << "wan22_vace_context_test passed\n";
   return failures == 0 ? 0 : 1;

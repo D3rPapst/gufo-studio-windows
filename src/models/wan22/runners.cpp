@@ -20,6 +20,7 @@
 #include "src/models/wan22/animate_context.hpp"
 #include "src/models/wan22/pipeline21.hpp"
 #include "src/models/wan22/pipeline_animate.hpp"
+#include "src/models/wan22/pipeline_i2v22.hpp"
 #include "src/models/wan22/pipeline_vace.hpp"
 #include "src/models/wan22/talk21.hpp"
 #include "src/models/wan22/video_io.hpp"
@@ -471,6 +472,101 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
       extra["experts_resident"] = stages.experts_resident;
       extra["experts_reused"] = stages.experts_reused;
     }
+    extra["preview_ms"] = stages.preview_ms;
+    extra["previews"] = stages.previews;
+    telemetry->prompt_ms = stages.text_ms;
+    telemetry->denoise_ms = stages.dit_load_ms + stages.context_ms + denoise;
+    telemetry->video_vae_ms = stages.decode_ms;
+    telemetry->media_ms = Since(media_start);
+    telemetry->total_ms = stages.total_ms + telemetry->media_ms;
+    extra["total_ms"] = telemetry->total_ms;
+    telemetry->extra_json = extra.dump();
+  }
+  return true;
+}
+
+bool RunWan22I2VJob(const JobRequest& request, const JobCallbacks& callbacks,
+                    ext::VideoTelemetry* telemetry, std::string* error) {
+  json::Value manifest;
+  json::Value options = json::Value::object();
+  if (!ReadManifest(request, "gufo-i2v22.json", &manifest, error))
+    return false;
+  try {
+    if (!request.i2v_json.empty())
+      options = json::parse(request.i2v_json);
+  } catch (const std::exception& e) {
+    SetError(error, std::string("gufo.i2v: ") + e.what());
+    return false;
+  }
+  I2V22Request job;
+  job.vae_root = Part(request, manifest, "vae");
+  job.t5_root = Part(request, manifest, "t5");
+  job.high_dit_file = Part(request, manifest, "dit_high");
+  job.high_lora_file = Part(request, manifest, "lora_high");
+  job.high_lora_strength =
+      static_cast<float>(manifest.member_double("lora_high_strength", 1.0));
+  job.low_dit_file = Part(request, manifest, "dit_low");
+  job.low_lora_file = Part(request, manifest, "lora_low");
+  job.low_lora_strength =
+      static_cast<float>(manifest.member_double("lora_low_strength", 1.0));
+  if (job.high_dit_file.empty() || job.low_dit_file.empty() ||
+      job.vae_root.empty() || job.t5_root.empty()) {
+    SetError(error, "gufo-i2v22.json needs vae, t5, dit_high and dit_low");
+    return false;
+  }
+  if (const json::Value* lora = options.find("lora");
+      lora != nullptr && lora->is_bool() && !lora->as_bool()) {
+    job.high_lora_file.clear();
+    job.low_lora_file.clear();
+  }
+  job.boundary = options.member_double(
+      "boundary", manifest.member_double("boundary", kI2V22Boundary));
+  job.switch_step = static_cast<int>(options.member_double("switch_step", -1.0));
+  job.high_guidance =
+      static_cast<float>(options.member_double("high_guidance", 0.0));
+  job.shift = static_cast<float>(options.member_double(
+      "shift", manifest.member_double("shift", kI2V22Shift)));
+  job.sampler =
+      options.member_str("sampler", manifest.member_str("sampler", "euler"));
+  if (const json::Value* keep = manifest.find("experts_resident");
+      keep != nullptr && keep->is_bool())
+    job.experts_resident = keep->as_bool();
+  job.prompt = request.prompt;
+  job.negative_prompt = request.negative_prompt;
+  job.guidance = static_cast<float>(request.guidance);
+  job.width = request.width;
+  job.height = request.height;
+  job.frames = request.frames;
+  job.steps = request.steps;
+  job.seed = request.seed;
+  const std::vector<std::uint8_t> first_frame = FitFirstFrame(request);
+  if (first_frame.empty()) {
+    SetError(error, "invalid first frame");
+    return false;
+  }
+  job.first_frame = first_frame;
+  const I2V21Callbacks pipeline = Wan21Callbacks(request, callbacks);
+  DecodedVideo video;
+  I2V22Telemetry stages;
+  if (!GenerateI2V22(job, pipeline, nullptr, &video, &stages, error))
+    return false;
+  if (Cancelled(callbacks, error))
+    return false;
+  Report(callbacks, "media", 0, 1);
+  const auto media_start = Clock::now();
+  if (!WriteMp4(request.output_path, video, Fps(Family::kWan22I2V), error))
+    return false;
+  Report(callbacks, "media", 1, 1);
+  if (telemetry != nullptr) {
+    double denoise = 0;
+    for (double ms : stages.step_ms)
+      denoise += ms;
+    json::Value extra = json::Value::object();
+    extra["keyframe_ms"] = stages.condition_ms;
+    extra["switch_step"] = stages.switch_step;
+    extra["dit_load_ms"] = stages.dit_load_ms;
+    extra["experts_resident"] = stages.experts_resident;
+    extra["experts_reused"] = stages.experts_reused;
     extra["preview_ms"] = stages.preview_ms;
     extra["previews"] = stages.previews;
     telemetry->prompt_ms = stages.text_ms;

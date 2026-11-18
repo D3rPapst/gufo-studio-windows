@@ -427,6 +427,10 @@ void TestBuiltInFloor() {
   const auto floor = gufo::router::BuiltInFloor("wan2.2-fun-vace-a14b");
   CHECK(floor.has_value() && floor->gpu >= Gb(44));
   CHECK(!gufo::router::BuiltInFloor("wan2.1-vace-14b").has_value());
+  // wan2.2-i2v-a14b keeps both I2V experts (2 x 15 GB FP8) resident too.
+  const auto i2v_floor = gufo::router::BuiltInFloor("wan2.2-i2v-a14b");
+  CHECK(i2v_floor.has_value() && i2v_floor->gpu >= Gb(40) &&
+        i2v_floor->gpu < floor->gpu);
   MemoryBook book({});
   book.SetFloor("wan2.2-fun-vace-a14b", *floor);
   bool exclusive = true;

@@ -9,6 +9,7 @@ gufo_extension_target(
     tokenizer.cpp
     scheduler.cpp
     vace_context.cpp
+    i2v22_context.cpp
     animate_context.cpp
     animate_host.cpp
     camera_path.cpp
@@ -46,6 +47,7 @@ gufo_extension_target(
     pipeline21.cpp
     pipeline_vace.cpp
     pipeline_animate.cpp
+    pipeline_i2v22.cpp
     talk21.cpp
     ${gufo_wan22_video_io}
     runners.cpp

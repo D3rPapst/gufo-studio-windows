@@ -461,6 +461,54 @@ void TestFunVace(const std::filesystem::path& root) {
     Rejected(service, bad, "", "invalid Fun VACE request " + bad);
 }
 
+// Wan 2.2 I2V A14B: the start image is required, guidance / negative prompt
+// and the expert options (gufo.i2v) reach the runner; family kWan22I2V.
+void TestI2V22(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobService service(Options(root, "wan2.2-i2v-a14b", &runner));
+  Check(service.ready(), service.initialization_error());
+  Check(service.model_id() == "wan2.2-i2v-a14b", "I2V A14B model id");
+  const std::string prefix =
+      R"({"model":"wan2.2-i2v-a14b","prompt":"walk","size":"832x480","seconds":"1","first_frame":")" +
+      std::string(kPng) + R"(","gufo":{)";
+  int calls = 0;
+  const wan22::JobRequest job = Accept(
+      service, runner, &calls, wan22::Family::kWan22I2V,
+      prefix +
+          R"("guidance":3.5,"negative_prompt":"blur","steps":6,"i2v":{"switch_step":3,"boundary":0.9,"high_guidance":4,"sampler":"lcm","shift":8,"lora":false}}})");
+  Check(job.frames == 17 && job.steps == 6 && job.guidance == 3.5 &&
+            job.negative_prompt == "blur" && job.first_frame.rgb.size() == 3,
+        "I2V A14B frames, steps, guidance and start image reach the runner");
+  const gufo::json::Value i2v = gufo::json::parse(job.i2v_json);
+  Check(i2v.member_double("switch_step") == 3 &&
+            i2v.member_double("boundary") == 0.9 &&
+            i2v.member_double("high_guidance") == 4 &&
+            i2v.member_str("sampler") == "lcm" &&
+            i2v.member_double("shift") == 8 && i2v.contains("lora"),
+        "I2V A14B expert options reach the runner: " + job.i2v_json);
+  const wan22::JobRequest plain =
+      Accept(service, runner, &calls, wan22::Family::kWan22I2V,
+             R"({"model":"wan2.2-i2v-a14b","prompt":"walk","seconds":"1","first_frame":")" +
+                 std::string(kPng) + R"("})");
+  Check(plain.guidance == 1.0 && plain.steps == 4 && plain.i2v_json == "{}" &&
+            plain.width == 832 && plain.height == 480,
+        "I2V A14B defaults: 832x480, no CFG, 4 steps, switch from the "
+        "boundary");
+  Rejected(service, R"({"model":"wan2.2-i2v-a14b","prompt":"x","seconds":"1"})",
+           "invalid_input_reference", "I2V A14B without a start image");
+  for (const std::string& bad :
+       {prefix + R"("i2v":{"switch_step":5}}})",
+        prefix + R"("i2v":{"switch_step":1.5}}})",
+        prefix + R"("i2v":{"boundary":1.5}}})",
+        prefix + R"("i2v":{"high_guidance":0.5}}})",
+        prefix + R"("i2v":{"sampler":"dpm"}}})",
+        prefix + R"("i2v":{"camera":1}}})", prefix + R"("guidance":0.5}})",
+        prefix + R"("vace":{}}})",
+        R"({"model":"wan2.2-i2v-a14b","prompt":"x","size":"1920x1080","seconds":"1","first_frame":")" +
+            std::string(kPng) + R"("})"})
+    Rejected(service, bad, "", "invalid I2V A14B request " + bad);
+}
+
 // Wan 2.1 Uni3C: a camera move or a render video reaches the runner; the
 // first frame is required; "gufo.preview" is accepted (no preview service
 // yet) and a bad one refused.
@@ -804,6 +852,8 @@ void TestProbe(const std::filesystem::path& root) {
   write(camera / "gufo-camera.json", R"({"_class_name":"GufoWan21Uni3CCamera"})");
   const std::filesystem::path fun = root / "fun-vace-bundle";
   write(fun / "gufo-vace22.json", R"({"_class_name":"GufoWan22FunVace"})");
+  const std::filesystem::path i2v = root / "i2v22-bundle";
+  write(i2v / "gufo-i2v22.json", R"({"_class_name":"GufoWan22I2V"})");
   const auto probed = [](const std::filesystem::path& path) {
     const auto* provider = gufo::ext::ProbeVideoProvider(path.string());
     return provider == nullptr ? std::string() : provider->id;
@@ -813,6 +863,7 @@ void TestProbe(const std::filesystem::path& root) {
   Check(probed(vace) == "wan2.1-vace-14b", "VACE bundle probe");
   Check(probed(camera) == "wan2.1-uni3c", "camera bundle probe");
   Check(probed(fun) == "wan2.2-fun-vace-a14b", "Fun VACE bundle probe");
+  Check(probed(i2v) == "wan2.2-i2v-a14b", "I2V A14B bundle probe");
   Check(probed(root) == "generic-test", "unknown directory: generic provider");
 
   FakeRunner runner;
@@ -841,6 +892,7 @@ int main() {
   TestWan22(base / "wan22");
   TestVace(base / "vace");
   TestFunVace(base / "fun-vace");
+  TestI2V22(base / "i2v22");
   TestUni3C(base / "uni3c");
   TestTalk(base / "talk");
   TestPostSteps(base / "post");
