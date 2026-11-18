@@ -24,8 +24,9 @@ the requests instead of letting several processes compete for the cores.
 - `image`: a `data:` URL, plain base64, a public `https://` URL or an Ablage path
   `/v1/jobs/{id}/files/{name}` of one of your own jobs. PNG, JPEG or WebP, at most
   20 MB. An alpha channel is dropped.
-- `tasks`: any of `person`, `head`, `face`, `hand`, `ocr`, `wd14_tags`, `pose`,
+- `tasks`: any of `person`, `head`, `face`, `hand`, `hand_fingers`, `ocr`, `wd14_tags`, `pose`,
   `pose_wholebody`; the four detectors when left out (the others only when asked for).
+  `hand_fingers`: see [Finger count](#finger-count).
   `pose_options`: `min_score` (0.35) and `max_persons` (4) for the pose person search.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per detector; for `ocr` `heat` and `box`. Each in (0, 1].
@@ -85,6 +86,46 @@ counted from 23), 91-111 left and 112-132 right hand); each `[x, y, score]` in i
 pixels of the original image, also with `brighten_dark`. `"pose_boxes": [[x0, y0, x1, y1], ...]`
 (up to 16) skips RT-DETR: the poses are made in exactly these boxes, in your order, without
 `score` (the film pipeline keeps the first frame's box for a whole shot).
+
+## Finger count
+
+`hand_fingers` checks every hand for the film direction (arm without a hand, wrong number of
+fingers). It runs the `hand` detector (also answered), cuts out each hand box with 25 % margin
+on every side (at least 224 px on the short side) and asks a vision chat model on this router
+how many fingers it sees:
+
+```json
+{"image": "...", "tasks": ["hand_fingers"],
+ "hand_fingers_options": {"model": "qwen3.8-27b", "max_hands": 6, "thinking": false,
+                          "timeout_seconds": 120, "margin": 0.25, "max_tokens": 256}}
+```
+
+All options are optional (the values above are the defaults; `max_hands` 1 to 16,
+`timeout_seconds` per hand 5 to 600, `margin` 0 to 1). The answer has one entry per hand box,
+in score order:
+
+```json
+"hand_fingers": [
+  {"box": [812, 488, 884, 538], "score": 0.81, "crop": [794, 476, 902, 551],
+   "fingers": 4, "sicher": false, "befund": "Daumen verdeckt", "seconds": 6.2},
+  {"box": [320, 590, 420, 705], "score": 0.74, "crop": [295, 561, 445, 734],
+   "fehler": "chat 507: cannot load 'qwen3.8-27b': ...", "seconds": 0.1}
+]
+```
+
+- `fingers` (0 to 10) counts only visible fingers, the thumb included; `0` means no hand is
+  visible in the box. `sicher` is `false` for a fist, a covered, blurred or cut-off hand.
+  `befund` is one short German sentence.
+- A hand whose question failed (model refused or not loadable, timeout, no valid JSON) gets
+  `fehler` instead; the other hands and tasks are answered normally. Hands beyond
+  `max_hands` get `fehler` too.
+- `models.hand_fingers.model` names the model asked; `hand_fingers_seconds` is the time of
+  the questions. The questions run after the CPU part and don't hold the CPU queue.
+- The questions are ordinary chats under your own token: you need the `text` area too, they
+  count like other chats, and the router loads the model if needed (that can take minutes or
+  fail when the memory is taken).
+- The model counts; it does not measure. Treat `sicher: false` and small hands as "look at
+  it", not as a finding.
 
 ## Models
 

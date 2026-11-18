@@ -1030,6 +1030,41 @@ Those poses carry no `score`; `models.pose_detector` is
 reference boxes) and `router_vision_test` (the RT-DETR boxes given back as
 `pose_boxes` give the same points).
 
+#### Finger count (`hand_fingers`)
+
+For the film direction's hand check (an arm without a hand, a wrong number of
+fingers). `hand_fingers` adds the `hand` task (same thresholds, also answered)
+and, after the CPU part, releases the CPU turn and asks a vision chat model
+once per hand box, in score order, at most `max_hands`: the box plus
+`margin` x its width left and right and x its height above and below
+(floor / ceil, clipped; `FingerCropBox`), from the original pixels (never the
+brightened copy), enlarged with LANCZOS to at least 224 px on the short side
+(at most 1024 px on the long side), PNG data URL. The chat goes through the
+gate and `Dispatch` (`vision::Options::serve`, as the Ablage reads) as
+`POST /v1/chat/completions` under the caller's own `Authorization` / cookie:
+the caller needs the `text` area and the chat counts like any other. Body:
+`model` (default `qwen3.8-27b`), the image and a German/English prompt
+("count the visible fingers, the thumb counts, hidden ones not; no hand
+visible: 0"), `temperature` 0, `max_tokens`, `chat_template_kwargs.enable_thinking`
+= `thinking` (default false) and `response_format` `json_schema`
+`{fingers: integer 0-10, sicher: boolean, befund: string}` (strict).
+`ParseFingerAnswer` takes the message content (tolerates a `<think>` block,
+code fences, text around the object) and checks the three fields. Each hand
+has its own deadline (`timeout_seconds`, polled through the inner request's
+`is_cancelled`, so the proxy drops the generation); a refused chat (its
+`error.message` is kept), a timeout, a cut answer or bad JSON give that hand
+`"fehler"` instead of the verdict, never a 500. Hands beyond `max_hands`
+answer `"fehler": "not checked: ..."`; a caller that disconnects ends the
+request with 499. `hand_fingers_seconds` is the chat time, `models.hand_fingers`
+`{"model", "detector": "hand", "thinking", "max_hands", "margin",
+"timeout_seconds"}`. Pool: such a request is relayed only when the models are
+missing here (`kPartnerOnly`); a busy CPU here does not send it to the partner,
+whose older build would answer the unknown task with a 400 that counts as
+its answer. Code: `src/cli/serve/router/vision_fingers.{hpp,cpp}`. Test:
+`router_vision_test` (`TestHandFingers`: options, crop, chat body, answer
+parsing, `CountFingers` with a scripted chat: verdict, 503, no JSON,
+`max_hands`, no chat, cancelled caller, token passed on).
+
 ### CPU queue and pool for the router services
 
 `/v1/vision/detect` and `/v1/figuren` `"verfahren": "ccip"` compute on the
