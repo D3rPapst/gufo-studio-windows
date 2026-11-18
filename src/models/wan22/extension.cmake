@@ -10,6 +10,7 @@ gufo_extension_target(
     scheduler.cpp
     vace_context.cpp
     animate_context.cpp
+    animate_host.cpp
     camera_path.cpp
     talk_audio.cpp
     request.cpp
@@ -67,6 +68,7 @@ if(TARGET gufo_wan22_hip)
       clip_vision.hip
       uni3c.hip
       vace.hip
+      animate.hip
       moge.hip
       point_render.hip
       wav2vec2.hip

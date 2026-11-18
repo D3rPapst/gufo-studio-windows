@@ -4,6 +4,7 @@
 // node's outputs, the frame seeks, the continue_motion / background / mask
 // layout and the chunk chain of long-video workflows.
 #include "src/models/wan22/animate_context.hpp"
+#include "src/models/wan22/animate_host.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -238,6 +239,68 @@ void Chunks() {
          "invalid chunk arguments are rejected");
 }
 
+void Directions() {
+  // numpy.linalg.qr([[1, 2], [3, 4], [5, 6]]) (LAPACK signs).
+  std::vector<double> q;
+  wan22::HouseholderQ({1, 2, 3, 4, 5, 6}, 3, 2, &q);
+  const double expected[] = {-0.16903085, 0.89708523, -0.50709255,
+                             0.27602622,  -0.84515425, -0.34503278};
+  bool ok = q.size() == 6;
+  for (int i = 0; ok && i < 6; ++i)
+    ok = std::fabs(q[i] - expected[i]) < 1e-7;
+  Expect(ok, "Householder Q matches LAPACK's signs");
+  // Motion head: one linear, directions = the first identity columns (no
+  // reflection when the column below the diagonal is zero: Q = I columns).
+  wan22::MotionHead head;
+  head.width = 3;
+  head.motion = 2;
+  head.weights = {{1, 0, 0, 0, 1, 0}};
+  head.biases = {{0.5F, -1.0F}};
+  wan22::SetMotionDirections(std::vector<float>{1, 0, 0, 1, 0, 0}, &head);
+  const auto motion = wan22::MotionVector(head, std::vector<float>{2, 3, 4});
+  Expect(motion.size() == 3 && Near(motion[0], 2.5F) &&
+             Near(motion[1], 2.0F) && std::fabs(motion[2]) < 1e-6F,
+         "motion vector = fc(x) @ Q^T");
+}
+
+void FaceTokens() {
+  // Zero convolutions: every layer norm sees a constant row -> 0, so the
+  // tokens are out_proj's bias; frame 0 zero, padding token last, frames
+  // past the encoder output zero.
+  wan22::FaceEncoderWeights w;
+  w.in_dim = 2;
+  w.heads = 2;
+  w.channels = 2;
+  w.width = 3;
+  w.conv1_weight.assign(4 * 2 * 3, 0.0F);
+  w.conv1_bias = {1, 2, 3, 4};
+  w.conv2_weight.assign(2 * 2 * 3, 0.0F);
+  w.conv2_bias = {5, 6};
+  w.conv3_weight = w.conv2_weight;
+  w.conv3_bias = {7, 8};
+  w.out_weight.assign(3 * 2, 0.0F);
+  w.out_bias = {0.25F, 0.5F, 0.75F};
+  w.padding = {9, 10, 11};
+  Expect(wan22::FaceEncoderFrames(77) == 20 &&
+             wan22::FaceEncoderFrames(5) == 2 &&
+             wan22::FaceEncoderFrames(1) == 1,
+         "face encoder frames: 77 -> 20, 5 -> 2");
+  std::vector<float> motion(5 * 2, 1.0F);
+  const auto tokens = wan22::RunFaceEncoder(w, motion, 5, 4);
+  Expect(tokens.size() == 4 * 3 * 3, "tokens [4, 3, 3]");
+  if (tokens.size() == 36) {
+    const auto at = [&](int f, int n, int c) { return tokens[(f * 3 + n) * 3 + c]; };
+    Expect(Near(at(0, 0, 0), 0) && Near(at(0, 2, 2), 0), "frame 0 is zero");
+    Expect(Near(at(1, 0, 1), 0.5F) && Near(at(2, 1, 2), 0.75F) &&
+               Near(at(1, 2, 0), 9) && Near(at(2, 2, 2), 11),
+           "encoder frames: head tokens then the padding token");
+    Expect(Near(at(3, 0, 0), 0) && Near(at(3, 2, 0), 0),
+           "frames past the encoder output are zero");
+  }
+  Expect(wan22::RunFaceEncoder(w, motion, 4, 4).empty(),
+         "size mismatch is rejected");
+}
+
 }  // namespace
 
 int main() {
@@ -247,6 +310,8 @@ int main() {
   MaskVideoOffset();
   Invalid();
   Chunks();
+  Directions();
+  FaceTokens();
   if (failures == 0)
     std::cout << "wan22_animate_context_test: ok\n";
   return failures == 0 ? 0 : 1;
