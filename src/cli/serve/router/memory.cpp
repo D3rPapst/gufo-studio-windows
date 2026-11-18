@@ -197,6 +197,16 @@ std::string BlockerList(const std::vector<const ResidentView*>& views) {
   return text;
 }
 
+std::vector<std::string> BlockerIds(
+    const std::vector<const ResidentView*>& views) {
+  std::vector<std::string> ids;
+  ids.reserve(views.size());
+  for (const ResidentView* view : views) {
+    ids.push_back(view->id);
+  }
+  return ids;
+}
+
 /// Turns `plan` into the eviction of the idle residents in `evict` that
 /// have no memory sample (Project credits them nothing). False when every
 /// one of them was measured.
@@ -257,6 +267,45 @@ MemoryWaitVerdict MemoryWaitClock::Next(const AdmissionPlan& plan,
   return MemoryWaitVerdict::kContinue;
 }
 
+void LoadWaitBook::Note(std::string_view id, const AdmissionPlan& plan,
+                        Clock::time_point now) {
+  if (plan.action == AdmissionPlan::Action::kSpawn) {
+    Clear(id);
+    return;
+  }
+  if (plan.action != AdmissionPlan::Action::kWait ||
+      plan.wait != AdmissionPlan::Wait::kBusy || plan.blocker_ids.empty()) {
+    return;
+  }
+  auto it = waits_.find(id);
+  if (it == waits_.end()) {
+    it = waits_.emplace(std::string(id), Entry{}).first;
+  }
+  it->second.blockers = plan.blocker_ids;
+  it->second.until = now + kLinger;
+}
+
+void LoadWaitBook::Clear(std::string_view id) {
+  const auto it = waits_.find(id);
+  if (it != waits_.end()) {
+    waits_.erase(it);
+  }
+}
+
+std::string LoadWaitBook::WaitingFor(std::string_view model,
+                                     Clock::time_point now) const {
+  for (const auto& [id, entry] : waits_) {
+    if (now >= entry.until || id == model) {
+      continue;
+    }
+    if (std::find(entry.blockers.begin(), entry.blockers.end(), model) !=
+        entry.blockers.end()) {
+      return id;
+    }
+  }
+  return {};
+}
+
 std::int64_t SystemMemory::DedicatedFree() const {
   return std::max<std::int64_t>(0, gpu_dedicated_total - gpu_dedicated_used);
 }
@@ -302,6 +351,7 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
       plan.action = AdmissionPlan::Action::kWait;
       plan.wait = AdmissionPlan::Wait::kBusy;
       plan.blocked_by = BlockerList(blockers);
+      plan.blocker_ids = BlockerIds(blockers);
       plan.reason = "exclusive, waiting for " + plan.blocked_by;
       return plan;
     }
@@ -344,6 +394,7 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
         plan.action = AdmissionPlan::Action::kWait;
         plan.wait = AdmissionPlan::Wait::kBusy;
         plan.blocked_by = BlockerList({view});
+        plan.blocker_ids = {view->id};
         plan.reason = "waiting for exclusive " + plan.blocked_by;
         return plan;
       }
@@ -377,6 +428,7 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     plan.action = AdmissionPlan::Action::kWait;
     plan.wait = AdmissionPlan::Wait::kBusy;
     plan.blocked_by = BlockerList(kept);
+    plan.blocker_ids = BlockerIds(kept);
     plan.reason = "waiting for " + plan.blocked_by + "; need " +
                   Gb(need.gpu) + " GB gpu, " + RoomText(room);
     return plan;

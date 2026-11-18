@@ -20,6 +20,7 @@ namespace {
 
 using gufo::router::AdmissionPlan;
 using gufo::router::kGiB;
+using gufo::router::LoadWaitBook;
 using gufo::router::MemoryBook;
 using gufo::router::MemoryNeed;
 using gufo::router::MemoryPolicy;
@@ -702,6 +703,62 @@ void TestMemoryWaitClock() {
   }
 }
 
+void TestLoadWaitBook() {
+  // 2.2.4 (18.11. 17:48): wan2.1-vace-14b waits for the busy 27B; relayed
+  // pool requests of the 27B make way until the load starts or the wait
+  // lingered out.
+  const auto at = [](int s) {
+    return Clock::time_point{} + std::chrono::seconds(s);
+  };
+  ResidentView h3 = Resident("27b", 20, 20, 10, /*busy=*/true);
+  const AdmissionPlan busy = PlanAdmission(
+      Machine(22, 1, 20), {h3}, "vace", Need(40), /*exclusive=*/true,
+      MemoryPolicy{});
+  CHECK(busy.wait == AdmissionPlan::Wait::kBusy);
+  CHECK(busy.blocker_ids == std::vector<std::string>{"27b"});
+  LoadWaitBook book;
+  CHECK(book.WaitingFor("27b", at(0)).empty());
+  book.Note("vace", busy, at(0));
+  CHECK(book.WaitingFor("27b", at(1)) == "vace");
+  CHECK(book.WaitingFor("other", at(1)).empty());
+  CHECK(book.WaitingFor("vace", at(1)).empty());
+  // Evict or release plans keep the wait; it refreshes on each busy plan.
+  AdmissionPlan evict;
+  evict.action = Action::kEvict;
+  evict.evict = {"27b"};
+  book.Note("vace", evict, at(100));
+  CHECK(book.WaitingFor("27b", at(110)) == "vace");
+  CHECK(book.WaitingFor("27b", at(120)).empty());  // lingered out
+  book.Note("vace", busy, at(200));
+  CHECK(book.WaitingFor("27b", at(200 + 119)) == "vace");
+  // The load starts: the 27B takes partner work again.
+  AdmissionPlan spawn;
+  spawn.action = Action::kSpawn;
+  book.Note("vace", spawn, at(201));
+  CHECK(book.WaitingFor("27b", at(202)).empty());
+  // Several blockers (non-exclusive load behind a busy and a loading one);
+  // Clear ends the wait (gave up for memory held outside).
+  const AdmissionPlan mixed = PlanAdmission(
+      Machine(26, 5, 20),
+      {Resident("chat", 10, 10, 10, true), Resident("idle", 5, 5, 1),
+       Resident("tts", 10, 4, 5, false, /*loading=*/true)},
+      "big", Need(30), false, MemoryPolicy{});
+  CHECK(mixed.wait == AdmissionPlan::Wait::kBusy);
+  book.Note("big", mixed, at(300));
+  CHECK(book.WaitingFor("chat", at(301)) == "big");
+  CHECK(book.WaitingFor("tts", at(301)) == "big");
+  CHECK(book.WaitingFor("idle", at(301)).empty());
+  book.Clear("big");
+  CHECK(book.WaitingFor("chat", at(302)).empty());
+  // Outside waits name no blocker and record nothing.
+  const AdmissionPlan outside = PlanAdmission(
+      Machine(20, 10, 10), {}, "image", Need(30), false, MemoryPolicy{});
+  CHECK(outside.wait == AdmissionPlan::Wait::kOutside);
+  CHECK(outside.blocker_ids.empty());
+  book.Note("image", outside, at(400));
+  CHECK(book.WaitingFor("chat", at(401)).empty());
+}
+
 int main() {
   TestEmptyFits();
   TestCoResidency();
@@ -728,6 +785,7 @@ int main() {
   TestWaitKinds();
   TestUnmeasuredIdleEvictedInsteadOfOutsideWait();
   TestMemoryWaitClock();
+  TestLoadWaitBook();
   if (failures != 0) {
     std::cerr << failures << " router memory checks failed.\n";
     return 1;

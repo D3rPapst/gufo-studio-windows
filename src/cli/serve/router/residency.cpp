@@ -268,6 +268,21 @@ bool Residency::AbortedSince(std::string_view id,
   return it != aborted_.end() && it->second >= since;
 }
 
+void Residency::NoteLoadWait(std::string_view id, const AdmissionPlan& plan) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  load_waits_.Note(id, plan, Clock::now());
+}
+
+void Residency::ClearLoadWait(std::string_view id) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  load_waits_.Clear(id);
+}
+
+std::string Residency::LoadWaitingFor(std::string_view model) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return load_waits_.WaitingFor(model, Clock::now());
+}
+
 void Residency::Event(std::string text) {
   server::Logger::Info("router", "event=residency " + text);
   const std::lock_guard<std::mutex> lock(mutex_);

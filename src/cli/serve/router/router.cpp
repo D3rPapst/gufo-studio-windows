@@ -1612,6 +1612,9 @@ public:
     /// Requests that fell back to this machine (B5: partner gone, failed,
     /// or waited on longer than pool-wait-seconds).
     long long fallbacks{0};
+    /// Requests that made way for a load waiting for this model (2.2.4,
+    /// pool_yield_for_load: partner work turned back, own work sent over).
+    long long load_yields{0};
     /// Last decision ("remote: warm").
     std::string last;
   };
@@ -1626,6 +1629,14 @@ public:
     return preset.switchable && preset.remote.has_value() &&
            registry.PlacementOf(preset.id) == router::Placement::kPool &&
            req.method == "POST";
+  }
+
+  /// A cold load here that waits for `model_id` to become idle (2.2.4), or
+  /// empty (no --memory-guard: nothing waits).
+  std::string LoadWaitingForLocked(const std::string& model_id) const {
+    if (residency == nullptr || !residency->enabled())
+      return {};
+    return residency->LoadWaitingFor(model_id);
   }
 
   /// The pool's busy rule (state mutex held): GPU work runs on this
@@ -1996,6 +2007,30 @@ public:
                      "server_error", router::jobs::kPoolRedirected);
         }
       }
+      // 2.2.4: a cold load here waits for this model to become idle (it
+      // holds the memory). The partner's relayed work would keep it busy
+      // forever (18.11. 17:48: wan2.1-vace-14b waited on the .198 while the
+      // .56 relayed one 27B request after another), so it is turned back
+      // with 503 pool_busy: the partner runs it itself at once
+      // (ClassifyPoolRemoteAnswer: kRetryFailed) and keeps the model off
+      // this machine for kPoolRemoteFailHold. Own requests stay.
+      const std::string load_waiting = LoadWaitingForLocked(model_id);
+      if (forwarded && !load_waiting.empty()) {
+        stop_waiting();
+        ++pool_[model_id].load_yields;
+        Logger::Warn("router", "event=pool_yield_for_load model=" + model_id +
+                                   " waiting=" + load_waiting +
+                                   " side=partner waited_ms=" +
+                                   std::to_string(waited.count()));
+        HttpResponse refused =
+            Err(503, "Service Unavailable",
+                "pool model '" + model_id + "' makes way for loading '" +
+                    load_waiting +
+                    "' on this router; run the request on your own machine",
+                "server_error", "pool_busy");
+        refused.headers.emplace_back("Retry-After", "30");
+        return refused;
+      }
       router::PoolInput pool_input =
           PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited,
                           /*ignore_remote_hold=*/forced == "remote");
@@ -2054,6 +2089,21 @@ public:
         } else {
           yield_clock.Pause(now);
         }
+      }
+      // 2.2.4: an own request goes to the partner instead while a load
+      // here waits for this model, but only when the partner is free right
+      // now and warm (never waits for it; unpinned, before any fallback).
+      if (decision.choice == router::PoolChoice::kLocal && !forwarded &&
+          !load_waiting.empty() && forced.empty() && fallback == nullptr &&
+          !remote_failed && pool_input.remote.available &&
+          pool_input.remote.warm && pool_input.remote.free &&
+          !pool_input.remote.gpu_busy) {
+        ++pool_[model_id].load_yields;
+        Logger::Info("router", "event=pool_yield_for_load model=" + model_id +
+                                   " waiting=" + load_waiting +
+                                   " side=own waited_ms=" +
+                                   std::to_string(waited.count()));
+        decision = {router::PoolChoice::kRemote, "makes way for a load"};
       }
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
@@ -2243,6 +2293,7 @@ public:
       out["remote_done"] = pool.remote_done;
       out["retried_local"] = pool.retried_local;
       out["fallbacks"] = pool.fallbacks;
+      out["load_yields"] = pool.load_yields;
       out["last"] = pool.last;
       if (pool.local_failed) {
         out["local_failed_s_ago"] = static_cast<long long>(
@@ -3106,6 +3157,9 @@ public:
     if (plan.action != router::AdmissionPlan::Action::kWait ||
         plan.wait != router::AdmissionPlan::Wait::kBusy)
       return std::nullopt;
+    // 2.2.4: the turned-away prompt counts as a waiting load, so relayed
+    // pool work of its blockers makes way until the retry.
+    residency->NoteLoadWait(id, plan);
     return "cannot load '" + id + "' now: memory is in use by " +
            plan.blocked_by + "; retry in " +
            std::to_string(router::kMemoryBusyRetryAfterSeconds) + " s";
@@ -3911,6 +3965,8 @@ private:
     const router::AdmissionPlan plan =
         residency->PlanFor(model_id, residents, PidsLocked());
     *planned = plan;
+    // 2.2.4: relayed pool requests of the models it waits for make way.
+    residency->NoteLoadWait(model_id, plan);
     if (plan.action == router::AdmissionPlan::Action::kWait) {
       // One event per kind of wait, not one per changed number.
       const std::string kind = plan.reason.substr(0, plan.reason.find(';'));
@@ -4202,6 +4258,7 @@ private:
         if (decision == router::LoadDecision::kSpawn && residency != nullptr &&
             residency->enabled()) {
           if (residency->AbortedSince(model_id, began)) {
+            residency->ClearLoadWait(model_id);
             registry.MarkUnloaded(model_id);
             return Err(
                 507, "Insufficient Storage",
@@ -4222,6 +4279,7 @@ private:
             // client timeout, so after kMemoryWaitLimit answer with the
             // reason (how much is needed and how much is free) instead.
             if (verdict == router::MemoryWaitVerdict::kGiveUpOutside) {
+              residency->ClearLoadWait(model_id);
               registry.MarkUnloaded(model_id);
               residency->Event("gave up loading " + model_id + ": " +
                                plan.reason);

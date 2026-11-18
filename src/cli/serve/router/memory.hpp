@@ -130,6 +130,8 @@ struct AdmissionPlan {
   /// kBusy: the models the load waits for, "id (busy)" / "id (loading)",
   /// comma separated.
   std::string blocked_by;
+  /// kBusy: the same models by id only (2.2.4).
+  std::vector<std::string> blocker_ids;
 };
 
 /// Pure admission decision for starting `id` (need already factored). Rules:
@@ -184,6 +186,38 @@ public:
 private:
   std::optional<Clock::time_point> busy_since_;
   std::optional<Clock::time_point> outside_since_;
+};
+
+/// Cold loads that wait for busy (or loading) models of ours (2.2.4).
+/// While a load of Y waits for X, relayed pool requests of X (the partner's
+/// work) are turned back, so X becomes idle and Y can load (18.11. 17:48:
+/// wan2.1-vace-14b waited for the 27B on the .198 while the .56 kept
+/// relaying 27B requests to it). A wait lingers kLinger after its last
+/// plan: across the 503 memory_busy and the client's retry, the partner
+/// work stays off X. Not thread-safe (Residency locks it).
+class LoadWaitBook {
+public:
+  using Clock = std::chrono::steady_clock;
+  /// Covers Retry-After (kMemoryBusyRetryAfterSeconds) and the slower
+  /// retries of a job queue (90 s).
+  static constexpr std::chrono::seconds kLinger{120};
+  /// The plan of a cold load of `id`: a busy wait records (refreshes) its
+  /// blockers, a spawn ends the wait, other plans (evict, release or
+  /// outside waits) leave it as it is.
+  void Note(std::string_view id, const AdmissionPlan& plan,
+            Clock::time_point now);
+  /// The load of `id` no longer waits (gave up for another reason).
+  void Clear(std::string_view id);
+  /// A load still waiting for `model`, or empty (the first by id).
+  [[nodiscard]] std::string WaitingFor(std::string_view model,
+                                       Clock::time_point now) const;
+
+private:
+  struct Entry {
+    std::vector<std::string> blockers;
+    Clock::time_point until{};
+  };
+  std::map<std::string, Entry, std::less<>> waits_;
 };
 
 /// Seconds a client should wait before it retries a memory_busy load.

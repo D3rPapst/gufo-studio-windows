@@ -78,6 +78,15 @@ public:
 
   void Event(std::string text);
 
+  /// Records the admission plan of a cold load of `id` (2.2.4,
+  /// LoadWaitBook): a busy wait names the models it waits for.
+  void NoteLoadWait(std::string_view id, const AdmissionPlan& plan);
+  /// The load of `id` stopped waiting (gave up for another reason).
+  void ClearLoadWait(std::string_view id);
+  /// A cold load that waits for `model` to become idle (recently), or
+  /// empty. Relayed pool requests of `model` make way for it.
+  [[nodiscard]] std::string LoadWaitingFor(std::string_view model) const;
+
   [[nodiscard]] json::Value Status(
       const std::vector<Registry::ResidentEntry>& residents,
       const std::set<std::string>& stopping,
@@ -111,6 +120,7 @@ private:
   std::map<std::string, Clock::time_point, std::less<>> spawned_;
   std::map<std::string, Clock::time_point, std::less<>> aborted_;
   std::deque<std::pair<std::string, std::string>> events_;  // time, text
+  LoadWaitBook load_waits_;
   Clock::time_point last_save_{};
   bool learned_pending_{false};
 };
