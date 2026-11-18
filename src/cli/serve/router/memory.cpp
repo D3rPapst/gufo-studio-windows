@@ -665,6 +665,9 @@ std::optional<MemoryNeed> BuiltInFloor(std::string_view id) {
   if (id == "wan2.2-fun-vace-a14b") {
     return MemoryNeed{.gpu = FromGb(46.0), .host = FromGb(2.0)};
   }
+  if (id == "wan2.2-i2v-a14b") {
+    return MemoryNeed{.gpu = FromGb(44.0), .host = FromGb(2.0)};
+  }
   return std::nullopt;
 }
 

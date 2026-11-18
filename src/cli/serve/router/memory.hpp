@@ -241,6 +241,7 @@ WatchdogAction PlanWatchdog(const SystemMemory& system,
 /// wan2.2-fun-vace-a14b keeps both experts loaded (2.2.6): 2 x (14 GB FP8
 /// DiT + 2.8 GB VACE module) + umT5 (10.6 GB) and the VAE during a job; a
 /// peak learned while it loaded one expert at a time is far smaller.
+/// wan2.2-i2v-a14b likewise: 2 x 15 GB FP8 experts + umT5 + VAE.
 [[nodiscard]] std::optional<MemoryNeed> BuiltInFloor(std::string_view id);
 
 /// Estimates (preset keys or the JSON file) and learned peaks per model,

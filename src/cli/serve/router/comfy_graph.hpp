@@ -22,6 +22,12 @@
 //          -> /v1/audio/speech
 //   music  KSampler <- EmptyAceStep1.5LatentAudio + TextEncodeAceStepAudio1.5
 //          -> /v1/audio/music (ace-step-1.5-xl-turbo)
+//   i2v22  KSamplerAdvanced (high noise) -> KSamplerAdvanced (low noise) <-
+//          WanImageToVideo (start_image from LoadImage), two checkpoints, or
+//          one KSampler on a Wan 2.2 I2V A14B checkpoint, when
+//          ModelIds::available has `i2v22` -> /v1/videos (wan2.2-i2v-a14b,
+//          gufo.i2v.switch_step / high_guidance, 16 fps); without it such a
+//          chain fails with a message naming the missing model
 //   camera KSampler <- WanImageToVideo with the model through
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
@@ -112,6 +118,10 @@ struct ModelIds {
   std::string vace22{"wan2.2-fun-vace-a14b"};
   std::string talk{"wan2.1-infinitetalk-14b"};
   std::string animate{"wan2.2-animate-14b"};
+  /// Wan 2.2 I2V A14B: a WanImageToVideo KSamplerAdvanced chain (high /
+  /// low noise experts) runs here as one two-expert job when this id is in
+  /// `available`; otherwise the chain is refused (unsupported_link).
+  std::string i2v22{"wan2.2-i2v-a14b"};
   std::string foley{"mmaudio-44k"};
   /// The router's model ids. When not empty, a Turbo graph whose
   /// `image_turbo` is not among them fails validation at the loader node
@@ -306,9 +316,19 @@ json::Value FoleyRequestBody(const FoleyTask& task);
 
 /// kProcess: no generation, a loaded video is only interpolated / upscaled
 /// (LoadVideo -> GetVideoComponents -> RIFE VFI / ImageUpscaleWithModel).
-enum class VideoFamily { kH3, kWan, kCamera, kProcess, kVace, kTalk, kAnimate };
+enum class VideoFamily {
+  kH3,
+  kWan,
+  kCamera,
+  kProcess,
+  kVace,
+  kTalk,
+  kAnimate,
+  kI2V22,
+};
 
-/// Frames per second a family generates (16 camera / VACE, 25 talk, 24 else).
+/// Frames per second a family generates (16 camera / VACE / animate / Wan
+/// 2.2 I2V A14B, 25 talk, 24 else).
 int VideoFamilyFps(VideoFamily family);
 
 /// Real-ESRGAN upscaling of the finished video -> gufo.upscale.
@@ -488,6 +508,16 @@ struct VideoTask {
   /// (`guidance`) -> gufo.vace.high_guidance.
   std::optional<int> vace_switch_step;
   std::optional<double> vace_high_guidance;
+  /// Wan 2.2 I2V A14B (kI2V22, gufo.i2v): the first step of the low-noise
+  /// expert (its KSamplerAdvanced start_at_step; unset: gufo's boundary),
+  /// the high-noise stage's cfg when it differs from `guidance`, the
+  /// sampler ("euler" | "lcm"), the ModelSamplingSD3 shift and whether the
+  /// bundle's step-distill LoRAs apply (false: the graph has no LoRA).
+  std::optional<int> i2v_switch_step;
+  std::optional<double> i2v_high_guidance;
+  std::string i2v_sampler;
+  std::optional<double> i2v_shift;
+  bool i2v_lora{true};
   /// Talk family (InfiniteTalk): the speakers' audio (one or two LoadAudio
   /// files), with two speakers their masks and the mask channel ("red",
   /// "green", "blue", or "inverted_alpha": ComfyUI's alpha masks), sent
