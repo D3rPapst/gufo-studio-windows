@@ -26,6 +26,7 @@ enum class Family : std::uint8_t {
   kWan21Uni3C,  // Wan 2.1 I2V 14B + lightx2v + Uni3C camera, 16 fps
   kWan21Vace,   // Wan 2.1 T2V 14B + VACE, 16 fps
   kWan21Talk,   // Wan 2.1 I2V 14B + InfiniteTalk, 25 fps
+  kWan22FunVace,  // Wan 2.2 T2V A14B (two experts) + Fun VACE, 16 fps
 };
 
 inline constexpr std::string_view kWan22ModelId = "wan2.2-ti2v-5b";
@@ -36,6 +37,9 @@ inline constexpr std::string_view kWan21VaceModelId = "wan2.1-vace-14b";
 inline constexpr std::string_view kWan21VacePreset = "wan21-vace";
 inline constexpr std::string_view kWan21TalkModelId = "wan2.1-infinitetalk-14b";
 inline constexpr std::string_view kWan21TalkPreset = "wan21-talk";
+inline constexpr std::string_view kWan22FunVaceModelId =
+    "wan2.2-fun-vace-a14b";
+inline constexpr std::string_view kWan22FunVacePreset = "wan22-fun-vace";
 
 [[nodiscard]] std::string_view ModelId(Family family) noexcept;
 [[nodiscard]] std::string_view Preset(Family family) noexcept;
@@ -50,6 +54,13 @@ inline constexpr std::string_view kWan21TalkPreset = "wan21-talk";
 [[nodiscard]] bool IsWan21CameraDirectory(const std::filesystem::path& root);
 [[nodiscard]] bool IsWan21VaceDirectory(const std::filesystem::path& root);
 [[nodiscard]] bool IsWan21TalkDirectory(const std::filesystem::path& root);
+/// gufo-vace22.json with _class_name GufoWan22FunVace.
+[[nodiscard]] bool IsWan22FunVaceDirectory(
+    const std::filesystem::path& root);
+/// Wan 2.1 VACE or Wan 2.2 Fun VACE (the same request format and runner).
+[[nodiscard]] constexpr bool IsVaceFamily(Family family) noexcept {
+  return family == Family::kWan21Vace || family == Family::kWan22FunVace;
+}
 
 /// "WxH".
 [[nodiscard]] bool ParseVideoSize(std::string_view size, int* width,
@@ -109,7 +120,7 @@ struct JobRequest {
   std::string camera_json;
   // Uni3C render video, VACE control video, InfiniteTalk input video.
   std::filesystem::path guide_video_path;
-  // VACE: options JSON, mask file (".mp4" or ".ppm"), reference images.
+  // VACE (2.1 and 2.2 Fun): options JSON, mask file (".mp4" or ".ppm"), reference images.
   std::string vace_json;
   std::filesystem::path mask_path;
   std::vector<Image> references;

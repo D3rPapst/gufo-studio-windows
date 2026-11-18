@@ -113,7 +113,9 @@ struct Transformer21Probes {
 /// `scale_weight` per tensor, everything else F16/F32, original Wan keys).
 /// The FP8 matrices stay FP8 on the device (gfx1151 has no FP8 matrix
 /// cores) and are unpacked to BF16 right before each GEMM; an optional LoRA
-/// (lightx2v format: lora_up/lora_down, `diff`, `diff_b`, no alpha) is added
+/// (lightx2v format: lora_up/lora_down, `diff`, `diff_b`, no alpha; or F16
+/// lora_up/lora_down with `alpha`, scaled alpha / rank, as Kijai's Wan 2.2
+/// Lightning files) is added
 /// exactly: its low-rank product into the unpacked BF16 matrix (FP32
 /// accumulation), its full differences into norms, biases and the F16
 /// matrices at load time. Activations BF16, residual stream, norms,
@@ -121,6 +123,9 @@ struct Transformer21Probes {
 /// The text-to-video 14B (Kijai's `Wan2_1-T2V-14B_fp8_e4m3fn_scaled_KJ`, the
 /// base of VACE) loads as well: no img_emb / k_img / v_img, 16 input
 /// channels (patch embedding zero-padded to 36), text-only cross-attention.
+/// So do the Wan 2.2 T2V A14B experts (`Wan2_2-T2V-A14B_HIGH/-LOW_fp8_
+/// e4m3fn_scaled_KJ`, same layout, non-FP8 tensors F32), the base of Wan 2.2
+/// Fun VACE.
 class Transformer21 {
 public:
   static constexpr int kInChannels = 36;

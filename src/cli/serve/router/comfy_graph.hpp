@@ -38,7 +38,9 @@
 //          background_video + character_mask as control video + mask,
 //          reference_image; gufo has no Wan 2.2 Animate model); a
 //          KSamplerAdvanced chain (Wan 2.2 high / low noise) runs as one
-//          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace)
+//          sampling -> /v1/videos (wan2.1-vace-14b, gufo.vace), or, with
+//          two checkpoints and wan2.2-fun-vace-a14b served, as its two
+//          experts (gufo.vace.switch_step)
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
 //          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
 //          windows via previous_frames become one job; video to video:
@@ -97,6 +99,11 @@ struct ModelIds {
   /// with --rife-model. When `available` is set and lacks it, `h3` serves.
   std::string process{"gufo-rife"};
   std::string vace{"wan2.1-vace-14b"};
+  /// Wan 2.2 Fun VACE A14B: a VACE KSamplerAdvanced chain whose stages run
+  /// two different checkpoints (high noise first, then low noise) is sent
+  /// here as one two-expert job when this id is in `available`; otherwise
+  /// (or empty) it runs on `vace` with a warning.
+  std::string vace22{"wan2.2-fun-vace-a14b"};
   std::string talk{"wan2.1-infinitetalk-14b"};
   std::string animate{"wan2.2-animate-14b"};
   std::string foley{"mmaudio-44k"};
@@ -453,6 +460,12 @@ struct VideoTask {
   std::string vace_sampler;  // "lcm" or "euler"; empty = bundle default
   std::optional<double> vace_shift;
   bool vace_lora{true};
+  /// Wan 2.2 Fun VACE (model `vace22`): the first step of the low-noise
+  /// expert (its KSamplerAdvanced start_at_step) -> gufo.vace.switch_step,
+  /// and the high-noise stage's cfg when it differs from the low-noise one
+  /// (`guidance`) -> gufo.vace.high_guidance.
+  std::optional<int> vace_switch_step;
+  std::optional<double> vace_high_guidance;
   /// Talk family (InfiniteTalk): the speakers' audio (one or two LoadAudio
   /// files), with two speakers their masks and the mask channel ("red",
   /// "green", "blue", or "inverted_alpha": ComfyUI's alpha masks), sent

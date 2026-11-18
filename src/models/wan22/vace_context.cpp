@@ -91,4 +91,27 @@ std::vector<float> BuildVaceContext(const VaceContextInputs& in) {
   return out;
 }
 
+std::vector<double> VaceSigmas(int steps, double shift) {
+  std::vector<double> sigmas;
+  if (steps < 1)
+    return {0.0};
+  for (int i = 0; i < steps; ++i) {
+    const double t = 1.0 - static_cast<double>(i) / steps;
+    sigmas.push_back(shift * t / (1.0 + (shift - 1.0) * t));
+  }
+  sigmas.push_back(0.0);
+  return sigmas;
+}
+
+int VaceSwitchStep(const std::vector<double>& sigmas, double boundary,
+                   int requested) {
+  const int steps = std::max(static_cast<int>(sigmas.size()) - 1, 0);
+  if (requested >= 0 && requested <= steps)
+    return requested;
+  for (int i = 0; i < steps; ++i)
+    if (1000.0 * sigmas[i] < boundary * 1000.0)
+      return i;
+  return steps;
+}
+
 }  // namespace gufo::models::wan22

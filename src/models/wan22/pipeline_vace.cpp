@@ -84,7 +84,25 @@ bool GenerateVace21(const Vace21Request& request,
     }
     return false;
   };
-  const bool cfg = request.guidance > 1.0F;
+  const bool two_experts = !request.high_dit_file.empty();
+  const float high_guidance =
+      request.high_guidance > 0.0F ? request.high_guidance : request.guidance;
+  if (two_experts &&
+      (request.high_vace_file.empty() || !(high_guidance >= 1.0F) ||
+       !(request.boundary >= 0.0 && request.boundary <= 1.0))) {
+    SetError(error, "Wan 2.2 Fun VACE: the high-noise expert needs its VACE "
+                    "module, guidance >= 1 and a boundary in 0..1");
+    return false;
+  }
+  const std::vector<double> sigmas = VaceSigmas(request.steps, request.shift);
+  const int switch_at =
+      two_experts
+          ? VaceSwitchStep(sigmas, request.boundary, request.switch_step)
+          : 0;
+  tel.switch_step = switch_at;
+  // CFG (negative prompt) when any step that runs uses guidance > 1.
+  const bool cfg = (switch_at < request.steps && request.guidance > 1.0F) ||
+                   (switch_at > 0 && high_guidance > 1.0F);
   const int refs = static_cast<int>(request.references.size());
   const int lf = 1 + (n - 1) / 4, lh = h / 8, lw = w / 8;
   const int frames = refs + lf;  // latent frames incl. references
@@ -190,45 +208,64 @@ bool GenerateVace21(const Vace21Request& request,
   if (cancelled())
     return false;
 
-  // 3. Transformer (T2V 14B) + VACE blocks and sampling.
+  // 3. Transformer (T2V 14B; Wan 2.2: the high-noise expert first, then the
+  // low-noise one) + VACE blocks and sampling. One expert on the device at a
+  // time: the first is released before the second loads.
   std::vector<float> latents;
   {
-    auto start = Clock::now();
-    auto dit = Transformer21::Load(request.dit_file, request.lora_file,
-                                   request.lora_strength, error);
-    if (!dit)
+    std::unique_ptr<Transformer21> dit;
+    std::unique_ptr<Vace> vace;
+    bool loaded_high = false;
+    float guidance = request.guidance;
+    const auto load = [&](bool high) {
+      vace.reset();
+      dit.reset();
+      auto start = Clock::now();
+      const auto& dit_file = high ? request.high_dit_file : request.dit_file;
+      dit = Transformer21::Load(
+          dit_file, high ? request.high_lora_file : request.lora_file,
+          high ? request.high_lora_strength : request.lora_strength, error);
+      if (!dit)
+        return false;
+      if (!dit->text_only()) {
+        SetError(error, "VACE needs a text-to-video 14B checkpoint, not " +
+                            dit_file.string());
+        return false;
+      }
+      vace = Vace::Load(high ? request.high_vace_file : request.vace_file,
+                        dit->stream(), error);
+      if (!vace || !vace->SetContext(context, frames, lh, lw, error))
+        return false;
+      vace->set_strength(request.strength);
+      tel.dit_load_ms += Ms(start);
+      TrackDevice(&tel.peak_device_bytes);
+      guidance = high ? high_guidance : request.guidance;
+      start = Clock::now();
+      if (!dit->PrepareContext(0, text, TextEncoder::kMaxTokens, {}, nullptr,
+                               nullptr, error) ||
+          (guidance > 1.0F &&
+           !dit->PrepareContext(1, negative, TextEncoder::kMaxTokens, {},
+                                nullptr, nullptr, error)))
+        return false;
+      tel.context_ms += Ms(start);
+      loaded_high = high;
+      return true;
+    };
+    if (!load(switch_at > 0))
       return false;
-    if (!dit->text_only()) {
-      SetError(error, "Wan 2.1 VACE needs the text-to-video 14B checkpoint, "
-                      "not " + request.dit_file.string());
-      return false;
-    }
-    auto vace = Vace::Load(request.vace_file, dit->stream(), error);
-    if (!vace || !vace->SetContext(context, frames, lh, lw, error))
-      return false;
-    std::vector<float>().swap(context);
-    vace->set_strength(request.strength);
-    tel.dit_load_ms = Ms(start);
-    TrackDevice(&tel.peak_device_bytes);
-    start = Clock::now();
-    if (!dit->PrepareContext(0, text, TextEncoder::kMaxTokens, {}, nullptr,
-                             nullptr, error) ||
-        (cfg && !dit->PrepareContext(1, negative, TextEncoder::kMaxTokens, {},
-                                     nullptr, nullptr, error)))
-      return false;
-    tel.context_ms = Ms(start);
+    if (!two_experts || switch_at == 0 || switch_at >= request.steps)
+      std::vector<float>().swap(context);  // no second expert to set up
     latents = GaussianNoise(16 * frames * plane, request.seed);
     dump("noise0", latents, shape16(frames));
-    std::vector<double> sigmas;
-    for (int i = 0; i < request.steps; ++i) {
-      const double t = 1.0 - static_cast<double>(i) / request.steps;
-      sigmas.push_back(request.shift * t / (1.0 + (request.shift - 1.0) * t));
-    }
-    sigmas.push_back(0.0);
     std::vector<float> velocity, uncond;
     for (int step = 0; step < request.steps; ++step) {
       if (cancelled())
         return false;
+      if (loaded_high && step >= switch_at) {
+        if (!load(false))
+          return false;
+        std::vector<float>().swap(context);
+      }
       const auto step_start = Clock::now();
       Transformer21Input in;
       in.latent = latents;
@@ -240,12 +277,12 @@ bool GenerateVace21(const Vace21Request& request,
       in.context_slot = 0;
       if (!dit->Forward(in, &velocity, nullptr, error))
         return false;
-      if (cfg) {
+      if (guidance > 1.0F) {
         in.context_slot = 1;
         if (!dit->Forward(in, &uncond, nullptr, error))
           return false;
         for (std::size_t i = 0; i < velocity.size(); ++i)
-          velocity[i] = uncond[i] + request.guidance * (velocity[i] - uncond[i]);
+          velocity[i] = uncond[i] + guidance * (velocity[i] - uncond[i]);
       }
       TrackDevice(&tel.peak_device_bytes);
       dump("step" + std::to_string(step) + "_velocity", velocity,

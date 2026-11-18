@@ -2305,10 +2305,13 @@ void FirstLastControl(const Graph& graph, const std::string& node,
 /// The samplers of a VACE job: one KSampler / KSamplerAdvanced, or a
 /// KSamplerAdvanced chain splitting one schedule (Wan 2.2 high / low noise
 /// experts: start_at_step / end_at_step 0..k, k..steps), first stage
-/// first. Checks the split and returns the first stage.
+/// first. Checks the split and returns the first stage. `experts` > 0: the
+/// stages run as two experts (Wan 2.2 Fun VACE), stages[experts] is the
+/// first low-noise one (its cfg may differ from the high-noise stages').
 std::string CheckSamplerStages(const Graph& graph,
                                const std::vector<std::string>& stages,
-                               std::vector<std::string>* warnings) {
+                               std::vector<std::string>* warnings,
+                               std::size_t experts = 0) {
   const std::string& head = stages.front();
   const bool split = stages.size() > 1;
   const int steps = static_cast<int>(graph.Num(head, "steps"));
@@ -2354,22 +2357,74 @@ std::string CheckSamplerStages(const Graph& graph,
     std::string names;
     for (const std::string& stage : stages)
       names += (names.empty() ? "" : ", ") + stage;
-    warnings->push_back("node " + head + ": the KSamplerAdvanced stages (" +
-                        names + ") run as one sampling of " +
-                        std::to_string(steps) +
-                        " steps on one model; settings from node " + head);
-    for (std::size_t i = 1; i < stages.size(); ++i)
+    if (experts == 0)
+      warnings->push_back("node " + head + ": the KSamplerAdvanced stages (" +
+                          names + ") run as one sampling of " +
+                          std::to_string(steps) +
+                          " steps on one model; settings from node " + head);
+    else if (stages.size() > 2)
+      warnings->push_back("node " + head + ": the KSamplerAdvanced stages (" +
+                          names + ") run as the two experts' samplings of " +
+                          std::to_string(steps) +
+                          " steps; settings from node " + head +
+                          " (high noise) and node " + stages[experts] +
+                          " (low noise)");
+    for (std::size_t i = 1; i < stages.size(); ++i) {
+      // Two experts: each stage against its expert's first stage; the
+      // low-noise expert's own cfg is used.
+      const std::string& reference =
+          experts > 0 && i > experts ? stages[experts] : head;
       for (const char* key : {"cfg", "sampler_name", "scheduler"}) {
-        const json::Value* a = graph.Literal(head, key);
+        if (experts > 0 && i == experts && std::string(key) == "cfg")
+          continue;
+        const json::Value* a = graph.Literal(reference, key);
         const json::Value* b = graph.Literal(stages[i], key);
         if ((a == nullptr) != (b == nullptr) ||
             (a != nullptr && a->dump() != b->dump()))
           warnings->push_back("node " + stages[i] + ": " + key +
-                              " differs from node " + head +
-                              ", gufo uses node " + head + "'s");
+                              " differs from node " + reference +
+                              ", gufo uses node " + reference + "'s");
       }
+    }
   }
   return head;
+}
+
+/// Wan 2.2 Fun VACE A14B: the index of the first low-noise stage when
+/// `stages` run two different checkpoints in two consecutive groups (high
+/// noise first, as ComfyUI samples them) and `models.vace22` is served; 0
+/// otherwise (one VACE model).
+std::size_t VaceExpertSplit(const Graph& graph,
+                            const std::vector<std::string>& stages,
+                            const ModelIds& models,
+                            std::vector<std::string>* warnings) {
+  if (stages.size() < 2 || models.vace22.empty() ||
+      std::find(models.available.begin(), models.available.end(),
+                models.vace22) == models.available.end())
+    return 0;
+  std::vector<std::string> files;
+  for (const std::string& stage : stages) {
+    files.push_back(FollowModel(graph, stage).loader);
+    if (files.back().empty())
+      return 0;
+  }
+  std::size_t split = 0;
+  for (std::size_t i = 1; i < files.size(); ++i)
+    if (files[i] != files[i - 1]) {
+      if (split != 0)
+        return 0;  // three model groups
+      split = i;
+    }
+  if (split == 0)
+    return 0;
+  const std::string first = Lower(files.front());
+  const std::string last = Lower(files.back());
+  if (first.find("low") != std::string::npos &&
+      last.find("high") != std::string::npos)
+    warnings->push_back("node " + stages.front() + ": " + files.front() +
+                        " samples the first (high-noise) steps; gufo runs "
+                        "them on its high-noise expert");
+  return split;
 }
 
 /// `generators` as one linear sampler chain (each stage's latent_image is
@@ -2578,12 +2633,16 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
   const std::string vace = latent.node;
   const bool first_last = graph.Class(vace) == "WanFirstLastFrameToVideo";
   const bool animate = graph.Class(vace) == "WanAnimateToVideo";
+  // Wan 2.2 Fun VACE A14B (two checkpoints over the stages, the model
+  // served): one two-expert job; else everything runs on Wan 2.1 VACE.
+  const std::size_t experts = VaceExpertSplit(graph, stages, models, warnings);
   const std::string sampler = CheckSamplerStages(
       graph, stages.empty() ? std::vector<std::string>{first} : stages,
-      warnings);
+      warnings, experts);
   VideoTask task;
   task.family = VideoFamily::kVace;
-  task.model = models.vace;
+  task.model = experts > 0 ? models.vace22 : models.vace;
+  const std::string gufo_model = "gufo " + task.model;
   task.fps = 16;
   task.width = static_cast<int>(graph.Num(vace, "width", 832));
   task.height = static_cast<int>(graph.Num(vace, "height", 480));
@@ -2591,18 +2650,18 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
       task.height < 256 || task.width > 1280 || task.height > 1280 ||
       task.width * task.height > 1280 * 720)
     throw NodeFailure(vace, "unsupported_value",
-                      "gufo wan2.1-vace-14b needs width/height in multiples "
+                      gufo_model + " needs width/height in multiples "
                       "of 16, 256..1280 and at most 1280x720 pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));
   task.frames = static_cast<int>(graph.Num(vace, "length", 81));
   if (task.frames < 5 || task.frames > 81 || (task.frames - 1) % 4 != 0)
     throw NodeFailure(vace, "unsupported_value",
-                      "gufo wan2.1-vace-14b length must be 4k+1 frames, "
+                      gufo_model + " length must be 4k+1 frames, "
                       "5..81 (16 fps)");
   if (graph.Num(vace, "batch_size", 1) != 1)
     throw NodeFailure(vace, "unsupported_value",
-                      "gufo wan2.1-vace-14b renders batch_size 1");
+                      gufo_model + " renders batch_size 1");
   const double strength = graph.Num(vace, "strength", 1.0);
   if (strength < 0 || strength > 1000)
     throw NodeFailure(vace, "unsupported_value",
@@ -2635,26 +2694,40 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
   task.steps = static_cast<int>(graph.Num(sampler, "steps"));
   if (task.steps < 1 || task.steps > 50)
     throw NodeFailure(sampler, "unsupported_value",
-                      "gufo wan2.1-vace-14b takes 1..50 steps");
+                      gufo_model + " takes 1..50 steps");
   task.seed = Seed(graph.Num(sampler, SeedKey(graph.Class(sampler)), 0));
-  const double cfg = graph.Num(sampler, "cfg", 1.0);
-  if (cfg < 1.0 || cfg > 20.0)
-    throw NodeFailure(sampler, "unsupported_value",
-                      "gufo wan2.1-vace-14b takes cfg 1..20");
+  const auto read_cfg = [&](const std::string& stage) {
+    const double value = graph.Num(stage, "cfg", 1.0);
+    if (value < 1.0 || value > 20.0)
+      throw NodeFailure(stage, "unsupported_value",
+                        gufo_model + " takes cfg 1..20");
+    return value;
+  };
+  // Two experts: gufo.guidance is the low-noise expert's cfg,
+  // gufo.vace.high_guidance the high-noise one's when it differs.
+  const std::string low = experts > 0 ? stages[experts] : sampler;
+  const double cfg = read_cfg(low);
   if (cfg != 1.0)
     task.guidance = cfg;
+  if (experts > 0) {
+    task.vace_switch_step =
+        static_cast<int>(graph.Num(low, "start_at_step", 0));
+    const double high_cfg = read_cfg(sampler);
+    if (high_cfg != cfg)
+      task.vace_high_guidance = high_cfg;
+  }
   const std::string sampler_name = graph.Str(sampler, "sampler_name", "lcm");
   task.vace_sampler = sampler_name == "lcm" ? "lcm" : "euler";
   if (sampler_name != "lcm" && sampler_name != "euler")
     warnings->push_back("node " + sampler + ": sampler " + sampler_name +
-                        " runs as euler on gufo wan2.1-vace-14b");
+                        " runs as euler on " + gufo_model);
   const std::string scheduler = graph.Str(sampler, "scheduler", "simple");
   if (scheduler != "simple" && scheduler != "normal")
     warnings->push_back("node " + sampler + ": scheduler " + scheduler +
                         " runs as gufo's shifted linear (simple) schedule");
   if (graph.Num(sampler, "denoise", 1.0) != 1.0)
     throw NodeFailure(sampler, "unsupported_value",
-                      "gufo wan2.1-vace-14b samples with denoise 1");
+                      gufo_model + " samples with denoise 1");
   const ModelChain chain = FollowModel(graph, sampler);
   if (!chain.uni3c.empty())
     throw NodeFailure(chain.uni3c, "unsupported_link",
@@ -2662,9 +2735,11 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
   task.vace_lora = !chain.loras.empty();
   for (const auto& [name, lora_strength] : chain.loras) {
     const std::string lower = Lower(name);
+    const bool lightning = lower.find("lightning") != std::string::npos;
     if (lower.find("lightx2v") == std::string::npos &&
         lower.find("distill") == std::string::npos &&
-        lower.find("causvid") == std::string::npos) {
+        lower.find("causvid") == std::string::npos &&
+        !(experts > 0 && lightning)) {
       // Wan 2.2 Animate LoRAs (e.g. relight) have no VACE counterpart.
       if (animate) {
         warnings->push_back("node " + sampler + ": LoRA " + name +
@@ -2672,49 +2747,83 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
         continue;
       }
       throw NodeFailure(sampler, "unsupported_value",
-                        "gufo wan2.1-vace-14b has its step-distill LoRA "
-                        "(lightx2v) built in and takes no other LoRA, not " +
+                        gufo_model +
+                            (experts > 0
+                                 ? " has its step-distill LoRAs (Wan 2.2 "
+                                   "Lightning) built in and takes no other "
+                                   "LoRA, not "
+                                 : " has its step-distill LoRA (lightx2v) "
+                                   "built in and takes no other LoRA, not ") +
                             name);
     }
-    if (lower.find("lightx2v") == std::string::npos || lora_strength != 1.0)
+    if (experts > 0) {
+      if (!lightning || lora_strength != 1.0)
+        warnings->push_back("node " + sampler + ": LoRA " + name +
+                            " runs as gufo's built-in Wan 2.2 Lightning "
+                            "LoRAs at strength 1");
+    } else if (lower.find("lightx2v") == std::string::npos ||
+               lora_strength != 1.0) {
       warnings->push_back("node " + sampler + ": LoRA " + name +
                           " runs as gufo's built-in lightx2v T2V LoRA at "
                           "strength 1");
+    }
   }
-  // Other checkpoints (Wan 2.2 Fun VACE high / low noise, Wan 2.1 FLF2V)
-  // run as the one VACE model gufo has.
-  for (const std::string& stage :
-       stages.empty() ? std::vector<std::string>{sampler} : stages) {
+  // Other checkpoints (Wan 2.2 Fun VACE high / low noise without the
+  // two-expert model, Wan 2.1 FLF2V) run as the one VACE model gufo has.
+  const std::vector<std::string> all_stages =
+      stages.empty() ? std::vector<std::string>{sampler} : stages;
+  for (std::size_t index = 0; index < all_stages.size(); ++index) {
+    const std::string& stage = all_stages[index];
     const ModelChain stage_chain = FollowModel(graph, stage);
     const std::string file = Lower(stage_chain.loader);
-    if (!file.empty() && (file.find("vace") == std::string::npos ||
-                          file.find("2.2") != std::string::npos ||
-                          file.find("2_2") != std::string::npos ||
-                          file.find("wan22") != std::string::npos ||
-                          file.find("fun") != std::string::npos))
+    const bool wan22 = file.find("2.2") != std::string::npos ||
+                       file.find("2_2") != std::string::npos ||
+                       file.find("wan22") != std::string::npos;
+    if (experts > 0) {
+      if (index != 0 && index != experts)
+        continue;  // the same checkpoint as its expert's first stage
+      if (!file.empty() && (file.find("vace") == std::string::npos || !wan22))
+        warnings->push_back("node " + stage_chain.loader_node + ": " +
+                            stage_chain.loader + " runs as " + gufo_model +
+                            " (Wan 2.2 Fun VACE A14B, " +
+                            (index == 0 ? "high" : "low") + " noise)");
+    } else if (!file.empty() &&
+               (file.find("vace") == std::string::npos || wan22 ||
+                file.find("fun") != std::string::npos)) {
       warnings->push_back("node " + stage_chain.loader_node + ": " +
                           stage_chain.loader + " runs as gufo " + models.vace +
                           " (Wan 2.1 VACE 14B)");
+    }
     if (stage != sampler && stage_chain.loras.empty() != chain.loras.empty())
       warnings->push_back("node " + stage +
                           ": LoRAs differ from node " + sampler +
                           ", gufo uses node " + sampler + "'s");
   }
-  // ModelSamplingSD3 shift on the model path -> gufo.vace.shift.
-  Link link = graph.RequireLink(sampler, "model");
-  for (int guard = 0; guard < 64; ++guard) {
-    const std::string cls = graph.Class(link.node);
-    if (cls == "ModelSamplingSD3") {
-      task.vace_shift = graph.Num(link.node, "shift", 8.0);
-      if (*task.vace_shift < 1.0 || *task.vace_shift > 20.0)
-        throw NodeFailure(link.node, "unsupported_value",
-                          "gufo wan2.1-vace-14b takes shift 1..20");
-      break;
+  // ModelSamplingSD3 shift on the model path -> gufo.vace.shift (two
+  // experts: the high-noise stage's; the low-noise one should match).
+  const auto shift_of = [&](const std::string& stage) {
+    std::optional<double> shift;
+    Link link = graph.RequireLink(stage, "model");
+    for (int guard = 0; guard < 64; ++guard) {
+      const std::string cls = graph.Class(link.node);
+      if (cls == "ModelSamplingSD3") {
+        shift = graph.Num(link.node, "shift", 8.0);
+        if (*shift < 1.0 || *shift > 20.0)
+          throw NodeFailure(link.node, "unsupported_value",
+                            gufo_model + " takes shift 1..20");
+        break;
+      }
+      if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple")
+        break;
+      link = graph.RequireLink(link.node, "model");
     }
-    if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple")
-      break;
-    link = graph.RequireLink(link.node, "model");
-  }
+    return shift;
+  };
+  task.vace_shift = shift_of(sampler);
+  if (experts > 0 && shift_of(low) != task.vace_shift)
+    warnings->push_back("node " + low +
+                        ": shift differs from node " + sampler +
+                        ", gufo uses node " + sampler + "'s");
   return task;
 }
 
@@ -3617,6 +3726,11 @@ json::Value VideoRequestBody(const VideoTask& task) {
       vace["shift"] = *task.vace_shift;
     if (!task.vace_lora)
       vace["lora"] = false;
+    // Wan 2.2 Fun VACE A14B: the high / low noise KSamplerAdvanced split.
+    if (task.vace_switch_step)
+      vace["switch_step"] = *task.vace_switch_step;
+    if (task.vace_high_guidance)
+      vace["high_guidance"] = *task.vace_high_guidance;
     gufo["vace"] = std::move(vace);
   } else if (task.family == VideoFamily::kTalk) {
     // 25 fps: gufo maps seconds back to round(25 s) frames.

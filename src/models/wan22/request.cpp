@@ -365,6 +365,7 @@ bool CheckUploads(const Body& body, Family family,
                   name == "render_video";
         break;
       case Family::kWan21Vace:
+      case Family::kWan22FunVace:
         allowed = name == "control_video" || name == "mask" ||
                   name.starts_with("reference_image");
         break;
@@ -591,25 +592,32 @@ bool PrepareWan21(const Body& body, ext::VideoPreparedRequest* prepared,
 // "control_video", "mask" and "reference_image" / "reference_image_<n>"
 // files instead. Without a control video the model sees grey
 // (reference-to-video / text-to-video).
-bool PrepareVace(const Body& body, ext::VideoPreparedRequest* prepared,
+// Wan 2.2 Fun VACE A14B ("wan2.2-fun-vace-a14b") takes the same request;
+// "gufo.vace" may also carry "switch_step" (0..steps: the first step of the
+// low-noise expert, as ComfyUI's KSamplerAdvanced end_at_step; default from
+// the boundary), "boundary" (0..1, default the bundle's, 0.875) and
+// "high_guidance" (1..20: CFG of the high-noise expert; default
+// "gufo.guidance").
+bool PrepareVace(Family family, const Body& body,
+                 ext::VideoPreparedRequest* prepared,
                  ext::VideoRequestError* error) {
+  const bool fun22 = family == Family::kWan22FunVace;
   if (!HasOnlyMembers(body.json, {"model", "prompt", "size", "seconds", "gufo"}))
     return Fail(error, "unsupported_field",
                 "request contains an unsupported video field (VACE inputs "
                 "go into 'gufo.vace')");
-  if (!CheckUploads(body, Family::kWan21Vace, error))
+  if (!CheckUploads(body, family, error))
     return false;
   Common common;
   if (!ParseCommon(body, "832x480", false, &common, error))
     return false;
   const std::string seconds = SecondsText(body.json.find("seconds"), "5");
   std::string duration_error;
-  const auto frames =
-      ResolveDurationFrames(Family::kWan21Vace, seconds, &duration_error);
+  const auto frames = ResolveDurationFrames(family, seconds, &duration_error);
   if (!frames)
     return Fail(error, "invalid_seconds", duration_error);
   ext::VideoParameters parameters;
-  if (!InitParameters(Family::kWan21Vace, common, 4, &parameters, error))
+  if (!InitParameters(family, common, 4, &parameters, error))
     return false;
   parameters.frames = *frames;
   std::uint64_t seed = 42;
@@ -679,13 +687,25 @@ bool PrepareVace(const Body& body, ext::VideoPreparedRequest* prepared,
   }
   if (vace != nullptr &&
       (!vace->is_object() ||
-       !HasOnlyMembers(*vace, {"control_video", "mask", "mask_channel",
-                               "invert_mask", "reference_images", "strength",
-                               "sampler", "shift", "lora"})))
+       !(fun22 ? HasOnlyMembers(*vace,
+                                {"control_video", "mask", "mask_channel",
+                                 "invert_mask", "reference_images", "strength",
+                                 "sampler", "shift", "lora", "switch_step",
+                                 "boundary", "high_guidance"})
+               : HasOnlyMembers(*vace, {"control_video", "mask", "mask_channel",
+                                        "invert_mask", "reference_images",
+                                        "strength", "sampler", "shift",
+                                        "lora"}))))
     return Fail(error, "invalid_vace",
-                "'gufo.vace' may contain only 'control_video', 'mask', "
-                "'mask_channel', 'invert_mask', 'reference_images', "
-                "'strength', 'sampler', 'shift' and 'lora'");
+                fun22 ? "'gufo.vace' may contain only 'control_video', "
+                        "'mask', 'mask_channel', 'invert_mask', "
+                        "'reference_images', 'strength', 'sampler', 'shift', "
+                        "'lora', 'switch_step', 'boundary' and "
+                        "'high_guidance'"
+                      : "'gufo.vace' may contain only 'control_video', "
+                        "'mask', 'mask_channel', 'invert_mask', "
+                        "'reference_images', 'strength', 'sampler', 'shift' "
+                        "and 'lora'");
   const auto member = [&](const char* name) -> const json::Value* {
     return vace == nullptr ? nullptr : vace->find(name);
   };
@@ -766,6 +786,28 @@ bool PrepareVace(const Body& body, ext::VideoPreparedRequest* prepared,
                   "'gufo.vace.shift' must be a number in 1..20");
     vace_options["shift"] = value;
   }
+  if (const json::Value* step = member("switch_step")) {
+    const double value = step->is_number() ? step->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 0.0 ||
+        value > parameters.evaluations || std::floor(value) != value)
+      return Fail(error, "invalid_vace",
+                  "'gufo.vace.switch_step' must be an integer in 0..steps");
+    vace_options["switch_step"] = static_cast<int>(value);
+  }
+  if (const json::Value* boundary = member("boundary")) {
+    const double value = boundary->is_number() ? boundary->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 0.0 || value > 1.0)
+      return Fail(error, "invalid_vace",
+                  "'gufo.vace.boundary' must be a number in 0..1");
+    vace_options["boundary"] = value;
+  }
+  if (const json::Value* guidance = member("high_guidance")) {
+    const double value = guidance->is_number() ? guidance->as_double(-1) : -1;
+    if (!std::isfinite(value) || value < 1.0 || value > 20.0)
+      return Fail(error, "invalid_vace",
+                  "'gufo.vace.high_guidance' must be a number in 1..20");
+    vace_options["high_guidance"] = value;
+  }
   // Reference images: JSON entries first, then uploads in name order.
   std::vector<std::vector<std::uint8_t>> references;
   if (const json::Value* list = member("reference_images")) {
@@ -794,7 +836,7 @@ bool PrepareVace(const Body& body, ext::VideoPreparedRequest* prepared,
   if (references.size() > 4)
     return Fail(error, "invalid_vace", "at most 4 VACE reference images");
   std::string parameter_error;
-  if (!ValidateParameters(Family::kWan21Vace, parameters, &parameter_error))
+  if (!ValidateParameters(family, parameters, &parameter_error))
     return Fail(error, "invalid_parameters", parameter_error);
   options["vace"] = std::move(vace_options);
   if (!control_video.empty())
@@ -1065,6 +1107,8 @@ std::string_view ModelId(Family family) noexcept {
       return kWan21VaceModelId;
     case Family::kWan21Talk:
       return kWan21TalkModelId;
+    case Family::kWan22FunVace:
+      return kWan22FunVaceModelId;
   }
   return kWan22ModelId;
 }
@@ -1079,6 +1123,8 @@ std::string_view Preset(Family family) noexcept {
       return kWan21VacePreset;
     case Family::kWan21Talk:
       return kWan21TalkPreset;
+    case Family::kWan22FunVace:
+      return kWan22FunVacePreset;
   }
   return kWan22Preset;
 }
@@ -1126,6 +1172,10 @@ bool IsWan21VaceDirectory(const std::filesystem::path& root) {
 
 bool IsWan21TalkDirectory(const std::filesystem::path& root) {
   return ReadClassName(root / "gufo-talk.json", "GufoWan21InfiniteTalk");
+}
+
+bool IsWan22FunVaceDirectory(const std::filesystem::path& root) {
+  return ReadClassName(root / "gufo-vace22.json", "GufoWan22FunVace");
 }
 
 bool ParseVideoSize(std::string_view size, int* width, int* height) {
@@ -1182,6 +1232,7 @@ bool ValidateParameters(Family family, const ext::VideoParameters& p,
         return fail("steps must be 1..20");
       return true;
     case Family::kWan21Vace:
+    case Family::kWan22FunVace:
       if (w < 256 || h < 256 || w > 1280 || h > 1280 || w % 16 != 0 ||
           h % 16 != 0 || w * h > 1280 * 720)
         return fail(
@@ -1210,7 +1261,8 @@ std::optional<int> ResolveDurationFrames(Family family,
       return std::min(4 * groups + 1, 121);
     }
     case Family::kWan21Uni3C:
-    case Family::kWan21Vace: {
+    case Family::kWan21Vace:
+    case Family::kWan22FunVace: {
       if (!value || *value < 0.25 || *value > 5.05) {
         SetError(error, "'seconds' must be a number between 0.25 and 5");
         return std::nullopt;
@@ -1329,7 +1381,8 @@ bool PrepareRequest(Family family, const ext::VideoRequestInput& input,
     case Family::kWan21Uni3C:
       return PrepareWan21(body, prepared, error);
     case Family::kWan21Vace:
-      return PrepareVace(body, prepared, error);
+    case Family::kWan22FunVace:
+      return PrepareVace(family, body, prepared, error);
     case Family::kWan21Talk:
       return PrepareTalk(body, prepared, error);
   }
@@ -1377,7 +1430,7 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   job->steps = request.parameters.evaluations;
   job->negative_prompt = options.member_str("negative_prompt");
   job->guidance = options.member_double(
-      "guidance", family == Family::kWan21Vace ? 1.0 : 5.0);
+      "guidance", IsVaceFamily(family) ? 1.0 : 5.0);
   if (const auto* first = attachment("first_frame");
       first != nullptr && !image(*first, &job->first_frame))
     return false;
@@ -1389,7 +1442,7 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   }
   if (const json::Value* camera = options.find("camera"))
     job->camera_json = camera->dump();
-  if (family == Family::kWan21Vace) {
+  if (IsVaceFamily(family)) {
     const json::Value* vace = options.find("vace");
     job->vace_json = vace != nullptr ? vace->dump() : "{}";
     if (const auto* mask = attachment("mask")) {
