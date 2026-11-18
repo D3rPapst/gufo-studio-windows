@@ -45,6 +45,7 @@ public:
       case Family::kWan21Uni3C:
         return RunWan21Job(job, callbacks, telemetry, error);
       case Family::kWan21Vace:
+      case Family::kWan22FunVace:
         return RunWan21VaceJob(job, callbacks, telemetry, error);
       case Family::kWan21Talk:
         return RunWan21TalkJob(job, callbacks, telemetry, error);
@@ -88,6 +89,13 @@ void wan21_vace_provider_register(gufo::ext::Registry& registry) {
   registry.AddProvider(generated::kProvider_wan21_vace_14b);
   registry.AddVideoProvider(MakeVideoProvider(
       Family::kWan21Vace, &gufo::models::wan22::Create<Family::kWan21Vace>));
+}
+
+void wan22_fun_vace_provider_register(gufo::ext::Registry& registry) {
+  registry.AddProvider(generated::kProvider_wan22_fun_vace_a14b);
+  registry.AddVideoProvider(
+      MakeVideoProvider(Family::kWan22FunVace,
+                        &gufo::models::wan22::Create<Family::kWan22FunVace>));
 }
 
 void wan21_talk_provider_register(gufo::ext::Registry& registry) {

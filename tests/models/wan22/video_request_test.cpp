@@ -422,6 +422,43 @@ void TestVace(const std::filesystem::path& root) {
         std::string(
             R"({"model":"wan2.1-vace-14b","prompt":"x","seconds":"1","gufo":{"guidance":0.5}})")})
     Rejected(service, bad, "", "invalid VACE request " + bad);
+  // The Wan 2.2 Fun VACE options belong to its own model.
+  Rejected(service, prefix + R"("switch_step":2}}})", "invalid_vace",
+           "a Wan 2.2 expert switch on Wan 2.1 VACE");
+}
+
+// Wan 2.2 Fun VACE A14B: the Wan 2.1 VACE request plus the expert switch
+// (switch_step, boundary, high_guidance), family kWan22FunVace.
+void TestFunVace(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobService service(Options(root, "wan2.2-fun-vace-a14b", &runner));
+  Check(service.ready(), service.initialization_error());
+  Check(service.model_id() == "wan2.2-fun-vace-a14b", "Fun VACE model id");
+  const std::string prefix =
+      R"({"model":"wan2.2-fun-vace-a14b","prompt":"walk","size":"832x480","seconds":"1","gufo":{"guidance":1,"steps":4,"vace":{)";
+  int calls = 0;
+  const wan22::JobRequest job = Accept(
+      service, runner, &calls, wan22::Family::kWan22FunVace,
+      prefix + R"("switch_step":2,"boundary":0.9,"high_guidance":3.5,"sampler":"euler","shift":5}}})");
+  Check(job.frames == 17 && job.steps == 4 && job.guidance == 1.0,
+        "Fun VACE frames, steps and guidance reach the runner");
+  const gufo::json::Value vace = gufo::json::parse(job.vace_json);
+  Check(vace.member_double("switch_step") == 2 &&
+            vace.member_double("boundary") == 0.9 &&
+            vace.member_double("high_guidance") == 3.5 &&
+            vace.member_str("sampler") == "euler",
+        "Fun VACE expert options reach the runner: " + job.vace_json);
+  const wan22::JobRequest plain = Accept(
+      service, runner, &calls, wan22::Family::kWan22FunVace,
+      R"({"model":"wan2.2-fun-vace-a14b","prompt":"walk","seconds":"1"})");
+  Check(plain.guidance == 1.0 && plain.steps == 4 && plain.vace_json == "{}",
+        "Fun VACE defaults: no CFG, 4 steps, switch from the boundary");
+  for (const std::string& bad :
+       {prefix + R"("switch_step":5}}})", prefix + R"("switch_step":1.5}}})",
+        prefix + R"("boundary":1.5}}})", prefix + R"("high_guidance":0.5}}})",
+        std::string(
+            R"({"model":"wan2.2-fun-vace-a14b","prompt":"x","size":"1920x1080","seconds":"1"})")})
+    Rejected(service, bad, "", "invalid Fun VACE request " + bad);
 }
 
 // Wan 2.1 Uni3C: a camera move or a render video reaches the runner; the
@@ -765,6 +802,8 @@ void TestProbe(const std::filesystem::path& root) {
   write(vace / "gufo-vace.json", R"({"_class_name":"GufoWan21Vace"})");
   const std::filesystem::path camera = root / "camera-bundle";
   write(camera / "gufo-camera.json", R"({"_class_name":"GufoWan21Uni3CCamera"})");
+  const std::filesystem::path fun = root / "fun-vace-bundle";
+  write(fun / "gufo-vace22.json", R"({"_class_name":"GufoWan22FunVace"})");
   const auto probed = [](const std::filesystem::path& path) {
     const auto* provider = gufo::ext::ProbeVideoProvider(path.string());
     return provider == nullptr ? std::string() : provider->id;
@@ -773,6 +812,7 @@ void TestProbe(const std::filesystem::path& root) {
   Check(probed(talk) == "wan2.1-infinitetalk-14b", "talk bundle probe");
   Check(probed(vace) == "wan2.1-vace-14b", "VACE bundle probe");
   Check(probed(camera) == "wan2.1-uni3c", "camera bundle probe");
+  Check(probed(fun) == "wan2.2-fun-vace-a14b", "Fun VACE bundle probe");
   Check(probed(root) == "generic-test", "unknown directory: generic provider");
 
   FakeRunner runner;
@@ -800,6 +840,7 @@ int main() {
   std::filesystem::create_directories(base);
   TestWan22(base / "wan22");
   TestVace(base / "vace");
+  TestFunVace(base / "fun-vace");
   TestUni3C(base / "uni3c");
   TestTalk(base / "talk");
   TestPostSteps(base / "post");

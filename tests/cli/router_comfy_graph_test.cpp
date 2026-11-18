@@ -2048,6 +2048,71 @@ void TestVaceKeyframes() {
             std::pair<int, int>{896, 512}));
   }
 
+  // With wan2.2-fun-vace-a14b in the preset the two stages run 1:1 as its
+  // two experts: high noise steps 0..9 (k1, mh), low noise 10..19 (k2, ml).
+  comfy::ModelIds served;
+  served.available = {"wan2.1-vace-14b", "wan2.2-fun-vace-a14b"};
+  const auto plan_with = [&](const std::string& text,
+                             const comfy::ModelIds& models) {
+    comfy::Plan out;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(json::parse(text), models, &out, &error);
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return out;
+  };
+  const comfy::Plan fun = plan_with(kVaceKeyframes, served);
+  assert(fun.tasks.size() == 1 && fun.tasks[0].node_id == "k1");
+  const auto& fun_video = std::get<comfy::VideoTask>(fun.tasks[0].spec);
+  assert(fun_video.family == comfy::VideoFamily::kVace);
+  assert(fun_video.model == "wan2.2-fun-vace-a14b");
+  assert(fun_video.steps == 20 && fun_video.seed == 533302944);
+  assert(fun_video.vace_switch_step && *fun_video.vace_switch_step == 10);
+  assert(fun_video.guidance && *fun_video.guidance == 3.5);
+  assert(!fun_video.vace_high_guidance);
+  assert(fun_video.vace_shift && *fun_video.vace_shift == 8.0);
+  assert(comfy::FrameCount(fun_video.control_runs) == 49);
+  // No "one model" / "runs as Wan 2.1" warnings: the graph runs as built.
+  if (!fun.warnings.empty())
+    std::cerr << "unexpected warning: " << fun.warnings[0] << "\n";
+  assert(fun.warnings.empty());
+  const json::Value fun_body = comfy::VideoRequestBody(fun_video);
+  assert(fun_body.member_str("model") == "wan2.2-fun-vace-a14b");
+  const json::Value* fun_vace = fun_body.find("gufo")->find("vace");
+  assert(fun_vace->find("switch_step")->as_double() == 10);
+  assert(fun_vace->find("high_guidance") == nullptr);
+  // Per-expert cfg (high 3.5, low 1) -> guidance 1 + high_guidance 3.5; a
+  // different low-noise shift warns.
+  const std::string low_cfg = Replace(
+      Replace(kVaceKeyframes,
+              "   \"cfg\": 3.5,\n   \"sampler_name\": \"euler\",\n   "
+              "\"scheduler\": \"simple\",\n   \"positive\": [\n    \"vace\",\n"
+              "    0\n   ],\n   \"negative\": [\n    \"vace\",\n    1\n   ],\n"
+              "   \"model\": [\n    \"sl\",",
+              "   \"cfg\": 1.0,\n   \"sampler_name\": \"euler\",\n   "
+              "\"scheduler\": \"simple\",\n   \"positive\": [\n    \"vace\",\n"
+              "    0\n   ],\n   \"negative\": [\n    \"vace\",\n    1\n   ],\n"
+              "   \"model\": [\n    \"sl\","),
+      "    \"ml\",\n    0\n   ],\n   \"shift\": 8.0",
+      "    \"ml\",\n    0\n   ],\n   \"shift\": 5.0");
+  const comfy::Plan split_cfg = plan_with(low_cfg, served);
+  const auto& split_video =
+      std::get<comfy::VideoTask>(split_cfg.tasks[0].spec);
+  assert(!split_video.guidance);
+  assert(split_video.vace_high_guidance &&
+         *split_video.vace_high_guidance == 3.5);
+  assert(split_cfg.warnings.size() == 1 &&
+         split_cfg.warnings[0].find("shift differs") != std::string::npos);
+  // One checkpoint on both stages stays on Wan 2.1 VACE.
+  const comfy::Plan same = plan_with(
+      Replace(kVaceKeyframes, "wan2.2_fun_vace_low_noise_14B",
+              "wan2.2_fun_vace_high_noise_14B"),
+      served);
+  const auto& same_video = std::get<comfy::VideoTask>(same.tasks[0].spec);
+  assert(same_video.model == "wan2.1-vace-14b" &&
+         !same_video.vace_switch_step);
+
   // Errors: a gap between the stages, a colour out of range.
   assert(ErrorOf(Replace(kVaceKeyframes, "\"start_at_step\": 10,",
                          "\"start_at_step\": 12,"))

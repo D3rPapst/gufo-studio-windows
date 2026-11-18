@@ -112,6 +112,34 @@ int main() {
     // Padded grey frame: 0.
     Expect(Near(in[3], 0.0F) && Near(re[5], 0.0F), "split grey padding");
   }
+
+  // Wan 2.2 Fun VACE expert switch. 4 steps, shift 5: sigmas 1, 0.9375,
+  // 0.8333, 0.625, 0; boundary 0.875 -> high noise steps 0, 1 (as the
+  // Lightning 2 + 2 split in ComfyUI).
+  const std::vector<double> sigmas = wan22::VaceSigmas(4, 5.0);
+  Expect(sigmas.size() == 5, "sigmas size");
+  if (sigmas.size() == 5) {
+    Expect(std::fabs(sigmas[0] - 1.0) < 1e-12, "sigma 0");
+    Expect(std::fabs(sigmas[1] - 0.9375) < 1e-12, "sigma 1");
+    Expect(std::fabs(sigmas[2] - 2.5 / 3.0) < 1e-12, "sigma 2");
+    Expect(std::fabs(sigmas[3] - 0.625) < 1e-12, "sigma 3");
+    Expect(sigmas[4] == 0.0, "sigma end");
+  }
+  Expect(wan22::VaceSwitchStep(sigmas, 0.875, -1) == 2, "switch from boundary");
+  Expect(wan22::VaceSwitchStep(sigmas, 0.875, 3) == 3, "switch as requested");
+  Expect(wan22::VaceSwitchStep(sigmas, 0.875, 0) == 0, "low noise only");
+  Expect(wan22::VaceSwitchStep(sigmas, 0.875, 4) == 4, "high noise only");
+  Expect(wan22::VaceSwitchStep(sigmas, 0.875, 9) == 2, "out of range: boundary");
+  Expect(wan22::VaceSwitchStep(sigmas, 0.0, -1) == 4, "boundary 0: all high");
+  Expect(wan22::VaceSwitchStep(sigmas, 1.0, -1) == 1,
+         "boundary 1: only t = 1000 is high noise");
+  // 20 steps, shift 12 (VideoX-Fun's 50-step default shape): t >= 875.
+  const std::vector<double> long_sigmas = wan22::VaceSigmas(20, 12.0);
+  const int switch_at = wan22::VaceSwitchStep(long_sigmas, 0.875, -1);
+  Expect(switch_at > 0 && switch_at < 20 &&
+             long_sigmas[switch_at - 1] >= 0.875 &&
+             long_sigmas[switch_at] < 0.875,
+         "switch at the boundary");
   if (failures == 0)
     std::cout << "wan22_vace_context_test passed\n";
   return failures == 0 ? 0 : 1;

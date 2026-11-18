@@ -812,17 +812,42 @@ bool Transformer21::Impl::LoadLora(const std::string& base, std::size_t rows,
   const TensorLocation* d = Find("lora:" + base + ".lora_down.weight");
   if (u == nullptr && d == nullptr)
     return true;
+  const auto half = [](const TensorLocation* t) {
+    return t->dtype == DType::kBF16 || t->dtype == DType::kF16;
+  };
   if (u == nullptr || d == nullptr || u->shape.size() != 2 ||
       d->shape.size() != 2 || u->shape[0] != rows || d->shape[1] != columns ||
-      u->shape[1] != d->shape[0] || u->dtype != DType::kBF16 ||
-      d->dtype != DType::kBF16) {
+      u->shape[1] != d->shape[0] || !half(u) || !half(d)) {
     SetError(error, "unsupported LoRA tensors for " + base);
     return false;
   }
   *rank = static_cast<int>(u->shape[1]);
-  weight_bytes += u->bytes + d->bytes;
-  return up.Allocate(u->bytes, error) && down.Allocate(d->bytes, error) &&
-         UploadRaw(*u, up.raw(), error) && UploadRaw(*d, down.raw(), error);
+  // Kohya-style LoRAs (Wan 2.2 Lightning: F16 with "<base>.alpha") scale the
+  // product by alpha / rank; folded into `up` here, converted to BF16.
+  const TensorLocation* alpha = Find("lora:" + base + ".alpha");
+  if (u->dtype == DType::kBF16 && d->dtype == DType::kBF16 &&
+      alpha == nullptr) {
+    weight_bytes += u->bytes + d->bytes;
+    return up.Allocate(u->bytes, error) && down.Allocate(d->bytes, error) &&
+           UploadRaw(*u, up.raw(), error) && UploadRaw(*d, down.raw(), error);
+  }
+  float scale = 1.0F;
+  if (alpha != nullptr) {
+    std::vector<float> value;
+    if (!ReadHost("lora:" + base + ".alpha", 1, &value, error))
+      return false;
+    scale = value[0] / static_cast<float>(*rank);
+  }
+  std::vector<float> host_up, host_down;
+  if (!ReadHost("lora:" + base + ".lora_up.weight", u->count, &host_up,
+                error) ||
+      !ReadHost("lora:" + base + ".lora_down.weight", d->count, &host_down,
+                error))
+    return false;
+  if (scale != 1.0F)
+    for (float& v : host_up)
+      v *= scale;
+  return UploadBf16(up, host_up, error) && UploadBf16(down, host_down, error);
 }
 
 // row-major C[rows, columns] += strength * up[rows, r] . down[r, columns]:

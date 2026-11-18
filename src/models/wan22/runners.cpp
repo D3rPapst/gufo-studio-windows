@@ -301,9 +301,11 @@ bool RunWan21Job(const JobRequest& request, const JobCallbacks& callbacks,
 
 bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
                      ext::VideoTelemetry* telemetry, std::string* error) {
+  const bool fun22 = request.family == Family::kWan22FunVace;
   json::Value manifest;
   json::Value options = json::Value::object();
-  if (!ReadManifest(request, "gufo-vace.json", &manifest, error))
+  if (!ReadManifest(request, fun22 ? "gufo-vace22.json" : "gufo-vace.json",
+                    &manifest, error))
     return false;
   try {
     if (!request.vace_json.empty())
@@ -315,14 +317,43 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
   Vace21Request job;
   job.vae_root = Part(request, manifest, "vae");
   job.t5_root = Part(request, manifest, "t5");
-  job.dit_file = Part(request, manifest, "dit");
-  job.vace_file = Part(request, manifest, "vace");
-  job.lora_file = Part(request, manifest, "lora");
-  job.lora_strength =
-      static_cast<float>(manifest.member_double("lora_strength", 1.0));
+  if (fun22) {
+    // Two experts: the low-noise one in the single-model fields.
+    job.dit_file = Part(request, manifest, "dit_low");
+    job.vace_file = Part(request, manifest, "vace_low");
+    job.lora_file = Part(request, manifest, "lora_low");
+    job.lora_strength =
+        static_cast<float>(manifest.member_double("lora_low_strength", 1.0));
+    job.high_dit_file = Part(request, manifest, "dit_high");
+    job.high_vace_file = Part(request, manifest, "vace_high");
+    job.high_lora_file = Part(request, manifest, "lora_high");
+    job.high_lora_strength =
+        static_cast<float>(manifest.member_double("lora_high_strength", 1.0));
+    job.boundary =
+        options.member_double("boundary", manifest.member_double("boundary",
+                                                                 0.875));
+    job.switch_step =
+        static_cast<int>(options.member_double("switch_step", -1.0));
+    job.high_guidance =
+        static_cast<float>(options.member_double("high_guidance", 0.0));
+    if (job.dit_file.empty() || job.vace_file.empty() ||
+        job.high_dit_file.empty() || job.high_vace_file.empty()) {
+      SetError(error, "gufo-vace22.json needs dit_high, vace_high, dit_low "
+                      "and vace_low");
+      return false;
+    }
+  } else {
+    job.dit_file = Part(request, manifest, "dit");
+    job.vace_file = Part(request, manifest, "vace");
+    job.lora_file = Part(request, manifest, "lora");
+    job.lora_strength =
+        static_cast<float>(manifest.member_double("lora_strength", 1.0));
+  }
   if (const json::Value* lora = options.find("lora");
-      lora != nullptr && lora->is_bool() && !lora->as_bool())
+      lora != nullptr && lora->is_bool() && !lora->as_bool()) {
     job.lora_file.clear();
+    job.high_lora_file.clear();
+  }
   job.shift = static_cast<float>(
       options.member_double("shift", manifest.member_double("shift", 5.0)));
   job.sampler =
@@ -418,7 +449,7 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
     return false;
   Report(callbacks, "media", 0, 1);
   const auto media_start = Clock::now();
-  if (!WriteMp4(request.output_path, video, Fps(Family::kWan21Vace), error))
+  if (!WriteMp4(request.output_path, video, Fps(request.family), error))
     return false;
   Report(callbacks, "media", 1, 1);
   if (telemetry != nullptr) {
@@ -427,6 +458,10 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
       denoise += ms;
     json::Value extra = json::Value::object();
     extra["keyframe_ms"] = stages.condition_ms;
+    if (fun22) {
+      extra["switch_step"] = stages.switch_step;
+      extra["dit_load_ms"] = stages.dit_load_ms;
+    }
     extra["preview_ms"] = stages.preview_ms;
     extra["previews"] = stages.previews;
     telemetry->prompt_ms = stages.text_ms;

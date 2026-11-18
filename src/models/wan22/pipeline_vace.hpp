@@ -29,6 +29,8 @@ namespace gufo::models::wan22 {
 ///    LoRA) or "euler"; guidance > 1 runs classifier-free guidance with the
 ///    negative prompt (two transformer passes a step);
 ///  - Wan 2.1 VAE decode.
+/// Wan 2.2 Fun VACE A14B runs the same way (same VAE, umT5, VACE context
+/// and block layout) with two experts, see `high_dit_file`.
 struct Vace21Request {
   std::filesystem::path vae_root;  // Diffusers Wan 2.1 root with vae/
   std::filesystem::path t5_root;   // Diffusers root with tokenizer/ and
@@ -58,11 +60,25 @@ struct Vace21Request {
   int mask_frames{0};
   /// Reference images RGB8 [height, width, 3] at the video size.
   std::vector<std::span<const std::uint8_t>> references;
+  /// Wan 2.2 Fun VACE A14B: the high-noise expert (Wan 2.2 T2V A14B high +
+  /// its Fun VACE module, optional LoRA). Empty `high_dit_file`: one model
+  /// (Wan 2.1 VACE). With it, dit_file / vace_file / lora_file are the
+  /// low-noise expert. The high-noise expert runs steps [0, switch), the
+  /// low-noise one [switch, steps) (see VaceSwitchStep); only one is on the
+  /// device at a time (each ~18 GB with its VACE module).
+  std::filesystem::path high_dit_file;
+  std::filesystem::path high_vace_file;
+  std::filesystem::path high_lora_file;
+  float high_lora_strength{1.0F};
+  float high_guidance{0.0F};  // 0: `guidance`
+  double boundary{0.875};     // Wan 2.2 T2V A14B
+  int switch_step{-1};        // -1: from boundary
 };
 
 struct Vace21Telemetry {
   double text_ms{0}, condition_ms{0}, dit_load_ms{0}, context_ms{0};
   double decode_ms{0}, total_ms{0};
+  int switch_step{0};  // Wan 2.2: first low-noise step
   std::vector<double> step_ms;
   double preview_ms{0};
   int previews{0};

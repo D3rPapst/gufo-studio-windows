@@ -49,6 +49,19 @@ void SplitVaceControl(std::span<const std::uint8_t> video, int video_frames,
                       int width, std::vector<float>* inactive,
                       std::vector<float>* reactive);
 
+/// The flow sigmas of a VACE run: steps + 1 values, t = 1 - i / steps
+/// shifted (sigma = shift * t / (1 + (shift - 1) * t)), the last one 0.
+[[nodiscard]] std::vector<double> VaceSigmas(int steps, double shift);
+
+/// Wan 2.2 A14B (two experts): the first step the low-noise expert runs.
+/// `requested` in 0..steps is taken as given (ComfyUI's KSamplerAdvanced
+/// end_at_step of the high-noise sampler); otherwise the first step whose
+/// timestep 1000 * sigma is below boundary * 1000 (Wan 2.2 / VideoX-Fun:
+/// the high-noise expert runs while t >= boundary * num_train_timesteps).
+/// `sigmas` as VaceSigmas (steps + 1 values).
+[[nodiscard]] int VaceSwitchStep(const std::vector<double>& sigmas,
+                                 double boundary, int requested);
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_VACE_CONTEXT_HPP_
