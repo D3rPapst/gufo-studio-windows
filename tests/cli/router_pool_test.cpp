@@ -496,6 +496,114 @@ void TestProbeActivity() {
   CHECK(!hub.View(url, "big").served);
 }
 
+/// 2.2.7 (Regie, .56, 18.11.): qwen3.8-27b with `sessions = 2` ran two
+/// requests strictly one after the other (36.6 s together, 17.4/19.3 s
+/// alone): the pool let one request per model and machine through. A text
+/// model now takes up to its sessions; everything else stays at one.
+void TestTextSessions() {
+  using gufo::router::PoolSessionFree;
+  using gufo::router::PoolSessionsOf;
+  using gufo::router::RemoteObservation;
+  using gufo::router::RemotePoolSide;
+  gufo::router::PresetModel text = PoolTwin();
+  CHECK(PoolSessionsOf(text) == 1);  // no key: the worker's default 1
+  text.argv = {"--model", "/m/big.gguf", "--sessions", "2"};
+  CHECK(PoolSessionsOf(text) == 2);
+  text.argv = {"--sessions", "0"};
+  CHECK(PoolSessionsOf(text) == 1);
+  text.argv = {"--sessions", "x2"};
+  CHECK(PoolSessionsOf(text) == 1);
+  text.argv = {"--sessions", "999"};
+  CHECK(PoolSessionsOf(text) == gufo::router::kPoolSessionsMax);
+  // External `args = serve llm` counts as text, other modalities never.
+  gufo::router::PresetModel external;
+  external.modality = "external";
+  external.argv = {"serve", "llm", "--sessions", "3"};
+  CHECK(PoolSessionsOf(external) == 3);
+  external.argv = {"serve", "image", "--sessions", "3"};
+  CHECK(PoolSessionsOf(external) == 1);
+  gufo::router::PresetModel image;
+  image.modality = "image";
+  image.argv = {"--sessions", "4"};
+  CHECK(PoolSessionsOf(image) == 1);
+
+  // Local: one of two sessions taken -> still free; two -> full.
+  CHECK(PoolSessionFree(0, 1) && !PoolSessionFree(1, 1));
+  CHECK(PoolSessionFree(1, 2) && !PoolSessionFree(2, 2));
+  CHECK(PoolSessionFree(0, 0) && !PoolSessionFree(1, 0));  // clamps to 1
+  // The measured case: X-Gufo-Pool: local (partner out), one runs here.
+  PoolSide here = Warm(PoolSessionFree(1, 2));
+  here.idle = false;
+  CHECK(Choose(here, Unreachable()) == PoolChoice::kLocal);
+  CHECK(Choose(Warm(PoolSessionFree(2, 2)), Unreachable()) ==
+        PoolChoice::kWait);
+  // GPU exclusivity stays: an image model busy here keeps the second text
+  // request off this machine while the partner can take it.
+  PoolSide gpu = here;
+  gpu.gpu_busy = true;
+  CHECK(Choose(gpu, Warm(true)) == PoolChoice::kRemote);
+
+  // Partner: reports inflight + sessions.
+  const std::vector<gufo::router::PresetModel> presets = {PoolTwin()};
+  gufo::router::RemoteHub hub(presets);
+  const auto& url = presets[0].remote->url;
+  RemoteObservation seen;
+  seen.reachable = true;
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"waiting":0,"gpu_busy":false,)"
+                         R"("others_busy":false,"inflight":1,"sessions":2})");
+  CHECK(seen.view.activity.inflight == 1 && seen.view.activity.sessions == 2);
+  PoolSide there = RemotePoolSide(seen);
+  CHECK(there.available && there.free && !there.idle);
+  CHECK(Choose(Warm(false), there) == PoolChoice::kRemote);
+  // Our open relays and its count overlap: the larger one counts.
+  seen.ours = 1;
+  CHECK(RemotePoolSide(seen).free);
+  seen.ours = 2;
+  CHECK(!RemotePoolSide(seen).free);
+  seen.ours = 0;
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"gpu_busy":false,)"
+                         R"("others_busy":false,"inflight":2,"sessions":2})");
+  CHECK(!RemotePoolSide(seen).free);
+  // A stale probe (our relay ended after it): its count is not trusted,
+  // as before with "busy".
+  seen.stale = true;
+  CHECK(RemotePoolSide(seen).free);
+  seen.stale = false;
+  // One session (or a partner older than the fields): "busy" = occupied.
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"gpu_busy":false,)"
+                         R"("others_busy":false,"inflight":1,"sessions":1})");
+  CHECK(!RemotePoolSide(seen).free);
+  seen.view = ProbedView(
+      hub, url, R"({"busy":true,"gpu_busy":false,"others_busy":false})");
+  CHECK(seen.view.activity.inflight == -1 && seen.view.activity.sessions == 1);
+  CHECK(!RemotePoolSide(seen).free);
+  seen.view = ProbedView(
+      hub, url, R"({"busy":false,"gpu_busy":false,"others_busy":false})");
+  CHECK(RemotePoolSide(seen).free && RemotePoolSide(seen).idle);
+  seen.ours = 1;
+  CHECK(!RemotePoolSide(seen).free);  // one relay at a time, as before
+  seen.ours = 0;
+  // Busy without a count from a 2.2.7 partner (a claim): at least one.
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"gpu_busy":false,)"
+                         R"("others_busy":false,"inflight":0,"sessions":2})");
+  CHECK(RemotePoolSide(seen).free && !RemotePoolSide(seen).idle);
+  // Nonsense sessions fall back to one.
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"gpu_busy":false,)"
+                         R"("others_busy":false,"inflight":1,"sessions":0})");
+  CHECK(seen.view.activity.sessions == 1 && !RemotePoolSide(seen).free);
+  // GPU work on the partner still keeps text off it while this one can.
+  seen.view = ProbedView(hub, url,
+                         R"({"busy":true,"gpu_busy":true,)"
+                         R"("others_busy":true,"inflight":1,"sessions":2})");
+  CHECK(Choose(Warm(true), RemotePoolSide(seen)) == PoolChoice::kLocal);
+  CHECK(Choose(Warm(false), RemotePoolSide(seen)) == PoolChoice::kWait);
+}
+
 void TestGpuSlotIdle() {
   gufo::router::GpuSlots slots;
   CHECK(slots.Idle(""));
@@ -520,6 +628,7 @@ void TestRegistryCounts() {
   registry.RequestStarted("big");
   registry.RequestStarted("big", /*remote=*/true);
   CHECK(registry.LocalRequests("big") == 1);
+  CHECK(registry.LocalWork("big") == 1);  // relays are not local work
   CHECK(registry.RemoteRequests("big") == 1);
   CHECK(registry.AnyBusy());
   registry.RequestFinished("big", /*remote=*/true);
@@ -789,6 +898,7 @@ int main() {
   TestDrainingPartner();
   TestNoSelfBlockadeWithPartnerOut();
   TestCpuModel();
+  TestTextSessions();
   TestGpuSlotIdle();
   TestRegistryCounts();
   TestFallback();
