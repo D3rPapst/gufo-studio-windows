@@ -1623,6 +1623,9 @@ public:
     std::string last;
   };
   std::map<std::string, PoolEntry> pool_;
+  /// ComfyUI adapter requests (X-Gufo-Origin: comfy) that wait in the pool
+  /// for a machine now (state mutex; /router/status comfy_parallel, 2.2.6).
+  int comfy_pool_waiting_{0};
 
   /// Whether this request for `preset` is decided by the pool: a POST (new
   /// work) to a model placed in the pool. Everything else is served like
@@ -1977,8 +1980,13 @@ public:
     const std::string job_id =
         forwarded ? std::string() : req.header(router::jobs::kJobHeader);
     const auto began = std::chrono::steady_clock::now();
+    // 2.2.6: the ComfyUI adapter's requests wait without the queue timeout
+    // (pool.hpp, ComfyOriginWait); its prompt's cancel flag ends the wait.
+    const bool comfy_wait =
+        router::ComfyOriginWait(req.header(router::kOriginHeader));
     const auto deadline =
-        began + std::chrono::seconds(preset.remote->queue_timeout_seconds);
+        began + router::PoolQueueTimeout(preset.remote->queue_timeout_seconds,
+                                         comfy_wait);
     bool remote_failed = false;
     bool waiting = false;
     // How long this request has let a higher priority go first (2.0.3):
@@ -1989,6 +1997,8 @@ public:
       if (waiting) {
         --pool_[model_id].waiting;
         --pool_[model_id].waiting_by_priority[priority];
+        if (comfy_wait)
+          --comfy_pool_waiting_;
         waiting = false;
       }
     };
@@ -2241,6 +2251,8 @@ public:
         waiting = true;
         ++pool_[model_id].waiting;
         ++pool_[model_id].waiting_by_priority[priority];
+        if (comfy_wait)
+          ++comfy_pool_waiting_;
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "wait");
       }
@@ -2719,8 +2731,11 @@ public:
                                                const router::RemoteSpec& spec,
                                                RemoteHold& hold) {
     const auto began = std::chrono::steady_clock::now();
-    const auto deadline =
-        began + std::chrono::seconds(spec.queue_timeout_seconds);
+    // 2.2.6: no queue timeout for the ComfyUI adapter's requests.
+    const std::chrono::seconds limit = router::PoolQueueTimeout(
+        spec.queue_timeout_seconds,
+        router::ComfyOriginWait(req.header(router::kOriginHeader)));
+    const auto deadline = began + limit;
     const auto busy = [&](const std::string& what) {
       Logger::Warn("router", "event=remote_busy model=" + model_id +
                                  " waited_ms=" +
@@ -2741,9 +2756,7 @@ public:
     if (!spec.gpu_slot.empty()) {
       auto slot = gpu_slots.Acquire(
           spec.gpu_slot, req.method + " " + req.path + " " + model_id,
-          std::chrono::milliseconds(std::chrono::seconds(
-              spec.queue_timeout_seconds)),
-          req.is_cancelled);
+          std::chrono::milliseconds(limit), req.is_cancelled);
       if (slot == nullptr) {
         return busy("gpu slot '" + spec.gpu_slot + "' stayed taken");
       }
@@ -3786,6 +3799,26 @@ public:
     return partner;
   }
 
+  /// 2.2.6: whether a ComfyUI prompt beyond the adapter's own number may
+  /// start now with this first model: a pool model needs a machine the
+  /// pool decision would pick (pool.hpp PoolCanStartSoon, the partner as
+  /// its last probe saw it) and no other request of it waiting there;
+  /// anything else (local, remote, unknown) needs no free machine here.
+  bool ComfyModelFree(const std::string& model) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    const std::string id = registry.CanonicalId(model);
+    const router::PresetModel* preset = id.empty() ? nullptr : registry.Find(id);
+    if (preset == nullptr || !preset->remote.has_value() ||
+        registry.PlacementOf(id) != router::Placement::kPool)
+      return true;
+    if (const auto it = pool_.find(id);
+        it != pool_.end() && it->second.waiting > 0)
+      return false;
+    return router::PoolCanStartSoon(PoolInputLocked(
+        *preset, /*forwarded=*/false, /*from_comfy=*/true,
+        /*remote_failed=*/false, std::chrono::milliseconds(0)));
+  }
+
   static HttpResponse JsonOk(const json::Value& body) {
     return HttpResponse{.status = 200,
                         .reason = "OK",
@@ -3947,6 +3980,12 @@ public:
       parallel["own"] = static_cast<long long>(comfy_parallel_own);
       parallel["partner"] = static_cast<long long>(comfy->PartnerShare());
       parallel["limit"] = static_cast<long long>(comfy->ParallelLimit());
+      {
+        // Adapter requests that wait in the pool for a free machine now.
+        const std::lock_guard<std::mutex> lock(mutex);
+        parallel["waiting_in_pool"] =
+            static_cast<long long>(comfy_pool_waiting_);
+      }
       body["comfy_parallel"] = std::move(parallel);
     }
     return HttpResponse{.status = 200,
@@ -5209,6 +5248,10 @@ int RunRouter(std::span<const char* const> args) {
     // 2.2.6: plus the pool partner's free share (its capabilities). The
     // router's partner is set below; without one this answers nullopt.
     comfy_options.partner_comfy = [raw] { return raw->PartnerComfy(); };
+    // An extra prompt starts only when its first model finds a machine.
+    comfy_options.model_free = [raw](const std::string& model) {
+      return raw->ComfyModelFree(model);
+    };
     try {
       state->comfy =
           std::make_unique<router::comfy::Adapter>(std::move(comfy_options));

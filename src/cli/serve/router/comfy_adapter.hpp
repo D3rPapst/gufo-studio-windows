@@ -94,6 +94,13 @@ struct AdapterOptions {
   /// Optional (unset = `parallel` alone).
   std::function<std::optional<PartnerComfy>()> partner_comfy;
   std::chrono::milliseconds partner_poll{std::chrono::seconds(5)};
+  /// 2.2.6: whether a prompt beyond `parallel` may start now: the router's
+  /// answer whether its first task's model finds a free machine (pool),
+  /// so the extra prompt does not just wait in the pool. Asked outside the
+  /// adapter's mutex, about every `model_free_poll` while the next prompt
+  /// is held. Optional (unset = extra prompts start at once).
+  std::function<bool(const std::string& model)> model_free;
+  std::chrono::milliseconds model_free_poll{std::chrono::seconds(1)};
 };
 
 /// Seconds a client waits before it sends a prompt again after memory_busy

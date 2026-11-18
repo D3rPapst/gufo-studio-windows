@@ -66,6 +66,8 @@ struct Adapter::Job {
   std::vector<std::string> outputs;
   Plan plan;
   std::atomic<bool> cancel{false};
+  /// Held back as an extra prompt (2.2.6) and logged once (mutex_).
+  bool held_logged{false};
   /// Warnings found while running (worker thread only).
   std::vector<std::string> warnings;
   /// Live preview ids (2.1, TaskPreviewId): extra_data.gufo_preview_id or
@@ -1662,6 +1664,36 @@ void Adapter::WorkerMain() {
       });
       if (stopping_)
         return;
+      // A prompt beyond the own number (2.2.6) starts only when its first
+      // model finds a free machine; until then it stays first in line
+      // here instead of waiting in the pool.
+      const std::size_t own = std::max<std::size_t>(1, options_.parallel);
+      if (running_.size() >= own && options_.model_free) {
+        const std::shared_ptr<Job> next = pending_.front();
+        const std::string model =
+            next->plan.tasks.empty() ? std::string()
+                                     : TaskModel(next->plan.tasks.front());
+        lock.unlock();
+        const bool free = model.empty() || options_.model_free(model);
+        lock.lock();
+        if (stopping_)
+          return;
+        if (!free) {
+          if (!next->held_logged) {
+            next->held_logged = true;
+            Logger::Info("comfy", "event=comfy_parallel_hold prompt_id=" +
+                                      next->id + " model=" + model +
+                                      " running=" +
+                                      std::to_string(running_.size()));
+          }
+          wake_.wait_for(lock, options_.model_free_poll);
+          continue;
+        }
+        // The queue may have changed while the lock was free.
+        if (pending_.empty() || pending_.front() != next ||
+            running_.size() >= limit_.load())
+          continue;
+      }
       job = pending_.front();
       pending_.pop_front();
       running_.push_back(job);

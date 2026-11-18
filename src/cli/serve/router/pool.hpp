@@ -291,6 +291,36 @@ enum class PoolRemoteAnswer {
          answer == PoolRemoteAnswer::kRetryUnreachable;
 }
 
+/// 2.2.6: a request of the ComfyUI adapter (X-Gufo-Origin: comfy, also when
+/// the partner relayed it) waits for a free machine without the remote
+/// section's queue-timeout-seconds: with --comfy-parallel counted per
+/// machine, a prompt may wait behind 7-27 min film clips on both machines,
+/// and a 503 after 900 s would end the film. Only the client leaving (the
+/// prompt's /interrupt or removal sets its cancel flag) or the router
+/// stopping end such a wait; kComfyWaitCap only keeps the clock finite.
+inline constexpr std::chrono::hours kComfyWaitCap{24 * 30};
+
+[[nodiscard]] inline bool ComfyOriginWait(std::string_view origin) {
+  return origin == "comfy";
+}
+
+/// How long a pool or remote-GPU wait may last: queue-timeout-seconds, or
+/// kComfyWaitCap for a ComfyUI adapter request.
+[[nodiscard]] inline std::chrono::seconds PoolQueueTimeout(
+    int queue_timeout_seconds, bool comfy_origin) {
+  return comfy_origin ? std::chrono::seconds(kComfyWaitCap)
+                      : std::chrono::seconds(queue_timeout_seconds);
+}
+
+/// 2.2.6: whether a new request of the model would find a machine (now or
+/// after the hysteresis wait) instead of waiting "both busy": the ComfyUI
+/// adapter starts a prompt beyond its own number only then.
+[[nodiscard]] inline bool PoolCanStartSoon(PoolInput in) {
+  in.forwarded = false;
+  in.waited = std::max<std::chrono::milliseconds>(in.waited, kPoolSpillAfter);
+  return ChoosePool(in).choice != PoolChoice::kWait;
+}
+
 /// pool-wait-seconds default: how long a pool request waits on the partner
 /// before it falls back to this machine.
 inline constexpr int kPoolWaitSecondsDefault = 60;

@@ -848,17 +848,31 @@ adds worker threads; when it sinks (partner gone) running prompts go on
 and spare workers start nothing until the running count is below the
 limit. Each change logs `event=comfy_parallel limit=<n> own=<a>
 partner=<b> partner_parallel=<p> partner_queue=<q>`; `/router/status`
-shows `"comfy_parallel": {"own", "partner", "limit"}`.
+shows `"comfy_parallel": {"own", "partner", "limit", "waiting_in_pool"}`
+(`waiting_in_pool`: adapter requests waiting in the pool for a machine now).
 The prompts beyond the own number are not sent anywhere themselves: their
 requests go through the pool like any other (`X-Gufo-Origin: comfy`), so
 they compute wherever the pool decision puts them. The pool runs one
 request per model per machine (`kPoolRemoteCapacity`) and keeps GPU work
 off a machine that has other GPU work, so with four image/video prompts
-two compute (one per machine) and two wait **in the pool** (`both busy`,
-not in the adapter queue) and take whichever machine frees first. Such a
-wait counts against the remote section's `queue-timeout-seconds`
-(default 900 s, then 503 `remote_busy`, the task fails): with long video
-prompts on both machines set it higher or keep `--comfy-parallel 1`.
+of one model only two compute at once. Two rules keep the others from
+failing:
+- *Hold before start:* a prompt beyond the own number starts only when
+  the router says its first task's model finds a machine
+  (`AdapterOptions::model_free` -> `ComfyModelFree`: a pool model with no
+  other request of it waiting and `PoolCanStartSoon`, i.e. the pool
+  decision with the hysteresis wait passed would not say "both busy";
+  local, remote or unknown models start at once). Until then it stays
+  first in the adapter queue (checked every second, logged once as
+  `event=comfy_parallel_hold`); first in, first out is kept.
+- *No queue timeout for the adapter:* a request with `X-Gufo-Origin:
+  comfy` (here or relayed to the partner) that still waits in the pool or
+  for a remote GPU slot / busy check does not end after
+  `queue-timeout-seconds` (pool.hpp `ComfyOriginWait`, `PoolQueueTimeout`;
+  cap 30 days). Only the prompt's cancel flag (`/interrupt`, adapter
+  stop), the router stopping or a client that left end the wait. Film
+  clips of 7-27 min on both machines no longer end a waiting prompt with
+  503 `pool_busy` / `remote_busy`.
 `/v1/jobs` needs no such change: with the shared queue (1.4.20) a free
 runner of the partner pulls this router's queued and pool-waiting jobs,
 so `--jobs-parallel 2` on both machines already runs up to four jobs.

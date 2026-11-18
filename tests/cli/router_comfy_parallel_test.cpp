@@ -2,15 +2,30 @@
 // --comfy-parallel plus the free share of the reachable pool partner
 // (comfy_parallel.hpp). Pure code, no server.
 
+#include <chrono>
 #include <cstddef>
 #include <iostream>
 #include <optional>
 
 #include "src/cli/serve/router/comfy_parallel.hpp"
+#include "src/cli/serve/router/pool.hpp"
 
 namespace comfy = gufo::router::comfy;
+namespace router = gufo::router;
 
 namespace {
+
+/// An available machine with the model loaded and nothing in flight.
+router::PoolSide Free() {
+  router::PoolSide side;
+  side.available = true;
+  side.warm = true;
+  side.free = true;
+  side.idle = true;
+  side.empty = true;
+  side.sticky = true;
+  return side;
+}
 
 int failures = 0;
 
@@ -57,6 +72,50 @@ int main() {
   CHECK(comfy::PartnerComfyShare(Partner(2, 7)) == 0);
   // A partner that says 0 adds nothing.
   CHECK(comfy::ComfyParallelLimit(2, Partner(0)) == 2);
+
+  // The adapter's requests (X-Gufo-Origin: comfy) wait without the queue
+  // timeout: 7-27 min film clips on both machines must not end in 503.
+  CHECK(router::ComfyOriginWait("comfy"));
+  CHECK(!router::ComfyOriginWait(""));
+  CHECK(!router::ComfyOriginWait("pages"));
+  CHECK(router::PoolQueueTimeout(900, false) == std::chrono::seconds(900));
+  CHECK(router::PoolQueueTimeout(900, true) >= std::chrono::hours(24));
+  CHECK(router::PoolQueueTimeout(0, true) > std::chrono::seconds(27 * 60));
+
+  // An extra prompt starts only when its model finds a machine.
+  {
+    router::PoolInput in;
+    in.local = Free();
+    in.remote = Free();
+    CHECK(router::PoolCanStartSoon(in));
+    in.local.free = false;  // a request of it runs here
+    in.local.idle = false;
+    CHECK(router::PoolCanStartSoon(in));  // the partner is free
+    in.remote.free = false;
+    in.remote.idle = false;
+    CHECK(!router::PoolCanStartSoon(in));  // both busy: hold it back
+    in.remote = router::PoolSide{};        // partner gone
+    CHECK(!router::PoolCanStartSoon(in));
+    in.local = Free();
+    CHECK(router::PoolCanStartSoon(in));
+    // GPU work on both machines (another image/video model busy there).
+    in.local.gpu_busy = true;
+    in.remote = Free();
+    in.remote.gpu_busy = true;
+    CHECK(!router::PoolCanStartSoon(in));
+    // Cold on the partner while this machine had the model (hysteresis):
+    // after kPoolSpillAfter it may load there, so it counts as free.
+    in = router::PoolInput{};
+    in.local = Free();
+    in.local.free = false;
+    in.local.idle = false;
+    in.local.sticky = true;
+    in.remote = Free();
+    in.remote.warm = false;
+    in.remote.sticky = false;
+    CHECK(router::ChoosePool(in).choice == router::PoolChoice::kWait);
+    CHECK(router::PoolCanStartSoon(in));
+  }
 
   if (failures != 0) {
     std::cerr << failures << " check(s) failed\n";
