@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "name": "qwen3_omni",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [
+    "deepseek_v4_flash",
+    "qwen3_asr"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_qwen3_omni_model": {
+      "requires": []
+    },
+    "gufo_qwen3_omni": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/",
+      "reference/"
+    ]
+  },
+  "tests": [
+    {
+      "target": "qwen3_omni_model_test",
+      "ctest": "qwen3_omni_model_test",
+      "check_pr": false,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "omni"
+  ]
+}

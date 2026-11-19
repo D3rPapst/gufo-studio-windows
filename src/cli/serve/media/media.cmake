@@ -24,7 +24,7 @@ add_subdirectory(src/models/yue2)
 # Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).
 # (src/models/vision_dsg is a library extension.)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
-add_subdirectory(src/models/qwen3_omni)
+# (src/models/qwen3_omni is a library extension.)
 
 add_library(gufo_media STATIC
   src/cli/serve/media/media_serve.cpp
