@@ -1,6 +1,8 @@
 // Unit tests for the MiniMax H3 nodes of the ComfyUI adapter beyond the
 // FilmStudio graphs in router_comfy_graph_test: /object_info signatures,
-// EmptyMiniMaxH3LatentAV, MiniMaxH3SigmaShift and the audio noise mask.
+// EmptyMiniMaxH3LatentAV, MiniMaxH3SigmaShift, the audio noise mask,
+// MiniMaxH3FunControlNetApply (gufo.control) and MiniMaxH3ReferenceToVideo
+// (gufo.references).
 // Graphs are built from the node signatures of ComfyUI's
 // comfy_extras/nodes_minimax_h3.py.
 
@@ -200,6 +202,199 @@ void TestAudioMask() {
          soft.warnings[0].find("below 0.5") != std::string::npos);
 }
 
+/// kH3Empty with a MiniMaxH3FunControlNetApply ("50") between the LoRA and
+/// the sampler; the control video is LoadVideo -> GetVideoComponents.
+std::string WithControl(const std::string& control_inputs) {
+  return Replace(
+      WithNodes(kH3Empty,
+                std::string(R"( "51": {"class_type": "ModelPatchLoader", "inputs": {"name": "MiniMax-H3-Fun-Controlnet-Union-2.0.safetensors"}},
+ "52": {"class_type": "LoadVideo", "inputs": {"file": "pose.mp4"}},
+ "53": {"class_type": "GetVideoComponents", "inputs": {"video": ["52", 0]}},
+ "50": {"class_type": "MiniMaxH3FunControlNetApply", "inputs": {"model": ["2", 0], "model_patch": ["51", 0], "vae": ["4", 0], )") +
+                    control_inputs + "}},\n"),
+      R"("model": ["2", 0], "positive")", R"("model": ["50", 0], "positive")");
+}
+
+void TestFunControlNet() {
+  const std::string pose = WithControl(
+      R"("strength": 0.8, "start_percent": 0.0, "end_percent": 0.9, "control_video": ["53", 0])");
+  const comfy::Plan plan = PlanOf(pose);
+  assert(plan.tasks.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kH3);
+  assert(video.h3_control && !video.h3_references);
+  assert(video.h3_control_strength == 0.8);
+  assert(video.h3_control_start == 0.0 && video.h3_control_end == 0.9);
+  assert((video.control_video == comfy::FileRef{"pose.mp4", "input"}));
+  assert(!video.h3_control_mask && !video.h3_control_source);
+  // The turbo LoRA stays on, with a warning (the ControlNet was trained
+  // without it).
+  assert(video.lora == "turbo");
+  assert(plan.warnings.size() == 1 &&
+         plan.warnings[0].find("turbo") != std::string::npos);
+  const json::Value body = comfy::VideoRequestBody(video);
+  const json::Value* control = body.find("gufo")->find("control");
+  assert(control != nullptr);
+  assert(control->find("strength")->as_double() == 0.8);
+  assert(control->find("start_percent")->as_double() == 0.0);
+  assert(control->find("end_percent")->as_double() == 0.9);
+  // The executor attaches the videos; the body has none yet.
+  assert(control->find("video") == nullptr);
+  // The other H3 options stay out.
+  assert(body.find("gufo")->find("references") == nullptr);
+  assert(body.find("gufo")->find("sigma_shift") == nullptr);
+  assert(body.find("gufo")->find("audio_mask") == nullptr);
+  // Without the LoRA: no warning.
+  const comfy::Plan plain_model = PlanOf(Replace(
+      pose, R"("model": ["2", 0], "model_patch")",
+      R"("model": ["1", 0], "model_patch")"));
+  assert(plain_model.warnings.empty());
+  assert(std::get<comfy::VideoTask>(plain_model.tasks[0].spec).lora.empty());
+  // Strength 0, or neither control video nor mask: ComfyUI returns the
+  // model unchanged, so does gufo.
+  const comfy::VideoTask off = std::get<comfy::VideoTask>(
+      PlanOf(Replace(pose, R"("strength": 0.8)", R"("strength": 0.0)"))
+          .tasks[0].spec);
+  assert(!off.h3_control && !off.control_video);
+  assert(comfy::VideoRequestBody(off).find("gufo")->find("control") == nullptr);
+  const comfy::VideoTask empty = std::get<comfy::VideoTask>(
+      PlanOf(WithControl(
+                 R"("strength": 1.0, "start_percent": 0.0, "end_percent": 1.0)"))
+          .tasks[0].spec);
+  assert(!empty.h3_control);
+  // Inpaint: the mask through ImageToMask (red) on a loaded video, and the
+  // source video behind it.
+  const std::string inpaint = WithNodes(
+      WithControl(
+          R"("strength": 1.0, "start_percent": 0.0, "end_percent": 1.0, "mask": ["56", 0], "source_video": ["58", 0])"),
+      R"( "54": {"class_type": "LoadVideo", "inputs": {"file": "maske.mp4"}},
+ "55": {"class_type": "GetVideoComponents", "inputs": {"video": ["54", 0]}},
+ "56": {"class_type": "ImageToMask", "inputs": {"image": ["55", 0], "channel": "red"}},
+ "57": {"class_type": "LoadVideo", "inputs": {"file": "quelle.mp4"}},
+ "58": {"class_type": "GetVideoComponents", "inputs": {"video": ["57", 0]}},
+)");
+  const comfy::VideoTask masked =
+      std::get<comfy::VideoTask>(PlanOf(inpaint).tasks[0].spec);
+  assert(masked.h3_control && !masked.control_video);
+  assert((masked.h3_control_mask == comfy::FileRef{"maske.mp4", "input"}));
+  assert((masked.h3_control_source == comfy::FileRef{"quelle.mp4", "input"}));
+  // The mask is read from the red channel only.
+  assert(ErrorOf(Replace(inpaint, R"("channel": "red")",
+                         R"("channel": "green")"))
+             .message.find("red channel") != std::string::npos);
+  // A mask that is not an ImageToMask of a video is refused.
+  const std::string solid = Replace(
+      inpaint,
+      R"("56": {"class_type": "ImageToMask", "inputs": {"image": ["55", 0], "channel": "red"}})",
+      R"("56": {"class_type": "SolidMask", "inputs": {"value": 1.0, "width": 512, "height": 512}})");
+  assert(ErrorOf(solid).message.find("ImageToMask") != std::string::npos);
+  // Out of ComfyUI's range.
+  assert(ErrorOf(Replace(pose, R"("strength": 0.8)", R"("strength": 11.0)"))
+             .message.find("strength") != std::string::npos);
+  assert(ErrorOf(Replace(pose, R"("end_percent": 0.9)",
+                         R"("end_percent": 1.5)"))
+             .message.find("percent") != std::string::npos);
+  // Two active control nodes on one model chain: gufo applies one.
+  const std::string twice = Replace(
+      WithNodes(pose,
+                R"( "59": {"class_type": "MiniMaxH3FunControlNetApply", "inputs": {"model": ["50", 0], "model_patch": ["51", 0], "vae": ["4", 0], "strength": 1.0, "start_percent": 0.0, "end_percent": 1.0, "control_video": ["53", 0]}},
+)"),
+      R"("model": ["50", 0], "positive")", R"("model": ["59", 0], "positive")");
+  assert(ErrorOf(twice).message.find("two") != std::string::npos);
+}
+
+// ComfyUI Ref2VA: MiniMaxH3ReferenceToVideo makes the conditioning and the
+// latent; autogrow inputs in ComfyUI's API naming ("group.prefix_N").
+constexpr const char* kH3Reference = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_bf16.safetensors", "weight_dtype": "default"}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+ "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+ "20": {"class_type": "LoadImage", "inputs": {"image": "person.png"}},
+ "21": {"class_type": "LoadImage", "inputs": {"image": "raum.png"}},
+ "22": {"class_type": "LoadVideo", "inputs": {"file": "gang.mp4"}},
+ "23": {"class_type": "GetVideoComponents", "inputs": {"video": ["22", 0]}},
+ "24": {"class_type": "LoadAudio", "inputs": {"audio": "stimme.wav"}},
+ "7": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {"clip": ["3", 0], "vae": ["4", 0], "audio_vae": ["5", 0], "prompt": "<Picture 1> walks through <Picture 2> like in <Video 1>, speaking with <Audio 1>", "width": 896, "height": 512, "length": 124, "ref_image_size": "max", "ref_images.ref_image_1": ["20", 0], "ref_images.ref_image_2": ["21", 0], "ref_videos.ref_video_1": ["23", 0], "ref_video_audios.ref_video_audio_1": ["23", 1], "ref_audios.ref_audio_1": ["24", 0]}},
+ "8": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "positive": ["7", 0], "latent_image": ["7", 1], "seed": 9, "steps": 50, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["4", 0]}},
+ "10": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["8", 0], "vae": ["5", 0]}},
+ "11": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "h3/ref"}},
+ "12": {"class_type": "SaveAudio", "inputs": {"audio": ["10", 0], "filename_prefix": "h3/refton"}}
+})";
+
+void TestReferenceToVideo() {
+  const comfy::Plan plan = PlanOf(kH3Reference);
+  assert(plan.tasks.size() == 1);
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kH3);
+  assert(video.prompt.starts_with("<Picture 1> walks"));
+  assert(video.width == 896 && video.height == 512 && video.frames == 124);
+  assert(video.steps == 50 && video.seed == 9 && video.lora.empty());
+  assert(video.h3_references && !video.h3_control);
+  assert(video.h3_ref_image_max);
+  assert(video.h3_ref_images.size() == 2);
+  assert((video.h3_ref_images[0] == comfy::FileRef{"person.png", "input"}));
+  assert((video.h3_ref_images[1] == comfy::FileRef{"raum.png", "input"}));
+  assert(video.h3_ref_videos.size() == 1);
+  assert((video.h3_ref_videos[0].file == comfy::FileRef{"gang.mp4", "input"}));
+  assert(video.h3_ref_videos[0].audio &&
+         video.h3_ref_videos[0].audio_from_video);
+  assert(video.h3_ref_audios.size() == 1);
+  assert((video.h3_ref_audios[0] == comfy::FileRef{"stimme.wav", "input"}));
+  assert(!video.first_frame && !video.last_frame);
+  const json::Value body = comfy::VideoRequestBody(video);
+  const json::Value* references = body.find("gufo")->find("references");
+  assert(references != nullptr);
+  assert(references->member_str("image_size") == "max");
+  // The executor attaches the files; the body has none yet.
+  assert(references->find("images") == nullptr);
+  assert(body.find("gufo")->find("control") == nullptr);
+  // Plain input names (no group prefix) work too; "match" is the default.
+  std::string plain = kH3Reference;
+  for (const auto& [from, to] :
+       {std::pair{"\"ref_images.ref_image_1\"", "\"ref_image_1\""},
+        std::pair{"\"ref_images.ref_image_2\"", "\"ref_image_2\""},
+        std::pair{"\"ref_videos.ref_video_1\"", "\"ref_video_1\""},
+        std::pair{"\"ref_video_audios.ref_video_audio_1\"",
+                  "\"ref_video_audio_1\""},
+        std::pair{"\"ref_audios.ref_audio_1\"", "\"ref_audio_1\""},
+        std::pair{"\"ref_image_size\": \"max\", ", ""}})
+    plain = Replace(plain, from, to);
+  const comfy::VideoTask named =
+      std::get<comfy::VideoTask>(PlanOf(plain).tasks[0].spec);
+  assert(!named.h3_ref_image_max);
+  assert(named.h3_ref_images.size() == 2 && named.h3_ref_videos.size() == 1 &&
+         named.h3_ref_audios.size() == 1);
+  assert(comfy::VideoRequestBody(named)
+             .find("gufo")
+             ->find("references")
+             ->member_str("image_size") == "match");
+  // A soundtrack from LoadAudio is a file, not the video's own track.
+  const comfy::VideoTask loaded = std::get<comfy::VideoTask>(
+      PlanOf(Replace(kH3Reference,
+                     R"("ref_video_audios.ref_video_audio_1": ["23", 1])",
+                     R"("ref_video_audios.ref_video_audio_1": ["24", 0])"))
+          .tasks[0].spec);
+  assert(loaded.h3_ref_videos[0].audio &&
+         !loaded.h3_ref_videos[0].audio_from_video);
+  assert((*loaded.h3_ref_videos[0].audio ==
+          comfy::FileRef{"stimme.wav", "input"}));
+  // Audio references alone are refused (as in ComfyUI's Ref2VA).
+  std::string audio_only = kH3Reference;
+  for (const char* input :
+       {R"("ref_images.ref_image_1": ["20", 0], )",
+        R"("ref_images.ref_image_2": ["21", 0], )",
+        R"("ref_videos.ref_video_1": ["23", 0], )",
+        R"("ref_video_audios.ref_video_audio_1": ["23", 1], )"})
+    audio_only = Replace(audio_only, input, "");
+  assert(ErrorOf(audio_only).message.find("audio references") !=
+         std::string::npos);
+  // gufo's size limits apply as for every H3 job.
+  assert(ErrorOf(Replace(kH3Reference, "\"width\": 896", "\"width\": 1600"))
+             .message.find("multiples of 32") != std::string::npos);
+}
+
 void TestNodeInfo() {
   // Every class with a signature is a class the adapter accepts.
   for (const std::string& cls : comfy::SupportedClassTypes()) {
@@ -233,6 +428,31 @@ void TestNodeInfo() {
   assert(video->find("output")->items()[1].str() == "LATENT");
   assert(video->find("input")->find("required")->find("length")
              ->items()[1].find("max")->as_double() == 345);
+  const auto reference = comfy::NodeInfo("MiniMaxH3ReferenceToVideo");
+  assert(reference);
+  assert(reference->find("output")->items()[0].str() == "CONDITIONING" &&
+         reference->find("output")->items()[1].str() == "LATENT");
+  // Autogrow inputs: prefix / min / max sit in the template (ComfyUI V3).
+  const json::Value* ref_optional = reference->find("input")->find("optional");
+  assert(ref_optional->find("ref_images")->items()[1].find("template")
+             ->find("max")->as_double() ==
+         9);
+  assert(ref_optional->find("ref_videos")->items()[1].find("template")
+             ->find("max")->as_double() ==
+         3);
+  assert(ref_optional->find("ref_audios")->items()[1].find("template")
+             ->find("max")->as_double() ==
+         3);
+  const auto control = comfy::NodeInfo("MiniMaxH3FunControlNetApply");
+  assert(control);
+  assert(control->find("output")->items()[0].str() == "MODEL");
+  const json::Value* control_required =
+      control->find("input")->find("required");
+  assert(control_required->find("strength")->items()[1].find("max")
+             ->as_double() == 10.0);
+  assert(control_required->find("end_percent")->items()[1].find("default")
+             ->as_double() == 1.0);
+  assert(control->find("input")->find("optional")->find("mask") != nullptr);
   // Classes without a signature keep the bare entry.
   assert(!comfy::NodeInfo("KSampler"));
 }
@@ -244,6 +464,8 @@ int main() {
   TestEmptyLatent();
   TestSigmaShift();
   TestAudioMask();
+  TestFunControlNet();
+  TestReferenceToVideo();
   std::cout << "router_comfy_h3_test: all passed\n";
   return 0;
 }

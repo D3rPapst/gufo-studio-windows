@@ -66,6 +66,44 @@ constexpr Entry kEntries[] = {
  "description": "Set the video/audio flow shifts.",
  "category": "model/patch/minimax",
  "search_aliases": ["sigma shift", "minimax shift"]})"},
+    {"MiniMaxH3ReferenceToVideo", "comfy_extras.nodes_minimax_h3", R"({
+ "input": {"required": {
+  "clip": ["CLIP", {}],
+  "prompt": ["STRING", {"multiline": true, "dynamicPrompts": true}],
+  "width": ["INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}],
+  "height": ["INT", {"default": 768, "min": 32, "max": 16384, "step": 32}],
+  "length": ["INT", {"default": 124, "min": 5, "max": 3600, "step": 17, "tooltip": "Frame count at 24 fps (124 = ~5s, trained range is ~124-362)."}],
+  "ref_image_size": [["match", "max"], {"default": "match", "tooltip": "'match' scales each reference image (down only) to the generation's pixel area; 'max' uses a 2048 px short edge."}]},
+  "optional": {
+  "vae": ["VAE", {}],
+  "audio_vae": ["VAE", {}],
+  "ref_images": ["COMFY_AUTOGROW_V3", {"template": {"input": {"required": {"ref_image": ["IMAGE", {"tooltip": "Reference image. gufo: LoadImage."}]}}, "prefix": "ref_image_", "min": 0, "max": 9}}],
+  "ref_videos": ["COMFY_AUTOGROW_V3", {"template": {"input": {"required": {"ref_video": ["IMAGE", {"tooltip": "Reference video at 24 fps (2-15 s). gufo: LoadVideo -> GetVideoComponents."}]}}, "prefix": "ref_video_", "min": 0, "max": 3}}],
+  "ref_video_audios": ["COMFY_AUTOGROW_V3", {"template": {"input": {"required": {"ref_video_audio": ["AUDIO", {"tooltip": "Soundtrack of the same-numbered reference video."}]}}, "prefix": "ref_video_audio_", "min": 0, "max": 3}}],
+  "ref_audios": ["COMFY_AUTOGROW_V3", {"template": {"input": {"required": {"ref_audio": ["AUDIO", {"tooltip": "Standalone reference audio. gufo: LoadAudio."}]}}, "prefix": "ref_audio_", "min": 0, "max": 3}}]}},
+ "input_order": {"required": ["clip", "prompt", "width", "height", "length", "ref_image_size"], "optional": ["vae", "audio_vae", "ref_images", "ref_videos", "ref_video_audios", "ref_audios"]},
+ "output": ["CONDITIONING", "LATENT"], "output_is_list": [false, false], "output_name": ["positive", "LATENT"],
+ "display_name": "MiniMax H3 Reference to Video",
+ "description": "<Picture i> / <Video k> / <Audio j> reference conditioning for MiniMax H3. Use the same tags when prompting. gufo: runs the Ref2VA transformer of the worker's model root.",
+ "category": "model/conditioning/minimax"})"},
+    {"MiniMaxH3FunControlNetApply", "comfy_extras.nodes_minimax_h3", R"({
+ "input": {"required": {
+  "model": ["MODEL", {}],
+  "model_patch": ["MODEL_PATCH", {}],
+  "vae": ["VAE", {}],
+  "strength": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}],
+  "start_percent": ["FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, "advanced": true}],
+  "end_percent": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, "advanced": true}]},
+  "optional": {
+  "control_video": ["IMAGE", {"tooltip": "Canny, depth, HED, MLSD, pose, scribble, layout or gray video. gufo: LoadVideo -> GetVideoComponents or VHS_LoadVideo (run preprocessors in ComfyUI and load their result)."}],
+  "mask": ["MASK", {"tooltip": "1 marks the regions to regenerate. gufo: ImageToMask (red) on a loaded video."}],
+  "source_video": ["IMAGE", {"tooltip": "Video behind the mask; only read when a mask is given."}]}},
+ "input_order": {"required": ["model", "model_patch", "vae", "strength", "start_percent", "end_percent"], "optional": ["control_video", "mask", "source_video"]},
+ "output": ["MODEL"], "output_is_list": [false], "output_name": ["MODEL"],
+ "display_name": "Apply MiniMax H3 Fun ControlNet",
+ "description": "Apply a MiniMax H3 Fun ControlNet to a text-to-video model as a model patch. gufo: the worker's --control-model; needs all 50 blocks (preset exact).",
+ "category": "model/patch/minimax",
+ "search_aliases": ["minimax controlnet", "h3 controlnet", "video inpaint controlnet"]})"},
     // The audio noise mask of an H3 video: VAEEncodeAudio of the source
     // audio, SetLatentNoiseMask (0 = keep, 1 = generate), then this node
     // with the H3 latent as video_latent.

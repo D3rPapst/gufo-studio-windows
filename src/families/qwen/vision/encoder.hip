@@ -118,7 +118,8 @@ __device__ __forceinline__ float Round(float x) {
 }
 
 __global__ void Patchify(const std::uint8_t* pixels, Bf16* patches,
-                         unsigned width, unsigned grid_width, unsigned count) {
+                         unsigned width, unsigned grid_width, unsigned count,
+                         const std::uint8_t* second = nullptr) {
   const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count * kPatchDim)
     return;
@@ -131,9 +132,13 @@ __global__ void Patchify(const std::uint8_t* pixels, Bf16* patches,
   const unsigned spatial = element % (16 * 16);
   const unsigned pixel =
       ((y * 16 + spatial / 16) * width + x * 16 + spatial % 16) * 3;
+  // A still repeats its frame in both temporal slots; a video block reads
+  // its second frame for slot 1.
+  const std::uint8_t* frame =
+      second != nullptr && (element / (16 * 16)) % 2 == 1 ? second : pixels;
   // Match rescale_and_normalize: multiply by 1/255 then subtract/divide.
   patches[i] = Bf16(
-      (static_cast<float>(pixels[pixel + channel]) * (1.0F / 255.0F) - 0.5F) /
+      (static_cast<float>(frame[pixel + channel]) * (1.0F / 255.0F) - 0.5F) /
       0.5F);
 }
 
@@ -639,6 +644,21 @@ Encoder::Embedding::~Embedding() {
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const core::Image& image, const Observer& observer,
     const CancellationCheck& is_cancelled) {
+  return EncodeFrames(image, nullptr, observer, is_cancelled);
+}
+
+std::shared_ptr<const Encoder::Embedding> Encoder::EncodePair(
+    const core::Image& image, const core::Image& second,
+    const Observer& observer, const CancellationCheck& is_cancelled) {
+  if (second.width != image.width || second.height != image.height ||
+      second.pixels.size() != image.pixels.size())
+    throw std::invalid_argument("vision frame pair sizes differ");
+  return EncodeFrames(image, &second, observer, is_cancelled);
+}
+
+std::shared_ptr<const Encoder::Embedding> Encoder::EncodeFrames(
+    const core::Image& image, const core::Image* second,
+    const Observer& observer, const CancellationCheck& is_cancelled) {
   const auto check_cancelled = [&] {
     if (is_cancelled && is_cancelled())
       throw std::runtime_error("vision encoding cancelled");
@@ -675,9 +695,17 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     PinnedUpload upload(stream, image.pixels.size());
     upload.Copy(pixels.data, image.pixels.data(), image.pixels.size());
   }
+  Allocation second_pixels(second != nullptr ? second->pixels.size() : 1);
+  if (second != nullptr) {
+    PinnedUpload upload(stream, second->pixels.size());
+    upload.Copy(second_pixels.data, second->pixels.data(),
+                second->pixels.size());
+  }
   Patchify<<<(count * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
              stream>>>(pixels.As<std::uint8_t>(), normalized.As<Bf16>(),
-                       image.width, image.width / 16, count);
+                       image.width, image.width / 16, count,
+                       second != nullptr ? second_pixels.As<std::uint8_t>()
+                                         : nullptr);
   impl_->Gemm("patch", normalized.As<Bf16>(), hidden.As<float>(), count,
               kHidden, kPatchDim);
   PatchPosition<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,

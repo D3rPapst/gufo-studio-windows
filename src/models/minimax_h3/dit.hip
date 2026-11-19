@@ -991,27 +991,58 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     return nullptr;
   }
 
+  const bool control = options.control_index >= 0;
+  if (control && options.lora != nullptr) {
+    SetError(error, "a MiniMax H3 control block takes no LoRA");
+    return nullptr;
+  }
   const std::string prefix =
-      "blocks." + std::to_string(options.block_index) + ".";
+      control ? "control_blocks." + std::to_string(options.control_index) + "."
+              : "blocks." + std::to_string(options.block_index) + ".";
+  // The VideoX-Fun (diffusers) names of a control block.
+  const char* query_norm_name =
+      control ? "attn.norm_q.weight" : "attn.q_norm.weight";
+  const char* key_norm_name =
+      control ? "attn.norm_k.weight" : "attn.k_norm.weight";
+  const char* output_name =
+      control ? "attn.to_out.0.weight" : "attn.out_proj.weight";
+  const char* fc1_name = control ? "ff.net.0.proj.weight" : "mlp.fc1.weight";
+  const char* fc2_name = control ? "ff.net.2.weight" : "mlp.fc2.weight";
   const TensorDescriptor* norm1 = RequireTensor(
       inventory, prefix + "norm1.weight", {kDitHiddenSize}, error);
   const TensorDescriptor* norm2 = RequireTensor(
       inventory, prefix + "norm2.weight", {kDitHiddenSize}, error);
-  const TensorDescriptor* qkv_weight =
-      RequireTensor(inventory, prefix + "attn.qkv_proj.weight",
-                    {kDitAttentionWidth * 3U, kDitHiddenSize}, error);
+  std::array<const TensorDescriptor*, 3> qkv_parts{};
+  const TensorDescriptor* qkv_weight = nullptr;
+  if (control) {
+    const char* names[3] = {"attn.to_q.weight", "attn.to_k.weight",
+                            "attn.to_v.weight"};
+    for (std::size_t part = 0; part < 3; ++part) {
+      qkv_parts[part] = RequireTensor(inventory, prefix + names[part],
+                                      {kDitAttentionWidth, kDitHiddenSize},
+                                      error);
+      if (qkv_parts[part] == nullptr) {
+        return nullptr;
+      }
+    }
+    qkv_weight = qkv_parts[0];
+  } else {
+    qkv_weight =
+        RequireTensor(inventory, prefix + "attn.qkv_proj.weight",
+                      {kDitAttentionWidth * 3U, kDitHiddenSize}, error);
+  }
   const TensorDescriptor* query_norm = RequireTensor(
-      inventory, prefix + "attn.q_norm.weight", {kDitHeadDimension}, error);
+      inventory, prefix + query_norm_name, {kDitHeadDimension}, error);
   const TensorDescriptor* key_norm = RequireTensor(
-      inventory, prefix + "attn.k_norm.weight", {kDitHeadDimension}, error);
+      inventory, prefix + key_norm_name, {kDitHeadDimension}, error);
   const TensorDescriptor* output_weight =
-      RequireTensor(inventory, prefix + "attn.out_proj.weight",
+      RequireTensor(inventory, prefix + output_name,
                     {kDitHiddenSize, kDitAttentionWidth}, error);
   const TensorDescriptor* fc1_weight =
-      RequireTensor(inventory, prefix + "mlp.fc1.weight",
+      RequireTensor(inventory, prefix + fc1_name,
                     {kDitFeedForwardSize * 2U, kDitHiddenSize}, error);
   const TensorDescriptor* fc2_weight =
-      RequireTensor(inventory, prefix + "mlp.fc2.weight",
+      RequireTensor(inventory, prefix + fc2_name,
                     {kDitHiddenSize, kDitFeedForwardSize}, error);
   if (norm1 == nullptr || norm2 == nullptr || qkv_weight == nullptr ||
       query_norm == nullptr || key_norm == nullptr ||
@@ -1021,17 +1052,23 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   }
 
   const auto load_begin = Clock::now();
-  const std::array<std::pair<const TensorDescriptor*, LoadedWeight*>, 8>
-      weights = {{
-          {norm1, &impl->norm1},
-          {norm2, &impl->norm2},
-          {qkv_weight, &impl->qkv_weight},
-          {query_norm, &impl->query_norm},
-          {key_norm, &impl->key_norm},
-          {output_weight, &impl->output_weight},
-          {fc1_weight, &impl->fc1_weight},
-          {fc2_weight, &impl->fc2_weight},
-      }};
+  std::vector<std::pair<const TensorDescriptor*, LoadedWeight*>> weights = {
+      {norm1, &impl->norm1},
+      {norm2, &impl->norm2},
+      {query_norm, &impl->query_norm},
+      {key_norm, &impl->key_norm},
+      {output_weight, &impl->output_weight},
+      {fc1_weight, &impl->fc1_weight},
+      {fc2_weight, &impl->fc2_weight},
+  };
+  std::array<LoadedWeight, 3> qkv_loaded;
+  if (control) {
+    for (std::size_t part = 0; part < 3; ++part) {
+      weights.emplace_back(qkv_parts[part], &qkv_loaded[part]);
+    }
+  } else {
+    weights.emplace_back(qkv_weight, &impl->qkv_weight);
+  }
   for (const auto& [descriptor, weight] : weights) {
     if (!LoadWeight(inventory, *descriptor, impl->device, impl->stream,
                     impl->staging, WeightStagingBytes(), cancellation, weight,
@@ -1039,6 +1076,56 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       return nullptr;
     }
     impl->weight_bytes += descriptor->payload_bytes;
+  }
+  if (control) {
+    // Native layout: the fused QKV rows interleave per head
+    // ([head0: q k v, head1: q k v, ...]) and fc1 is [gate; value], where
+    // the VideoX-Fun checkpoint stores to_q/to_k/to_v and [value; gate].
+    const std::size_t head_bytes =
+        kDitHeadDimension * kDitHiddenSize * sizeof(std::uint16_t);
+    if (!impl->qkv_weight.storage.Allocate(
+            head_bytes * kDitAttentionHeads * 3U, error)) {
+      return nullptr;
+    }
+    status = hipSuccess;
+    for (std::size_t head = 0;
+         head < kDitAttentionHeads && status == hipSuccess; ++head) {
+      for (std::size_t part = 0; part < 3 && status == hipSuccess; ++part) {
+        status = hipMemcpyAsync(
+            static_cast<std::byte*>(impl->qkv_weight.storage.data()) +
+                (head * 3U + part) * head_bytes,
+            static_cast<const std::byte*>(qkv_loaded[part].storage.data()) +
+                head * head_bytes,
+            head_bytes, hipMemcpyDeviceToDevice, impl->stream);
+      }
+    }
+    DeviceBuffer swapped;
+    const std::size_t half_bytes =
+        kDitFeedForwardSize * kDitHiddenSize * sizeof(std::uint16_t);
+    if (status == hipSuccess && !swapped.Allocate(half_bytes * 2U, error)) {
+      return nullptr;
+    }
+    if (status == hipSuccess) {
+      status = hipMemcpyAsync(
+          swapped.data(),
+          static_cast<const std::byte*>(impl->fc1_weight.storage.data()) +
+              half_bytes,
+          half_bytes, hipMemcpyDeviceToDevice, impl->stream);
+    }
+    if (status == hipSuccess) {
+      status = hipMemcpyAsync(
+          static_cast<std::byte*>(swapped.data()) + half_bytes,
+          impl->fc1_weight.storage.data(), half_bytes,
+          hipMemcpyDeviceToDevice, impl->stream);
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(impl->stream);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("arrange H3 control block weights", status));
+      return nullptr;
+    }
+    impl->fc1_weight.storage = std::move(swapped);
   }
   (void)hipHostFree(impl->staging);
   impl->staging = nullptr;

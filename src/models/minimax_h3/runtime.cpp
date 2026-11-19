@@ -539,6 +539,122 @@ std::optional<ModelInventory> ModelInventory::Inspect(
   }
 }
 
+std::optional<ModelInventory> ModelInventory::WithTransformerPartition(
+    std::string_view partition, std::string* error) const {
+  try {
+    if (partition.empty() || partition.find_first_of("/\\.:") !=
+                                 std::string_view::npos) {
+      throw json::Error("invalid transformer partition");
+    }
+    ModelInventory inventory = *this;
+    const std::filesystem::path relative =
+        std::filesystem::path(std::string(partition)) / "transformer";
+    const auto weight_map = ParseWeightMap(
+        model_root_ / relative / "model.safetensors.index.json",
+        &inventory.telemetry_);
+    std::map<std::string, ParsedHeader> headers;
+    std::size_t replaced = 0;
+    for (TensorDescriptor& tensor : inventory.tensors_) {
+      if (tensor.component != "transformer") {
+        continue;
+      }
+      const auto shard = weight_map.find(tensor.name);
+      if (shard == weight_map.end()) {
+        throw json::Error(std::string(partition) + " transformer lacks " +
+                          tensor.name);
+      }
+      const std::filesystem::path shard_path =
+          SafeRelativePath((relative / shard->second).generic_string());
+      auto header = headers.find(shard_path.generic_string());
+      if (header == headers.end()) {
+        header = headers
+                     .emplace(shard_path.generic_string(),
+                              ParseSafetensorsHeader(model_root_ / shard_path,
+                                                     &inventory.telemetry_))
+                     .first;
+      }
+      const auto found = header->second.tensors.find(tensor.name);
+      if (found == header->second.tensors.end() ||
+          found->second.dtype != tensor.dtype ||
+          found->second.shape != tensor.shape ||
+          found->second.end - found->second.begin != tensor.payload_bytes) {
+        throw json::Error(std::string(partition) +
+                          " transformer tensor differs: " + tensor.name);
+      }
+      tensor.shard = shard_path;
+      tensor.file_offset = header->second.payload_offset + found->second.begin;
+      ++replaced;
+    }
+    std::size_t indexed = 0;
+    for (const auto& entry : weight_map) {
+      (void)entry;
+      ++indexed;
+    }
+    if (replaced == 0 || indexed != replaced) {
+      throw json::Error(std::string(partition) +
+                        " transformer tensor set differs from FL2VA");
+    }
+    std::erase_if(inventory.shards_, [](const ShardDescriptor& shard) {
+      return shard.relative_path.generic_string().find("/transformer/") !=
+             std::string::npos;
+    });
+    for (const auto& [path, header] : headers) {
+      inventory.shards_.push_back({std::filesystem::path(path),
+                                   header.file_bytes, header.payload_offset,
+                                   header.tensors.size()});
+    }
+    return inventory;
+  } catch (const std::exception& exception) {
+    SetError(error, "MiniMax H3 " + std::string(partition) +
+                        " inspection failed: " + exception.what());
+    return std::nullopt;
+  }
+}
+
+std::optional<ModelInventory> ModelInventory::InspectControlPatch(
+    const std::filesystem::path& file, std::string* error) {
+  try {
+    ModelInventory inventory;
+    const std::filesystem::path canonical =
+        std::filesystem::weakly_canonical(file);
+    if (!std::filesystem::is_regular_file(canonical)) {
+      throw json::Error("control checkpoint is not a file");
+    }
+    inventory.model_root_ = canonical.parent_path();
+    const ParsedHeader header =
+        ParseSafetensorsHeader(canonical, &inventory.telemetry_);
+    inventory.tensors_.reserve(header.tensors.size());
+    for (const auto& [name, tensor] : header.tensors) {
+      TensorDescriptor descriptor;
+      descriptor.component = "transformer";
+      descriptor.name = name;
+      descriptor.dtype = tensor.dtype;
+      descriptor.shape = tensor.shape;
+      descriptor.shard = canonical.filename();
+      descriptor.file_offset = header.payload_offset + tensor.begin;
+      descriptor.payload_bytes = tensor.end - tensor.begin;
+      descriptor.phase = TensorPhase("transformer", name);
+      const std::size_t index = inventory.tensors_.size();
+      inventory.tensor_index_.emplace(name, index);
+      inventory.tensors_.push_back(std::move(descriptor));
+    }
+    inventory.shards_.push_back({canonical.filename(), header.file_bytes,
+                                 header.payload_offset,
+                                 header.tensors.size()});
+    const TensorDescriptor* input = inventory.FindTensor("control_proj_in.weight");
+    if (input == nullptr || input->dtype != DType::kFloat32 ||
+        input->shape.size() != 2 || input->shape[0] != 5376U) {
+      throw json::Error(
+          "not a MiniMax H3 Fun-ControlNet checkpoint (control_proj_in)");
+    }
+    return inventory;
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("MiniMax H3 control inspection failed: ") +
+                        exception.what());
+    return std::nullopt;
+  }
+}
+
 const TensorDescriptor* ModelInventory::FindTensor(
     std::string_view name) const noexcept {
   const auto iterator = tensor_index_.find(std::string(name));

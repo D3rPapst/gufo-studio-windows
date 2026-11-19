@@ -76,6 +76,8 @@ constexpr std::string_view kPlumbing[] = {
     "WanCameraEmbedding",
     "WanUni3CControlnetApply",
     "ModelPatchLoader",
+    // MiniMax H3 Fun-ControlNet-Union: gufo.control.
+    "MiniMaxH3FunControlNetApply",
     // Qwen-Image 2.1 Fun ControlNet-Union (ApplyQwenControl).
     "QwenImageDiffsynthControlnet",
     "ZImageFunControlnet",
@@ -124,6 +126,7 @@ constexpr std::string_view kGenerators[] = {
     "KSampler",
     "KSamplerAdvanced",
     "MiniMaxH3ImageToVideo",
+    "MiniMaxH3ReferenceToVideo",
     "Wan22ImageToVideoLatent",
     "FB_Qwen3TTSVoiceDesign",
     "FB_Qwen3TTSVoiceClone",
@@ -525,6 +528,8 @@ struct ModelChain {
   std::string uni3c;  // WanUni3CControlnetApply node id, "" if none
   std::string talk;   // WanInfiniteTalkToVideo node id, "" if none
   std::string control;  // Qwen-Image ControlNet apply node id, "" if none
+  // MiniMaxH3FunControlNetApply node id, "" if none.
+  std::string h3_control;
   // MiniMaxH3SigmaShift nearest the sampler (the one ComfyUI applies last),
   // "" if none.
   std::string sigma_shift;
@@ -566,6 +571,20 @@ ModelChain FollowModel(const Graph& graph, const std::string& sampler) {
     } else if (cls == "MiniMaxH3SigmaShift") {
       if (chain.sigma_shift.empty())
         chain.sigma_shift = link.node;
+    } else if (cls == "MiniMaxH3FunControlNetApply") {
+      // A strength-0 node, or one without control video and mask, returns
+      // the model unchanged in ComfyUI.
+      const bool inert = graph.Num(link.node, "strength", 1.0) == 0.0 ||
+                         (!graph.LinkOf(link.node, "control_video") &&
+                          !graph.LinkOf(link.node, "mask"));
+      if (!inert) {
+        if (!chain.h3_control.empty())
+          throw NodeFailure(sampler, "unsupported_link",
+                            "the model input passes through two "
+                            "MiniMaxH3FunControlNetApply nodes (gufo applies "
+                            "one)");
+        chain.h3_control = link.node;
+      }
     } else if (cls != "ModelSamplingAuraFlow" && cls != "ModelSamplingSD3") {
       throw NodeFailure(
           sampler, "unsupported_link",
@@ -614,6 +633,7 @@ Conditioning FollowConditioning(const Graph& graph, const std::string& sampler,
                                link->slot == 2 ? "negative" : "positive");
     } else if (cls == "TextEncodeQwenImage21" || cls == "CLIPTextEncode" ||
                cls == "MiniMaxH3ImageToVideo" ||
+               cls == "MiniMaxH3ReferenceToVideo" ||
                cls == "TextEncodeAceStepAudio1.5") {
       cond.encoder = link->node;
       cond.slot = link->slot;
@@ -1524,6 +1544,11 @@ void ReadAudioLatent(const Graph& graph, const std::string& sampler,
                         "strength)");
 }
 
+// Defined with the VACE builder below (fps defaults to 16 there).
+FileRef VideoFile(const Graph& graph, const std::string& id,
+                  const std::string& key, const Link& link,
+                  std::vector<std::string>* warnings, int fps);
+
 /// MiniMaxH3ImageToVideo (prompt, frames and size in one node) or
 /// EmptyMiniMaxH3LatentAV with the prompt in a CLIPTextEncode on the
 /// positive input (ComfyUI's text to video+audio wiring), either one
@@ -1566,6 +1591,49 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
                       "256..1344, at most 768x1344 pixels, not " +
                           std::to_string(task.width) + "x" +
                           std::to_string(task.height));
+  if (graph.Class(video) == "MiniMaxH3ReferenceToVideo") {
+    // Autogrow inputs: "ref_images.ref_image_N" (ComfyUI's API names) or
+    // plain "ref_image_N".
+    const auto slot = [&](const char* group, const char* prefix,
+                          int index) -> std::optional<Link> {
+      const std::string name = std::string(prefix) + std::to_string(index);
+      if (auto link = graph.LinkOf(video, std::string(group) + "." + name))
+        return link;
+      return graph.LinkOf(video, name);
+    };
+    task.h3_references = true;
+    task.h3_ref_image_max = graph.Str(video, "ref_image_size", "match") == "max";
+    for (int index = 1; index <= 9; ++index)
+      if (auto link = slot("ref_images", "ref_image_", index))
+        task.h3_ref_images.push_back(
+            ImageFile(graph, video, "ref_image_" + std::to_string(index), *link));
+    for (int index = 1; index <= 3; ++index) {
+      auto link = slot("ref_videos", "ref_video_", index);
+      if (!link)
+        continue;
+      VideoTask::Reference reference;
+      reference.file = VideoFile(graph, video,
+                                 "ref_video_" + std::to_string(index), *link,
+                                 warnings, 24);
+      if (auto audio = slot("ref_video_audios", "ref_video_audio_", index)) {
+        reference.audio_from_video =
+            graph.Class(audio->node) == "GetVideoComponents";
+        reference.audio =
+            reference.audio_from_video
+                ? VideoComponentsFile(graph, video, "ref_video_audio", *audio, 1)
+                : AudioFile(graph, video, "ref_video_audio", *audio);
+      }
+      task.h3_ref_videos.push_back(std::move(reference));
+    }
+    for (int index = 1; index <= 3; ++index)
+      if (auto link = slot("ref_audios", "ref_audio_", index))
+        task.h3_ref_audios.push_back(
+            AudioFile(graph, video, "ref_audio_" + std::to_string(index), *link));
+    if (task.h3_ref_images.empty() && task.h3_ref_videos.empty())
+      throw NodeFailure(video, "unsupported_value",
+                        "MiniMax H3 Ref2VA needs a reference image or video "
+                        "(audio references cannot be the only ones)");
+  }
   if (auto first = graph.LinkOf(video, "first_frame"))
     task.first_frame = ImageFile(graph, video, "first_frame", *first);
   if (auto last = graph.LinkOf(video, "last_frame"))
@@ -1678,6 +1746,43 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
     task.lora = "turbo";
     if (strength != 1.0)
       task.lora_strength = strength;
+  }
+  if (!chain.h3_control.empty()) {
+    const std::string node = chain.h3_control;
+    task.h3_control = true;
+    task.h3_control_strength = graph.Num(node, "strength", 1.0);
+    task.h3_control_start = graph.Num(node, "start_percent", 0.0);
+    task.h3_control_end = graph.Num(node, "end_percent", 1.0);
+    if (!(task.h3_control_strength >= 0.0 && task.h3_control_strength <= 10.0) ||
+        !(task.h3_control_start >= 0.0 && task.h3_control_start <= 1.0) ||
+        !(task.h3_control_end >= 0.0 && task.h3_control_end <= 1.0))
+      throw NodeFailure(node, "unsupported_value",
+                        "strength must be 0..10, start/end_percent 0..1");
+    if (auto control = graph.LinkOf(node, "control_video"))
+      task.control_video =
+          VideoFile(graph, node, "control_video", *control, warnings, 24);
+    if (auto mask = graph.LinkOf(node, "mask")) {
+      const std::string source = graph.Class(mask->node);
+      if (source != "ImageToMask")
+        throw NodeFailure(node, "unsupported_link",
+                          "the H3 control mask must come from ImageToMask "
+                          "on a loaded video, not " +
+                              source);
+      if (graph.Str(mask->node, "channel", "red") != "red")
+        throw NodeFailure(mask->node, "unsupported_value",
+                          "gufo reads the H3 control mask from the red "
+                          "channel");
+      task.h3_control_mask =
+          VideoFile(graph, mask->node, "image",
+                    graph.RequireLink(mask->node, "image"), warnings, 24);
+      if (auto source_video = graph.LinkOf(node, "source_video"))
+        task.h3_control_source = VideoFile(graph, node, "source_video",
+                                           *source_video, warnings, 24);
+    }
+    if (!task.lora.empty() && task.lora == "turbo")
+      warnings->push_back("node " + node +
+                          ": the Fun-ControlNet was trained without the "
+                          "turbo LoRA; gufo applies both");
   }
   // MiniMaxH3SigmaShift: the worker's video / audio flow shifts (12 / 3
   // unless set).
@@ -4912,6 +5017,23 @@ json::Value VideoRequestBody(const VideoTask& task) {
       shift["audio"] = task.shift_audio.value_or(kH3AudioShift);
       gufo["sigma_shift"] = std::move(shift);
     }
+    if (task.h3_references) {
+      // The executor adds the files (gufo.references.images / videos /
+      // audios).
+      json::Value references = json::Value::object();
+      references["image_size"] =
+          std::string(task.h3_ref_image_max ? "max" : "match");
+      gufo["references"] = std::move(references);
+    }
+    if (task.h3_control) {
+      // The executor adds the videos (gufo.control.video / mask /
+      // source_video).
+      json::Value control = json::Value::object();
+      control["strength"] = task.h3_control_strength;
+      control["start_percent"] = task.h3_control_start;
+      control["end_percent"] = task.h3_control_end;
+      gufo["control"] = std::move(control);
+    }
   } else if (task.family == VideoFamily::kCamera) {
     // 16 fps, 4k+1 frames: gufo maps seconds back to 4 * round(4 s) + 1.
     body["size"] =
@@ -5732,6 +5854,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           const std::string latent_class = graph.Class(latent.node);
           const auto is_h3 = [](const std::string& cls) {
             return cls == "MiniMaxH3ImageToVideo" ||
+                   cls == "MiniMaxH3ReferenceToVideo" ||
                    cls == "EmptyMiniMaxH3LatentAV";
           };
           const auto concat_video =

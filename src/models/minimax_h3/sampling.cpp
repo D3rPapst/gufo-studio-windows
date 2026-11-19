@@ -12,6 +12,7 @@
 #include <exception>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <utility>
 
 #include "src/models/minimax_h3/sha256.hpp"
@@ -404,6 +405,35 @@ std::optional<PackedLayout> BuildImageGuideLayout(
     std::size_t text_rows, const GenerationGeometry& geometry,
     std::span<const ImageGuidePlacement> image_guides,
     std::span<const AudioGuidePlacement> audio_guides, std::string* error) {
+  return BuildReferenceLayout(text_rows, geometry, image_guides, audio_guides,
+                              {}, error);
+}
+
+double ReferenceTimeSpan(const ReferencePlacement& reference) {
+  switch (reference.kind) {
+    case ReferenceKind::kImage:
+      return 1.0;
+    case ReferenceKind::kAudio:
+      return static_cast<double>(reference.audio_latent_frames);
+    case ReferenceKind::kVideo: {
+      double span = 0.0;
+      for (int index = 0; index < reference.latent_frames; ++index) {
+        span += kFrameRescale *
+                kFramesPerToken[static_cast<std::size_t>(index) %
+                                kFramesPerToken.size()];
+      }
+      return std::max(static_cast<double>(reference.audio_latent_frames),
+                      span);
+    }
+  }
+  return 0.0;
+}
+
+std::optional<PackedLayout> BuildReferenceLayout(
+    std::size_t text_rows, const GenerationGeometry& geometry,
+    std::span<const ImageGuidePlacement> image_guides,
+    std::span<const AudioGuidePlacement> audio_guides,
+    std::span<const ReferencePlacement> references, std::string* error) {
   if (text_rows == 0 || text_rows > std::numeric_limits<std::uint32_t>::max() ||
       geometry.width < kH3CanvasMultiple ||
       geometry.height < kH3CanvasMultiple ||
@@ -472,7 +502,36 @@ std::optional<PackedLayout> BuildImageGuideLayout(
     }
     guide_latent_frames += static_cast<std::size_t>(guide.latent_frames);
   }
-  std::size_t audio_condition_rows = 0;
+  // Reference rows: images and videos at their own latent size, a video's
+  // soundtrack and standalone audio as stereo rows.
+  std::size_t reference_video_rows = 0;
+  std::size_t reference_audio_rows = 0;
+  for (const ReferencePlacement& reference : references) {
+    if (reference.kind != ReferenceKind::kAudio &&
+        (reference.latent_height < 2 || reference.latent_width < 2 ||
+         reference.latent_height % 2 != 0 || reference.latent_width % 2 != 0 ||
+         reference.latent_frames < 1 ||
+         (reference.kind == ReferenceKind::kImage &&
+          reference.latent_frames != 1))) {
+      SetError(error, "invalid MiniMax H3 reference latent shape");
+      return std::nullopt;
+    }
+    if (reference.audio_latent_frames < 0 ||
+        (reference.kind == ReferenceKind::kAudio &&
+         reference.audio_latent_frames < 1)) {
+      SetError(error, "invalid MiniMax H3 reference audio length");
+      return std::nullopt;
+    }
+    if (reference.kind != ReferenceKind::kAudio) {
+      reference_video_rows +=
+          static_cast<std::size_t>(reference.latent_height / 2) *
+          static_cast<std::size_t>(reference.latent_width / 2) *
+          static_cast<std::size_t>(reference.latent_frames);
+    }
+    reference_audio_rows +=
+        2U * static_cast<std::size_t>(reference.audio_latent_frames);
+  }
+  std::size_t audio_condition_rows = reference_audio_rows;
   for (const AudioGuidePlacement& guide : audio_guides) {
     if (guide.latent_frames < 1 ||
         guide.latent_frames > MaximumAudioGuideFrames(geometry, guide.frame)) {
@@ -485,12 +544,16 @@ std::optional<PackedLayout> BuildImageGuideLayout(
   }
   if (!CheckedMultiply(frame_rows, guide_latent_frames, &condition_rows) ||
       condition_rows >
+          std::numeric_limits<std::size_t>::max() - reference_video_rows ||
+      condition_rows >
           std::numeric_limits<std::size_t>::max() - audio_condition_rows ||
       text_rows > std::numeric_limits<std::size_t>::max() - condition_rows -
                       audio_condition_rows) {
     SetError(error, "MiniMax H3 guide row count overflows");
     return std::nullopt;
   }
+  const std::size_t guide_condition_rows = condition_rows;
+  condition_rows += reference_video_rows;
   // The overflow checks below run on text plus conditioning rows.
   text_rows += condition_rows + audio_condition_rows;
   if (!CheckedMultiply(
@@ -531,13 +594,28 @@ std::optional<PackedLayout> BuildImageGuideLayout(
 
     const std::vector<Position3D> frame =
         FrameGrid(geometry.latent_height, geometry.latent_width);
+    // The target timeline starts after the references' spans.
+    double origin = static_cast<double>(text_rows);
+    for (const ReferencePlacement& reference : references) {
+      origin += ReferenceTimeSpan(reference);
+    }
     // Guides count from the target timeline origin: 5/3 rotary units per
     // pixel frame, one per audio latent frame (the reference's cond_t).
-    const auto guide_time = [text_rows](int frame_index) {
-      return static_cast<double>(text_rows) +
-             kFrameRescale * static_cast<double>(frame_index);
+    const auto guide_time = [origin](int frame_index) {
+      return origin + kFrameRescale * static_cast<double>(frame_index);
     };
-    if (!image_guides.empty()) {
+    const auto video_rows_at = [&](const std::vector<Position3D>& grid,
+                                   int latent_frames, double start) {
+      double time = start;
+      for (int index = 0; index < latent_frames; ++index) {
+        for (const Position3D& position : grid) {
+          layout.positions.push_back({time, position.height, position.width});
+        }
+        time += kFrameRescale * kFramesPerToken[static_cast<std::size_t>(index) %
+                                                kFramesPerToken.size()];
+      }
+    };
+    if (condition_rows != 0) {
       for (const ImageGuidePlacement& guide : image_guides) {
         // The reference's _video_grid(vt, frame, cond_t): latent frame k of
         // the guide starts 5/3 * sum(FRAME_PER_TOKEN[0..k)) after cond_t.
@@ -552,26 +630,62 @@ std::optional<PackedLayout> BuildImageGuideLayout(
                                   kFramesPerToken.size()];
         }
       }
+      // Reference images and videos, from the text's end on.
+      double cursor = static_cast<double>(text_rows);
+      for (const ReferencePlacement& reference : references) {
+        if (reference.kind != ReferenceKind::kAudio) {
+          video_rows_at(FrameGrid(reference.latent_height,
+                                  reference.latent_width),
+                        reference.latent_frames, cursor);
+        }
+        cursor += ReferenceTimeSpan(reference);
+      }
+      if (layout.positions.size() != text_rows + condition_rows) {
+        throw std::logic_error("condition rows differ");
+      }
       layout.segments.push_back({text_rows, text_rows + condition_rows,
                                  SegmentKind::kVideoCondition});
     }
+    (void)guide_condition_rows;
     const double low_width = frame.front().width;
     const double high_width =
         frame[static_cast<std::size_t>(geometry.latent_width / 2) - 1].width;
-    if (!audio_guides.empty()) {
+    if (audio_condition_rows != 0) {
       for (const AudioGuidePlacement& guide : audio_guides) {
-        const double origin = guide_time(guide.frame);
+        const double start = guide_time(guide.frame);
         for (const double width : {low_width, high_width}) {
           for (int index = 0; index < guide.latent_frames; ++index) {
-            layout.positions.push_back({origin + index, 0.0, width});
+            layout.positions.push_back({start + index, 0.0, width});
           }
         }
+      }
+      // Reference soundtracks (on their video's grid) and standalone audio.
+      double cursor = static_cast<double>(text_rows);
+      for (const ReferencePlacement& reference : references) {
+        if (reference.audio_latent_frames > 0) {
+          double low = low_width;
+          double high = high_width;
+          if (reference.kind == ReferenceKind::kVideo) {
+            const std::vector<Position3D> grid =
+                FrameGrid(reference.latent_height, reference.latent_width);
+            low = grid.front().width;
+            high = grid[static_cast<std::size_t>(reference.latent_width / 2) -
+                        1].width;
+          }
+          for (const double width : {low, high}) {
+            for (int index = 0; index < reference.audio_latent_frames;
+                 ++index) {
+              layout.positions.push_back({cursor + index, 0.0, width});
+            }
+          }
+        }
+        cursor += ReferenceTimeSpan(reference);
       }
       const std::size_t begin = text_rows + condition_rows;
       layout.segments.push_back(
           {begin, begin + audio_condition_rows, SegmentKind::kAudioCondition});
     }
-    const double cursor = static_cast<double>(text_rows);
+    const double cursor = origin;
     for (int index = 0; index < geometry.temporal.audio_latent_frames;
          ++index) {
       layout.positions.push_back({cursor + index, 0.0, low_width});

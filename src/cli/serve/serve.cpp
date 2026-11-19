@@ -553,7 +553,10 @@ void AddVideoProviderOptions(
                    "Register a transformer LoRA for requests "
                    "(\"gufo\":{\"lora\":NAME}); repeatable"},
         std::tuple{"vision-projector", "GGUF",
-                   "Qwen3-VL vision tower for keyframe prompt blocks"}}) {
+                   "Qwen3-VL vision tower for keyframe prompt blocks"},
+        std::tuple{"control-model", "SAFETENSORS",
+                   "Fun-ControlNet-Union checkpoint for \"gufo\":"
+                   "{\"control\":...}"}}) {
     const std::string option = name;
     parser.AddCustomOption(
         "", "--" + option, metavar, help, "Model",
