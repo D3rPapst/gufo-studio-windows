@@ -39,8 +39,10 @@ namespace gufo::models::wan22 {
 /// `experts_resident` both load together and stay in the worker over jobs
 /// (same files, LoRAs and strengths: no reload; another LoRA choice on
 /// either expert reloads both) when the device has room
-/// (KeepVaceExpertsResident); otherwise one is on the device at a time,
-/// loaded from disk every job.
+/// (VaceExpertsFit: the experts plus the largest job phase, umT5, VAE or one
+/// expert sampling); otherwise one is on the device at a time, loaded from
+/// disk every job. Resident experts free their job buffers (activations,
+/// context slots) at the switch and after each job, before the VAE decode.
 struct I2V22Request {
   std::filesystem::path vae_root;  // Diffusers root with vae/ (Wan 2.1 VAE)
   std::filesystem::path t5_root;   // Diffusers root with tokenizer/ and

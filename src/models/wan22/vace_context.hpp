@@ -67,8 +67,9 @@ void SplitVaceControl(std::span<const std::uint8_t> video, int video_frames,
 inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
                                                         << 30;
 
-/// Wan 2.2 I2V A14B (Fun VACE counts per phase, see VaceExpertsFit): whether
-/// both experts (DiT + VACE module each) are loaded together and stay in the worker over jobs. `requested`
+/// Wan 2.2 Fun VACE / I2V A14B up to 2.2.11 (both now count per phase, see
+/// VaceExpertsFit): whether both experts (DiT + VACE module each) are loaded
+/// together and stay in the worker over jobs. `requested`
 /// (gufo-vace22.json experts_resident, default true); `free_bytes` what the
 /// device can still give with nothing of this model loaded (the admission
 /// reading); `expert_bytes` the weights of both experts; `job_bytes` what
@@ -98,7 +99,7 @@ inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
 [[nodiscard]] bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
                                             std::uint64_t job_bytes);
 
-/// Wan 2.2 Fun VACE residency, counted per phase of a job instead of with
+/// Wan 2.2 Fun VACE and I2V A14B residency, counted per phase of a job instead of with
 /// file sizes and a flat margin. A job loads umT5, then the VAE encoder,
 /// then samples, then loads the VAE decoder: these never sit on the device
 /// together, so beside resident experts only the largest of them needs room
@@ -122,6 +123,16 @@ inline constexpr std::uint64_t kVaceVaeWorkBytes = std::uint64_t{4} << 30;
 /// without the token embedding.
 [[nodiscard]] std::uint64_t VaceTextEncoderDeviceBytes(
     std::uint64_t text_encoder_files);
+
+/// One Wan 2.1 / 2.2 14B Transformer21's job buffers while it samples a
+/// latent of `frames` x `latent_height` x `latent_width`: the activations of
+/// that token count (as its Impl::Reserve) and `slots` prepared context
+/// slots (1 without CFG, 2 with). What Transformer21::ReleaseJobBuffers
+/// frees. Wan 2.2 I2V A14B: one expert sampling.
+[[nodiscard]] std::uint64_t Transformer21JobBytes(int frames,
+                                                  int latent_height,
+                                                  int latent_width,
+                                                  int slots);
 
 /// One expert's job buffers while it samples a latent of `frames` (incl.
 /// reference frames) x `latent_height` x `latent_width`: the Transformer21

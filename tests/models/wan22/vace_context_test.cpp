@@ -239,6 +239,45 @@ int main() {
            "no overflow (beside resident)");
   }
 
+  // Wan 2.2 I2V A14B residency per phase: one expert sampling is the
+  // Transformer21 job buffers alone (no VACE module); 832x480x81 = 21 x 60 x
+  // 104 latent, 32760 tokens: ~4.0 GiB activations + ~0.4 GiB per context
+  // slot.
+  {
+    const std::uint64_t one = wan22::Transformer21JobBytes(21, 60, 104, 1);
+    const std::uint64_t cfg = wan22::Transformer21JobBytes(21, 60, 104, 2);
+    Expect(one > 4 * kGb && one < 9 * kGb / 2,
+           "I2V sampling 832x480x81 one slot: ~4.4 GiB");
+    Expect(cfg > one && cfg - one > 3 * kGb / 8 && cfg - one < kGb / 2,
+           "I2V CFG: a second context slot of ~0.4 GiB");
+    Expect(wan22::VaceSamplingBytes(21, 60, 104, 1, 8) > one,
+           "VACE sampling: Transformer21 job buffers plus the VACE module");
+    Expect(wan22::Transformer21JobBytes(0, 60, 104, 1) == 0 &&
+               wan22::Transformer21JobBytes(21, 0, 104, 2) == 0,
+           "I2V no latent: nothing");
+    Expect(wan22::Transformer21JobBytes(21, 90, 160, 2) > cfg,
+           "I2V 1280x720: more tokens, more buffers");
+    const std::uint64_t umt5 =
+        wan22::VaceTextEncoderDeviceBytes(11361874539ULL);
+    const std::uint64_t peak = wan22::VaceJobPeakBytes(
+        umt5, kGb / 2 + wan22::kVaceVaeWorkBytes, cfg);
+    Expect(peak == umt5, "I2V 832x480: umT5 is the largest phase");
+    // Two FP8 experts ~28.6 GiB on 46.6 GiB free (example numbers).
+    const std::uint64_t experts = 28 * kGb + 6 * kGb / 10;
+    const std::uint64_t free = 46 * kGb + 6 * kGb / 10;
+    Expect(wan22::VaceExpertsFit(free, experts, peak),
+           "I2V: both experts resident beside the largest phase");
+    Expect(!wan22::VaceExpertsFit(experts + peak, experts, peak),
+           "I2V: the reserve counts");
+    // Up to 2.2.11 both experts kept their buffers (activations + slots,
+    // ~2 x 4.8 GiB): the next job's umT5 did not fit beside them.
+    const std::uint64_t leftovers = 2 * cfg;
+    Expect(!wan22::VaceJobFitsBesideResident(free - experts - leftovers, peak),
+           "I2V leftovers on both experts: no room for umT5");
+    Expect(wan22::VaceJobFitsBesideResident(free - experts, peak),
+           "I2V buffers released: the next job fits beside the experts");
+  }
+
   // Wan 2.2 I2V A14B: boundary 0.900 (t >= 900 runs the high-noise
   // expert). 8 steps at shift 5: sigmas 1, .972, .9375, .893, ... -> the
   // low-noise expert from step 3 (with T2V's 0.875 it would be step 4).

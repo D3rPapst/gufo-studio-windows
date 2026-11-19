@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -91,11 +93,16 @@ std::uint64_t DirectoryBytes(const std::filesystem::path& directory) {
   return total;
 }
 
-/// What this process can still allocate on the device, as the admission
-/// check reads it (DXGI budget on a Windows iGPU, else hipMemGetInfo).
+/// What this process can still allocate on the device: the admission
+/// reading, capped by the dedicated (DXGI local) budget left on a Windows
+/// iGPU, whose shared segment the next job's umT5 cannot count on (as
+/// GenerateVace21).
 std::uint64_t DeviceFreeBytes() {
   if (const auto memory = gufo::hip::QueryAdmissionMemory())
-    return memory->free_bytes;
+    return VaceDeviceFreeBytes(
+        memory->free_bytes, memory->local.has_value(),
+        memory->local ? memory->local->budget_bytes : 0,
+        memory->local ? memory->local->usage_bytes : 0);
   return 0;
 }
 
@@ -108,6 +115,88 @@ std::string Gib(std::uint64_t bytes) {
 
 void LogI2V(const std::string& message) {
   gufo::server::Logger::Info("video", "wan22-i2v-a14b " + message);
+}
+
+/// The phases of one job beside the experts (vace_context.hpp): umT5, the
+/// VAE (encoder or decoder) and one expert sampling never sit on the device
+/// together.
+struct JobNeed {
+  std::uint64_t text_encoder{0}, vae{0}, sampling{0}, peak{0};
+  std::string Numbers() const {
+    return " umt5_gib=" + Gib(text_encoder) + " vae_gib=" + Gib(vae) +
+           " sampling_gib=" + Gib(sampling) + " peak_gib=" + Gib(peak) +
+           " reserve_gib=" + Gib(kVaceReserveBytes);
+  }
+};
+
+JobNeed JobPeak(const I2V22Request& request, int frames, int lh, int lw,
+                bool cfg) {
+  JobNeed need;
+  need.text_encoder = VaceTextEncoderDeviceBytes(
+      DirectoryBytes(request.t5_root / "text_encoder"));
+  need.vae = DirectoryBytes(request.vae_root / "vae") + kVaceVaeWorkBytes;
+  need.sampling = Transformer21JobBytes(frames, lh, lw, cfg ? 2 : 1);
+  need.peak = VaceJobPeakBytes(need.text_encoder, need.vae, need.sampling);
+  return need;
+}
+
+/// event=<event> with the device memory now: hipMemGetInfo, the DXGI
+/// dedicated budget and usage of this process (Windows iGPU) and what the
+/// residency checks count on (free_gib).
+void LogMemory(const std::string& event, const std::string& extra) {
+  std::size_t hip_free = 0, hip_total = 0;
+  (void)hipMemGetInfo(&hip_free, &hip_total);
+  std::string line = "event=" + event + " hip_free_gib=" + Gib(hip_free) +
+                     " hip_total_gib=" + Gib(hip_total);
+  if (const auto memory = gufo::hip::QueryAdmissionMemory();
+      memory && memory->local) {
+    const auto& local = *memory->local;
+    line += " dxgi_budget_gib=" + Gib(local.budget_bytes) +
+            " dxgi_usage_gib=" + Gib(local.usage_bytes) + " dxgi_free_gib=" +
+            Gib(local.budget_bytes > local.usage_bytes
+                    ? local.budget_bytes - local.usage_bytes
+                    : 0);
+  }
+  LogI2V(line + " free_gib=" + Gib(DeviceFreeBytes()) + extra);
+}
+
+/// umT5 states of recent prompts (the real rows, FP32), per text encoder:
+/// the same prompt (and the usual fixed negative prompt) skips umT5. The
+/// encoder is deterministic, so a hit gives the states the first job had.
+class PromptCache {
+public:
+  static constexpr std::size_t kEntries = 8;  // <= 8 x 8 MB host RAM
+
+  bool Find(const std::string& key, std::vector<float>* states) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+      if (it->first == key) {
+        *states = it->second;
+        entries_.splice(entries_.begin(), entries_, it);  // most recent
+        return true;
+      }
+    return false;
+  }
+  void Put(const std::string& key, const std::vector<float>& states) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+      if (it->first == key) {
+        entries_.erase(it);
+        break;
+      }
+    entries_.emplace_front(key, states);
+    if (entries_.size() > kEntries)
+      entries_.pop_back();
+  }
+
+private:
+  std::mutex mutex_;
+  std::list<std::pair<std::string, std::vector<float>>> entries_;
+};
+
+PromptCache& Prompts() {
+  static PromptCache* cache = new PromptCache;  // never destroyed at exit
+  return *cache;
 }
 
 std::unique_ptr<Transformer21> LoadExpert(const ExpertKey& key,
@@ -123,6 +212,18 @@ std::unique_ptr<Transformer21> LoadExpert(const ExpertKey& key,
     return nullptr;
   }
   return dit;
+}
+
+/// Releases the resident experts (this job's umT5, VAE or sampling would
+/// not fit beside them). False when none were loaded.
+bool ReleaseResidentExperts(const std::string& reason) {
+  const std::lock_guard<std::mutex> lock(ResidentMutex());
+  ResidentExperts& kept = Resident();
+  if (!kept.loaded && !kept.high && !kept.low)
+    return false;
+  kept.Reset();
+  LogI2V("event=experts_released reason=" + reason);
+  return true;
 }
 
 }  // namespace
@@ -184,32 +285,99 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
                                          static_cast<std::size_t>(lh),
                                          static_cast<std::size_t>(lw)};
 
+  // Device memory before and after the job (event=job_memory_start /
+  // job_memory_end), to measure what a job leaves behind.
+  LogMemory("job_memory_start", std::string(" experts_resident_requested=") +
+                                    (request.experts_resident ? "1" : "0"));
+  bool job_ok = false;
+  struct EndLog {
+    const I2V22Telemetry& tel;
+    const bool& ok;
+    ~EndLog() {
+      LogMemory("job_memory_end",
+                std::string(" ok=") + (ok ? "1" : "0") +
+                    " experts_resident=" + (tel.experts_resident ? "1" : "0") +
+                    " experts_reused=" + (tel.experts_reused ? "1" : "0") +
+                    " peak_used_gib=" + Gib(tel.peak_device_bytes) +
+                    " total_s=" + std::to_string(tel.total_ms / 1000.0));
+    }
+  } end_log{tel, job_ok};
+
+  // 0. Resident experts from an earlier job: the umT5, VAE and sampling of
+  // this job run beside them, so the largest of them needs room now (the
+  // first job ran umT5 before the experts loaded). No room: release them.
+  {
+    bool fits = true;
+    std::string numbers;
+    {
+      const std::lock_guard<std::mutex> lock(ResidentMutex());
+      if (Resident().loaded) {
+        const JobNeed need = JobPeak(request, lf, lh, lw, cfg);
+        const std::uint64_t free_bytes = DeviceFreeBytes();
+        fits = VaceJobFitsBesideResident(free_bytes, need.peak);
+        numbers = " free_gib=" + Gib(free_bytes) + need.Numbers();
+        LogI2V(std::string("event=resident_check fits=") +
+               (fits ? "1" : "0") + numbers);
+      }
+    }
+    if (!fits)
+      (void)ReleaseResidentExperts("low_memory_before_job" + numbers);
+  }
+
   // 1. Prompts (umT5, 512 rows: the states of the real tokens, then zeros).
+  // States of a recent identical prompt come from the cache; umT5 loads
+  // only when one is missing and is freed right after encoding.
   std::vector<float> text, negative;
   {
     auto start = Clock::now();
-    const auto tokenizer = Tokenizer::Load(
-        request.t5_root / "tokenizer" / "tokenizer.json", error);
-    if (!tokenizer)
-      return false;
-    auto encoder = TextEncoder::Load(request.t5_root / "text_encoder", error);
-    if (!encoder)
-      return false;
-    TrackDevice(&tel.peak_device_bytes);
-    const auto encode = [&](const std::string& prompt,
-                            std::vector<float>* out) {
-      std::vector<float> states;
-      if (!encoder->Encode(tokenizer->Encode(CleanPrompt(prompt)), &states,
-                           error))
+    const std::string cache_root = request.t5_root.generic_string() + '|';
+    const std::string text_key = cache_root + CleanPrompt(request.prompt);
+    const std::string negative_key =
+        cache_root + CleanPrompt(request.negative_prompt);
+    std::vector<float> text_states, negative_states;
+    const bool text_hit = Prompts().Find(text_key, &text_states);
+    const bool negative_hit =
+        !cfg || Prompts().Find(negative_key, &negative_states);
+    if (!text_hit || !negative_hit) {
+      const auto tokenizer = Tokenizer::Load(
+          request.t5_root / "tokenizer" / "tokenizer.json", error);
+      if (!tokenizer)
         return false;
+      auto encoder =
+          TextEncoder::Load(request.t5_root / "text_encoder", error);
+      if (!encoder && ReleaseResidentExperts("text_encoder_load_failed")) {
+        (void)hipGetLastError();  // the failed allocation, not sticky
+        encoder = TextEncoder::Load(request.t5_root / "text_encoder", error);
+      }
+      if (!encoder)
+        return false;
+      TrackDevice(&tel.peak_device_bytes);
+      const auto encode = [&](const std::string& prompt,
+                              const std::string& key,
+                              std::vector<float>* states) {
+        if (!encoder->Encode(tokenizer->Encode(CleanPrompt(prompt)), states,
+                             error))
+          return false;
+        Prompts().Put(key, *states);
+        return true;
+      };
+      if ((!text_hit && !encode(request.prompt, text_key, &text_states)) ||
+          (!negative_hit &&
+           !encode(request.negative_prompt, negative_key, &negative_states)))
+        return false;
+    }  // umT5 freed here
+    const auto pad = [](const std::vector<float>& states,
+                        std::vector<float>* out) {
       out->assign(TextEncoder::kMaxTokens * TextEncoder::kModelWidth, 0.0F);
       std::copy_n(states.begin(), std::min(states.size(), out->size()),
                   out->begin());
-      return true;
     };
-    if (!encode(request.prompt, &text) ||
-        (cfg && !encode(request.negative_prompt, &negative)))
-      return false;
+    pad(text_states, &text);
+    if (cfg)
+      pad(negative_states, &negative);
+    LogI2V(std::string("event=prompt_cache text=") +
+           (text_hit ? "hit" : "miss") + " negative=" +
+           (!cfg ? "unused" : negative_hit ? "hit" : "miss"));
     tel.text_ms = Ms(start);
     progress("prompt", 1, 1);
   }
@@ -303,20 +471,19 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
       };
       const std::uint64_t expert_bytes = (kept.high ? 0 : bytes_of(high_key)) +
                                          (kept.low ? 0 : bytes_of(low_key));
-      const std::uint64_t job_bytes =
-          DirectoryBytes(request.t5_root / "text_encoder") +
-          DirectoryBytes(request.vae_root / "vae");
+      // Beside them: the largest phase of a job (umT5, VAE or one expert
+      // sampling; each expert frees its job buffers after its steps), not
+      // all of them at once.
+      const JobNeed need = JobPeak(request, lf, lh, lw, cfg);
       const std::uint64_t free_bytes = DeviceFreeBytes();
       const std::string numbers =
           " free_gib=" + Gib(free_bytes) + " experts_gib=" +
-          Gib(expert_bytes) + " job_gib=" + Gib(job_bytes) +
-          " margin_gib=" + Gib(kVaceExpertMarginBytes) +
+          Gib(expert_bytes) + need.Numbers() +
           " lora_high=" + (high_key.lora.empty() ? "0" : "1") +
           " lora_low=" + (low_key.lora.empty() ? "0" : "1") +
           " kept=" + (kept.high ? (kept.low ? "both" : "high")
                                 : (kept.low ? "low" : "none"));
-      if (KeepVaceExpertsResident(true, free_bytes, expert_bytes,
-                                  job_bytes)) {
+      if (VaceExpertsFit(free_bytes, expert_bytes, need.peak)) {
         const auto start = Clock::now();
         std::string load_error;
         if (!kept.high)
@@ -382,9 +549,10 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
       return true;
     };
     if (resident) {
-      if (switch_at > 0 && !prepare(*high_expert, true))
-        return false;
-      if (switch_at < request.steps && !prepare(*low_expert, false))
+      // Only the expert that runs first holds this job's buffers; the
+      // low-noise one is set up at the switch, after the high-noise one
+      // freed its own.
+      if (!prepare(switch_at > 0 ? *high_expert : *low_expert, switch_at > 0))
         return false;
       use(switch_at > 0 ? high_expert : low_expert, switch_at > 0);
     } else if (!load(switch_at > 0)) {
@@ -397,10 +565,14 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
       if (cancelled())
         return false;
       if (on_high && step >= switch_at) {
-        if (resident)
+        if (resident) {
+          high_expert->ReleaseJobBuffers();
+          if (!prepare(*low_expert, false))
+            return false;
           use(low_expert, false);
-        else if (!load(false))
+        } else if (!load(false)) {
           return false;
+        }
       }
       const auto step_start = Clock::now();
       if (!I2VModelInput(latents, condition_channels, &input)) {
@@ -466,6 +638,15 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
     if (!sampled && (error == nullptr || *error != "cancelled")) {
       Resident().Reset();
       LogI2V("event=experts_released reason=job_failed");
+    } else {
+      // Done or cancelled: the experts stay with their weights only; the
+      // activations and context slots of this job go before the VAE
+      // decoder loads (2.2.11 kept them on both experts over jobs).
+      for (Transformer21* expert :
+           {Resident().high.get(), Resident().low.get()})
+        if (expert != nullptr)
+          expert->ReleaseJobBuffers();
+      LogMemory("experts_job_buffers_released", "");
     }
     resident_lock.unlock();
   }
@@ -491,6 +672,7 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
     tel.decode_ms = Ms(start);
   }
   tel.total_ms = Ms(total_start);
+  job_ok = true;
   return true;
 }
 

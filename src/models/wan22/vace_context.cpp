@@ -145,9 +145,8 @@ std::uint64_t VaceTextEncoderDeviceBytes(std::uint64_t text_encoder_files) {
              : text_encoder_files;
 }
 
-std::uint64_t VaceSamplingBytes(int frames, int latent_height,
-                                int latent_width, int slots,
-                                int vace_blocks) {
+std::uint64_t Transformer21JobBytes(int frames, int latent_height,
+                                   int latent_width, int slots) {
   if (frames <= 0 || latent_height <= 0 || latent_width <= 0)
     return 0;
   constexpr std::uint64_t W = 5120, F = 13824, kPatchIn = 144,
@@ -157,7 +156,6 @@ std::uint64_t VaceSamplingBytes(int frames, int latent_height,
   const std::uint64_t T = static_cast<std::uint64_t>(frames) *
                           (latent_height / 2) * (latent_width / 2);
   const std::uint64_t S = static_cast<std::uint64_t>(std::max(slots, 0));
-  const std::uint64_t B = static_cast<std::uint64_t>(std::max(vace_blocks, 0));
   // Transformer21::Impl::Reserve.
   std::uint64_t bytes = T * kPatchIn * 4 + T * kPatchIn * 2 + T * W * 4 +
                         T * W * 2 + T * 3 * W * 2 + 3 * T * W * 2 +
@@ -167,6 +165,22 @@ std::uint64_t VaceSamplingBytes(int frames, int latent_height,
   // Context slots: keys, packed values, embedded text.
   bytes += S * (kLayers * kText * W * 2 + kLayers * padded(kText) * W * 2 +
                 kText * W * 2);
+  return bytes;
+}
+
+std::uint64_t VaceSamplingBytes(int frames, int latent_height,
+                                int latent_width, int slots,
+                                int vace_blocks) {
+  if (frames <= 0 || latent_height <= 0 || latent_width <= 0)
+    return 0;
+  constexpr std::uint64_t W = 5120, kText = 512;
+  const auto padded = [](std::uint64_t rows) { return (rows + 31) & ~31ULL; };
+  const std::uint64_t T = static_cast<std::uint64_t>(frames) *
+                          (latent_height / 2) * (latent_width / 2);
+  const std::uint64_t S = static_cast<std::uint64_t>(std::max(slots, 0));
+  const std::uint64_t B = static_cast<std::uint64_t>(std::max(vace_blocks, 0));
+  std::uint64_t bytes =
+      Transformer21JobBytes(frames, latent_height, latent_width, slots);
   // VACE: context [96, frames, h, w] FP32, stream [T, W] FP32, text keys /
   // values per slot, text scratch.
   bytes += 96ULL * frames * latent_height * latent_width * 4 + T * W * 4 +
