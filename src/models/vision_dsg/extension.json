@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "name": "vision_dsg",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [
+    "ccip"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_vision_dsg_cpu": {
+      "requires": []
+    },
+    "gufo_vision_dsg": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/",
+      "reference/"
+    ]
+  }
+}

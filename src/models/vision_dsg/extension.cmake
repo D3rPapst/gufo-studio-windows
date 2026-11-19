@@ -3,20 +3,34 @@
 # GPU, weights read from the Hugging Face snapshots. CPU side: the
 # transformers image processors (Pillow-exact resizing from the ccip
 # extension) and the request-independent post-processing.
+# gufo-studio-windows: a library extension (no upstream capability for
+# depth / grounding / segmentation yet); src/cli/serve/media links
+# gufo_vision_dsg directly when it is built.
 # Written with AI assistance (Claude Code).
 
-add_library(gufo_vision_dsg_cpu STATIC depth_preprocess.cpp grounding_cpu.cpp
-  sam_cpu.cpp)
-target_include_directories(gufo_vision_dsg_cpu PUBLIC ${PROJECT_SOURCE_DIR})
-target_compile_features(gufo_vision_dsg_cpu PUBLIC cxx_std_20)
-target_link_libraries(gufo_vision_dsg_cpu PUBLIC gufo_ccip)
+gufo_extension_target(
+  NAME gufo_vision_dsg_cpu
+  SOURCES
+    depth_preprocess.cpp
+    grounding_cpu.cpp
+    sam_cpu.cpp
+)
+if(TARGET gufo_vision_dsg_cpu)
+  target_include_directories(gufo_vision_dsg_cpu PUBLIC ${PROJECT_SOURCE_DIR})
+  target_compile_features(gufo_vision_dsg_cpu PUBLIC cxx_std_20)
+  target_link_libraries(gufo_vision_dsg_cpu PUBLIC gufo_ccip)
+endif()
 
-if (ENGINE_ENABLE_HIP)
-  add_library(gufo_vision_dsg STATIC EXCLUDE_FROM_ALL
+gufo_extension_target(
+  NAME gufo_vision_dsg
+  SOURCES
     hip_ops.hip
     depth_anything.hip
     grounding_dino.hip
-    sam.hip)
+    sam.hip
+)
+if(TARGET gufo_vision_dsg)
+  set_target_properties(gufo_vision_dsg PROPERTIES EXCLUDE_FROM_ALL TRUE)
   target_include_directories(gufo_vision_dsg PUBLIC ${PROJECT_SOURCE_DIR})
   target_compile_options(gufo_vision_dsg PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-O3>)
   target_link_libraries(gufo_vision_dsg PUBLIC gufo_vision_dsg_cpu gufo_core
@@ -24,7 +38,8 @@ if (ENGINE_ENABLE_HIP)
 
   # Oracle probe: runs one model on one image and writes the raw outputs as
   # little-endian float32 files for reference/compare_*.py. Not named gufo-*.
-  add_executable(vision-dsg-probe EXCLUDE_FROM_ALL probe_main.cpp)
+  add_executable(vision-dsg-probe EXCLUDE_FROM_ALL
+    ${GUFO_EXTENSION_BUILD_ROOT}/probe_main.cpp)
   set_target_properties(vision-dsg-probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
   target_link_libraries(vision-dsg-probe PRIVATE gufo_vision_dsg)

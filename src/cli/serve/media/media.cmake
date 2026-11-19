@@ -22,7 +22,7 @@ add_subdirectory(src/models/yue2)
 # Real-ESRGAN (src/models/realesrgan) is a library extension too; it
 # declares GUFO_ENABLE_ONNXRUNTIME.
 # Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).
-add_subdirectory(src/models/vision_dsg)
+# (src/models/vision_dsg is a library extension.)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
 add_subdirectory(src/models/qwen3_omni)
 
