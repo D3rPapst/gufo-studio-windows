@@ -15,7 +15,7 @@
 # Written with AI assistance (Claude Code).
 
 # RIFE (src/models/rife) is a library extension, built with the extensions.
-add_subdirectory(src/models/ace_step)
+# ACE-Step (src/models/ace_step) is a library extension; yue2 links it.
 # YuE2-3B songs (`gufo serve music --yue2`), on the ACE-Step stack.
 add_subdirectory(src/models/yue2)
 add_subdirectory(src/models/mmaudio)

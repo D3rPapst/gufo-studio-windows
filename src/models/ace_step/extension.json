@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "name": "ace_step",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_ace_step": {
+      "requires": []
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "tests": [
+    {
+      "target": "ace_step_tokens_oracle_test",
+      "ctest": "ace_step_tokens_oracle_test",
+      "check_pr": false,
+      "windows_build": true
+    },
+    {
+      "target": "ace_step_preview_test",
+      "ctest": "ace_step_preview_test",
+      "check_pr": false,
+      "windows_build": true
+    },
+    {
+      "target": "ace_step_sampler_test",
+      "ctest": "ace_step_sampler_test",
+      "check_pr": false,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "ace_step",
+    "music"
+  ]
+}
