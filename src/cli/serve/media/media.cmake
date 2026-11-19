@@ -18,7 +18,7 @@
 # ACE-Step (src/models/ace_step) is a library extension; yue2 links it.
 # YuE2-3B songs (`gufo serve music --yue2`), on the ACE-Step stack.
 add_subdirectory(src/models/yue2)
-add_subdirectory(src/models/mmaudio)
+# MMAudio (src/models/mmaudio) is a library extension.
 # Real-ESRGAN (src/models/realesrgan) is a library extension too; it
 # declares GUFO_ENABLE_ONNXRUNTIME.
 # Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).

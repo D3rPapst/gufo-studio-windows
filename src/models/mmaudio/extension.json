@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "name": "mmaudio",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [
+    "rife"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_mmaudio": {
+      "requires": []
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "tests": [
+    {
+      "target": "mmaudio_preprocess_test",
+      "ctest": "mmaudio_preprocess_test",
+      "check_pr": false,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "mmaudio"
+  ]
+}
