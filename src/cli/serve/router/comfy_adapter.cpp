@@ -2509,6 +2509,8 @@ json::Value Adapter::RunFoley(const std::shared_ptr<Job>& job,
     throw std::runtime_error("gufo foley request failed (HTTP " +
                              std::to_string(result.status) +
                              "): " + ErrorMessage(result));
+  if (auto warning = FoleyShortWarning(spec, task.node_id, result.body))
+    job->warnings.push_back(std::move(*warning));
   json::Value ui = json::Value::object();
   for (const OutputTarget& target : task.outputs) {
     if (target.kind != OutputKind::kVideo) {

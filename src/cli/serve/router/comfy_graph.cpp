@@ -4001,6 +4001,20 @@ FoleyTask BuildFoley(const Graph& graph, const std::string& id,
         warnings->push_back("node " + images->node +
                             ": custom_width / custom_height are ignored "
                             "(MMAudio resizes the frames itself)");
+      // Frame options shape the IMAGE batch: only ComfyUI-MMAudio's way
+      // (the batch as 25 fps) applies them. Without them the video's own
+      // frame rate holds, so `duration` is not cut to frames / 25.
+      task.consecutive = task.force_rate > 0 || task.skip_first_frames > 0 ||
+                         task.select_every_nth > 1 || task.frame_load_cap > 0;
+      if (task.force_rate > 0 && std::abs(task.force_rate - 25.0) > 1e-6) {
+        char rate[32];
+        std::snprintf(rate, sizeof(rate), "%g", task.force_rate);
+        warnings->push_back(
+            "node " + images->node + ": force_rate " + rate +
+            " - MMAudio reads the frames as 25 fps (as ComfyUI-MMAudio), so "
+            "the sound runs off the picture; force_rate 25 or 0 keeps the "
+            "video's timing");
+      }
     } else if (cls == "GetVideoComponents") {
       const Link file = graph.RequireLink(images->node, "video");
       if (graph.Class(file.node) != "LoadVideo")
@@ -4773,7 +4787,10 @@ json::Value FoleyRequestBody(const FoleyTask& task) {
   body["cfg_strength"] = task.cfg;
   body["seed"] = task.seed;
   body["mask_away_clip"] = task.mask_away_clip;
-  if (task.video) {
+  if (task.video && !task.consecutive) {
+    // LoadVideo / plain VHS_LoadVideo: by time at the file's frame rate.
+    body["frame_mode"] = "resample";
+  } else if (task.video) {
     // ComfyUI-MMAudio feeds the IMAGE batch's first frames, not 8 / 25 fps.
     body["frame_mode"] = "consecutive";
     if (task.force_rate > 0)
@@ -5052,6 +5069,32 @@ std::optional<std::string> JoinWavs(const std::vector<std::string>& parts,
     joined.pcm += wav->pcm;
   }
   return BuildWav(joined);
+}
+
+std::optional<std::string> FoleyShortWarning(const FoleyTask& task,
+                                             const std::string& node_id,
+                                             std::string_view wav) {
+  if (!task.video)
+    return std::nullopt;
+  const auto parsed = ParseWav(wav);
+  if (!parsed || parsed->sample_rate <= 0 || parsed->channels < 1)
+    return std::nullopt;
+  const double seconds =
+      static_cast<double>(parsed->pcm.size()) /
+      (2.0 * parsed->channels * static_cast<double>(parsed->sample_rate));
+  // The worker cuts to whole 25 fps Synchformer frames: allow a few.
+  if (seconds >= task.duration - 0.1)
+    return std::nullopt;
+  char text[160];
+  std::snprintf(text, sizeof(text), "the sound is %.2f s, shorter than "
+                                    "duration %.2f s",
+                seconds, task.duration);
+  return "node " + node_id + ": " + text +
+         (task.consecutive
+              ? " (the frames run as 25 fps, as in ComfyUI-MMAudio: too few "
+                "after force_rate / skip_first_frames / select_every_nth / "
+                "frame_load_cap)"
+              : " (the video is shorter)");
 }
 
 namespace {

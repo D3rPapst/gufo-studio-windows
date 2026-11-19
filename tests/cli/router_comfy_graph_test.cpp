@@ -4086,6 +4086,77 @@ void TestFoley() {
       std::get<comfy::FoleyTask>(still_plan.tasks[0].spec);
   assert((still_foley.image == comfy::FileRef{"kf.png", "input"}));
   assert(still_plan.warnings.size() == 1);
+
+  // force_rate 25 keeps ComfyUI-MMAudio's frames-as-25-fps (= the video's
+  // timing); without frame options the worker resamples by time at the
+  // file's own rate, so duration is not cut to frames / 25 (Regie 19.11.:
+  // 81 frames at 16 fps gave 3.25 s instead of 5.06 s).
+  assert(foley.consecutive);
+  const comfy::Plan plain_plan =
+      PlanOf(Replace(kMmaudio, "\"force_rate\": 25", "\"force_rate\": 0")
+                 .c_str());
+  const auto& plain = std::get<comfy::FoleyTask>(plain_plan.tasks[0].spec);
+  assert(!plain.consecutive && plain_plan.warnings.empty());
+  const json::Value plain_body = comfy::FoleyRequestBody(plain);
+  assert(plain_body.member_str("frame_mode") == "resample");
+  assert(plain_body.find("force_rate") == nullptr);
+  // Any frame option keeps the ComfyUI way (only it applies them).
+  for (const auto& [from, to] :
+       {std::pair{"\"frame_load_cap\": 0", "\"frame_load_cap\": 50"},
+        std::pair{"\"skip_first_frames\": 0", "\"skip_first_frames\": 4"},
+        std::pair{"\"select_every_nth\": 1", "\"select_every_nth\": 2"}}) {
+    const comfy::Plan cut_plan = PlanOf(
+        Replace(Replace(kMmaudio, "\"force_rate\": 25", "\"force_rate\": 0"),
+                from, to)
+            .c_str());
+    const auto& cut = std::get<comfy::FoleyTask>(cut_plan.tasks[0].spec);
+    assert(cut.consecutive);
+    assert(comfy::FoleyRequestBody(cut).member_str("frame_mode") ==
+           "consecutive");
+  }
+  // force_rate other than 25: ComfyUI-faithful, with a warning.
+  const comfy::Plan rate_plan =
+      PlanOf(Replace(kMmaudio, "\"force_rate\": 25", "\"force_rate\": 16")
+                 .c_str());
+  assert(std::get<comfy::FoleyTask>(rate_plan.tasks[0].spec).consecutive);
+  assert(rate_plan.warnings.size() == 1 &&
+         rate_plan.warnings[0].find("force_rate 16") != std::string::npos);
+  // LoadVideo -> GetVideoComponents: the video object carries its rate.
+  const comfy::Plan native_plan = PlanOf(R"({
+ "1": {"class_type": "MMAudioModelLoader", "inputs": {"mmaudio_model": "mmaudio_large_44k_v2_fp16.safetensors", "base_precision": "fp16"}},
+ "2": {"class_type": "MMAudioFeatureUtilsLoader", "inputs": {"vae_model": "mmaudio_vae_44k_fp16.safetensors", "synchformer_model": "mmaudio_synchformer_fp16.safetensors", "clip_model": "apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors", "mode": "44k", "precision": "fp16"}},
+ "3": {"class_type": "LoadVideo", "inputs": {"file": "shot16fps.mp4"}},
+ "7": {"class_type": "GetVideoComponents", "inputs": {"video": ["3", 0]}},
+ "4": {"class_type": "MMAudioSampler", "inputs": {"mmaudio_model": ["1", 0], "feature_utils": ["2", 0], "duration": 5.06, "steps": 25, "cfg": 4.5, "seed": 1, "prompt": "rain", "negative_prompt": "", "mask_away_clip": false, "force_offload": true, "images": ["7", 0]}},
+ "5": {"class_type": "SaveAudio", "inputs": {"audio": ["4", 0], "filename_prefix": "ton/s16"}}
+})");
+  const auto& native = std::get<comfy::FoleyTask>(native_plan.tasks[0].spec);
+  assert((native.video == comfy::FileRef{"shot16fps.mp4", "input"}));
+  assert(!native.consecutive && native_plan.warnings.empty());
+  assert(comfy::FoleyRequestBody(native).member_str("frame_mode") ==
+         "resample");
+
+  // A sound clearly shorter than duration warns (for /history); a cut of a
+  // few 25 fps frames, text mode and an unreadable WAV do not.
+  const auto wav_of = [](double seconds) {
+    comfy::Wav wav;
+    wav.sample_rate = 44100;
+    wav.channels = 1;
+    wav.pcm.assign(static_cast<std::size_t>(seconds * 44100) * 2, '\0');
+    return comfy::BuildWav(wav);
+  };
+  const auto short_native =
+      comfy::FoleyShortWarning(native, "4", wav_of(3.25));
+  assert(short_native && short_native->find("node 4: the sound is 3.25 s, "
+                                            "shorter than duration 5.06 s") ==
+                             0);
+  assert(short_native->find("the video is shorter") != std::string::npos);
+  assert(!comfy::FoleyShortWarning(native, "4", wav_of(5.04)));
+  assert(!comfy::FoleyShortWarning(native, "4", wav_of(5.2)));
+  assert(!comfy::FoleyShortWarning(native, "4", "not a wav"));
+  assert(!comfy::FoleyShortWarning(text_foley, "4", wav_of(1.0)));
+  const auto short_vhs = comfy::FoleyShortWarning(foley, "4", wav_of(4.0));
+  assert(short_vhs && short_vhs->find("25 fps") != std::string::npos);
 }
 
 int main() {

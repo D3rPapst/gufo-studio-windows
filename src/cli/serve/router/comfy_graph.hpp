@@ -314,10 +314,17 @@ struct FoleyTask {
   std::uint64_t seed{0};
   bool mask_away_clip{false};
   /// The frames of the sampler's `images` input: a video file (VHS_LoadVideo
-  /// or LoadVideo) sent as gufo frame_mode "consecutive", or one image
-  /// (LoadImage, MMAudio's image mode). Neither = text to audio.
+  /// or LoadVideo), or one image (LoadImage, MMAudio's image mode). Neither
+  /// = text to audio.
   std::optional<FileRef> video;
   std::optional<FileRef> image;
+  /// How the worker reads `video`: false = gufo frame_mode "resample" (by
+  /// time at the file's own frame rate, so `duration` holds up to the video
+  /// length; LoadVideo and VHS_LoadVideo without frame options), true =
+  /// "consecutive" (ComfyUI-MMAudio: the IMAGE batch taken as 25 fps; a
+  /// VHS_LoadVideo with force_rate / skip_first_frames / select_every_nth /
+  /// frame_load_cap, which only that mode applies).
+  bool consecutive{false};
   /// VHS_LoadVideo options, applied by the worker like VHS does.
   double force_rate{0};
   int skip_first_frames{0};
@@ -328,6 +335,13 @@ struct FoleyTask {
 /// The /v1/audio/foley body for `task` without the media (the executor adds
 /// video / image as data URLs).
 json::Value FoleyRequestBody(const FoleyTask& task);
+
+/// A gufo_warning for node `node_id` when the worker's sound `wav` is
+/// clearly shorter than the sampler's duration (the video ran out of
+/// frames); nothing for text / image mode or a WAV it cannot read.
+std::optional<std::string> FoleyShortWarning(const FoleyTask& task,
+                                             const std::string& node_id,
+                                             std::string_view wav);
 
 /// kProcess: no generation, a loaded video is only interpolated / upscaled
 /// (LoadVideo -> GetVideoComponents -> RIFE VFI / ImageUpscaleWithModel).

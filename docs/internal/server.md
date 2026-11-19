@@ -860,6 +860,17 @@ is 60 fps, so a `CreateVideo` at 60 fps and a `SaveImage` of the same
 graph name one output. Outputs of one video job must share the RIFE
 multiplier and the upscale; target frame rates only have to agree with
 each other within 0.5 % (59.94 ~ 60), and the error names what differs.
+ComfyUI `MMAudioSampler` with a video (after 2.2.9, Regie 19.11.): from
+`LoadVideo` -> `GetVideoComponents` and from a `VHS_LoadVideo` without
+frame options the worker gets `frame_mode` `resample` (frames by time at
+the file's own rate), so `duration` holds up to the video's length; before,
+every video went as `consecutive` (ComfyUI-MMAudio: the IMAGE batch taken
+as 25 fps), which cut 81 frames at 16 fps to 3.25 s. A `VHS_LoadVideo` with
+`force_rate`, `skip_first_frames`, `select_every_nth` or `frame_load_cap`
+stays `consecutive` (only that mode applies those options; `force_rate` 25
+is then exactly the video's timing, another rate is a `gufo_warning` that
+the sound runs off the picture). A sound more than 0.1 s shorter than
+`duration` is a `gufo_warning` in `/history` (`FoleyShortWarning`).
 
 **Parallel prompts and the pool view (2.1).** The adapter runs up to
 `--comfy-parallel` prompts at once (default: `--jobs-parallel`, at least
