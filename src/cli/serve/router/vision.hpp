@@ -60,6 +60,14 @@
 //   "sicher", "fingers_sichtbar", "verdeckt", "befunde", "befund",
 //   "seconds", "waited_seconds"} or {..., "fehler"}]; not relayed to the pool
 //   partner unless the models are missing here.
+//   "person_count" (vision_persons.hpp): the whole picture checked for its
+//   persons by a vision chat model (default qwen3.8-27b,
+//   "person_count_options": expected count, reference pictures):
+//   detections.person_count = {"personen", "erwartet", "detektor_personen",
+//   "liste", "befunde" (extra_limb, duplicate_person, count_mismatch,
+//   sonstiges, each with stelle and sicherheit), "sicher", "befund",
+//   "urteil", "seconds", "waited_seconds"} or {..., "fehler"}; the "person"
+//   detector runs too; not relayed unless the models are missing here.
 //   Unknown task or bad option: 400.
 //   Models: <--vision-dir>/<model>.{safetensors,json} from
 //   extensions-ours/ccip/reference/convert_weights.py, each loaded on first
@@ -94,6 +102,7 @@
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/cli/serve/router/vision_fingers.hpp"
+#include "src/cli/serve/router/vision_persons.hpp"
 #include "src/cli/serve/router/vision_wd14.hpp"
 #include "src/core/json.hpp"
 
@@ -164,6 +173,9 @@ struct Request {
   /// "hand_fingers" and "hand_fingers_options" (vision_fingers.hpp); the
   /// "hand" detector then runs too.
   HandFingersRequest hand_fingers;
+  /// "person_count" and "person_count_options" (vision_persons.hpp); the
+  /// "person" detector then runs too.
+  PersonCountRequest person_count;
 };
 /// Most "pose_boxes" per request.
 inline constexpr std::size_t kMaxPoseBoxes = 16;
@@ -188,8 +200,9 @@ struct Options {
   /// The pool partner (cpu_pool.hpp); null: never relayed.
   cpu::Relay relay;
   /// One request through the gate and the router (for Ablage paths and the
-  /// "hand_fingers" chats), as mcp::Options::serve. Null: Ablage paths are
-  /// refused (400), every hand_fingers hand answers "fehler".
+  /// "hand_fingers" and "person_count" chats), as mcp::Options::serve.
+  /// Null: Ablage paths are refused (400), every hand_fingers hand and
+  /// person_count answer "fehler".
   std::function<server::HttpResponse(const server::HttpRequest&)> serve;
 };
 

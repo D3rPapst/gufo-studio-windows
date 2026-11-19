@@ -13,7 +13,8 @@
 // ocr models missing here, X-Gufo-Pool local/remote, the partner's 503
 // falling back here, and /v1/figuren "ccip" over the same queue/relay.
 // Request limits: encoded bytes and decoded pixels over all pictures,
-// decoding only after the CPU turn.
+// decoding only after the CPU turn. The model checks hand_fingers and
+// person_count with a scripted chat (no model).
 // Written with AI assistance (Claude Code).
 #undef NDEBUG
 #include <algorithm>
@@ -361,8 +362,8 @@ void TestErrors() {
   // Unknown task: 400 naming every task; no --vision-dir: 503 for each task.
   auto response = service.Handle(Post(Body("AAAA", {"cat"})));
   assert(response->status == 400);
-  assert(response->body.find("person, head, face, hand, hand_fingers, pose, pose_wholebody, ocr, "
-                             "wd14_tags") != std::string::npos);
+  assert(response->body.find("person, head, face, hand, hand_fingers, person_count, pose, "
+                             "pose_wholebody, ocr, wd14_tags") != std::string::npos);
   for (const char* task : {"person", "ocr", "wd14_tags"}) {
     response = service.Handle(Post(Body("AAAA", {task})));
     assert(response->status == 503);
@@ -388,6 +389,10 @@ void TestErrors() {
   response = service_missing.Handle(Post(Body("AAAA", {"hand_fingers"})));
   assert(response->status == 503);
   assert(response->body.find("hand_detect_v1.0_s.safetensors") != std::string::npos);
+  // person_count needs the person detector.
+  response = service_missing.Handle(Post(Body("AAAA", {"person_count"})));
+  assert(response->status == 503);
+  assert(response->body.find("person_detect_v1.1_m.safetensors") != std::string::npos);
 }
 
 HttpResponse JsonAnswer(int status, std::string body) {
@@ -708,6 +713,361 @@ void TestHandFingers() {
   // models.hand_fingers names the model.
   assert(vision::HandFingersModelInfo(defaults).member_str("model") == "qwen3.8-27b");
   assert(vision::HandFingersModelInfo(defaults).member_double("wait_seconds") == 600);
+}
+
+/// A person verdict as the model writes it.
+std::string PersonVerdictText(const std::string& personen, const std::string& befunde,
+                              bool sicher, const std::string& befund) {
+  return "{\"personen\": [" + personen + "], \"befunde\": [" + befunde +
+         "], \"sicher\": " + (sicher ? "true" : "false") + ", \"befund\": \"" + befund + "\"}";
+}
+
+bool PersonParseFails(const std::string& body) {
+  try {
+    (void)vision::ParsePersonAnswer(body);
+  } catch (const std::runtime_error&) {
+    return true;
+  }
+  return false;
+}
+
+bool BadPersonOption(const char* key, json::Value value, std::vector<std::string> tasks) {
+  json::Value bad = Body("AAAA", std::move(tasks));
+  json::Value o = json::Value::object();
+  o[key] = std::move(value);
+  bad["person_count_options"] = std::move(o);
+  return Throws([&] { (void)vision::ParseRequest(bad); });
+}
+
+/// "person_count": options, the question, the chat body, the answer
+/// parsing, gufo's count check and verdict, and CheckPersons with a
+/// scripted chat (no model). GUFO_PERSON_BODY_OUT=<file>: the chat bodies
+/// of two example requests are written there (for comparing the prompt
+/// test script's bodies).
+void TestPersonCount() {
+  // The task runs the person detector too; defaults.
+  vision::Request r = vision::ParseRequest(Body("AAAA", {"person_count"}));
+  assert(r.tasks.size() == 1 && r.tasks[0].task == "person");
+  assert(r.person_count.enabled && r.person_count.model == "qwen3.8-27b");
+  assert(r.person_count.thinking && r.person_count.expected == -1);
+  assert(r.person_count.timeout_seconds == 300 && r.person_count.wait_seconds == 600);
+  assert(r.person_count.max_tokens == 4096 && r.person_count.references.empty());
+  assert(!vision::ParseRequest(Body("AAAA", {"person"})).person_count.enabled);
+  // Both model checks in one request: hand and person detectors.
+  r = vision::ParseRequest(Body("AAAA", {"hand_fingers", "person_count"}));
+  assert(r.tasks.size() == 2 && r.tasks[0].task == "person" && r.tasks[1].task == "hand");
+  // Options: expected, references as objects and plain strings.
+  json::Value body = Body("AAAA", {"person", "person_count"});
+  json::Value options = json::Value::object();
+  options["model"] = "qwen3.8-flash";
+  options["thinking"] = false;
+  options["timeout_seconds"] = 30;
+  options["wait_seconds"] = 0;
+  options["max_tokens"] = 64;
+  options["expected"] = 2;
+  json::Value references = json::Value::array();
+  json::Value bernd = json::Value::object();
+  bernd["name"] = "Bernd";
+  bernd["image"] = "/v1/jobs/j1/files/bernd.png";
+  references.push_back(std::move(bernd));
+  references.push_back("BBBB");
+  options["references"] = std::move(references);
+  body["person_count_options"] = std::move(options);
+  r = vision::ParseRequest(body);
+  assert(r.tasks.size() == 1 && r.tasks[0].task == "person");
+  assert(r.person_count.model == "qwen3.8-flash" && !r.person_count.thinking);
+  assert(r.person_count.timeout_seconds == 30 && r.person_count.wait_seconds == 0);
+  assert(r.person_count.max_tokens == 64 && r.person_count.expected == 2);
+  assert(r.person_count.references.size() == 2);
+  assert(r.person_count.references[0].name == "Bernd");
+  assert(r.person_count.references[0].image == "/v1/jobs/j1/files/bernd.png");
+  assert(r.person_count.references[1].name == "Figur 2");
+  assert(r.person_count.references[1].image == "BBBB");
+  // German aliases.
+  body = Body("AAAA", {"person_count"});
+  options = json::Value::object();
+  options["erwartet"] = 0;
+  json::Value referenzen = json::Value::array();
+  referenzen.push_back("CCCC");
+  options["referenzen"] = std::move(referenzen);
+  body["person_count_options"] = std::move(options);
+  r = vision::ParseRequest(body);
+  assert(r.person_count.expected == 0 && r.person_count.references.size() == 1);
+  assert(r.person_count.references[0].name == "Figur 1");
+  // Refused options.
+  assert(BadPersonOption("expected", 21, {"person_count"}));
+  assert(BadPersonOption("expected", -1, {"person_count"}));
+  assert(BadPersonOption("expected", 1.5, {"person_count"}));
+  assert(BadPersonOption("model", "", {"person_count"}));
+  assert(BadPersonOption("thinking", "ja", {"person_count"}));
+  assert(BadPersonOption("timeout_seconds", 1, {"person_count"}));
+  assert(BadPersonOption("wait_seconds", 3601, {"person_count"}));
+  assert(BadPersonOption("max_tokens", 9000, {"person_count"}));
+  assert(BadPersonOption("max_hands", 2, {"person_count"}));  // a hand_fingers option
+  assert(BadPersonOption("expected", 1, {"person"}));          // options without the task
+  assert(BadPersonOption("references", "AAAA", {"person_count"}));
+  json::Value five = json::Value::array();
+  for (int i = 0; i < 5; ++i)
+    five.push_back("AAAA");
+  assert(BadPersonOption("references", five, {"person_count"}));
+  const auto one_reference = [](const char* name, const char* image) {
+    json::Value list = json::Value::array();
+    json::Value item = json::Value::object();
+    if (name != nullptr)
+      item["name"] = name;
+    if (image != nullptr)
+      item["image"] = image;
+    list.push_back(std::move(item));
+    return list;
+  };
+  assert(BadPersonOption("references", one_reference("Bernd", nullptr), {"person_count"}));
+  assert(BadPersonOption("references", one_reference("Be\"rnd", "AAAA"), {"person_count"}));
+  assert(BadPersonOption("references", one_reference("", "AAAA"), {"person_count"}));
+  json::Value twice = one_reference("Bernd", "AAAA");
+  twice.push_back(one_reference("Bernd", "BBBB").items()[0]);
+  assert(BadPersonOption("references", twice, {"person_count"}));
+  json::Value number = json::Value::array();
+  number.push_back(5);
+  assert(BadPersonOption("references", number, {"person_count"}));
+  json::Value both = Body("AAAA", {"person_count"});
+  json::Value both_options = json::Value::object();
+  both_options["expected"] = 1;
+  both_options["erwartet"] = 2;
+  both["person_count_options"] = std::move(both_options);
+  assert(Throws([&] { (void)vision::ParseRequest(both); }));
+
+  // The question: hidden body parts are no finding; the expected count and
+  // the reference names are worked in.
+  vision::PersonCountRequest plain;
+  plain.enabled = true;
+  std::string prompt = vision::PersonPrompt(plain);
+  assert(prompt.find("Hidden body parts are NOT an error") != std::string::npos);
+  assert(prompt.find("extra_limb") != std::string::npos);
+  assert(prompt.find("duplicate_person") != std::string::npos);
+  assert(prompt.find("here none is, so do not use it") != std::string::npos);
+  assert(prompt.find("reference") == std::string::npos);
+  assert(prompt.find("Mann im grauen Mantel") != std::string::npos);
+  vision::PersonCountRequest with = plain;
+  with.expected = 1;
+  with.references = {{"Bernd", "AAAA"}, {"Mayk", "BBBB"}};
+  prompt = vision::PersonPrompt(with);
+  assert(prompt.find("exactly 1 person;") != std::string::npos);
+  assert(prompt.find("in this order: Bernd, Mayk.") != std::string::npos);
+  assert(prompt.find("\"unbekannt\"") != std::string::npos);
+  with.expected = 3;
+  assert(vision::PersonPrompt(with).find("exactly 3 persons;") != std::string::npos);
+  with.expected = 1;
+
+  // The chat body: "Szene:", the picture, each reference after its name,
+  // the question last; schema; streamed, thinking on.
+  const json::Value chat =
+      vision::PersonChatBody(with, "data:image/png;base64,SCENE", {"data:image/png;base64,REF1",
+                                                                    "data:image/png;base64,REF2"});
+  assert(chat.member_str("model") == "qwen3.8-27b");
+  const json::Value& parts = *chat.find("messages")->items()[0].find("content");
+  assert(parts.size() == 7);
+  assert(parts.items()[0].member_str("text") == "Szene:");
+  assert(parts.items()[1].find("image_url")->member_str("url") == "data:image/png;base64,SCENE");
+  assert(parts.items()[2].member_str("text") == "Referenz Bernd:");
+  assert(parts.items()[3].find("image_url")->member_str("url") == "data:image/png;base64,REF1");
+  assert(parts.items()[4].member_str("text") == "Referenz Mayk:");
+  assert(parts.items()[6].member_str("text") == vision::PersonPrompt(with));
+  assert(chat.find("stream")->as_bool());
+  assert(chat.find("chat_template_kwargs")->find("enable_thinking")->as_bool());
+  assert(chat.member_double("max_tokens") == 4096 && chat.member_double("temperature") == 0);
+  const json::Value& format = *chat.find("response_format");
+  assert(format.member_str("type") == "json_schema");
+  assert(format.find("json_schema")->member_str("name") == "person_count");
+  assert(format.find("json_schema")->find("strict")->as_bool());
+  const json::Value& schema = *format.find("json_schema")->find("schema");
+  assert(schema.find("required")->size() == 4 && !schema.find("additionalProperties")->as_bool());
+  const json::Value& props = *schema.find("properties");
+  assert(props.find("personen")->find("items")->find("required")->size() == 2);
+  const json::Value& finding = *props.find("befunde")->find("items")->find("properties");
+  assert(finding.find("art")->find("enum")->size() == 4);
+  assert(finding.find("art")->find("enum")->items()[0].str() == "extra_limb");
+  assert(finding.find("sicherheit")->find("enum")->size() == 3);
+  assert(props.find("sicher")->member_str("type") == "boolean");
+  assert(props.find("plausibel") == nullptr);
+  const json::Value lone = vision::PersonChatBody(plain, "data:image/png;base64,SCENE", {});
+  assert(lone.find("messages")->items()[0].find("content")->size() == 3);
+  if (const char* out = std::getenv("GUFO_PERSON_BODY_OUT"); out != nullptr && *out != '\0') {
+    json::Value bodies = json::Value::object();
+    bodies["ohne"] = lone;
+    bodies["mit"] = chat;
+    std::ofstream(out, std::ios::binary) << bodies.dump();
+  }
+
+  // Parsing the answer: plain, streamed, fenced, after a think block.
+  auto verdict = vision::ParsePersonAnswer(ChatAnswer(PersonVerdictText(
+      "{\"stelle\": \"links am Tisch\", \"wer\": \"Bernd\"}", "", true, "eine Person, normal")));
+  assert(verdict.personen.size() == 1 && verdict.personen[0].wer == "Bernd");
+  assert(verdict.personen[0].stelle == "links am Tisch");
+  assert(verdict.befunde.empty() && verdict.sicher && verdict.befund == "eine Person, normal");
+  verdict = vision::ParsePersonAnswer(StreamAnswer(PersonVerdictText(
+      "{\"stelle\": \"Mitte\", \"wer\": \"Bernd\"}",
+      "{\"art\": \"extra_limb\", \"stelle\": \"rechts hinter Bernd\", \"sicherheit\": \"hoch\"}",
+      true, "durchscheinender Arm")));
+  assert(verdict.befunde.size() == 1 && verdict.befunde[0].art == "extra_limb");
+  assert(verdict.befunde[0].sicherheit == "hoch" && verdict.befunde[0].quelle == "modell");
+  verdict = vision::ParsePersonAnswer(ChatAnswer(
+      "<think>{\"personen\": []}</think>\n```json\n" +
+      PersonVerdictText("", "", false, "dunkel") + "\n```"));
+  assert(verdict.personen.empty() && !verdict.sicher);
+  assert(PersonParseFails(ChatAnswer("zwei Personen")));
+  assert(PersonParseFails(ChatAnswer(
+      PersonVerdictText("", "{\"art\": \"ghost\", \"stelle\": \"\", \"sicherheit\": \"hoch\"}",
+                        true, ""))));
+  assert(PersonParseFails(ChatAnswer(PersonVerdictText(
+      "", "{\"art\": \"extra_limb\", \"stelle\": \"\", \"sicherheit\": \"sehr\"}", true, ""))));
+  assert(PersonParseFails(ChatAnswer(
+      PersonVerdictText("", "{\"art\": \"extra_limb\", \"stelle\": \"x\"}", true, ""))));
+  assert(PersonParseFails(ChatAnswer(PersonVerdictText("{\"stelle\": \"links\"}", "", true, ""))));
+  assert(PersonParseFails(ChatAnswer(PersonVerdictText("\"Bernd\"", "", true, ""))));
+  assert(PersonParseFails(ChatAnswer(
+      "{\"personen\": 2, \"befunde\": [], \"sicher\": true, \"befund\": \"\"}")));
+  assert(PersonParseFails(ChatAnswer(
+      "{\"personen\": [], \"befunde\": [], \"sicher\": \"ja\", \"befund\": \"\"}")));
+  assert(PersonParseFails(ChatAnswer("{\"personen\": [], \"befunde\": [], \"sicher\": true}")));
+  std::string many;
+  for (int i = 0; i < 33; ++i)
+    many += std::string(i == 0 ? "" : ", ") + "{\"stelle\": \"x\", \"wer\": \"y\"}";
+  assert(PersonParseFails(ChatAnswer(PersonVerdictText(many, "", true, ""))));
+
+  // gufo's count check and the verdict.
+  const auto seen = [](int n) {
+    std::vector<vision::PersonSeen> list(static_cast<std::size_t>(n));
+    return list;
+  };
+  vision::PersonVerdict two;
+  two.personen = seen(2);
+  two.sicher = true;
+  vision::PersonVerdict v = two;
+  vision::CheckPersonCount(with, v);  // expected 1, two listed
+  assert(v.befunde.size() == 1 && v.befunde[0].art == "count_mismatch");
+  assert(v.befunde[0].quelle == "gufo" && v.befunde[0].sicherheit == "hoch");
+  assert(v.befunde[0].stelle == "2 gezählt, 1 erwartet");
+  assert(vision::PersonUrteil(v) == "fehler");
+  v = two;
+  v.sicher = false;
+  vision::CheckPersonCount(with, v);
+  assert(v.befunde.size() == 1 && v.befunde[0].sicherheit == "mittel");
+  assert(vision::PersonUrteil(v) == "pruefen");
+  // The model's own count_mismatch is kept, none added.
+  v = two;
+  v.befunde.push_back({"count_mismatch", "eine Person zu viel", "niedrig", "modell"});
+  vision::CheckPersonCount(with, v);
+  assert(v.befunde.size() == 1 && v.befunde[0].quelle == "modell");
+  // Without expected a model's count_mismatch is dropped, other findings
+  // stay.
+  v = two;
+  v.befunde.push_back({"count_mismatch", "x", "hoch", "modell"});
+  v.befunde.push_back({"duplicate_person", "Bernd zweimal", "mittel", "modell"});
+  vision::CheckPersonCount(plain, v);
+  assert(v.befunde.size() == 1 && v.befunde[0].art == "duplicate_person");
+  assert(vision::PersonUrteil(v) == "pruefen");
+  // Matching count: nothing added.
+  v = two;
+  v.personen = seen(1);
+  vision::CheckPersonCount(with, v);
+  assert(v.befunde.empty() && vision::PersonUrteil(v) == "ok");
+  v.sicher = false;
+  assert(vision::PersonUrteil(v) == "pruefen");
+  v.sicher = true;
+  v.befunde.push_back({"extra_limb", "rechts", "niedrig", "modell"});
+  assert(vision::PersonUrteil(v) == "pruefen");
+  v.befunde.push_back({"extra_limb", "links", "hoch", "modell"});
+  assert(vision::PersonUrteil(v) == "fehler");
+
+  // CheckPersons with a scripted chat.
+  gufo::models::ccip::RgbImage image;
+  image.width = 64;
+  image.height = 48;
+  image.rgb.assign(static_cast<std::size_t>(64) * 48 * 3, 120);
+  gufo::models::ccip::RgbImage reference = image;
+  reference.width = 16;
+  reference.height = 32;
+  reference.rgb.assign(static_cast<std::size_t>(16) * 32 * 3, 60);
+  std::vector<HttpRequest> asked;
+  std::string answer = PersonVerdictText(
+      "{\"stelle\": \"links\", \"wer\": \"Bernd\"}, {\"stelle\": \"rechts\", \"wer\": \"Bernd\"}",
+      "{\"art\": \"duplicate_person\", \"stelle\": \"Bernd links und rechts\", "
+      "\"sicherheit\": \"hoch\"}",
+      true, "Bernd zweimal");
+  const std::function<HttpResponse(const HttpRequest&)> serve =
+      [&asked, &answer](const HttpRequest& inner) {
+        asked.push_back(inner);
+        HttpResponse streamed;
+        streamed.headers = {{"Content-Type", "text/event-stream"}};
+        const std::string text = answer;
+        streamed.streaming_body = [text](const HttpResponse::BodyWriter& write) {
+          (void)write(StreamAnswer(text));
+        };
+        return streamed;
+      };
+  HttpRequest outer = Post(Body("AAAA", {"person_count"}));
+  outer.headers.emplace_back("Cookie", "gufo_session=abc");
+  outer.headers.emplace_back("X-Other", "nicht weiter");
+  vision::PersonCountRequest one_bernd = plain;
+  one_bernd.expected = 1;
+  one_bernd.references = {{"Bernd", "AAAA"}};
+  json::Value entry =
+      vision::CheckPersons(one_bernd, image, {reference}, 2, serve, outer);
+  assert(asked.size() == 1 && asked[0].path == "/v1/chat/completions");
+  bool cookie = false;
+  bool other = false;
+  for (const auto& [name, value] : asked[0].headers) {
+    cookie = cookie || (name == "Cookie" && value == "gufo_session=abc");
+    other = other || name == "X-Other";
+  }
+  assert(cookie && !other);
+  const json::Value sent = json::parse(asked[0].body);
+  const json::Value& sent_parts = *sent.find("messages")->items()[0].find("content");
+  assert(sent_parts.size() == 5);
+  assert(sent_parts.items()[1].find("image_url")->member_str("url").starts_with(
+      "data:image/png;base64,"));
+  assert(sent_parts.items()[2].member_str("text") == "Referenz Bernd:");
+  assert(entry.member_double("personen") == 2 && entry.member_double("erwartet") == 1);
+  assert(entry.member_double("detektor_personen") == 2);
+  assert(entry.find("liste")->size() == 2);
+  assert(entry.find("liste")->items()[1].member_str("wer") == "Bernd");
+  // The model's duplicate plus gufo's count_mismatch.
+  assert(entry.find("befunde")->size() == 2);
+  assert(entry.find("befunde")->items()[0].member_str("art") == "duplicate_person");
+  assert(entry.find("befunde")->items()[1].member_str("art") == "count_mismatch");
+  assert(entry.find("befunde")->items()[1].member_str("quelle") == "gufo");
+  assert(entry.member_str("urteil") == "fehler" && entry.find("sicher")->as_bool());
+  assert(entry.member_str("befund") == "Bernd zweimal");
+  assert(entry.find("seconds") != nullptr && entry.find("waited_seconds") != nullptr);
+  assert(entry.find("fehler") == nullptr);
+  // A good picture without expected: ok, no erwartet.
+  answer = PersonVerdictText("{\"stelle\": \"Mitte\", \"wer\": \"Mann im Cardigan\"}", "", true,
+                             "eine Person, alles normal");
+  entry = vision::CheckPersons(plain, image, {}, 1, serve, outer);
+  assert(entry.member_str("urteil") == "ok" && entry.find("erwartet") == nullptr);
+  assert(entry.find("befunde")->empty() && entry.member_double("personen") == 1);
+  // Garbage, a refusal, no chat, a cancelled caller: fehler, no exception.
+  answer = "kein JSON";
+  entry = vision::CheckPersons(plain, image, {}, 1, serve, outer);
+  assert(entry.member_str("fehler").find("no JSON object") != std::string::npos);
+  assert(entry.find("urteil") == nullptr && entry.member_double("detektor_personen") == 1);
+  const std::function<HttpResponse(const HttpRequest&)> refuse = [](const HttpRequest&) {
+    return JsonAnswer(404, "{\"error\": {\"message\": \"model not found\"}}");
+  };
+  entry = vision::CheckPersons(one_bernd, image, {reference}, 0, refuse, outer);
+  assert(entry.member_str("fehler") == "chat 404: model not found");
+  assert(entry.member_double("erwartet") == 1);
+  entry = vision::CheckPersons(plain, image, {}, 0, nullptr, outer);
+  assert(entry.member_str("fehler") == "no chat on this router");
+  HttpRequest gone = outer;
+  gone.is_cancelled = [] { return true; };
+  asked.clear();
+  entry = vision::CheckPersons(plain, image, {}, 0, serve, gone);
+  assert(asked.empty() && entry.member_str("fehler") == "cancelled");
+  // models.person_count.
+  const json::Value info = vision::PersonCountModelInfo(one_bernd);
+  assert(info.member_str("model") == "qwen3.8-27b" && info.member_str("detector") == "person");
+  assert(info.member_double("references") == 1 && info.find("thinking")->as_bool());
 }
 
 void TestPool() {
@@ -1212,6 +1572,7 @@ int main() {
   TestRequestBytes();
   TestAblageCookie();
   TestHandFingers();
+  TestPersonCount();
   const char* dir = std::getenv("GUFO_VISION_DIR");
   const char* frame = std::getenv("GUFO_VISION_FRAME");
   if (dir != nullptr && *dir != '\0' && frame != nullptr && *frame != '\0')

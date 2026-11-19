@@ -1218,7 +1218,50 @@ Test: `router_vision_test` (`TestHandFingers`: options, crop, chat body and
 schema, answer parsing plain and streamed, `CountFingers` with a scripted
 chat: streamed verdict, 503, no JSON, `max_hands`, no chat, cancelled caller,
 token passed on, 503 `memory_busy` retried, wait clock spent, generation
-timeout).
+timeout). The chat itself (body, data URL, answer text, the two clocks) is
+shared with `person_count`: `src/cli/serve/router/vision_chat.{hpp,cpp}`
+(`VisionChatBody`, `ImageDataUrl`, `ChatAnswerObject`, `AskVisionChat`).
+
+#### Person check (`person_count`)
+
+For the film direction's person check (2.2.10): ghost arms, the same person
+twice, more or fewer persons than the shot needs. The ghost double of
+fehler_07 (a see-through second Bernd with an extra arm) is no hand error,
+and the hand detector need not find it at all; this check looks at the whole
+picture. `person_count` adds the `person` task (same thresholds, also
+answered; its box count is `detektor_personen`, not shown to the model),
+releases the CPU turn after the CPU part and asks one chat for the picture
+(after `hand_fingers` when both are asked), through the same path as
+`hand_fingers` (`AskVisionChat`: caller's token, `wait_seconds` /
+`timeout_seconds`, 503 `memory_busy` retried). Content: text `Szene:`, the
+original picture (never the brightened copy, at most 1536 px long side),
+per reference `Referenz <name>:` and its picture (at most 768 px; read like
+`image`, inside the request's byte and pixel budget, inlined as data URLs
+when relayed), the question `PersonPrompt` last. The question lists the
+persons first, then the findings `extra_limb`, `duplicate_person`,
+`count_mismatch` (with `expected`: "exactly N persons"; without: "do not use
+it"), `sonstiges`, each with `sicherheit` hoch / mittel / niedrig. It says
+hidden body parts are NOT an error (the hand_fingers lesson: the hidden
+thumb), excludes posters, screens, reflections and a drawn face on a
+monitor, and asks to report a see-through ghost figure instead of listing
+it. Schema (strict): `{personen: [{stelle, wer}], befunde: [{art, stelle,
+sicherheit}], sicher: boolean, befund: string}`; no `plausibel` from the
+model: `CheckPersonCount` adds `count_mismatch` (`quelle` `gufo`) when
+`expected` differs from the listed persons and the model reported none
+(drops the model's without `expected`), `PersonUrteil` gives `fehler` for a
+`hoch` finding, `pruefen` for other findings or `sicher` false, else `ok`.
+A failed chat gives `"fehler"`, never a 500. Options in
+`person_count_options`: `model`, `thinking`, `expected` / `erwartet` (0-20),
+`references` / `referenzen` (up to 4, `{"name", "image"}` or a string; names
+1-64 characters without quotes, unique), `timeout_seconds`, `wait_seconds`,
+`max_tokens`. Pool: like `hand_fingers`, relayed only when the models are
+missing here. Code: `src/cli/serve/router/vision_persons.{hpp,cpp}`. Test:
+`router_vision_test` (`TestPersonCount`: options and aliases, refused
+options, question with and without expected / references, chat body and
+schema, answer parsing, count check and verdict, `CheckPersons` with a
+scripted chat). Prompt test: `D:\claude\gufo-arbeit\finger-test\personen-test.py`
+(the direction's good pictures, fehler_07, count and duplicate cases; run in
+a pause, not yet run).
 
 ### CPU queue and pool for the router services
 

@@ -243,14 +243,33 @@ std::string DataUrl(const std::vector<std::uint8_t>& bytes) {
 }
 
 /// The request body for the partner: every member as sent, the image (and
-/// the further wd14_tags pictures) inline as data URLs (the partner cannot
-/// read this machine's Ablage).
+/// the further wd14_tags pictures and person_count references) inline as
+/// data URLs (the partner cannot read this machine's Ablage).
 std::string RelayBody(const json::Value& body, const std::vector<std::uint8_t>& bytes,
-                      const std::vector<std::vector<std::uint8_t>>& wd14_images) {
+                      const std::vector<std::vector<std::uint8_t>>& wd14_images,
+                      const PersonCountRequest& persons,
+                      const std::vector<std::vector<std::uint8_t>>& reference_images) {
   json::Value out = json::Value::object();
   for (const auto& [key, value] : body.members()) {
     if (key == "image" || key == "bild")
       continue;
+    if (key == kPersonCountOptions && value.is_object() && !reference_images.empty()) {
+      json::Value options = json::Value::object();
+      for (const auto& [name, option] : value.members()) {
+        if (name != "references" && name != "referenzen")
+          options[name] = option;
+      }
+      json::Value references = json::Value::array();
+      for (std::size_t i = 0; i < reference_images.size() && i < persons.references.size(); ++i) {
+        json::Value reference = json::Value::object();
+        reference["name"] = persons.references[i].name;
+        reference["image"] = DataUrl(reference_images[i]);
+        references.push_back(std::move(reference));
+      }
+      options["references"] = std::move(references);
+      out[key] = std::move(options);
+      continue;
+    }
     if (key == kWd14Task && value.is_object() && !wd14_images.empty()) {
       json::Value options = json::Value::object();
       for (const auto& [name, option] : value.members()) {
@@ -417,12 +436,13 @@ Request ParseRequest(const json::Value& body) {
     const auto& known = DetectorTasks();
     const auto& poses = PoseTasks();
     if (name != kWd14Task && name != kOcrTask && name != kHandFingersTask &&
+        name != kPersonCountTask &&
         std::none_of(known.begin(), known.end(),
                      [&](const TaskSpec& spec) { return spec.task == name; }) &&
         std::find(poses.begin(), poses.end(), name) == poses.end())
       throw std::invalid_argument("unknown task " + name +
-                                  " (person, head, face, hand, hand_fingers, pose, pose_wholebody, ocr, "
-                                  "wd14_tags)");
+                                  " (person, head, face, hand, hand_fingers, person_count, pose, "
+                                  "pose_wholebody, ocr, wd14_tags)");
   }
   // wd14_tags options; regions "person" run the person detector too.
   request.wd14 =
@@ -434,6 +454,12 @@ Request ParseRequest(const json::Value& body) {
       body, std::find(names.begin(), names.end(), kHandFingersTask) != names.end());
   if (request.hand_fingers.enabled && std::find(names.begin(), names.end(), "hand") == names.end())
     names.push_back("hand");
+  // person_count answers the person detector's count next to the model's.
+  request.person_count = ParsePersonCount(
+      body, std::find(names.begin(), names.end(), kPersonCountTask) != names.end());
+  if (request.person_count.enabled &&
+      std::find(names.begin(), names.end(), "person") == names.end())
+    names.push_back("person");
   // Answer order: the table order, whatever order the caller used.
   for (const TaskSpec& spec : DetectorTasks()) {
     if (std::find(names.begin(), names.end(), spec.task) != names.end())
@@ -748,21 +774,40 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
                    "invalid_request");
     }
   }
+  std::vector<std::vector<std::uint8_t>> reference_bytes;
+  for (std::size_t i = 0; i < parsed.person_count.references.size(); ++i) {
+    try {
+      std::optional<HttpResponse> failure;
+      reference_bytes.push_back(ReadInput(options_, request,
+                                          parsed.person_count.references[i].image, budget,
+                                          &failure));
+      if (failure.has_value())
+        return std::move(*failure);
+    } catch (const std::exception& error) {
+      return Error(400, "Bad Request",
+                   "person_count_options.references[" + std::to_string(i) + "]: " + error.what(),
+                   "invalid_request");
+    }
+  }
   // Pool (cpu_pool.hpp): the partner when this machine is busy or lacks
   // the models.
   cpu::CpuQueue& queue = *options_.queue;
   const cpu::Route route = cpu::Decide(request, static_cast<bool>(options_.relay),
                                        !queue.Idle(), !missing.empty());
-  // hand_fingers stays here unless the models are missing: an older
-  // partner would refuse the task with a 400 that counts as its answer.
-  const bool try_partner =
-      route == cpu::Route::kTryPartner && !parsed.hand_fingers.enabled;
+  // hand_fingers and person_count stay here unless the models are
+  // missing: an older partner would refuse the task with a 400 that counts
+  // as its answer.
+  const bool try_partner = route == cpu::Route::kTryPartner && !parsed.hand_fingers.enabled &&
+                           !parsed.person_count.enabled;
   if (try_partner || route == cpu::Route::kPartnerOnly) {
     const bool force = route == cpu::Route::kPartnerOnly;
     std::optional<HttpResponse> answer;
     if (options_.relay)
       answer = options_.relay(
-          cpu::RelayRequest(request, RelayBody(body, bytes, wd14_bytes), force));
+          cpu::RelayRequest(request,
+                            RelayBody(body, bytes, wd14_bytes, parsed.person_count,
+                                      reference_bytes),
+                            force));
     if (answer.has_value() && (force || cpu::PartnerAnswered(*answer))) {
       answer->headers.emplace_back(cpu::kRanOnHeader, "partner");
       return std::move(*answer);
@@ -786,7 +831,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     case cpu::CpuQueue::Result::kCancelled:
       return Error(499, "Client Closed Request", "cancelled while waiting", "cancelled");
   }
-  // Released before the hand_fingers chats (GPU, possibly minutes).
+  // Released before the hand_fingers / person_count chats (GPU, possibly
+  // minutes).
   std::optional<cpu::CpuQueue::Turn> turn;
   turn.emplace(queue);
   const auto started = std::chrono::steady_clock::now();
@@ -813,6 +859,19 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     wd14_bytes[i].shrink_to_fit();
   }
   wd14_bytes.clear();
+  std::vector<models::ccip::RgbImage> reference_images;
+  for (std::size_t i = 0; i < reference_bytes.size(); ++i) {
+    try {
+      reference_images.push_back(DecodeRgb(reference_bytes[i], &pixels_left));
+    } catch (const std::exception& error) {
+      return Error(400, "Bad Request",
+                   "person_count_options.references[" + std::to_string(i) + "]: " + error.what(),
+                   "invalid_request");
+    }
+    reference_bytes[i].clear();
+    reference_bytes[i].shrink_to_fit();
+  }
+  reference_bytes.clear();
   // Explicit wd14 regions must leave a cut-out inside the image.
   for (std::size_t i = 0; i < parsed.wd14.boxes.size(); ++i) {
     const auto cut = models::ccip::MarginCropBox(parsed.wd14.boxes[i], parsed.wd14.margin,
@@ -1017,6 +1076,19 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
     if (request.is_cancelled && request.is_cancelled())
       return Error(499, "Client Closed Request", "cancelled", "cancelled");
   }
+  double persons_seconds = 0;
+  if (parsed.person_count.enabled) {
+    // The chat runs on the GPU through the router: the CPU queue goes on.
+    turn.reset();
+    const auto asked = std::chrono::steady_clock::now();
+    detections[kPersonCountTask] =
+        CheckPersons(parsed.person_count, image, reference_images,
+                     static_cast<int>(persons.size()), options_.serve, request);
+    used[kPersonCountTask] = PersonCountModelInfo(parsed.person_count);
+    persons_seconds = seconds(asked, std::chrono::steady_clock::now());
+    if (request.is_cancelled && request.is_cancelled())
+      return Error(499, "Client Closed Request", "cancelled", "cancelled");
+  }
   json::Value out = json::Value::object();
   out["object"] = "vision.detection";
   out["width"] = image.width;
@@ -1031,6 +1103,8 @@ std::optional<HttpResponse> VisionService::Handle(const HttpRequest& request) co
   out["queue_seconds"] = seconds(queued, started);
   if (parsed.hand_fingers.enabled)
     out["hand_fingers_seconds"] = fingers_seconds;
+  if (parsed.person_count.enabled)
+    out["person_count_seconds"] = persons_seconds;
   return JsonResponse(200, "OK", out.dump());
 }
 
