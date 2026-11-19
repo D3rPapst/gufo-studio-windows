@@ -36,6 +36,13 @@ struct DenoiserOptions {
   // Flow shifts of the sigma schedules (MiniMaxH3SigmaShift).
   float video_sigma_shift{kH3VideoSigmaShift};
   float audio_sigma_shift{kH3AudioSigmaShift};
+  // MiniMax-H3-Image: one latent frame and no audio rows
+  // (BuildImageTextLayout), the provided unshifted `sigmas` grid (evaluations
+  // = sigmas.size() - 1, no velocity reuse) and per step `i` the PDD output
+  // head `pdd.video_out.{weight,bias}[i]` of an InspectImage inventory in
+  // place of `final_layer.video_out`. No guides, no audio mask.
+  bool image{false};
+  std::span<const float> sigmas;
 };
 
 /// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE

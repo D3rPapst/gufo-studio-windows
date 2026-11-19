@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_
 #define GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -219,6 +220,62 @@ struct ImageGuidePlacement {
     std::span<const ImageGuidePlacement> image_guides,
     std::span<const AudioGuidePlacement> audio_guides,
     std::string* error = nullptr);
+// --- MiniMax-H3-Image (text to image) ---------------------------------------
+
+// Fixed PDD grid of the release (pdd_config.json / modular_model_index.json
+// sample_sigmas): six steps, one output head each, no CFG.
+inline constexpr int kH3ImagePddSteps = 6;
+inline constexpr std::array<float, 7> kH3ImagePddSigmas = {
+    1.0F,
+    0.9675236940383911F,
+    0.8875485062599182F,
+    0.75F,
+    0.5327739119529724F,
+    0.23200887441635132F,
+    0.0F};
+// MiniMaxH3ImagePrepareCanvasStep: default and range of min_generation_area.
+inline constexpr std::int64_t kH3ImageDefaultMinimumArea = 2048LL * 2048LL;
+inline constexpr std::int64_t kH3ImageMinimumAreaFloor = 1024;
+inline constexpr std::int64_t kH3ImageMinimumAreaCeiling = 4096LL * 4096LL;
+// The model card's working range ends at about 20 MP (21:9 is 6272x2688).
+inline constexpr std::int64_t kH3ImageMaximumPixels = 20LL * 1024LL * 1024LL;
+inline constexpr int kH3ImageMaximumSide = 8192;
+
+struct ImageCanvas {
+  // The canvas the DiT generates on (multiples of 32).
+  int width{0};
+  int height{0};
+  // The size the caller asked for; differs when the canvas was scaled up to
+  // min_generation_area (the pipeline then resizes back with LANCZOS).
+  int output_width{0};
+  int output_height{0};
+};
+
+/// get_image_canvas_size: below `minimum_area` pixels both sides scale by
+/// sqrt(minimum_area / area); either way both sides round half-to-even to a
+/// multiple of 32 (at least 32).
+[[nodiscard]] std::optional<ImageCanvas> ResolveImageCanvas(
+    int width, int height,
+    std::int64_t minimum_area = kH3ImageDefaultMinimumArea,
+    std::string* error = nullptr);
+
+/// The single-latent-frame, audio-free geometry of an image canvas.
+[[nodiscard]] std::optional<GenerationGeometry> ImageGenerationGeometry(
+    const ImageCanvas& canvas, std::string* error = nullptr);
+
+/// `[text | generated image]` (build_image_packed_sequence without
+/// references): text row i at (i, 0, 0), image rows on rotary time
+/// `text_rows` with the aspect-normalized (h, w) grid. The layout keeps an
+/// empty audio-target segment so the H3 row-map contract still holds.
+[[nodiscard]] std::optional<PackedLayout> BuildImageTextLayout(
+    std::size_t text_rows, int latent_height, int latent_width,
+    std::string* error = nullptr);
+
+/// A provided (unshifted) sigma grid as an H3 schedule: video and audio
+/// streams share it; it must start at 1, decrease strictly and end at 0.
+[[nodiscard]] std::optional<SigmaSchedule> BuildProvidedSchedule(
+    std::span<const float> sigmas, std::string* error = nullptr);
+
 [[nodiscard]] std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
     const TimeRowSchedule& time_rows, int step, const PackedLayout& layout,
     std::span<const std::uint8_t> text_tags = {}, std::string* error = nullptr);

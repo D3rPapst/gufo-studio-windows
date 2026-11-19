@@ -1505,6 +1505,13 @@ endfunction()
   set_tests_properties(minimax_h3_image_vae_test PROPERTIES
     LABELS "cpu;models;minimax-h3;minimax-h3-image;image;vae;tiling")
 
+  add_executable(minimax_h3_image_test
+    tests/models/minimax_h3_image_test.cpp)
+  target_link_libraries(minimax_h3_image_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})
+  add_test(NAME minimax_h3_image_test COMMAND minimax_h3_image_test)
+  set_tests_properties(minimax_h3_image_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;minimax-h3-image;image;layout;schedule")
+
   add_executable(minimax_h3_media_test
     tests/models/minimax_h3_media_test.cpp)
   target_link_libraries(minimax_h3_media_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})
