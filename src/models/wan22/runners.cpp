@@ -782,6 +782,23 @@ bool RunWan22AnimateJob(const JobRequest& request,
   if (const json::Value* lora = options.find("lora");
       lora != nullptr && lora->is_bool() && !lora->as_bool())
     job.lora_file.clear();
+  // gufo.animate.relight_lora: true (the bundle's strength) or a strength;
+  // without it (or false / 0) no relight LoRA.
+  if (const json::Value* relight = options.find("relight_lora");
+      relight != nullptr &&
+      (relight->is_bool() ? relight->as_bool()
+                          : relight->as_double(0.0) != 0.0)) {
+    job.relight_lora_file = Part(request, manifest, "relight_lora");
+    if (job.relight_lora_file.empty()) {
+      SetError(error, "gufo.animate.relight_lora: the Animate bundle names no "
+                      "relight LoRA ('relight_lora' in gufo-animate.json)");
+      return false;
+    }
+    job.relight_lora_strength = static_cast<float>(
+        relight->is_bool()
+            ? manifest.member_double("relight_lora_strength", 1.0)
+            : relight->as_double(1.0));
+  }
   job.shift = static_cast<float>(
       options.member_double("shift", manifest.member_double("shift", 5.0)));
   job.sampler =

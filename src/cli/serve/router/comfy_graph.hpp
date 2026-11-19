@@ -637,6 +637,9 @@ struct VideoTask {
   int continue_motion_max_frames{5};
   /// ImageFromBatch on trim_image drops the continue_motion frames.
   bool animate_trim_continue{false};
+  /// LoraLoaderModelOnly with Kijai's relight LoRA (a name containing
+  /// "relight") on the model path: its strength (gufo.animate.relight_lora).
+  std::optional<double> animate_relight;
   /// Chained WanAnimateToVideo chunks as one job: frames per chunk
   /// (gufo.animate.length; 0 = `frames`, one chunk) and the continue_motion
   /// frames each next chunk takes from the one before

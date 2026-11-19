@@ -3268,9 +3268,10 @@ void TestAnimateNative() {
   assert(video.vace_lora && video.vace_sampler == "euler");
   assert(video.vace_shift && *video.vace_shift == 8.0);
   assert(!video.animate_trim_continue && video.animate_offset == 0);
-  // Only the relight LoRA is left out; no VACE warnings.
-  assert(plan.warnings.size() == 1);
-  assert(warned(plan, "WanAnimate_relight_lora"));
+  // The relight LoRA runs as gufo's (2.2.12); no warnings.
+  assert(video.animate_relight && *video.animate_relight == 1.0);
+  assert(plan.warnings.empty());
+  assert(!warned(plan, "WanAnimate_relight_lora"));
   assert(!warned(plan, "facial expression"));
   const json::Value body = comfy::VideoRequestBody(video);
   assert(body.member_str("model") == "wan2.2-animate-14b");
@@ -3281,6 +3282,7 @@ void TestAnimateNative() {
   assert(animate->member_str("sampler") == "euler" &&
          animate->find("shift")->as_double() == 8.0);
   assert(!animate->contains("lora") && !animate->contains("video_frame_offset"));
+  assert(animate->find("relight_lora")->as_double() == 1.0);
   assert(body.find("gufo")->find("frames")->as_double() == 77);
 
   // Without clip_vision_output: a note that gufo uses it anyway.

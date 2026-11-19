@@ -102,6 +102,13 @@ struct Transformer21Input {
   Transformer21Hook* hook{nullptr};
 };
 
+/// One LoRA file of Transformer21::Load (Kijai / lightx2v layout with
+/// "diffusion_model." keys) and its strength.
+struct Transformer21Lora {
+  std::filesystem::path file;
+  float strength{1.0F};
+};
+
 /// Optional intermediates for oracle comparison (FP32 row-major).
 struct Transformer21Probes {
   std::vector<float> temb;    // [5120]
@@ -144,6 +151,14 @@ public:
       const std::filesystem::path& dit_file,
       const std::filesystem::path& lora_file, float lora_strength,
       std::string* error);
+  /// Several LoRAs at once (Wan 2.2 Animate: lightx2v + relight), each with
+  /// its own strength; empty paths are skipped. Where more than one LoRA
+  /// touches a matrix, their low-rank factors are concatenated (each `up`
+  /// scaled by its alpha / rank and strength), so the sum of the products
+  /// is added in one GEMM, as ComfyUI adds the patches one after the other.
+  [[nodiscard]] static std::unique_ptr<Transformer21> Load(
+      const std::filesystem::path& dit_file,
+      std::span<const Transformer21Lora> loras, std::string* error);
   ~Transformer21();
   Transformer21(const Transformer21&) = delete;
   Transformer21& operator=(const Transformer21&) = delete;

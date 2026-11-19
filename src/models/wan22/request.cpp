@@ -1083,6 +1083,8 @@ bool MaskFile(std::vector<std::uint8_t>* file, std::string* format,
 // per chunk, 4k + 1, 5..81, default 77), "continue_frames" (overlap of
 // chained chunks, 4k + 1, default 5), "sampler" ("lcm" | "euler"), "shift"
 // (1..20), "lora" (false: without the bundle's step-distill LoRA),
+// "relight_lora" (true: the bundle's relight LoRA at its
+// relight_lora_strength, or a strength -10..10; default none),
 // "trim_continue" (true: drop the continue_motion frames from the result,
 // as ImageFromBatch on trim_image)}}}.
 // Multipart uploads may carry "reference_image", "pose_video",
@@ -1148,14 +1150,15 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                         "invert_mask", "continue_motion",
                         "continue_motion_max_frames", "video_frame_offset",
                         "length", "continue_frames", "sampler", "shift",
-                        "lora", "trim_continue"})))
+                        "lora", "relight_lora", "trim_continue"})))
     return Fail(error, "invalid_animate",
                 "'gufo.animate' may contain only 'reference_image', "
                 "'pose_video', 'face_video', 'background_video', "
                 "'character_mask', 'mask_channel', 'invert_mask', "
                 "'continue_motion', 'continue_motion_max_frames', "
                 "'video_frame_offset', 'length', 'continue_frames', "
-                "'sampler', 'shift', 'lora' and 'trim_continue'");
+                "'sampler', 'shift', 'lora', 'relight_lora' and "
+                "'trim_continue'");
   const auto member = [&](const char* name) -> const json::Value* {
     return animate == nullptr ? nullptr : animate->find(name);
   };
@@ -1238,6 +1241,19 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                         "' must be a boolean");
       animate_options[flag] = value->as_bool();
     }
+  if (const json::Value* relight = member("relight_lora")) {
+    const double strength =
+        relight->is_number() ? relight->as_double(100.0) : 100.0;
+    if (!relight->is_bool() &&
+        !(std::isfinite(strength) && strength >= -10.0 && strength <= 10.0))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.relight_lora' must be a boolean or a "
+                  "strength in -10..10");
+    if (relight->is_bool())
+      animate_options["relight_lora"] = relight->as_bool();
+    else
+      animate_options["relight_lora"] = strength;
+  }
   // 4k + 1 frame counts and the seek.
   const auto frame_count = [&](const char* name, int low, int high,
                                bool four_k_plus_one) {

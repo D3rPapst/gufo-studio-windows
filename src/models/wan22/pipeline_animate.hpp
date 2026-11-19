@@ -38,6 +38,11 @@ struct Animate22Request {
   std::filesystem::path dit_file;   // Kijai Wan2_2-Animate-14B FP8 file
   std::filesystem::path lora_file;  // optional (lightx2v I2V)
   float lora_strength{1.0F};
+  /// Optional relight LoRA (Kijai's WanAnimate_relight_lora, ComfyUI's
+  /// LoraLoaderModelOnly in replacement workflows: the character takes the
+  /// light of the background), added on top of `lora_file`.
+  std::filesystem::path relight_lora_file;
+  float relight_lora_strength{1.0F};
   std::string prompt;
   std::string negative_prompt;
   float guidance{1.0F};

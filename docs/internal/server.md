@@ -824,6 +824,15 @@ pose / face / background / mask / reference); another seed is a
 alone fails validation. Without `wan2.2-animate-14b` in the preset the
 chain still fails (no VACE fallback). `comfy_graph.cpp` `AnimateChain`,
 `ApplyAnimateChain`, `ChainOutputCut`.
+Wan 2.2 Animate relight LoRA (2.2.12): `gufo.animate.relight_lora` (`true`
+= the bundle's `relight_lora_strength`, or a strength -10..10; default
+none) adds Kijai's `WanAnimate_relight_lora` (path `relight_lora` in
+`gufo-animate.json`) on top of the lightx2v LoRA; where both touch a matrix
+their low-rank factors are concatenated (`Transformer21::Load` with several
+`Transformer21Lora`). A `LoraLoaderModelOnly` whose name contains `relight`
+on the Animate model path sends its `strength_model` as `relight_lora`
+(before 2.2.12: ignored with a `gufo_warning`). A request for it on a bundle
+without `relight_lora` fails the job.
 ComfyUI Wan I2V chains (after 2.2.9): `WanImageToVideo` chunks chained the
 ComfyUI way (Regie 19.11., FilmStudio `mehrsprecher.py` bewegung_wf: Wan
 2.1 I2V 480p + lightx2v, e.g. 81 + 81 + 25 frames; each next

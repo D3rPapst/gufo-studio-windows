@@ -3395,10 +3395,19 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
                             "strength 1");
       continue;
     }
-    // e.g. the relight LoRA: not in gufo yet.
+    // Kijai's WanAnimate_relight_lora (replacement workflows): gufo's
+    // bundled relight LoRA at the node's strength.
+    if (lower.find("relight") != std::string::npos) {
+      if (task.animate_relight)
+        warnings->push_back("node " + sampler + ": LoRA " + name +
+                            " - gufo applies one relight LoRA; the "
+                            "strengths are added");
+      task.animate_relight = task.animate_relight.value_or(0.0) + lora_strength;
+      continue;
+    }
     warnings->push_back("node " + sampler + ": LoRA " + name +
                         " is ignored (gufo wan2.2-animate-14b takes only its "
-                        "step-distill LoRA)");
+                        "step-distill and relight LoRAs)");
   }
   // ModelSamplingSD3 shift on the model path -> gufo.animate.shift.
   Link link = graph.RequireLink(sampler, "model");
@@ -3468,7 +3477,7 @@ std::string AnimateChunkDiffers(const VideoTask& a, const VideoTask& b) {
     return "length";
   if (a.steps != b.steps || a.guidance != b.guidance ||
       a.vace_sampler != b.vace_sampler || a.vace_shift != b.vace_shift ||
-      a.vace_lora != b.vace_lora)
+      a.vace_lora != b.vace_lora || a.animate_relight != b.animate_relight)
     return "the sampler settings (steps, cfg, sampler, shift, LoRA)";
   if (a.pose_video != b.pose_video || a.pose_runs != b.pose_runs ||
       a.pose_video_fits != b.pose_video_fits)
@@ -4944,6 +4953,8 @@ json::Value VideoRequestBody(const VideoTask& task) {
       animate["shift"] = *task.vace_shift;
     if (!task.vace_lora)
       animate["lora"] = false;
+    if (task.animate_relight && *task.animate_relight != 0.0)
+      animate["relight_lora"] = *task.animate_relight;
     gufo["animate"] = std::move(animate);
   } else if (task.family == VideoFamily::kTalk) {
     // 25 fps: gufo maps seconds back to round(25 s) frames.
