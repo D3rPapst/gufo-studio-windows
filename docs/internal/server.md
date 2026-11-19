@@ -824,6 +824,13 @@ give, so `ImageFromBatch(batch_index 1)` that drops a repeated start frame
 drops it here too; image outputs are joined losslessly, video outputs as
 H.264 (crf 18). A `start_image` must be exactly one frame; at most 16
 chunks and 4096 frames; outputs of the first chunks alone share the task.
+Every chunk is requested with `gufo.lossless: true` (Wan 2.1 Uni3C and Wan
+2.2 I2V A14B: the worker writes libx264rgb `-qp 0` rgb24 instead of crf 18
+yuv420p), so the next start frame and the joined frames are the decoded
+pixels; crf 18 start frames had shifted colour and sharpness at every seam
+(Regie 19.11.). A worker without the option refuses it with HTTP 400; the
+adapter then logs `event=i2v_chunk_lossy` and renders the rest of the chain
+at crf 18 as before. A single video request is unchanged.
 Branches (two chunks continuing one) and independent videos joined in one
 output fail validation, as do RIFE / upscale nodes behind a chain and sound
 outputs. Needs `--comfy-ffmpeg`. `comfy_graph.cpp` `I2VChain`,

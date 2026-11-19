@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <optional>
 #include <system_error>
 
@@ -538,15 +539,11 @@ bool RunFfmpeg(const std::vector<std::wstring>& arguments,
 
 }  // namespace
 
-bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
-              int fps, std::string* error) {
-  return WriteMp4WithAudio(path, video, fps, {}, error);
-}
+namespace {
 
-bool WriteMp4WithAudio(const std::filesystem::path& path,
-                       const DecodedVideo& video, int fps,
-                       const std::filesystem::path& audio,
-                       std::string* error) {
+bool EncodeMp4(const std::filesystem::path& path, const DecodedVideo& video,
+               int fps, const std::filesystem::path& audio, bool lossless,
+               std::string* error) {
   const std::size_t frame_bytes =
       static_cast<std::size_t>(video.width) * video.height * 3;
   if (video.frames < 1 || video.rgb8.size() != frame_bytes * video.frames ||
@@ -580,9 +577,15 @@ bool WriteMp4WithAudio(const std::filesystem::path& path,
           std::wstring(L"-shortest")})
       arguments.push_back(argument);
   }
-  for (const wchar_t* argument :
-       {L"-c:v", L"libx264", L"-preset", L"fast", L"-crf", L"18", L"-pix_fmt",
-        L"yuv420p", L"-movflags", L"+faststart"})
+  // Lossless: the decoded RGB bit for bit (a chain of I2V chunks takes
+  // its next start frame and the joined frames from it).
+  const std::initializer_list<const wchar_t*> h264 = {
+      L"-c:v", L"libx264", L"-preset", L"fast", L"-crf", L"18", L"-pix_fmt",
+      L"yuv420p", L"-movflags", L"+faststart"};
+  const std::initializer_list<const wchar_t*> rgb = {
+      L"-c:v", L"libx264rgb", L"-preset", L"fast", L"-qp", L"0", L"-pix_fmt",
+      L"rgb24", L"-movflags", L"+faststart"};
+  for (const wchar_t* argument : lossless ? rgb : h264)
     arguments.push_back(argument);
   arguments.push_back(partial.wstring());
   if (!RunFfmpeg(arguments, video.rgb8, log, error))
@@ -599,8 +602,10 @@ bool WriteMp4WithAudio(const std::filesystem::path& path,
                      : "-i '" + audio.string() +
                            "' -map 0:v -map 1:a -af apad -c:a aac -b:a 192k "
                            "-shortest ") +
-      "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags "
-      "+faststart '" +
+      (lossless ? "-c:v libx264rgb -preset fast -qp 0 -pix_fmt rgb24 "
+                  "-movflags +faststart '"
+                : "-c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "
+                  "-movflags +faststart '") +
       partial.string() + "' 2> '" + log.string() + "'";
   FILE* pipe = popen(command.c_str(), "w");
   if (pipe == nullptr) {
@@ -623,6 +628,25 @@ bool WriteMp4WithAudio(const std::filesystem::path& path,
   }
   std::filesystem::remove(log, ignored);
   return true;
+}
+
+}  // namespace
+
+bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
+              int fps, std::string* error) {
+  return EncodeMp4(path, video, fps, {}, false, error);
+}
+
+bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
+              int fps, bool lossless, std::string* error) {
+  return EncodeMp4(path, video, fps, {}, lossless, error);
+}
+
+bool WriteMp4WithAudio(const std::filesystem::path& path,
+                       const DecodedVideo& video, int fps,
+                       const std::filesystem::path& audio,
+                       std::string* error) {
+  return EncodeMp4(path, video, fps, audio, false, error);
 }
 
 }  // namespace gufo::models::wan22

@@ -649,6 +649,11 @@ struct VideoTask {
   /// as first_frame and joins the outputs' OutputTarget::chain_frames.
   std::vector<VideoTask> i2v_chunks;
   std::vector<ChainFrame> i2v_starts;
+  /// gufo.lossless (camera and I2V A14B families): the worker writes the
+  /// MP4 as lossless RGB. Set on every chunk of an I2V chain, so the next
+  /// start frame and the joined frames are the decoded pixels; a single
+  /// video keeps H.264 crf 18.
+  bool lossless{false};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

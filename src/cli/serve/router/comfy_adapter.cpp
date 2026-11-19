@@ -2608,9 +2608,22 @@ json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
   } cleanup{&made};
   const int count = 1 + static_cast<int>(spec.i2v_chunks.size());
   std::vector<fs::path> parts;
+  // The chunks ask for lossless MP4s (VideoTask::lossless). A worker before
+  // gufo.lossless refuses it ("'gufo' may contain only ..." without
+  // 'lossless'); the chain then goes on with crf 18 chunks as before.
+  bool lossless = true;
   for (int c = 0; c < count; ++c) {
     const VideoTask& chunk = c == 0 ? spec : spec.i2v_chunks[c - 1];
-    json::Value body = VideoBody(job, task, chunk);
+    const auto body_of = [&] {
+      if (lossless || !chunk.lossless)
+        return VideoBody(job, task, chunk);
+      VideoTask lossy = chunk;
+      lossy.lossless = false;
+      lossy.i2v_chunks.clear();
+      return VideoBody(job, task, lossy);
+    };
+    json::Value body = body_of();
+    std::string first_frame;
     if (c > 0) {
       // ComfyUI: ImageFromBatch(VAEDecode of the chunk before) ->
       // start_image. gufo: that frame of the chunk's video as first_frame.
@@ -2629,15 +2642,34 @@ json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
             " of chunk " + std::to_string(start.chunk + 1) +
             " as the start image of chunk " + std::to_string(c + 1) + ": " +
             (error.empty() ? "no such frame" : error));
-      body["first_frame"] = "data:image/png;base64," + Base64Encode(ReadAll(png));
+      first_frame = "data:image/png;base64," + Base64Encode(ReadAll(png));
+      body["first_frame"] = first_frame;
     }
     Logger::Info("comfy", "event=i2v_chunk prompt_id=" + job->id + " node=" +
                               task.node_id + " chunk=" + std::to_string(c + 1) +
                               "/" + std::to_string(count) + " frames=" +
                               std::to_string(chunk.frames) +
-                              " model=" + chunk.model);
-    const std::string content =
-        RenderVideo(job, task, chunk, body.dump(), c, count);
+                              " model=" + chunk.model + " lossless=" +
+                              (lossless && chunk.lossless ? "1" : "0"));
+    std::string content;
+    try {
+      content = RenderVideo(job, task, chunk, body.dump(), c, count);
+    } catch (const std::runtime_error& failure) {
+      const std::string message = failure.what();
+      if (!lossless || !chunk.lossless ||
+          message.find("HTTP 400") == std::string::npos ||
+          message.find("may contain only") == std::string::npos ||
+          message.find("lossless") != std::string::npos)
+        throw;
+      Logger::Warn("comfy", "event=i2v_chunk_lossy prompt_id=" + job->id +
+                                " node=" + task.node_id +
+                                " reason=\"worker without gufo.lossless\"");
+      lossless = false;
+      body = body_of();
+      if (!first_frame.empty())
+        body["first_frame"] = first_frame;
+      content = RenderVideo(job, task, chunk, body.dump(), c, count);
+    }
     parts.push_back(WorkFile("mp4"));
     made.push_back(parts.back());
     WriteAll(parts.back(), content);

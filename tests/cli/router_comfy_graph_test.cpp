@@ -1858,6 +1858,8 @@ void TestUni3C() {
   const json::Value body = comfy::VideoRequestBody(video);
   assert(body.member_str("model") == "wan2.1-uni3c");
   assert(body.member_str("size") == "832x480");
+  // A single video stays H.264 crf 18 (no gufo.lossless).
+  assert(!video.lossless && !body.find("gufo")->contains("lossless"));
   assert(body.find("seconds")->as_double() == 5);
   const json::Value* gufo = body.find("gufo");
   assert(gufo->find("frames")->as_double() == 81);
@@ -3419,6 +3421,18 @@ void TestI2VChain() {
   assert(c2_body.find("gufo")->find("frames")->as_double() == 25);
   assert(c2_body.find("gufo")->find("seed")->as_double() == 13);
   assert(c2_body.member_str("prompt") == "Ulrika looks out of the window");
+  // Every chunk asks the worker for a lossless MP4 (gufo.lossless): the
+  // next start frame and the joined frames are the decoded pixels.
+  assert(video.lossless && c1.lossless && c2.lossless);
+  assert(c2_body.find("gufo")->find("lossless")->as_bool());
+  assert(comfy::VideoRequestBody(video).find("gufo")->find("lossless")->as_bool());
+  {
+    comfy::VideoTask i2v22 = c1;
+    i2v22.family = comfy::VideoFamily::kI2V22;
+    assert(comfy::VideoRequestBody(i2v22).find("gufo")->find("lossless")->as_bool());
+    i2v22.lossless = false;
+    assert(!comfy::VideoRequestBody(i2v22).find("gufo")->contains("lossless"));
+  }
   // The SaveImage: 81 + 80 + 24 frames, the repeated start frames dropped
   // as ImageFromBatch(batch_index 1) does in ComfyUI.
   assert(plan.tasks[0].outputs.size() == 1);

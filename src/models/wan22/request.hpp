@@ -153,6 +153,10 @@ struct JobRequest {
   std::filesystem::path face_video_path;
   std::filesystem::path background_video_path;
   std::filesystem::path continue_video_path;
+  // "gufo.lossless" (Wan 2.1 Uni3C, Wan 2.2 I2V A14B): the MP4 as lossless
+  // RGB (libx264rgb -qp 0) instead of H.264 crf 18. The router's ComfyUI
+  // adapter sets it for the chunks of a chained I2V workflow.
+  bool lossless{false};
   // Live preview hook (unset: gufo 2.0 has no preview service yet).
   PreviewHook preview;
 };
