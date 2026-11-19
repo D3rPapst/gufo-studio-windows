@@ -14,24 +14,13 @@
 # CMakeLists.txt after the `gufo` executable is defined.
 # Written with AI assistance (Claude Code).
 
-# `gufo serve upscale --device npu|cpu`: ONNX Runtime is loaded at run time
-# (Windows ML on Windows); only its MIT C API header is vendored, so there is
-# no link dependency. Off elsewhere until a Linux NPU path is tested.
-if (WIN32)
-  set(GUFO_ENABLE_ONNXRUNTIME_DEFAULT ON)
-else()
-  set(GUFO_ENABLE_ONNXRUNTIME_DEFAULT OFF)
-endif()
-option(GUFO_ENABLE_ONNXRUNTIME
-  "Load ONNX Runtime at run time for the NPU / CPU upscaler"
-  ${GUFO_ENABLE_ONNXRUNTIME_DEFAULT})
-
 # RIFE (src/models/rife) is a library extension, built with the extensions.
 add_subdirectory(src/models/ace_step)
 # YuE2-3B songs (`gufo serve music --yue2`), on the ACE-Step stack.
 add_subdirectory(src/models/yue2)
 add_subdirectory(src/models/mmaudio)
-add_subdirectory(src/models/realesrgan)
+# Real-ESRGAN (src/models/realesrgan) is a library extension too; it
+# declares GUFO_ENABLE_ONNXRUNTIME.
 # Depth Anything V2, Grounding DINO, SAM (`gufo serve vision`, HIP only).
 add_subdirectory(src/models/vision_dsg)
 # Qwen3-Omni-30B-A3B-Captioner (`gufo serve omni`, HIP only).
