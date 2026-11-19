@@ -8,6 +8,7 @@ gufo_extension_target(
     denoiser.cpp
     dit.cpp
     generation.cpp
+    image_vae.cpp
     json.cpp
     lora.cpp
     media.cpp
@@ -58,6 +59,7 @@ if(TARGET gufo_minimax_h3_hip)
       denoiser.hip
       dit.hip
       dense.hip
+      image_vae.hip
       prompt_encoder.hip
       sampling.hip
       video_vae.hip

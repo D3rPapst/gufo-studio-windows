@@ -86,6 +86,21 @@ public:
       const std::filesystem::path& source_manifest,
       const InspectionOptions& options, std::string* error = nullptr);
 
+  /// MiniMax-H3-Image release (`MiniMaxAI/MiniMax-H3-Image`, partition
+  /// "image"): `transformer/` (indexed BF16/F32 shards, the H3 DiT without
+  /// its audio projections), `pdd_fused_heads.safetensors` (component "pdd",
+  /// tensors renamed to `pdd.video_out.weight` / `pdd.video_out.bias`) and
+  /// `vae/diffusion_pytorch_model.safetensors` (component "image_vae").
+  /// The Qwen3-VL text encoder is bit-identical to the H3 FL2VA one and is
+  /// read from `text_encoder_dir` (empty: no prompt-encoder tensors). The
+  /// image release has no pinned gufo manifest: every safetensors header is
+  /// checked against its index and against the tensor counts of the
+  /// published release instead.
+  [[nodiscard]] static std::optional<ModelInventory> InspectImage(
+      const std::filesystem::path& image_root,
+      const std::filesystem::path& text_encoder_dir,
+      std::string* error = nullptr);
+
   [[nodiscard]] const std::filesystem::path& model_root() const noexcept {
     return model_root_;
   }
@@ -111,6 +126,17 @@ private:
   std::unordered_map<std::string, std::size_t> tensor_index_;
   InspectionTelemetry telemetry_;
 };
+
+/// Reads one tensor into host memory as F32 (BF16 widened). For small CPU
+/// paths (reference decoders, config tensors), not for the large phases.
+[[nodiscard]] bool ReadTensorF32(const ModelInventory& inventory,
+                                 const TensorDescriptor& descriptor,
+                                 std::vector<float>* output,
+                                 std::string* error = nullptr);
+
+// Tensor counts of the MiniMax-H3-Image release (revision 8ced6006).
+inline constexpr std::size_t kH3ImageTransformerTensors = 531;
+inline constexpr std::size_t kH3ImagePddTensors = 2;
 
 class CancellationToken {
 public:

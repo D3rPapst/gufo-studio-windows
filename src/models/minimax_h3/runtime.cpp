@@ -81,8 +81,11 @@ Phase TensorPhase(std::string_view component, std::string_view name) {
   if (component == "text_encoder") {
     return Phase::kPromptEncoder;
   }
-  if (component == "video_vae") {
+  if (component == "video_vae" || component == "image_vae") {
     return Phase::kVisualVae;
+  }
+  if (component == "pdd") {
+    return Phase::kDitCore;
   }
   if (component == "audio_vae") {
     return Phase::kAudioVae;
@@ -537,6 +540,182 @@ std::optional<ModelInventory> ModelInventory::Inspect(
              std::string("MiniMax H3 inspection failed: ") + exception.what());
     return std::nullopt;
   }
+}
+
+std::optional<ModelInventory> ModelInventory::InspectImage(
+    const std::filesystem::path& image_root,
+    const std::filesystem::path& text_encoder_dir, std::string* error) {
+  try {
+    ModelInventory inventory;
+    inventory.model_root_ = std::filesystem::weakly_canonical(image_root);
+    if (!std::filesystem::is_directory(inventory.model_root_)) {
+      throw json::Error("image model root is not a directory");
+    }
+    {
+      const auto index_path = inventory.model_root_ / "model_index.json";
+      std::error_code size_error;
+      inventory.telemetry_.json_bytes_read +=
+          std::filesystem::file_size(index_path, size_error);
+      const json::Value index = json::ParseFile(index_path, 1U << 20U);
+      const json::Value& h3 = RequireField(index, "_minimax_h3");
+      if (RequireField(index, "_class_name").AsString() !=
+              "MiniMaxH3ImagePipeline" ||
+          RequireField(h3, "partition").AsString() != "image" ||
+          RequireField(h3, "pdd_fused_heads").AsString() !=
+              "pdd_fused_heads.safetensors") {
+        throw json::Error("model_index.json is not a MiniMax-H3-Image release");
+      }
+    }
+
+    // Tensors of one safetensors file; `prefix` renames them.
+    const auto add_file = [&](const std::filesystem::path& shard,
+                              const std::filesystem::path& full_path,
+                              std::string_view component,
+                              std::string_view prefix,
+                              const std::set<std::string, std::less<>>* names) {
+      const ParsedHeader header =
+          ParseSafetensorsHeader(full_path, &inventory.telemetry_);
+      std::size_t count = 0;
+      for (const auto& [name, tensor] : header.tensors) {
+        if (names != nullptr && !names->contains(name)) {
+          continue;
+        }
+        TensorDescriptor descriptor;
+        descriptor.component = std::string(component);
+        descriptor.name = std::string(prefix) + name;
+        descriptor.dtype = tensor.dtype;
+        descriptor.shape = tensor.shape;
+        descriptor.shard = shard;
+        descriptor.file_offset = header.payload_offset + tensor.begin;
+        descriptor.payload_bytes = tensor.end - tensor.begin;
+        descriptor.phase = TensorPhase(descriptor.component, name);
+        const std::size_t position = inventory.tensors_.size();
+        if (!inventory.tensor_index_.emplace(descriptor.name, position)
+                 .second) {
+          throw json::Error("duplicate tensor name across H3-Image components: " +
+                            descriptor.name);
+        }
+        inventory.tensors_.push_back(std::move(descriptor));
+        ++count;
+      }
+      if (names != nullptr && count != names->size()) {
+        throw json::Error("safetensors shard lacks indexed tensors: " +
+                          full_path.string());
+      }
+      inventory.shards_.push_back(
+          {shard, header.file_bytes, header.payload_offset, count});
+      return count;
+    };
+
+    // An indexed component: every indexed tensor must be in its shard.
+    const auto add_indexed = [&](const std::filesystem::path& directory,
+                                 bool relative, std::string_view component) {
+      const auto weight_map = ParseWeightMap(
+          directory / "model.safetensors.index.json", &inventory.telemetry_);
+      std::map<std::string, std::set<std::string, std::less<>>, std::less<>>
+          by_shard;
+      for (const auto& [name, shard] : weight_map) {
+        by_shard[shard].insert(name);
+      }
+      std::size_t count = 0;
+      for (const auto& [shard, names] : by_shard) {
+        const std::filesystem::path full = directory / shard;
+        // Shards of the image root stay relative to it; the shared text
+        // encoder keeps its absolute path (model_root() / absolute == the
+        // absolute path).
+        const std::filesystem::path stored =
+            relative ? std::filesystem::path(
+                           full.lexically_relative(inventory.model_root_))
+                     : full;
+        count += add_file(stored, full, component, "", &names);
+      }
+      return count;
+    };
+
+    const std::size_t transformer = add_indexed(
+        inventory.model_root_ / "transformer", true, "transformer");
+    if (transformer != kH3ImageTransformerTensors) {
+      throw json::Error("H3-Image transformer has " +
+                        std::to_string(transformer) + " tensors, expected " +
+                        std::to_string(kH3ImageTransformerTensors));
+    }
+    if (add_file("pdd_fused_heads.safetensors",
+                 inventory.model_root_ / "pdd_fused_heads.safetensors", "pdd",
+                 "pdd.", nullptr) != kH3ImagePddTensors) {
+      throw json::Error("pdd_fused_heads.safetensors must hold exactly "
+                        "video_out.weight and video_out.bias");
+    }
+    if (add_file("vae/diffusion_pytorch_model.safetensors",
+                 inventory.model_root_ /
+                     "vae/diffusion_pytorch_model.safetensors",
+                 "image_vae", "", nullptr) == 0) {
+      throw json::Error("H3-Image VAE has no tensors");
+    }
+    if (!text_encoder_dir.empty()) {
+      const auto directory = std::filesystem::weakly_canonical(text_encoder_dir);
+      if (!std::filesystem::is_directory(directory)) {
+        throw json::Error("text encoder directory is not a directory: " +
+                          directory.string());
+      }
+      (void)add_indexed(directory, false, "text_encoder");
+    }
+    return inventory;
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("MiniMax-H3-Image inspection failed: ") +
+                        exception.what());
+    return std::nullopt;
+  }
+}
+
+bool ReadTensorF32(const ModelInventory& inventory,
+                   const TensorDescriptor& descriptor,
+                   std::vector<float>* output, std::string* error) {
+  if (output == nullptr || (descriptor.dtype != DType::kFloat32 &&
+                            descriptor.dtype != DType::kBFloat16)) {
+    SetError(error, "unsupported MiniMax H3 host tensor read: " +
+                        descriptor.name);
+    return false;
+  }
+  const std::size_t element_size = DTypeSize(descriptor.dtype);
+  if (descriptor.payload_bytes % element_size != 0 ||
+      descriptor.payload_bytes > (std::uint64_t{1} << 34U)) {
+    SetError(error, "invalid MiniMax H3 host tensor size: " + descriptor.name);
+    return false;
+  }
+  const std::size_t elements =
+      static_cast<std::size_t>(descriptor.payload_bytes) / element_size;
+  const std::filesystem::path path = inventory.model_root() / descriptor.shard;
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open " + path.string() + ": " + open_error);
+    return false;
+  }
+  bool ok = false;
+  try {
+    output->assign(elements, 0.0F);
+    if (descriptor.dtype == DType::kFloat32) {
+      ok = ReadExact(file, output->data(), elements * sizeof(float),
+                     descriptor.file_offset);
+    } else {
+      std::vector<std::uint16_t> raw(elements);
+      ok = ReadExact(file, raw.data(), elements * sizeof(std::uint16_t),
+                     descriptor.file_offset);
+      for (std::size_t index = 0; ok && index < elements; ++index) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(raw[index])
+                                   << 16U;
+        std::memcpy(&(*output)[index], &bits, sizeof(float));
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    ok = false;
+  }
+  platform::CloseFile(file);
+  if (!ok) {
+    output->clear();
+    SetError(error, "short read of MiniMax H3 tensor " + descriptor.name);
+  }
+  return ok;
 }
 
 const TensorDescriptor* ModelInventory::FindTensor(
