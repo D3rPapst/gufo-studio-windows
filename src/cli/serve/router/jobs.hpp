@@ -270,6 +270,10 @@ struct Options {
   Resolver resolve;
   Deliver deliver;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// A video status poll that fails with a passing error (no answer, 429,
+  /// 502, 503, 504) is tried again for this long before the job fails
+  /// (2.2.8); the video job on the worker goes on meanwhile.
+  std::chrono::milliseconds video_poll_grace{std::chrono::minutes(10)};
   /// 503 memory_busy from the router (2.2.3: the model could not load
   /// because another, busy model holds the memory): the job goes back to
   /// the front of the queue (status "queued", "memory_wait" in its view)

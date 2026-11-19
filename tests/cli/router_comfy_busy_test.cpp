@@ -189,6 +189,172 @@ void TestSubmitRefused(const std::filesystem::path& root) {
   adapter.Stop();
 }
 
+// 2.2.8: a video task whose POST /v1/videos meets a full worker queue
+// (429 video_queue_full) or a full router (503 overloaded) waits and asks
+// again; a status poll that gets a passing error goes on polling.
+constexpr const char* kH3Text = R"({
+ "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+ "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "strength_model": 1.0}},
+ "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors", "type": "minimax", "device": "default"}},
+ "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+ "5": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+ "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["3", 0], "text": "a quiet office at night"}},
+ "7": {"class_type": "EmptyMiniMaxH3LatentAV", "inputs": {"width": 896, "height": 512, "length": 124}},
+ "8": {"class_type": "KSampler", "inputs": {"model": ["2", 0], "positive": ["6", 0], "latent_image": ["7", 0], "seed": 5, "steps": 8, "cfg": 1.0, "sampler_name": "res_multistep", "scheduler": "simple", "denoise": 1.0}},
+ "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["4", 0]}},
+ "10": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["8", 0], "vae": ["5", 0]}},
+ "11": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": "h3/f"}},
+ "12": {"class_type": "SaveAudio", "inputs": {"audio": ["10", 0], "filename_prefix": "h3/ton"}}
+})";
+
+constexpr const char* kQueueFullBody =
+    R"({"error":{"message":"video queue is full","type":"rate_limit_error","code":"video_queue_full"}})";
+constexpr const char* kOverloadedBody =
+    R"({"error":{"message":"connection limit reached","type":"server_error","code":"overloaded"}})";
+
+void TestRetryLaterOf() {
+  CHECK(comfy::RetryLaterOf({.status = 429, .body = kQueueFullBody}) ==
+        std::optional<std::string>("video_queue_full"));
+  CHECK(comfy::RetryLaterOf({.status = 503, .body = kOverloadedBody}) ==
+        std::optional<std::string>("overloaded"));
+  // memory_busy keeps its own path (GufoBusy); other codes are failures.
+  CHECK(!comfy::RetryLaterOf({.status = 503, .body = kBusyBody}));
+  CHECK(!comfy::RetryLaterOf({.status = 429, .body = kOverloadedBody}));
+  CHECK(!comfy::RetryLaterOf({.status = 503, .body = kQueueFullBody}));
+  CHECK(!comfy::RetryLaterOf({.status = 429, .body = "not json"}));
+  CHECK(!comfy::RetryLaterOf({.status = 202, .body = R"({"id":"v"})"}));
+  CHECK(comfy::IsPassingPollFailure(503) && comfy::IsPassingPollFailure(0) &&
+        comfy::IsPassingPollFailure(429) && !comfy::IsPassingPollFailure(404) &&
+        !comfy::IsPassingPollFailure(500));
+}
+
+std::string ErrorText(const json::Value& entry) {
+  const json::Value* status = entry.find("status");
+  if (status == nullptr || status->member_str("status_str") != "error")
+    return {};
+  for (const json::Value& message : status->find("messages")->items())
+    if (message.items()[0].str() == "execution_error")
+      return message.items()[1].member_str("exception_message");
+  return {};
+}
+
+void TestVideoWaits(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  std::atomic<int> polls{0};
+  comfy::AdapterOptions options;
+  options.root = root / "video-wait";
+  options.video_busy_retry = std::chrono::milliseconds(20);
+  options.video_poll = std::chrono::milliseconds(10);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      const int n = ++posts;
+      if (n == 1)
+        return comfy::FetchResult{.status = 429, .body = kQueueFullBody};
+      if (n == 2)
+        return comfy::FetchResult{.status = 503, .body = kOverloadedBody};
+      return comfy::FetchResult{.status = 202,
+                                .body = R"({"id":"video_wait1","status":"queued"})",
+                                .content_type = "application/json"};
+    }
+    if (request.method == "GET" && request.path == "/v1/videos/video_wait1") {
+      const int n = ++polls;
+      if (n == 1)
+        return comfy::FetchResult{.status = 503, .body = kOverloadedBody};
+      return comfy::FetchResult{
+          .status = 200,
+          .body = R"({"id":"video_wait1","status":"failed","progress":3,"error":{"message":"fake end"}})"};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry) {
+    // It got past the full queue and the overloaded poll: the worker's own
+    // end ("failed") is what ends the prompt.
+    const std::string error = ErrorText(*entry);
+    CHECK(error.find("fake end") != std::string::npos);
+    CHECK(error.find("429") == std::string::npos);
+  }
+  CHECK(posts.load() == 3);
+  CHECK(polls.load() == 2);
+  adapter.Stop();
+}
+
+void TestVideoWaitLimit(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "video-limit";
+  options.video_busy_retry = std::chrono::milliseconds(10);
+  options.video_busy_limit = std::chrono::milliseconds(60);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      ++posts;
+      return comfy::FetchResult{.status = 429, .body = kQueueFullBody};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry)
+    CHECK(ErrorText(*entry).find("HTTP 429") != std::string::npos);
+  CHECK(posts.load() >= 2);
+  adapter.Stop();
+}
+
+void TestVideoWaitInterrupted(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "video-interrupt";
+  options.video_busy_retry = std::chrono::milliseconds(20);
+  options.video_busy_limit = std::chrono::milliseconds(0);  // no limit
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      ++posts;
+      return comfy::FetchResult{.status = 429, .body = kQueueFullBody};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  for (int i = 0; i < 200 && posts.load() < 3; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(posts.load() >= 3);  // still waiting, not failed
+  CHECK(adapter.QueueRemaining() == 1);
+  HttpRequest interrupt;
+  interrupt.method = "POST";
+  interrupt.path = "/interrupt";
+  interrupt.body = "{}";
+  interrupt.headers.emplace_back("Content-Type", "application/json");
+  (void)adapter.Handle(interrupt);
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry) {
+    bool interrupted = false;
+    for (const json::Value& message :
+         entry->find("status")->find("messages")->items())
+      interrupted = interrupted ||
+                    message.items()[0].str() == "execution_interrupted";
+    CHECK(interrupted);
+  }
+  adapter.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -198,6 +364,10 @@ int main() {
   TestMemoryBusyOf();
   TestHistoryMark(root);
   TestSubmitRefused(root);
+  TestRetryLaterOf();
+  TestVideoWaits(root);
+  TestVideoWaitLimit(root);
+  TestVideoWaitInterrupted(root);
   std::filesystem::remove_all(root);
   if (failures != 0) {
     std::cerr << failures << " comfy memory_busy checks failed.\n";

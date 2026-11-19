@@ -77,6 +77,8 @@ struct JobQueue::Job {
   std::chrono::steady_clock::time_point memory_wait_began{};
   long long memory_wait_since{0};
   std::string memory_wait;
+  /// Its error code: memory_busy, video_queue_full or overloaded (2.2.8).
+  std::string memory_wait_code{"memory_busy"};
   /// PATCH {"keep": true}: the result files never expire.
   bool keep{false};
   /// When the result media were deleted (expiry); 0 = still there.
@@ -2580,7 +2582,7 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   // Back in the queue after 503 memory_busy (2.2.3): why, and since when.
   if (job.status == "queued" && !job.memory_wait.empty()) {
     json::Value wait = json::Value::object();
-    wait["code"] = "memory_busy";
+    wait["code"] = job.memory_wait_code;
     wait["message"] = job.memory_wait;
     wait["since"] = job.memory_wait_since;
     const auto left = std::chrono::duration_cast<std::chrono::seconds>(
@@ -3568,7 +3570,11 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     // model that is busy holds the memory. Nothing was started; the job
     // waits in the queue (not in an open request) and is tried again after
     // memory_busy_retry, for at most memory_busy_limit in a row.
-    if (failure.status == 503 && failure.code == "memory_busy" &&
+    // 2.2.8: 429 video_queue_full (the video worker's queue is full) and 503
+    // overloaded (a router's connection limit) wait the same way.
+    if (((failure.status == 503 && failure.code == "memory_busy") ||
+         (failure.status == 429 && failure.code == "video_queue_full") ||
+         (failure.status == 503 && failure.code == "overloaded")) &&
         job->upstream_id.empty()) {
       bool requeued = false;
       {
@@ -3590,6 +3596,7 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->side = job->pin_local ? "local" : "";
           job->retry_at = now + options_.memory_busy_retry;
           job->memory_wait = failure.what();
+          job->memory_wait_code = failure.code;
           InsertPendingLocked(job, /*front=*/true);
           PersistLocked();
           requeued = true;
@@ -3666,6 +3673,8 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
     PersistLocked();
   }
   json::Value final_status;
+  // First failed poll of the current run of passing failures (2.2.8).
+  std::optional<std::chrono::steady_clock::time_point> poll_trouble;
   for (;;) {
     const auto until = std::chrono::steady_clock::now() + options_.video_poll;
     while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
@@ -3686,9 +3695,24 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
     poll.path = "/v1/videos/" + video_id;
     poll.request_id = job->id;
     const FetchResult state = options_.fetch(poll);
-    if (state.status != 200)
+    if (state.status != 200) {
+      // 2.2.8: a full router (503 connection limit) or a short gap on the
+      // way to the worker does not fail a video that keeps running there.
+      const auto now = std::chrono::steady_clock::now();
+      if (comfy::IsPassingPollFailure(state.status) &&
+          (!poll_trouble || now - *poll_trouble < options_.video_poll_grace)) {
+        if (!poll_trouble) {
+          poll_trouble = now;
+          Logger::Warn("jobs", "event=video_poll_retry id=" + job->id +
+                                   " video=" + video_id + " status=" +
+                                   std::to_string(state.status));
+        }
+        continue;
+      }
       throw JobFailure("video status failed: " + ErrorMessage(state),
                        ErrorCode(state), state.status);
+    }
+    poll_trouble.reset();
     json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     {

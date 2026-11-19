@@ -97,8 +97,10 @@ the aspect ratio, between 1:4 and 4:1. Sizes, cropping, `gufo.keyframes` and
 - The prompt can be up to 4,096 tokens.
 - Over HTTP, `dev` needs `size: "256x256"` and `gufo.output_format: "ppm"`,
   and returns one frame.
-- The server runs one video at a time and queues one more; further requests
-  get HTTP 429.
+- The server runs one video at a time and queues up to `--video-queue`
+  more (default 8, at most 64; before 2.2.8 one); further requests get HTTP
+  429 `video_queue_full` with `Retry-After: 1`. A waiting job holds only its
+  request in host memory, no GPU memory.
 
 Video jobs run in the background. The [server guide](../server.md#videos)
 explains status, progress, downloads, cancellation and expiry.

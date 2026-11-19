@@ -84,6 +84,13 @@ struct VideoJobContent {
   std::uint64_t bytes{0};
 };
 
+/// `gufo serve video --video-queue` (2.2.8): jobs that may wait behind the
+/// running one. A waiting job holds its request in host memory (prompt and
+/// inputs, at most the server's request size) and a small JSON record on
+/// disk; GPU memory is taken only when it runs.
+inline constexpr std::size_t kDefaultVideoQueue = 8;
+inline constexpr std::size_t kMaxVideoQueue = 64;
+
 struct VideoJobServiceOptions {
   /// Video provider id; empty: the provider whose probe accepts
   /// `model_root` (highest `probe_priority`), else `minimax-h3`.

@@ -77,6 +77,18 @@ struct AdapterOptions {
   std::function<std::optional<std::string>(const std::string& model)>
       memory_busy;
   std::chrono::milliseconds video_poll{std::chrono::seconds(2)};
+  /// A video task whose POST /v1/videos gets "come back later"
+  /// (RetryLaterOf: 429 video_queue_full, 503 overloaded) waits and sends
+  /// it again every `video_busy_retry`, for at most `video_busy_limit` in a
+  /// row (0 = until the prompt is interrupted), instead of failing the
+  /// prompt (2.2.8; Regie 19.11.: four wan2.2 prompts against a worker
+  /// queue of one).
+  std::chrono::milliseconds video_busy_retry{std::chrono::seconds(10)};
+  std::chrono::milliseconds video_busy_limit{std::chrono::hours(6)};
+  /// A status poll of a running video that fails with a passing error
+  /// (no answer, 429, 502, 503, 504) is tried again for this long before
+  /// the prompt fails; the video job on the worker goes on meanwhile.
+  std::chrono::milliseconds video_poll_grace{std::chrono::minutes(10)};
   /// Preview poll interval while a /ws client watches.
   std::chrono::milliseconds preview_poll{std::chrono::milliseconds(400)};
   std::size_t history_limit{2000};
@@ -120,6 +132,18 @@ struct MemoryBusyError : std::runtime_error {
 /// nullopt for any other answer.
 [[nodiscard]] std::optional<MemoryBusyError> MemoryBusyOf(
     const FetchResult& result);
+
+/// The error code of an answer that means "full now, send it again later"
+/// (2.2.8): 429 video_queue_full (the video worker's queue is full) or 503
+/// overloaded (a router's connection limit); nullopt for anything else.
+[[nodiscard]] std::optional<std::string> RetryLaterOf(
+    const FetchResult& result);
+
+/// A status poll failure that may pass (no answer, 429, 502, 503, 504).
+[[nodiscard]] inline bool IsPassingPollFailure(int status) {
+  return status == 0 || status == 429 || status == 502 || status == 503 ||
+         status == 504;
+}
 
 /// The user a request acts for when it may touch only that user's
 /// prompts: X-Gufo-User from the access gate, empty for an admin, the

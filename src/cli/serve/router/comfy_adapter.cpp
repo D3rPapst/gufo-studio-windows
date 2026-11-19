@@ -764,6 +764,23 @@ std::optional<MemoryBusyError> MemoryBusyOf(const FetchResult& result) {
   }
 }
 
+std::optional<std::string> RetryLaterOf(const FetchResult& result) {
+  if (result.status != 429 && result.status != 503)
+    return std::nullopt;
+  try {
+    const json::Value body = json::parse(result.body);
+    const json::Value* error = body.find("error");
+    if (error == nullptr || !error->is_object())
+      return std::nullopt;
+    const std::string code = error->member_str("code");
+    if ((result.status == 429 && code == "video_queue_full") ||
+        (result.status == 503 && code == "overloaded"))
+      return code;
+  } catch (const std::exception&) {
+  }
+  return std::nullopt;
+}
+
 std::string RestrictedUser(const HttpRequest& request) {
   const std::string user = request.header("X-Gufo-User");
   if (user.empty())
@@ -2767,8 +2784,47 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     }
     body["gufo"]["audio_mask"]["audio"] = std::move(url);
   }
-  const FetchResult created =
-      Call(job, "POST", "/v1/videos", body.dump(), "application/json");
+  // Sleeps `total` unless the prompt is interrupted meanwhile.
+  const auto pause = [&job](std::chrono::milliseconds total) {
+    const auto until = std::chrono::steady_clock::now() + total;
+    while (!job->cancel.load()) {
+      const auto left = until - std::chrono::steady_clock::now();
+      if (left <= std::chrono::steady_clock::duration::zero())
+        return;
+      std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
+          left, std::chrono::milliseconds(200)));
+    }
+    throw Interrupted();
+  };
+  const std::string payload = body.dump();
+  FetchResult created =
+      Call(job, "POST", "/v1/videos", payload, "application/json");
+  // 2.2.8: the video worker's queue (or a router's connection limit) is
+  // full. Nothing was started; the task waits here and asks again, as a
+  // client would after Retry-After, instead of failing the prompt.
+  if (auto later = RetryLaterOf(created)) {
+    const auto began = std::chrono::steady_clock::now();
+    Logger::Warn("comfy", "event=video_wait prompt_id=" + job->id + " node=" +
+                              task.node_id + " model=" + spec.model +
+                              " code=" + *later + " retry_ms=" +
+                              std::to_string(options_.video_busy_retry.count()));
+    while (later &&
+           (options_.video_busy_limit.count() == 0 ||
+            std::chrono::steady_clock::now() - began <
+                options_.video_busy_limit)) {
+      pause(options_.video_busy_retry);
+      created = Call(job, "POST", "/v1/videos", payload, "application/json");
+      later = RetryLaterOf(created);
+    }
+    Logger::Info(
+        "comfy",
+        "event=video_wait_end prompt_id=" + job->id + " node=" + task.node_id +
+            " status=" + std::to_string(created.status) + " waited_ms=" +
+            std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - began)
+                    .count()));
+  }
   if (created.status != 200 && created.status != 202 && created.status != 201)
     throw std::runtime_error("gufo video request failed (HTTP " +
                              std::to_string(created.status) +
@@ -2785,6 +2841,8 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     RelayPreviews(job, task, video_id, "", false, stop);
   });
   int last_progress = -1;
+  // First failed poll of the current run of passing failures (2.2.8).
+  std::optional<std::chrono::steady_clock::time_point> poll_trouble;
   for (;;) {
     if (job->cancel.load()) {
       HttpRequest cancel;
@@ -2798,10 +2856,26 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     poll.method = "GET";
     poll.path = "/v1/videos/" + video_id;
     const FetchResult state = options_.fetch(poll);
-    if (state.status != 200)
+    if (state.status != 200) {
+      // A full router (503 connection limit) or a short gap on the way to
+      // the worker does not end a video that keeps running there.
+      const auto now = std::chrono::steady_clock::now();
+      if (IsPassingPollFailure(state.status) &&
+          (!poll_trouble || now - *poll_trouble < options_.video_poll_grace)) {
+        if (!poll_trouble) {
+          poll_trouble = now;
+          Logger::Warn("comfy", "event=video_poll_retry prompt_id=" + job->id +
+                                    " video=" + video_id + " status=" +
+                                    std::to_string(state.status) + " error=\"" +
+                                    ErrorMessage(state) + "\"");
+        }
+        continue;
+      }
       throw std::runtime_error("gufo video status failed (HTTP " +
                                std::to_string(state.status) +
                                "): " + ErrorMessage(state));
+    }
+    poll_trouble.reset();
     const json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     const int progress = static_cast<int>(parsed.member_double("progress", 0));

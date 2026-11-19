@@ -682,6 +682,12 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--ttl", "SEC",
                      "Completed-artifact TTL in seconds (default: 3600)",
                      "Storage", &video_ttl_seconds);
+    std::size_t video_queue = server::kDefaultVideoQueue;
+    parser.AddOption("", "--video-queue", "N",
+                     "Jobs that may wait behind the running one before "
+                     "POST /v1/videos answers 429 video_queue_full "
+                     "(default: 8; 1-64)",
+                     "Storage", &video_queue);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(parser, &video_names);
     std::vector<std::pair<std::string, std::string>> provider_options;
@@ -1334,6 +1340,15 @@ int RunServe(std::span<const char* const> args) {
     video_parser.AddOption("", "--ttl", "SEC",
                            "Completed-artifact TTL in seconds", "Storage",
                            &video_ttl_seconds);
+    // 2.2.8 (Regie 19.11.): four ComfyUI prompts of one video model met a
+    // fixed queue of one and got 429. A waiting job holds only its request
+    // (prompt, inputs of at most --max-request-bytes) in host memory and a
+    // small JSON file on disk; GPU memory is taken only by the running job.
+    std::size_t video_queue = server::kDefaultVideoQueue;
+    video_parser.AddOption("", "--video-queue", "N",
+                           "Jobs that may wait behind the running one "
+                           "(default: 8; 1-64)",
+                           "Storage", &video_queue);
     std::vector<std::string> video_names;
     AddServedModelNamesOption(video_parser, &video_names);
     std::vector<std::pair<std::string, std::string>> video_provider_options;
@@ -1362,6 +1377,11 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --ttl must be a positive duration\n";
       return 2;
     }
+    if (video_queue == 0 || video_queue > server::kMaxVideoQueue) {
+      std::cerr << "Error: --video-queue takes 1-" << server::kMaxVideoQueue
+                << "\n";
+      return 2;
+    }
 
     if (video_model.empty()) {
       std::cerr << "Error: --model <DIR> is required for video server\n";
@@ -1383,7 +1403,7 @@ int RunServe(std::span<const char* const> args) {
             .model_root = video_model,
             .source_manifest = video_manifest,
             .storage_root = video_root,
-            .queue_capacity = 1,
+            .queue_capacity = video_queue,
             .artifact_ttl = std::chrono::seconds(
                 static_cast<std::chrono::seconds::rep>(video_ttl_seconds)),
             // Video's canonical names select presets, so every supplied
@@ -1403,7 +1423,8 @@ int RunServe(std::span<const char* const> args) {
     }
     load_log.Complete(
         "model=" + video_jobs->model_id() +
-            " sessions=1 queue_capacity=1 weights=lazy rife=" +
+            " sessions=1 queue_capacity=" + std::to_string(video_queue) +
+            " weights=lazy rife=" +
             (post_args.rife_model.empty() ? "off" : "on") +
             " upscale=" + std::to_string(post_args.upscale_models.size()),
         false);

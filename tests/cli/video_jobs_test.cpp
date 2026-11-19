@@ -614,6 +614,68 @@ void TestRunnerOutputBoundary(const std::filesystem::path& root) {
         "runner output rejection preserves the external target");
 }
 
+void TestQueueCapacity(const std::filesystem::path& root) {
+  // 2.2.8 (`serve video --video-queue`): with capacity N, one job runs and
+  // N wait; the waiting ones do not reach the runner (no GPU work) and run
+  // in arrival order; job N+2 gets kQueueFull.
+  static_assert(gufo::server::kDefaultVideoQueue == 8);
+  FakeRunner runner;
+  VideoJobServiceOptions options{
+      .model_root = "/private/models/MiniMax-H3",
+      .source_manifest = "/private/manifest.json",
+      .storage_root = root,
+      .queue_capacity = 3,
+      .artifact_ttl = std::chrono::seconds(60),
+      .validate_model_inventory = false,
+      .id_factory = NextId,
+      .now = [] { return std::int64_t{1000}; },
+      .runner =
+          [&](const VideoRequest& request,
+              const CancellationCheck& cancellation, VideoProgress progress,
+              void* progress_opaque, VideoTelemetry* telemetry,
+              std::string* error) {
+            return runner.Run(request, cancellation, progress, progress_opaque,
+                              telemetry, error);
+          },
+  };
+  VideoJobService service(options);
+  Check(service.ready(), service.initialization_error());
+  std::vector<std::string> ids;
+  const auto first = service.Create(Mp4Request("prompt 0"));
+  Check(first.result == VideoJobResult::kOk, "capacity: first job admitted");
+  ids.push_back(first.job->id);
+  runner.WaitForCalls(1);
+  for (int i = 1; i <= 3; ++i) {
+    const auto queued = service.Create(Mp4Request("prompt " + std::to_string(i)));
+    Check(queued.result == VideoJobResult::kOk && queued.job.has_value() &&
+              queued.job->status == VideoJobStatus::kQueued,
+          "capacity: waiting job " + std::to_string(i) + " admitted");
+    ids.push_back(queued.job->id);
+  }
+  const auto full = service.Create(Mp4Request("prompt 4"));
+  Check(full.result == VideoJobResult::kQueueFull,
+        "capacity: job beyond the queue is refused");
+  {
+    const std::lock_guard<std::mutex> lock(runner.mutex);
+    Check(runner.calls == 1, "capacity: waiting jobs do not run");
+  }
+  runner.Release();
+  for (const std::string& id : ids) {
+    WaitUntil(
+        [&] {
+          const auto lookup = service.Get(id);
+          return lookup.job.has_value() &&
+                 lookup.job->status == VideoJobStatus::kCompleted;
+        },
+        "capacity: queued job did not complete");
+  }
+  const std::lock_guard<std::mutex> lock(runner.mutex);
+  Check(runner.requests.size() == 4, "capacity: all four ran");
+  for (std::size_t i = 0; i < runner.requests.size(); ++i)
+    Check(runner.requests[i].prompt == "prompt " + std::to_string(i),
+          "capacity: first in, first out");
+}
+
 }  // namespace
 
 void minimax_h3_register(gufo::ext::Registry&);
@@ -633,6 +695,7 @@ int main() {
   TestRecoveryHardening(base / "recovery-hardening");
   TestRunnerExceptionRecovery(base / "runner-exception");
   TestRunnerOutputBoundary(base / "runner-output-boundary");
+  TestQueueCapacity(base / "capacity");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video job lifecycle tests passed.\n";
   return 0;
