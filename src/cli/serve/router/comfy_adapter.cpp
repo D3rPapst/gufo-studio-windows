@@ -1974,7 +1974,24 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
 }
 
 json::Value Adapter::RunTask(const std::shared_ptr<Job>& job,
-                             const Task& task) {
+                             const Task& planned) {
+  // ImageFromBatch on loaded videos: cut the files first (work files,
+  // removed when the task ends), then run on the cut copy.
+  std::vector<fs::path> cut_files;
+  struct RemoveCuts {
+    std::vector<fs::path>* files;
+    ~RemoveCuts() {
+      std::error_code ignored;
+      for (const fs::path& file : *files)
+        fs::remove(file, ignored);
+    }
+  } cleanup{&cut_files};
+  std::optional<Task> cut;
+  if (HasFrameCuts(planned)) {
+    cut = planned;
+    CutVideoInputs(&*cut, &cut_files);
+  }
+  const Task& task = cut ? *cut : planned;
   if (const auto* image = std::get_if<ImageTask>(&task.spec))
     return RunImage(job, task, *image);
   if (const auto* speech = std::get_if<SpeechTask>(&task.spec))
@@ -3352,6 +3369,80 @@ std::string Adapter::ScaledBytes(const FileRef& file,
   std::error_code ignored;
   fs::remove(path, ignored);
   return bytes;
+}
+
+FileRef Adapter::CutVideo(const FileRef& file,
+                          std::vector<std::pair<FileRef, FileRef>>* done,
+                          std::vector<fs::path>* made) {
+  if (file.cuts.empty())
+    return file;
+  for (const auto& [from, to] : *done)
+    if (from == file)
+      return to;
+  FileRef plain = file;
+  plain.cuts.clear();
+  if (options_.ffmpeg.empty() || options_.ffprobe.empty())
+    throw std::runtime_error(
+        "ImageFromBatch on the loaded video " + file.name +
+        " cuts the file; start the router with --comfy-ffmpeg");
+  const fs::path path = FilePath(plain);
+  std::error_code ec;
+  if (path.empty() || !fs::is_regular_file(path, ec))
+    throw std::runtime_error("file not found: " + file.name + " [" +
+                             file.folder + "]");
+  jobs::VideoFrames info;
+  std::string error;
+  if (!jobs::ProbeVideoFrames(options_.ffprobe, path, &info, &error))
+    throw std::runtime_error("cannot count the frames of " + file.name +
+                             " (ImageFromBatch): " + error);
+  const auto [first, count] = ResolveFrameCuts(info.frames, file.cuts);
+  Logger::Info("comfy", "event=video_cut file=" + file.name +
+                            " frames=" + std::to_string(info.frames) +
+                            " first=" + std::to_string(first) +
+                            " count=" + std::to_string(count));
+  if (first == 0 && count == info.frames) {
+    done->emplace_back(file, plain);
+    return plain;  // the whole video: nothing to cut
+  }
+  // Frames [first, first + count) in decode order, every one as it is
+  // (lossless RGB, the file's frame rate); the sound over the same time.
+  const double fps = jobs::FrameRateValue(info.frame_rate);
+  const fs::path out = WorkFile("mp4");
+  made->push_back(out);
+  std::vector<fs::path> args{
+      "-i", path, "-map", "0:v:0", "-vf",
+      "trim=start_frame=" + std::to_string(first) +
+          ":end_frame=" + std::to_string(first + count) +
+          ",setpts=PTS-STARTPTS",
+      "-fps_mode", "passthrough", "-c:v", "libx264rgb", "-qp", "0",
+      "-pix_fmt", "rgb24"};
+  if (info.has_audio) {
+    char trim[96];
+    std::snprintf(trim, sizeof(trim),
+                  "atrim=start=%.6f:end=%.6f,asetpts=PTS-STARTPTS",
+                  info.start_time + first / fps,
+                  info.start_time + (first + count) / fps);
+    args.insert(args.end(), {"-map", "0:a:0", "-af", trim, "-c:a", "aac",
+                             "-b:a", "320k"});
+  } else {
+    args.emplace_back("-an");
+  }
+  args.push_back(out);
+  if (!RunFfmpeg(args, &error) || !fs::exists(out))
+    throw std::runtime_error("cannot cut frames " + std::to_string(first) +
+                             ".." + std::to_string(first + count - 1) +
+                             " of " + file.name + " (ImageFromBatch): " +
+                             (error.empty() ? "no output" : error));
+  FileRef cut{std::string(kWorkDir) + "/" + PathU8(out.filename()), "temp"};
+  done->emplace_back(file, cut);
+  return cut;
+}
+
+void Adapter::CutVideoInputs(Task* task, std::vector<fs::path>* made) {
+  std::vector<std::pair<FileRef, FileRef>> done;
+  for (std::optional<FileRef>* file : CuttableInputs(*task))
+    if (*file && !(*file)->cuts.empty())
+      *file = CutVideo(**file, &done, made);
 }
 
 std::string Adapter::AnimateReplaceControl(const VideoTask& spec) {

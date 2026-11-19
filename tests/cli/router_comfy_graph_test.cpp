@@ -3336,16 +3336,27 @@ void TestAnimateNative() {
   assert(resumed_animate->find("continue_motion_max_frames")->as_double() ==
          5);
 
-  // Errors: continue_motion from frames picked in the graph (as a chained
-  // node's ImageFromBatch would), no pose and no background, a background
-  // without mask.
-  std::string chained = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
-                                "\"pose_video\": [\"21\", 0], "
-                                "\"continue_motion\": [\"52\", 0]");
-  chained = Replace(chained, " \"30\":",
-                    " \"52\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
-                    "{\"image\": [\"21\", 0], \"batch_index\": 72, "
-                    "\"length\": 5}},\n \"30\":");
+  // ImageFromBatch on a loaded video is a cut of that video (FileRef::cuts,
+  // cut by the executor): frames 72..76 of the pose video.
+  std::string picked = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                               "\"pose_video\": [\"21\", 0], "
+                               "\"continue_motion\": [\"52\", 0]");
+  picked = Replace(picked, " \"30\":",
+                   " \"52\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+                   "{\"image\": [\"21\", 0], \"batch_index\": 72, "
+                   "\"length\": 5}},\n \"30\":");
+  const comfy::Plan picked_plan = plan_of(picked);
+  assert((std::get<comfy::VideoTask>(picked_plan.tasks[0].spec)
+              .continue_motion ==
+          comfy::FileRef{"pose_tanz.mp4", "input",
+                         std::vector<comfy::FrameCut>{{72, 5}}}));
+
+  // Errors: continue_motion from frames picked in the graph that are no
+  // loaded video (as a chained node's ImageFromBatch would), no pose and
+  // no background, a background without mask.
+  const std::string chained =
+      Replace(picked, "{\"image\": [\"21\", 0], \"batch_index\": 72",
+              "{\"image\": [\"24\", 0], \"batch_index\": 72");
   assert(error_of(chained).message.find("chained") != std::string::npos);
   assert(error_of(Replace(kAnimate, ", \"pose_video\": [\"21\", 0]", ""))
              .message.find("pose_video") != std::string::npos);
@@ -4019,6 +4030,156 @@ void TestInfiniteTalkVideoToVideo() {
              .message.find("LoadVideo") != std::string::npos);
 }
 
+// ImageFromBatch between a loaded video and the node that reads it
+// (Regie 19.11., Weg 2 of the film pipeline): FileRef::cuts, cut by the
+// executor with ComfyUI's clamping.
+void TestVideoCuts() {
+  // ComfyUI ImageFromBatch: batch_index = min(n - 1, batch_index),
+  // length = min(n - batch_index, length).
+  using Cuts = std::vector<comfy::FrameCut>;
+  assert((comfy::ResolveFrameCuts(285, Cuts{{0, 285}}) ==
+          std::pair<int, int>{0, 285}));
+  assert((comfy::ResolveFrameCuts(285, Cuts{}) ==
+          std::pair<int, int>{0, 285}));
+  assert((comfy::ResolveFrameCuts(200, Cuts{{0, 285}}) ==
+          std::pair<int, int>{0, 200}));
+  assert((comfy::ResolveFrameCuts(285, Cuts{{100, 81}}) ==
+          std::pair<int, int>{100, 81}));
+  assert((comfy::ResolveFrameCuts(285, Cuts{{100, 81}, {10, 5}}) ==
+          std::pair<int, int>{110, 5}));
+  // Past the end: the last frame (index), the rest of the batch (length).
+  assert((comfy::ResolveFrameCuts(285, Cuts{{400, 10}}) ==
+          std::pair<int, int>{284, 1}));
+  assert((comfy::ResolveFrameCuts(285, Cuts{{250, 81}}) ==
+          std::pair<int, int>{250, 35}));
+  assert((comfy::ResolveFrameCuts(285, Cuts{{100, 81}, {90, 4}}) ==
+          std::pair<int, int>{180, 1}));
+  assert((comfy::ResolveFrameCuts(0, Cuts{{0, 1}}) ==
+          std::pair<int, int>{0, 0}));
+
+  std::string v2v = Replace(
+      kTalk, " \"30\": {",
+      " \"60\": {\"class_type\": \"LoadVideo\", \"inputs\": {\"file\": "
+      "\"anna_motion.mp4\"}},\n \"61\": {\"class_type\": "
+      "\"GetVideoComponents\", \"inputs\": {\"video\": [\"60\", 0]}},\n "
+      "\"66\": {\"class_type\": \"ImageFromBatch\", \"inputs\": {\"image\": "
+      "[\"61\", 0], \"batch_index\": 0, \"length\": 285}},\n "
+      "\"62\": {\"class_type\": \"VAEEncode\", \"inputs\": {\"pixels\": "
+      "[\"66\", 0], \"vae\": [\"4\", 0]}},\n \"30\": {");
+  v2v = Replace(v2v, "\"latent_image\": [\"20\", 3]",
+                "\"latent_image\": [\"62\", 0]");
+  v2v = Replace(v2v, "\"denoise\": 1.0", "\"denoise\": 0.5");
+  // The Regie's graph: ImageFromBatch(0, 285) of a 285-frame video -> the
+  // whole video (the executor finds nothing to cut).
+  const comfy::Plan plan = PlanOf(v2v.c_str());
+  const auto& whole = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert((whole.talk_video ==
+          comfy::FileRef{"anna_motion.mp4", "input", Cuts{{0, 285}}}));
+  assert(plan.warnings.empty());
+  assert(comfy::HasFrameCuts(plan.tasks[0]));
+  assert(!comfy::HasFrameCuts(PlanOf(kTalk).tasks[0]));
+  // The start frame f0 = ImageFromBatch(0, 1) of the same frames: straight
+  // on GetVideoComponents (frame 0 of the file) ...
+  std::string f0 = Replace(v2v, "\"start_image\": [\"10\", 0]",
+                           "\"start_image\": [\"64\", 0]");
+  f0 = Replace(f0, " \"30\": {",
+               " \"64\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+               "{\"image\": [\"61\", 0], \"batch_index\": 0, \"length\": "
+               "1}},\n \"30\": {");
+  const comfy::Plan f0_plan = PlanOf(f0.c_str());
+  const auto& direct = std::get<comfy::VideoTask>(f0_plan.tasks[0].spec);
+  assert((direct.first_frame == comfy::FileRef{"anna_motion.mp4", "input"}));
+  assert(direct.first_frame_index && *direct.first_frame_index == 0);
+  assert(direct.talk_video->cuts == (Cuts{{0, 285}}));
+  // ... or on the cut the sampler encodes: the whole chain is the cut.
+  const comfy::Plan f0_cut_plan = PlanOf(
+      Replace(f0, "{\"image\": [\"61\", 0], \"batch_index\": 0, "
+                  "\"length\": 1}",
+              "{\"image\": [\"66\", 0], \"batch_index\": 0, \"length\": 1}")
+          .c_str());
+  const auto& chained =
+      std::get<comfy::VideoTask>(f0_cut_plan.tasks[0].spec);
+  assert((chained.first_frame ==
+          comfy::FileRef{"anna_motion.mp4", "input", Cuts{{0, 285}, {0, 1}}}));
+  assert(chained.first_frame_index && *chained.first_frame_index == 0);
+  assert(f0_cut_plan.warnings.empty());
+
+  // A real cut in the middle, through two ImageFromBatch nodes.
+  std::string middle = Replace(v2v, "\"batch_index\": 0, \"length\": 285",
+                               "\"batch_index\": 100, \"length\": 81");
+  middle =
+      Replace(middle, "\"pixels\": [\"66\", 0]", "\"pixels\": [\"67\", 0]");
+  middle = Replace(middle, " \"30\": {",
+                   " \"67\": {\"class_type\": \"ImageFromBatch\", \"inputs\": "
+                   "{\"image\": [\"66\", 0], \"batch_index\": 4, \"length\": "
+                   "200}},\n \"30\": {");
+  const comfy::Plan middle_plan = PlanOf(middle.c_str());
+  const auto& cut = std::get<comfy::VideoTask>(middle_plan.tasks[0].spec);
+  assert(cut.talk_video->cuts == (Cuts{{100, 81}, {4, 200}}));
+  assert((comfy::ResolveFrameCuts(285, cut.talk_video->cuts) ==
+          std::pair<int, int>{104, 77}));
+  // An index past the end is ComfyUI's to clamp (no plan error).
+  const comfy::Plan past_plan =
+      PlanOf(Replace(v2v, "\"batch_index\": 0, \"length\": 285",
+                     "\"batch_index\": 4000, \"length\": 10")
+                 .c_str());
+  const auto& past = std::get<comfy::VideoTask>(past_plan.tasks[0].spec);
+  assert(past.talk_video->cuts == (Cuts{{4000, 10}}));
+  assert((comfy::ResolveFrameCuts(285, past.talk_video->cuts) ==
+          std::pair<int, int>{284, 1}));
+  // Out of ImageFromBatch's own range, or not a whole number.
+  assert(ErrorOf(Replace(v2v, "\"length\": 285", "\"length\": 0"))
+             .message.find("length") != std::string::npos);
+  assert(ErrorOf(Replace(v2v, "\"batch_index\": 0, \"length\": 285",
+                         "\"batch_index\": 1.5, \"length\": 285"))
+             .message.find("batch_index") != std::string::npos);
+  // Still a loaded video behind the cut: not a LoadImage.
+  assert(ErrorOf(Replace(v2v, "{\"image\": [\"61\", 0], \"batch_index\": 0",
+                         "{\"image\": [\"10\", 0], \"batch_index\": 0"))
+             .message.find("LoadVideo") != std::string::npos);
+  // VHS_LoadVideo behind the cut works the same.
+  std::string vhs =
+      Replace(v2v, "{\"image\": [\"61\", 0], \"batch_index\": 0",
+              "{\"image\": [\"63\", 0], \"batch_index\": 0");
+  vhs = Replace(vhs, " \"30\": {",
+                " \"63\": {\"class_type\": \"VHS_LoadVideo\", \"inputs\": "
+                "{\"video\": \"anna_vhs.mp4\"}},\n \"30\": {");
+  const comfy::Plan vhs_plan = PlanOf(vhs.c_str());
+  assert((std::get<comfy::VideoTask>(vhs_plan.tasks[0].spec).talk_video ==
+          comfy::FileRef{"anna_vhs.mp4", "input", Cuts{{0, 285}}}));
+
+  // MMAudio on a cut of a LoadVideo.
+  const comfy::Plan foley_plan = PlanOf(R"({
+ "1": {"class_type": "MMAudioModelLoader", "inputs": {"mmaudio_model": "mmaudio_large_44k_v2_fp16.safetensors", "base_precision": "fp16"}},
+ "2": {"class_type": "MMAudioFeatureUtilsLoader", "inputs": {"vae_model": "mmaudio_vae_44k_fp16.safetensors", "synchformer_model": "mmaudio_synchformer_fp16.safetensors", "clip_model": "apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors", "mode": "44k", "precision": "fp16"}},
+ "3": {"class_type": "LoadVideo", "inputs": {"file": "shot16fps.mp4"}},
+ "7": {"class_type": "GetVideoComponents", "inputs": {"video": ["3", 0]}},
+ "8": {"class_type": "ImageFromBatch", "inputs": {"image": ["7", 0], "batch_index": 16, "length": 48}},
+ "4": {"class_type": "MMAudioSampler", "inputs": {"mmaudio_model": ["1", 0], "feature_utils": ["2", 0], "duration": 3, "steps": 25, "cfg": 4.5, "seed": 1, "prompt": "rain", "negative_prompt": "", "mask_away_clip": false, "force_offload": true, "images": ["8", 0]}},
+ "5": {"class_type": "SaveAudio", "inputs": {"audio": ["4", 0], "filename_prefix": "ton/s16"}}
+})");
+  const auto& foley = std::get<comfy::FoleyTask>(foley_plan.tasks[0].spec);
+  assert((foley.video ==
+          comfy::FileRef{"shot16fps.mp4", "input", Cuts{{16, 48}}}));
+  assert(comfy::HasFrameCuts(foley_plan.tasks[0]));
+
+  // Uni3C render_video through ImageFromBatch.
+  std::string rendered = Replace(
+      kUni3C,
+      "\"14\": {\"class_type\": \"GufoCameraMove\", \"inputs\": {\"camera\": "
+      "\"orbit_left\", \"speed\": 0.5, \"ease\": \"ease_in_out\", "
+      "\"amount\": -1}}",
+      "\"14\": {\"class_type\": \"ImageFromBatch\", \"inputs\": {\"image\": "
+      "[\"18\", 0], \"batch_index\": 8, \"length\": 81}},\n \"18\": "
+      "{\"class_type\": \"GetVideoComponents\", \"inputs\": "
+      "{\"video\": [\"17\", 0]}},\n \"17\": {\"class_type\": \"LoadVideo\", "
+      "\"inputs\": {\"file\": \"render_shot07.mp4\"}}");
+  const comfy::Plan guided_plan = PlanOf(rendered.c_str());
+  assert(
+      (std::get<comfy::VideoTask>(guided_plan.tasks[0].spec).render_video ==
+       comfy::FileRef{"render_shot07.mp4", "input", Cuts{{8, 81}}}));
+}
+
 void TestWanFunCamera() {
   // ComfyUI's Wan Fun Camera form: WanCameraEmbedding -> WanCameraImageToVideo.
   std::string text = Replace(
@@ -4540,6 +4701,7 @@ int main() {
   TestPoseAnimationScaled();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();
+  TestVideoCuts();
   TestDelivery();
   TestWavJoin();
   TestHelpers();

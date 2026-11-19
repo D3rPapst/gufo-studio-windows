@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -392,6 +393,60 @@ void MaskFile(const Graph& graph, const std::string& id, const Link& link,
   }
 }
 
+/// A node whose IMAGE output is a loaded video's frames.
+bool IsLoadedVideo(std::string_view cls) {
+  return cls == "VHS_LoadVideo" || cls == "GetVideoComponents";
+}
+
+/// ImageFromBatch nodes in front of an IMAGE input (ComfyUI slices the
+/// batch): appended to *cuts, the one nearest the source first. Returns the
+/// link behind them.
+Link SkipFrameCuts(const Graph& graph, Link link,
+                   std::vector<FrameCut>* cuts) {
+  std::vector<FrameCut> outer_first;
+  for (int guard = 0; graph.Class(link.node) == "ImageFromBatch"; ++guard) {
+    if (guard > 64)
+      throw NodeFailure(link.node, "invalid_prompt",
+                        "ImageFromBatch chain too long");
+    FrameCut cut;
+    for (auto [key, fallback, low, high, out] :
+         {std::tuple<const char*, double, double, double, int*>{
+              "batch_index", 0.0, 0.0, 4095.0, &cut.batch_index},
+          {"length", 1.0, 1.0, 4096.0, &cut.length}}) {
+      const double value = graph.Num(link.node, key, fallback);
+      if (value != std::floor(value) || value < low || value > high)
+        throw NodeFailure(link.node, "unsupported_value",
+                          std::string(key) + " must be a whole number in " +
+                              std::to_string(static_cast<int>(low)) + ".." +
+                              std::to_string(static_cast<int>(high)));
+      *out = static_cast<int>(value);
+    }
+    outer_first.push_back(cut);
+    link = graph.RequireLink(link.node, "image");
+  }
+  cuts->insert(cuts->end(), outer_first.rbegin(), outer_first.rend());
+  return link;
+}
+
+/// True when `link` is a loaded video's frames (VHS_LoadVideo or
+/// GetVideoComponents), possibly through ImageFromBatch nodes and, with
+/// `scales`, ImageScale / ImageScaleBy nodes.
+bool LoadedVideoBehind(const Graph& graph, Link link, bool scales) {
+  for (int guard = 0; guard < 256; ++guard) {
+    const std::string cls = graph.Class(link.node);
+    if (IsLoadedVideo(cls))
+      return true;
+    if (cls != "ImageFromBatch" &&
+        !(scales && (cls == "ImageScale" || cls == "ImageScaleBy")))
+      return false;
+    const auto next = graph.LinkOf(link.node, "image");
+    if (!next)
+      return false;
+    link = *next;
+  }
+  return false;
+}
+
 /// The LoadVideo file behind a GetVideoComponents output (0 = images,
 /// 1 = audio) that feeds input `key` of node `id`.
 FileRef VideoComponentsFile(const Graph& graph, const std::string& id,
@@ -408,6 +463,48 @@ FileRef VideoComponentsFile(const Graph& graph, const std::string& id,
                       "LoadVideo, not " +
                           graph.Class(file.node));
   return ParseFileRef(graph.Str(file.node, "file"), "input");
+}
+
+/// A video an IMAGE input receives: GetVideoComponents <- LoadVideo, or
+/// VHS_LoadVideo (gufo decodes and fits the file itself), optionally
+/// through ImageFromBatch nodes (FileRef::cuts, cut by the executor). The
+/// one place that checks a loaded video input (talk, VACE, Animate, Uni3C,
+/// MMAudio, start frames).
+FileRef VideoFile(const Graph& graph, const std::string& id,
+                  const std::string& key, const Link& link,
+                  std::vector<std::string>* warnings, int fps = 16) {
+  std::vector<FrameCut> cuts;
+  const Link video = SkipFrameCuts(graph, link, &cuts);
+  const std::string source = graph.Class(video.node);
+  FileRef file;
+  if (source == "VHS_LoadVideo") {
+    // gufo reads the file's frames in order from the start.
+    for (const char* option :
+         {"force_rate", "skip_first_frames", "select_every_nth"}) {
+      const double fallback = std::string_view(option) == "select_every_nth"
+                                  ? 1.0
+                                  : 0.0;
+      if (graph.Num(video.node, option, fallback) != fallback)
+        warnings->push_back("node " + video.node + ": " + option +
+                            " is not applied (gufo reads every frame from "
+                            "the start; prepare the video at " +
+                            std::to_string(fps) + " fps)");
+    }
+    file = ParseFileRef(graph.Str(video.node, "video"), "input");
+  } else if (source == "GetVideoComponents") {
+    file = VideoComponentsFile(graph, id, key, video, 0);
+  } else {
+    throw NodeFailure(id, "unsupported_link",
+                      "input '" + key +
+                          "' must come from LoadVideo (GetVideoComponents) "
+                          "or VHS_LoadVideo, optionally through "
+                          "ImageFromBatch, not " +
+                          source +
+                          " (run preprocessors in ComfyUI and load their "
+                          "result as a video)");
+  }
+  file.cuts = std::move(cuts);
+  return file;
 }
 
 FileRef AudioFile(const Graph& graph, const std::string& id,
@@ -1513,11 +1610,19 @@ VideoTask BuildH3(const Graph& graph, const std::string& sampler,
     auto image = graph.LinkOf(guide, "image");
     if (!image)
       continue;
-    if (graph.Class(image->node) == "GetVideoComponents") {
-      // A frame batch: gufo anchors its first 17k + 5 frames from `frame`
+    if (LoadedVideoBehind(graph, *image, false) &&
+        graph.Class(image->node) != "VHS_LoadVideo") {
+      // A frame batch (GetVideoComponents, optionally cut by
+      // ImageFromBatch): gufo anchors its first 17k + 5 frames from `frame`
       // on (fewer than 5 frames: the first one), like ComfyUI.
-      const FileRef file =
-          VideoComponentsFile(graph, guide, "image", *image, 0);
+      std::vector<FrameCut> cuts;
+      const Link source = SkipFrameCuts(graph, *image, &cuts);
+      if (graph.Class(source.node) != "GetVideoComponents")
+        throw NodeFailure(guide, "unsupported_link",
+                          "an H3 guide clip must come from LoadVideo "
+                          "(GetVideoComponents)");
+      FileRef file = VideoComponentsFile(graph, guide, "image", source, 0);
+      file.cuts = std::move(cuts);
       if (task.guide_video && !(*task.guide_video == file &&
                                 task.guide_video_frame == frame))
         throw NodeFailure(guide, "unsupported_value",
@@ -2039,15 +2144,9 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
       task.camera = GufoCameraMoveOf(graph, source->node);
     } else if (cls == "WanCameraEmbedding") {
       task.camera = WanCameraEmbeddingOf(graph, source->node, warnings);
-    } else if (cls == "VHS_LoadVideo") {
-      task.render_video =
-          ParseFileRef(graph.Str(source->node, "video"), "input");
-    } else if (cls == "GetVideoComponents") {
-      const Link file = graph.RequireLink(source->node, "video");
-      if (graph.Class(file.node) != "LoadVideo")
-        throw NodeFailure(source->node, "unsupported_link",
-                          "the guide video must come from LoadVideo");
-      task.render_video = ParseFileRef(graph.Str(file.node, "file"), "input");
+    } else if (LoadedVideoBehind(graph, *source, false)) {
+      task.render_video = VideoFile(graph, source_node, "render_video",
+                                    *source, warnings);
     } else {
       throw NodeFailure(source_node, "unsupported_link",
                         "the camera must come from GufoCameraMove, "
@@ -2069,42 +2168,6 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
   return task;
 }
 
-/// A video an IMAGE input receives: GetVideoComponents <- LoadVideo, or
-/// VHS_LoadVideo (gufo decodes and fits the file itself).
-FileRef VideoFile(const Graph& graph, const std::string& id,
-                  const std::string& key, const Link& link,
-                  std::vector<std::string>* warnings, int fps = 16) {
-  const std::string source = graph.Class(link.node);
-  if (source == "VHS_LoadVideo") {
-    // gufo reads the file's frames in order from the start.
-    for (const char* option :
-         {"force_rate", "skip_first_frames", "select_every_nth"}) {
-      const double fallback = std::string_view(option) == "select_every_nth"
-                                  ? 1.0
-                                  : 0.0;
-      if (graph.Num(link.node, option, fallback) != fallback)
-        warnings->push_back("node " + link.node + ": " + option +
-                            " is not applied (gufo reads every frame from "
-                            "the start; prepare the video at " +
-                            std::to_string(fps) + " fps)");
-    }
-    return ParseFileRef(graph.Str(link.node, "video"), "input");
-  }
-  if (source == "GetVideoComponents") {
-    const Link file = graph.RequireLink(link.node, "video");
-    if (graph.Class(file.node) != "LoadVideo")
-      throw NodeFailure(link.node, "unsupported_link",
-                        "the video must come from LoadVideo");
-    return ParseFileRef(graph.Str(file.node, "file"), "input");
-  }
-  throw NodeFailure(id, "unsupported_link",
-                    "input '" + key +
-                        "' must come from LoadVideo (GetVideoComponents) or "
-                        "VHS_LoadVideo, not " +
-                        source +
-                        " (run preprocessors in ComfyUI and load their "
-                        "result as a video)");
-}
 
 // IMAGE batches built in the graph (VACE control videos and masks).
 constexpr int kMaxBatchFrames = 4096;
@@ -2318,33 +2381,35 @@ void VaceFrames(const Graph& graph, const std::string& id,
                 std::optional<FileRef>* file, std::vector<FrameRun>* runs,
                 std::vector<FrameFit>* video_fits = nullptr) {
   const std::string cls = graph.Class(link.node);
-  if (IsScaleNode(cls)) {
-    std::vector<FrameFit> fits;
-    const Link source = SkipScaleNodes(graph, link, &fits);
-    const std::string base = graph.Class(source.node);
-    if (base == "VHS_LoadVideo" || base == "GetVideoComponents") {
+  if (LoadedVideoBehind(graph, link, true)) {
+    // ImageFromBatch (frame cuts) and ImageScale (per-frame fits) commute:
+    // cuts in front of the scale nodes go after the ones behind them.
+    std::vector<FrameCut> outer;
+    Link source = SkipFrameCuts(graph, link, &outer);
+    if (IsScaleNode(graph.Class(source.node))) {
       if (!video_fits)
         throw NodeFailure(id, "unsupported_link",
                           "input '" + key +
                               "': ImageScale on a loaded video is not "
                               "supported here by gufo");
-      *file = VideoFile(graph, id, key, source, warnings);
+      std::vector<FrameFit> fits;
+      source = SkipScaleNodes(graph, source, &fits);
       *video_fits = std::move(fits);
-      return;
     }
+    FileRef video = VideoFile(graph, id, key, source, warnings);
+    video.cuts.insert(video.cuts.end(), outer.begin(), outer.end());
+    *file = std::move(video);
+    return;
   }
   if (IsFrameSource(cls)) {
     *runs = FrameRuns(graph, id, key, link);
     return;
   }
-  if (cls == "VHS_LoadVideo" || cls == "GetVideoComponents") {
-    *file = VideoFile(graph, id, key, link, warnings);
-    return;
-  }
   throw NodeFailure(id, "unsupported_link",
                     "input '" + key +
                         "' must come from LoadVideo (GetVideoComponents), "
-                        "VHS_LoadVideo or frames from EmptyImage / LoadImage "
+                        "VHS_LoadVideo (optionally through ImageFromBatch) "
+                        "or frames from EmptyImage / LoadImage "
                         "/ ImageScale / ImageBatch / RepeatImageBatch, not " +
                         cls +
                         " (run preprocessors in ComfyUI and load their "
@@ -3245,7 +3310,7 @@ void AnimateVideo(const Graph& graph, const std::string& node,
     return;
   const std::string cls = graph.Class(link->node);
   if (key == "continue_motion" && !IsFrameSource(cls) &&
-      cls != "VHS_LoadVideo" && cls != "GetVideoComponents")
+      !LoadedVideoBehind(graph, *link, true))
     throw NodeFailure(node, "unsupported_link",
                       "continue_motion from " + cls +
                           " (a chained WanAnimateToVideo) is not supported by "
@@ -3975,9 +4040,19 @@ FileRef VideoFrameFile(const Graph& graph, const std::string& id,
                       "ImageFromBatch for '" + key +
                           "' must pick one frame: length 1 and a literal "
                           "batch_index >= 0");
-  *index = static_cast<int>(first->as_double());
-  return VideoFile(graph, batch, "image", graph.RequireLink(batch, "image"),
-                   warnings, fps);
+  const int pick = static_cast<int>(first->as_double());
+  FileRef file = VideoFile(graph, batch, "image",
+                           graph.RequireLink(batch, "image"), warnings, fps);
+  if (file.cuts.empty()) {
+    *index = pick;  // straight on the video: frame `pick` of the file
+  } else {
+    // Over more ImageFromBatch nodes (e.g. frame 0 of the cut the sampler
+    // encodes): the whole chain is the cut, ComfyUI's clamping included;
+    // the executor takes frame 0 of the one frame it leaves.
+    file.cuts.push_back(FrameCut{pick, 1});
+    *index = 0;
+  }
+  return file;
 }
 
 /// Wan 2.1 I2V + InfiniteTalk (wan2.1-infinitetalk-14b, 25 fps). A chain of
@@ -4226,19 +4301,23 @@ FoleyTask BuildFoley(const Graph& graph, const std::string& id,
   task.negative_prompt = graph.Str(id, "negative_prompt", "");
   task.mask_away_clip = graph.Bool(id, "mask_away_clip", false);
   if (auto images = graph.LinkOf(id, "images")) {
-    const std::string cls = graph.Class(images->node);
+    // ImageFromBatch nodes on the video: FileRef::cuts (the executor cuts
+    // the file with its sound before MMAudio reads it).
+    std::vector<FrameCut> cuts;
+    const Link source = SkipFrameCuts(graph, *images, &cuts);
+    const std::string cls = graph.Class(source.node);
     if (cls == "VHS_LoadVideo") {
-      task.video = ParseFileRef(graph.Str(images->node, "video"), "input");
-      task.force_rate = graph.Num(images->node, "force_rate", 0);
+      task.video = ParseFileRef(graph.Str(source.node, "video"), "input");
+      task.force_rate = graph.Num(source.node, "force_rate", 0);
       task.skip_first_frames =
-          static_cast<int>(graph.Num(images->node, "skip_first_frames", 0));
+          static_cast<int>(graph.Num(source.node, "skip_first_frames", 0));
       task.select_every_nth =
-          static_cast<int>(graph.Num(images->node, "select_every_nth", 1));
+          static_cast<int>(graph.Num(source.node, "select_every_nth", 1));
       task.frame_load_cap =
-          static_cast<int>(graph.Num(images->node, "frame_load_cap", 0));
-      if (graph.Num(images->node, "custom_width", 0) != 0 ||
-          graph.Num(images->node, "custom_height", 0) != 0)
-        warnings->push_back("node " + images->node +
+          static_cast<int>(graph.Num(source.node, "frame_load_cap", 0));
+      if (graph.Num(source.node, "custom_width", 0) != 0 ||
+          graph.Num(source.node, "custom_height", 0) != 0)
+        warnings->push_back("node " + source.node +
                             ": custom_width / custom_height are ignored "
                             "(MMAudio resizes the frames itself)");
       // Frame options shape the IMAGE batch: only ComfyUI-MMAudio's way
@@ -4250,18 +4329,24 @@ FoleyTask BuildFoley(const Graph& graph, const std::string& id,
         char rate[32];
         std::snprintf(rate, sizeof(rate), "%g", task.force_rate);
         warnings->push_back(
-            "node " + images->node + ": force_rate " + rate +
+            "node " + source.node + ": force_rate " + rate +
             " - MMAudio reads the frames as 25 fps (as ComfyUI-MMAudio), so "
             "the sound runs off the picture; force_rate 25 or 0 keeps the "
             "video's timing");
       }
+      if (!cuts.empty()) {
+        if (task.consecutive)
+          throw NodeFailure(id, "unsupported_link",
+                            "ImageFromBatch behind VHS_LoadVideo with frame "
+                            "options (force_rate, skip_first_frames, "
+                            "select_every_nth, frame_load_cap) is not "
+                            "supported by gufo; use one of them");
+        task.video->cuts = std::move(cuts);
+      }
     } else if (cls == "GetVideoComponents") {
-      const Link file = graph.RequireLink(images->node, "video");
-      if (graph.Class(file.node) != "LoadVideo")
-        throw NodeFailure(images->node, "unsupported_link",
-                          "the video must come from LoadVideo");
-      task.video = ParseFileRef(graph.Str(file.node, "file"), "input");
-    } else if (cls == "LoadImage" || cls == "LoadImageOutput") {
+      task.video = VideoFile(graph, id, "images", *images, warnings, 25);
+    } else if ((cls == "LoadImage" || cls == "LoadImageOutput") &&
+               cuts.empty()) {
       task.image = ImageFile(graph, id, "images", *images);
       warnings->push_back("node " + id +
                           ": one image runs as MMAudio's image mode (CLIP "
@@ -4269,7 +4354,8 @@ FoleyTask BuildFoley(const Graph& graph, const std::string& id,
     } else {
       throw NodeFailure(id, "unsupported_link",
                         "images must come from VHS_LoadVideo, LoadVideo "
-                        "(GetVideoComponents) or LoadImage, not " +
+                        "(GetVideoComponents), optionally through "
+                        "ImageFromBatch, or LoadImage, not " +
                             cls);
     }
   }
@@ -5913,6 +5999,54 @@ std::optional<std::string> SafeRelative(std::string_view path) {
     start = end + 1;
   }
   return out;
+}
+
+std::pair<int, int> ResolveFrameCuts(int frames,
+                                     const std::vector<FrameCut>& cuts) {
+  if (frames < 1)
+    return {0, 0};
+  // ComfyUI ImageFromBatch.frombatch on an n-frame batch:
+  //   batch_index = min(n - 1, batch_index)
+  //   length = min(n - batch_index, length)
+  int first = 0;
+  int count = frames;
+  for (const FrameCut& cut : cuts) {
+    const int index = std::min(count - 1, std::max(0, cut.batch_index));
+    const int length = std::min(count - index, std::max(1, cut.length));
+    first += index;
+    count = length;
+  }
+  return {first, count};
+}
+
+std::vector<std::optional<FileRef>*> CuttableInputs(Task& task) {
+  std::vector<std::optional<FileRef>*> inputs;
+  if (auto* foley = std::get_if<FoleyTask>(&task.spec)) {
+    inputs.push_back(&foley->video);
+    return inputs;
+  }
+  auto* video = std::get_if<VideoTask>(&task.spec);
+  if (video == nullptr)
+    return inputs;
+  std::vector<VideoTask*> videos{video};
+  for (VideoTask& chunk : video->i2v_chunks)
+    videos.push_back(&chunk);
+  for (VideoTask* spec : videos)
+    for (std::optional<FileRef>* file :
+         {&spec->first_frame, &spec->guide_video, &spec->render_video,
+          &spec->source_video, &spec->control_video, &spec->vace_mask,
+          &spec->animate_background, &spec->talk_video, &spec->pose_video,
+          &spec->face_video, &spec->background_video, &spec->continue_motion})
+      inputs.push_back(file);
+  return inputs;
+}
+
+bool HasFrameCuts(const Task& task) {
+  Task copy = task;
+  for (const std::optional<FileRef>* file : CuttableInputs(copy))
+    if (*file && !(*file)->cuts.empty())
+      return true;
+  return false;
 }
 
 std::pair<int, int> ScaleToArea(int width, int height, int resolution) {

@@ -151,12 +151,32 @@ struct ModelIds {
 /// any case), e.g. "qwen_image_2.1_turbo_bf16.safetensors".
 bool IsQwenImageTurboFile(std::string_view name);
 
+/// One ImageFromBatch node on a loaded video's frames (ComfyUI: frames
+/// [min(n - 1, batch_index), + min(n - that, length)] of an n-frame batch).
+struct FrameCut {
+  int batch_index{0};
+  int length{1};
+  bool operator==(const FrameCut&) const = default;
+};
+
 /// A file a Load* node names, e.g. "sub/name.png [output]".
 struct FileRef {
   std::string name;    // relative path inside `folder`, '/' separated
   std::string folder;  // "input", "output" or "temp"
+  /// A loaded video's frames through a chain of ImageFromBatch nodes, the
+  /// one next to the video first; empty = every frame. The executor cuts
+  /// the file (ffprobe frame count, ResolveFrameCuts, ffmpeg lossless with
+  /// the matching sound) before anything reads it; a cut that keeps every
+  /// frame leaves the file as it is.
+  std::vector<FrameCut> cuts;
   bool operator==(const FileRef&) const = default;
 };
+
+/// The frames [first, first + count) the `cuts` keep of an n-frame video,
+/// clamped as ComfyUI's ImageFromBatch does (an index past the end keeps
+/// the last frame). n < 1 gives {0, 0}.
+std::pair<int, int> ResolveFrameCuts(int frames,
+                                     const std::vector<FrameCut>& cuts);
 
 enum class OutputKind { kImage, kAudio, kVideo };
 
@@ -672,6 +692,13 @@ struct Task {
       spec;
   std::vector<OutputTarget> outputs;
 };
+
+/// The inputs of `task` that may name a loaded video with FileRef::cuts
+/// (talk / VACE / Animate / Uni3C / H3 guide / start frame videos, every I2V
+/// chunk's, MMAudio's video).
+std::vector<std::optional<FileRef>*> CuttableInputs(Task& task);
+/// True when one of them has cuts (the executor cuts before it runs).
+bool HasFrameCuts(const Task& task);
 
 struct Plan {
   std::vector<Task> tasks;

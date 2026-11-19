@@ -869,6 +869,34 @@ stage (or the reverse) runs as gufo's LoRA of that stage's expert, with a
 With `experts_resident` (I2V) another LoRA choice reloads only the expert
 that changed; the room check counts each expert's LoRA file (its factors
 stay on the device), so an expert without LoRA needs a little less.
+ComfyUI frame cuts on loaded videos (after 2.2.11): wherever the adapter
+reads a loaded video (`GetVideoComponents` <- `LoadVideo`, or
+`VHS_LoadVideo`), a chain of `ImageFromBatch` nodes may sit in between:
+the InfiniteTalk video-to-video `VAEEncode` pixels (Regie 19.11., Weg 2:
+`ImageFromBatch(0, 285)` -> `VAEEncode` -> `SamplerCustomAdvanced` from
+`SplitSigmas`), its `start_image` (`ImageFromBatch(i, 1)` straight on the
+video or on that cut), VACE control video / mask, Animate pose / face /
+background / continue_motion (also with `ImageScale` before or after the
+cut), the Uni3C `render_video`, an H3 guide clip and the MMAudio `images`.
+The graph keeps the cut chain on the file (`FileRef::cuts`, nearest the
+video first); `comfy_graph.cpp` `VideoFile` / `SkipFrameCuts` is the one
+check for all of them. Before a task runs, the adapter counts the file's
+decoded frames (`ffprobe -count_frames`), resolves the chain exactly as
+ComfyUI's `ImageFromBatch` does (`ResolveFrameCuts`: index =
+min(n-1, batch_index), length = min(n-index, length), so an index past the
+end keeps the last frame), and: a cut that keeps every frame (e.g. 285 of
+a 285-frame video) sends the file unchanged; any other cut becomes a work
+file in `temp/.gufo-work` (ffmpeg `trim=start_frame:end_frame`, libx264rgb
+`-qp 0` rgb24, the file's own frame rate, the sound trimmed to the same
+time as AAC), removed when the task ends (`comfy_adapter.cpp` `CutVideo`,
+log `event=video_cut`). Frame numbers are the file's own frames in decode
+order (ComfyUI does not resample either); a video with a variable frame
+rate cuts its sound at frame / r_frame_rate. Needs `--comfy-ffmpeg`
+(ffprobe and ffmpeg), also for a whole-video cut. MMAudio refuses a cut
+behind `VHS_LoadVideo` frame options (`force_rate`, `skip_first_frames`,
+`select_every_nth`, `frame_load_cap`). An I2V start frame cut from a
+loaded video and the RIFE / upscale delivery of a `LoadVideo` are not
+covered.
 ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
 previews under an id known from the answer on: `extra_data.gufo_preview_id`
 (1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with

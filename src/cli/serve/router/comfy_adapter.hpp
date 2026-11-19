@@ -324,6 +324,16 @@ private:
   std::filesystem::path ScaleToWorkFile(const FileRef& file,
                                         const std::vector<FrameFit>& fits,
                                         bool video, std::string_view what);
+  /// A loaded video with FileRef::cuts (ImageFromBatch in the graph) as a
+  /// FileRef without cuts: the file itself when the cut keeps every frame,
+  /// else a lossless work file of the kept frames (libx264rgb, the file's
+  /// frame rate, the sound trimmed to them) added to *made. `done` holds
+  /// the cuts of this task already made. Throws on errors.
+  FileRef CutVideo(const FileRef& file,
+                   std::vector<std::pair<FileRef, FileRef>>* done,
+                   std::vector<std::filesystem::path>* made);
+  /// Every FileRef of `task` with cuts replaced by CutVideo's result.
+  void CutVideoInputs(Task* task, std::vector<std::filesystem::path>* made);
   /// The bytes of `file`, scaled first when `fits` has steps.
   std::string ScaledBytes(const FileRef& file,
                           const std::vector<FrameFit>& fits, bool video,

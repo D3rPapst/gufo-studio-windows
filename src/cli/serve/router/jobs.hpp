@@ -376,6 +376,26 @@ std::string LocalUrlToward(std::string_view toward, int port);
 double ProbeFrameRate(const std::filesystem::path& ffprobe,
                       const std::filesystem::path& video, std::string* error);
 
+/// A video file's decoded frames (ffprobe -count_frames): count, frame
+/// rate as ffprobe prints it ("25/1"), the video stream's start time and
+/// whether there is sound.
+struct VideoFrames {
+  int frames{0};
+  std::string frame_rate;
+  double start_time{0};
+  bool has_audio{false};
+};
+
+/// Counts the frames of `video` (decodes the file); false with *error.
+bool ProbeVideoFrames(const std::filesystem::path& ffprobe,
+                      const std::filesystem::path& video, VideoFrames* out,
+                      std::string* error);
+
+/// Parses ffprobe's JSON (-count_frames -show_streams); false with *error
+/// when there is no video stream with frames and a frame rate.
+bool ParseVideoFrames(std::string_view text, VideoFrames* out,
+                      std::string* error);
+
 /// The LoRA names a request body asks for: "loras"[].name (images) and
 /// "gufo"."lora" (videos, a string); empty for anything else.
 std::vector<std::string> LoraNames(const json::Value& body);

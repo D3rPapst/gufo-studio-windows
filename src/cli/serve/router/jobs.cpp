@@ -868,18 +868,23 @@ std::string LocalUrlToward(std::string_view toward, int port) {
   return "http://" + address + ":" + std::to_string(port);
 }
 
-double ProbeFrameRate(const fs::path& ffprobe, const fs::path& video,
+namespace {
+
+/// ffprobe's JSON output (-print_format json, then `args`, then `video`);
+/// "" with *error when ffprobe fails.
+std::string ProbeJson(const fs::path& ffprobe, const fs::path& video,
+                      std::vector<fs::path> args, std::chrono::minutes timeout,
                       std::string* error) {
   if (ffprobe.empty()) {
     *error = "no ffprobe configured (--comfy-ffmpeg)";
-    return 0;
+    return {};
   }
   static std::atomic<unsigned> counter{0};
   std::error_code ec;
   const fs::path base = fs::temp_directory_path(ec);
   if (ec) {
     *error = "no temp directory: " + ec.message();
-    return 0;
+    return {};
   }
   TempDir work{base / ("gufo-probe-" +
                        std::to_string(std::chrono::steady_clock::now()
@@ -889,25 +894,91 @@ double ProbeFrameRate(const fs::path& ffprobe, const fs::path& video,
   fs::create_directories(work.path, ec);
   if (!fs::is_directory(work.path, ec)) {
     *error = "cannot create " + work.path.string();
-    return 0;
+    return {};
   }
   const fs::path out = work.path / "probe.json";
   const fs::path err = work.path / "probe.err";
-  const int code = RunCaptured(ffprobe,
-                               {"-v", "error", "-print_format", "json",
-                                "-show_streams", "-show_format", video},
-                               std::chrono::minutes(1), out, err, nullptr,
-                               error);
+  std::vector<fs::path> full{"-v", "error", "-print_format", "json"};
+  full.insert(full.end(), args.begin(), args.end());
+  full.push_back(video);
+  const int code =
+      RunCaptured(ffprobe, full, timeout, out, err, nullptr, error);
   if (code != 0) {
     if (error->empty())
       *error = "ffprobe exit " + std::to_string(code) + ": " +
                TailOf(ReadIfThere(err), 300);
-    return 0;
+    return {};
   }
+  return ReadIfThere(out);
+}
+
+}  // namespace
+
+double ProbeFrameRate(const fs::path& ffprobe, const fs::path& video,
+                      std::string* error) {
+  const std::string text =
+      ProbeJson(ffprobe, video, {"-show_streams", "-show_format"},
+                std::chrono::minutes(1), error);
+  if (text.empty())
+    return 0;
   ProbeInfo info;
-  if (!ParseProbe(ReadIfThere(out), &info, error))
+  if (!ParseProbe(text, &info, error))
     return 0;
   return FrameRateValue(info.frame_rate);
+}
+
+bool ProbeVideoFrames(const fs::path& ffprobe, const fs::path& video,
+                      VideoFrames* out, std::string* error) {
+  // -count_frames decodes the file: the frames ComfyUI's LoadVideo gives.
+  const std::string text = ProbeJson(
+      ffprobe, video, {"-count_frames", "-show_streams"},
+      std::chrono::minutes(10), error);
+  if (text.empty())
+    return false;
+  return ParseVideoFrames(text, out, error);
+}
+
+bool ParseVideoFrames(std::string_view text, VideoFrames* out,
+                      std::string* error) {
+  json::Value parsed;
+  try {
+    parsed = json::parse(std::string(text));
+  } catch (const std::exception& failure) {
+    *error = std::string("ffprobe output is not JSON: ") + failure.what();
+    return false;
+  }
+  VideoFrames info;
+  bool video = false;
+  if (const json::Value* streams = parsed.find("streams");
+      streams != nullptr && streams->is_array()) {
+    for (const json::Value& stream : streams->items()) {
+      if (!stream.is_object())
+        continue;
+      const std::string type = stream.member_str("codec_type");
+      if (type == "video" && !video) {
+        video = true;
+        info.frames = static_cast<int>(NumberOf(stream, "nb_read_frames"));
+        if (info.frames <= 0)
+          info.frames = static_cast<int>(NumberOf(stream, "nb_frames"));
+        info.frame_rate = stream.member_str("r_frame_rate");
+        if (FrameRateValue(info.frame_rate) <= 0)
+          info.frame_rate = stream.member_str("avg_frame_rate");
+        info.start_time = NumberOf(stream, "start_time");
+      } else if (type == "audio") {
+        info.has_audio = true;
+      }
+    }
+  }
+  if (!video) {
+    *error = "no video stream";
+    return false;
+  }
+  if (info.frames <= 0 || FrameRateValue(info.frame_rate) <= 0) {
+    *error = "video stream without frame count or frame rate";
+    return false;
+  }
+  *out = std::move(info);
+  return true;
 }
 
 std::string KindOf(std::string_view path) {
