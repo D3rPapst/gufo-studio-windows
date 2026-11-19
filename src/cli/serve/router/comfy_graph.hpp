@@ -12,10 +12,12 @@
 //          regional prompts through ConditioningCombine / ConditioningSetMask
 //          / ConditioningSetArea(Percentage) with SolidMask / MaskComposite
 //          masks -> gufo.regions (each region with its own references);
-//          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only);
-//          other unet_names run the BF16 qwen-image-2.1 (a warning for
-//          int8 / fp8 / ... names, an error for non-Qwen names); the
-//          optional KSampler input guidance_steps -> gufo.guidance_steps
+//          the UNETLoader / CheckpointLoaderSimple name picks the gufo
+//          image model (comfy_image_models: qwen-image-2.1, the *turbo*
+//          qwen-image-2.1-turbo with 8 steps only, moss-image for text to
+//          image); a name of no served model fails validation, int8 / fp8 /
+//          ... names warn (gufo runs its own weights); the optional
+//          KSampler input guidance_steps -> gufo.guidance_steps
 //   h3     KSampler <- MiniMaxH3ImageToVideo, or EmptyMiniMaxH3LatentAV
 //          with a CLIPTextEncode positive (+ MiniMaxH3AddGuide, whose
 //          image / audio may come from LoadVideo -> GetVideoComponents as a
@@ -114,6 +116,8 @@ struct ModelIds {
   /// (IsQwenImageTurboFile). They need exactly 8 steps and denoise 1; empty
   /// = such graphs fail validation instead of running on `image`.
   std::string image_turbo{"qwen-image-2.1-turbo"};
+  /// MOSS-Image (text to image only): loader names with "moss image".
+  std::string moss_image{"moss-image"};
   std::string h3{"minimax-h3"};
   std::string wan{"wan2.2-ti2v-5b"};
   std::string tts_custom{"qwen3-tts"};

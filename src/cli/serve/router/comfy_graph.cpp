@@ -1,4 +1,5 @@
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/comfy_image_models.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1050,52 +1051,6 @@ bool IsQwenImageTurboFile(std::string_view name) {
 
 namespace {
 
-/// The precision / quantization a ComfyUI checkpoint file name states when it
-/// is not BF16 ("int8", "fp8", "gguf", ...), "" otherwise.
-std::string_view NonBf16Tag(std::string_view lower) {
-  for (const std::string_view tag :
-       {"int8", "int4", "fp8", "fp4", "nf4", "e4m3", "e5m2", "gguf", "svdq",
-        "convrot", "fp16", "q2_", "q3_", "q4_", "q5_", "q6_", "q8_"})
-    if (lower.find(tag) != std::string_view::npos)
-      return tag;
-  return {};
-}
-
-/// The UNETLoader / CheckpointLoaderSimple of a Qwen-Image graph. gufo serves
-/// its registered Qwen-Image 2.1 BF16 checkpoint (or the Turbo one); the file
-/// name only picks Turbo or not. Names of other models fail validation; a
-/// Qwen-Image file of another release or precision runs with a warning, so a
-/// workflow never believes it ran weights gufo did not load.
-void CheckQwenImageLoader(const ModelChain& chain,
-                          std::vector<std::string>* warnings) {
-  if (chain.loader.empty())
-    return;
-  const std::string lower = Lower(chain.loader);
-  if (lower.find("qwen") == std::string::npos)
-    throw NodeFailure(chain.loader_node, "value_not_in_list",
-                      chain.loader +
-                          " is not a Qwen-Image checkpoint; gufo serves this "
-                          "graph only with Qwen-Image 2.1 (e.g. "
-                          "qwen_image_2.1_bf16.safetensors, or a *turbo* "
-                          "file for Qwen-Image 2.1 Turbo)");
-  const bool release_21 = lower.find("2.1") != std::string::npos ||
-                          lower.find("2_1") != std::string::npos ||
-                          lower.find("image21") != std::string::npos ||
-                          lower.find("image_21") != std::string::npos ||
-                          lower.find("image-21") != std::string::npos;
-  if (!release_21)
-    warnings->push_back("node " + chain.loader_node + ": " + chain.loader +
-                        " does not name Qwen-Image 2.1; gufo runs its "
-                        "Qwen-Image 2.1 checkpoint instead");
-  if (const std::string_view tag = NonBf16Tag(lower); !tag.empty())
-    warnings->push_back(
-        "node " + chain.loader_node + ": gufo runs its BF16 Qwen-Image 2.1 "
-        "transformer for " + chain.loader + "; the file's " +
-        std::string(tag) +
-        " weights are not loaded (the name only selects Turbo or not, so "
-        "the image is the same as with the _bf16 file)");
-}
-
 /// ModelPatchLoader -> QwenImageDiffsynthControlnet / ZImageFunControlnet on
 /// the sampler's model input: gufo.control_* of a built image task. The
 /// control image must be ready (LoadImage); gufo has no preprocessor nodes.
@@ -1185,6 +1140,35 @@ void ApplyQwenControl(const Graph& graph, const std::string& sampler,
   task->control = std::move(control);
 }
 
+/// The gufo image model of an image graph, from its UNETLoader /
+/// CheckpointLoaderSimple name (comfy_image_models.cpp): a name of no served
+/// image model fails at the loader (value_not_in_list, with the list), a
+/// graph the model cannot run fails at the sampler. Without a loader the
+/// graph runs on `models.image`.
+void FitImageModel(const Graph& graph, const std::string& sampler,
+                   const ModelIds& models, ImageTask* task,
+                   std::vector<std::string>* warnings) {
+  const ModelChain chain = FollowModel(graph, sampler);
+  const ImageModelSpec* spec = &ImageModelTable().front();
+  std::string id = models.image;
+  if (!chain.loader.empty() || !chain.loader_node.empty()) {
+    const std::string key = graph.Class(chain.loader_node) == "UNETLoader"
+                                ? "unet_name"
+                                : "ckpt_name";
+    ImageModelChoice choice =
+        ChooseImageModel(chain.loader, key, chain.loader_node, models);
+    if (choice.spec == nullptr)
+      throw NodeFailure(chain.loader_node, "value_not_in_list", choice.error);
+    spec = choice.spec;
+    id = choice.id;
+    warnings->insert(warnings->end(), choice.warnings.begin(),
+                     choice.warnings.end());
+  }
+  task->model = id;
+  if (const auto problem = FitImageTask(*spec, id, sampler, task, warnings))
+    throw NodeFailure(sampler, problem->type, problem->message);
+}
+
 ImageTask BuildImage(const Graph& graph, const std::string& sampler,
                      const ModelIds& models, const Link& latent,
                      std::vector<std::string>* warnings) {
@@ -1212,40 +1196,9 @@ ImageTask BuildImage(const Graph& graph, const std::string& sampler,
                         "guidance on every step)");
     task.guidance_steps = static_cast<int>(steps);
   }
+  // The model (from the loader name) and what it can run: FitImageModel,
+  // after the whole task is built.
   const ModelChain chain = FollowModel(graph, sampler);
-  CheckQwenImageLoader(chain, warnings);
-  if (IsQwenImageTurboFile(chain.loader)) {
-    // A Turbo checkpoint is a different transformer with a fixed 8-step
-    // schedule: run it on the Turbo model or fail, never on `image`. Like the
-    // other value rules here, settings Turbo cannot honor fail validation
-    // instead of being changed silently.
-    const bool served =
-        !models.image_turbo.empty() &&
-        (models.available.empty() ||
-         std::find(models.available.begin(), models.available.end(),
-                   models.image_turbo) != models.available.end());
-    if (!served) {
-      const std::string id = models.image_turbo.empty()
-                                 ? std::string("qwen-image-2.1-turbo")
-                                 : models.image_turbo;
-      throw NodeFailure(chain.loader_node, "value_not_in_list",
-                        chain.loader +
-                            " is a Qwen-Image Turbo checkpoint, but the "
-                            "router serves no model '" + id +
-                            "' (add an [external/" + id +
-                            "] section to the router preset)");
-    }
-    task.model = models.image_turbo;
-    if (task.steps != 8)
-      throw NodeFailure(sampler, "unsupported_value",
-                        "Qwen-Image-2.1-Turbo (" + chain.loader +
-                            ") runs exactly 8 steps, not " +
-                            std::to_string(task.steps) + "; set steps to 8");
-    if (task.strength)
-      throw NodeFailure(sampler, "unsupported_value",
-                        "Qwen-Image-2.1-Turbo has no partial-strength "
-                        "image to image; set denoise to 1");
-  }
   // LoraLoader / LoraLoaderModelOnly -> "loras", in the order ComfyUI applies
   // them (loader side first). The worker merges them into the transformer;
   // the CLIP half of LoraLoader has no gufo counterpart.
@@ -5749,6 +5702,7 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
             ImageTask image =
                 BuildImage(graph, generator, models, latent, &plan->warnings);
             ApplyQwenControl(graph, generator, &image, &plan->warnings);
+            FitImageModel(graph, generator, models, &image, &plan->warnings);
             task.spec = std::move(image);
           }
         }

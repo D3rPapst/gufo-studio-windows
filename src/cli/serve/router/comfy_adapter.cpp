@@ -40,6 +40,7 @@
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/router/comfy_adapter.hpp"
+#include "src/cli/serve/router/comfy_image_models.hpp"
 #include "src/cli/serve/router/comfy_node_info.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/cli/serve/router/jobs.hpp"
@@ -1356,6 +1357,36 @@ HttpResponse Adapter::ObjectInfo(std::string_view class_type) {
       continue;
     }
     json::Value required = json::Value::object();
+    json::Value outputs = json::Value::array();
+    if (cls == "UNETLoader" || cls == "CheckpointLoaderSimple") {
+      // The gufo image models this router serves, as ComfyUI's combo of
+      // model files (comfy_image_models: a name picks the model).
+      json::Value names = json::Value::array();
+      for (const std::string& id : ServedImageModels(options_.models))
+        names.push_back(id);
+      json::Value spec = json::Value::array();
+      spec.push_back(std::move(names));
+      json::Value tooltip = json::Value::object();
+      tooltip["tooltip"] =
+          "gufo image model (Qwen-Image / MOSS-Image graphs); gufo runs its "
+          "own weights, file precision tags only warn";
+      spec.push_back(std::move(tooltip));
+      if (cls == "UNETLoader") {
+        required["unet_name"] = std::move(spec);
+        json::Value dtypes = json::Value::array();
+        for (const char* dtype :
+             {"default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"})
+          dtypes.push_back(dtype);
+        json::Value combo = json::Value::array();
+        combo.push_back(std::move(dtypes));
+        required["weight_dtype"] = std::move(combo);
+        outputs.push_back("MODEL");
+      } else {
+        required["ckpt_name"] = std::move(spec);
+        for (const char* out : {"MODEL", "CLIP", "VAE"})
+          outputs.push_back(out);
+      }
+    }
     if (cls == "LoadImage" || cls == "LoadAudio") {
       json::Value spec = json::Value::array();
       spec.push_back(files("input"));
@@ -1368,9 +1399,12 @@ HttpResponse Adapter::ObjectInfo(std::string_view class_type) {
     input["required"] = std::move(required);
     json::Value info = json::Value::object();
     info["input"] = std::move(input);
-    info["output"] = json::Value::array();
-    info["output_is_list"] = json::Value::array();
-    info["output_name"] = json::Value::array();
+    json::Value output_is_list = json::Value::array();
+    for (std::size_t i = 0; i < outputs.size(); ++i)
+      output_is_list.push_back(false);
+    info["output"] = outputs;
+    info["output_is_list"] = std::move(output_is_list);
+    info["output_name"] = std::move(outputs);
     info["name"] = cls;
     info["display_name"] = cls;
     info["description"] = "served by gufo";

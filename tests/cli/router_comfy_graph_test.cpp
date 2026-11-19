@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "src/cli/serve/router/comfy_graph.hpp"
+#include "src/cli/serve/router/comfy_image_models.hpp"
 #include "src/cli/serve/router/comfy_node_info.hpp"
 #include "src/cli/serve/router/comfy_preview.hpp"
 #include "src/core/json.hpp"
@@ -1568,6 +1569,155 @@ void TestQwenLoaderName() {
   assert(node->find("errors")->items()[0].member_str("type") ==
          "value_not_in_list");
   assert(error.message.find("flux1-dev") != std::string::npos);
+}
+
+constexpr const char* kMossText = R"({
+ "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3.5_9b_bf16.safetensors", "type": "stable_diffusion", "device": "default"}},
+ "2": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2_small_vae.safetensors"}},
+ "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "moss/MOSS_Image_SFT_bf16.safetensors", "weight_dtype": "default"}},
+ "5": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 0], "text": "A red ceramic teapot on a wooden table"}},
+ "9": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 0], "text": "blurry"}},
+ "3": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 768, "batch_size": 1}},
+ "6": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "positive": ["5", 0], "negative": ["9", 0], "latent_image": ["3", 0], "seed": 42, "steps": 40, "cfg": 4.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+ "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["2", 0]}},
+ "8": {"class_type": "SaveImage", "inputs": {"images": ["7", 0], "filename_prefix": "moss"}}
+})";
+
+void TestImageModelChoice() {
+  // comfy_image_models: the loader name picks the gufo image model.
+  const comfy::ModelIds all;  // available empty: every row with an id
+  const auto pick = [&](const char* name) {
+    return comfy::ChooseImageModel(name, "unet_name", "4", all);
+  };
+  // Qwen-Image 2.1, whatever folder, case, separators or extension.
+  for (const char* name :
+       {"qwen_image_2.1_bf16.safetensors", "Qwen/Qwen-Image-2.1.safetensors",
+        "image\\QWEN_IMAGE_2_1_BF16.SAFETENSORS", "qwen-image-2.1",
+        "qwen_image_2.1_int8_convrot.safetensors",
+        "qwen-image-2.1-Q4_K_M.gguf"}) {
+    const auto choice = pick(name);
+    assert(choice.spec != nullptr && choice.id == "qwen-image-2.1");
+  }
+  assert(pick("qwen_image_2.1_bf16.safetensors").warnings.empty());
+  assert(pick("qwen-image-2.1").warnings.empty());
+  // Turbo / Lightning / distilled names -> the Turbo model.
+  for (const char* name :
+       {"qwen_image_2.1_turbo_bf16.safetensors",
+        "sub/Qwen-Image-2.1-TURBO-fp8_e4m3fn.safetensors",
+        "qwen-image-2.1-lightning-8steps.safetensors",
+        "Qwen_Image_2.1_Distill.safetensors", "qwen-image-2.1-turbo"}) {
+    const auto choice = pick(name);
+    assert(choice.spec != nullptr && choice.id == "qwen-image-2.1-turbo");
+  }
+  // MOSS-Image.
+  for (const char* name : {"moss_image_sft_bf16.safetensors",
+                           "OpenMOSS/MOSS-Image-SFT.safetensors", "moss-image"}) {
+    const auto choice = pick(name);
+    assert(choice.spec != nullptr && choice.id == "moss-image");
+  }
+  // MOSS-Music is not an image model; MOSS-Image has no Turbo.
+  assert(pick("moss_music_8b.safetensors").spec == nullptr);
+  const auto moss_turbo = pick("moss_image_turbo.safetensors");
+  assert(moss_turbo.spec == nullptr &&
+         moss_turbo.error.find("no turbo / lightning / distilled MOSS-Image") !=
+             std::string::npos);
+  // Unknown: ComfyUI's "value not in list" with the router's image models.
+  const auto flux = pick("flux1-dev.safetensors");
+  assert(flux.spec == nullptr);
+  assert(flux.error.starts_with(
+      "Value not in list: unet_name: 'flux1-dev.safetensors' not in "
+      "['qwen-image-2.1', 'qwen-image-2.1-turbo', 'moss-image']"));
+  // The list is what the router serves.
+  comfy::ModelIds two;
+  two.available = {"qwen3.8-27b", "qwen-image-2.1", "moss-image"};
+  assert((comfy::ServedImageModels(two) ==
+          std::vector<std::string>{"qwen-image-2.1", "moss-image"}));
+  assert((comfy::ServedImageModels(all) ==
+          std::vector<std::string>{"qwen-image-2.1", "qwen-image-2.1-turbo",
+                                   "moss-image"}));
+  const auto missing =
+      comfy::ChooseImageModel("qwen_image_2.1_turbo_bf16.safetensors",
+                              "ckpt_name", "4", two);
+  assert(missing.spec == nullptr);
+  assert(missing.error.find("ckpt_name: 'qwen_image_2.1_turbo_bf16."
+                            "safetensors' not in ['qwen-image-2.1', "
+                            "'moss-image']") != std::string::npos);
+  assert(missing.error.find("[external/qwen-image-2.1-turbo]") !=
+         std::string::npos);
+  // Precision tags warn; BF16 and untagged names do not.
+  assert(comfy::NonBf16Tag("qwen_image_2.1_int8_convrot.safetensors") == "int8");
+  assert(comfy::NonBf16Tag("x/Qwen-Image-2.1-Q4_K_M.gguf") == "gguf");
+  assert(comfy::NonBf16Tag("qwen-image-2.1-Q4_K_M.safetensors") == "q4");
+  assert(comfy::NonBf16Tag("qwen_image_2.1_fp8_e4m3fn.safetensors") == "fp8");
+  assert(comfy::NonBf16Tag("qwen_image_2.1_bf16.safetensors").empty());
+  assert(comfy::NonBf16Tag("qwen_image_2.1.safetensors").empty());
+  const auto quant = pick("qwen-image-2.1-Q8_0.gguf");
+  assert(quant.warnings.size() == 1 &&
+         quant.warnings[0].find("gguf weights are not loaded") !=
+             std::string::npos &&
+         quant.warnings[0].find("node 4") != std::string::npos);
+
+  // Whole graphs. MOSS text to image: negative prompt and cfg are not run
+  // (warnings), the size and steps go through.
+  const comfy::Plan moss = PlanOf(kMossText);
+  const auto& image = std::get<comfy::ImageTask>(moss.tasks[0].spec);
+  assert(image.model == "moss-image");
+  assert(image.prompt == "A red ceramic teapot on a wooden table");
+  assert(image.negative_prompt.empty() && !image.guidance);
+  assert(image.width == 1024 && image.height == 768 && image.steps == 40);
+  assert(comfy::ImageExtension(image).empty());
+  assert(moss.warnings.size() == 2);
+  assert(moss.warnings[0].find("negative prompt is ignored") != std::string::npos);
+  assert(moss.warnings[1].find("cfg 4 is ignored") != std::string::npos);
+  // cfg 3 and an empty negative: nothing to warn about.
+  std::string quiet = Replace(kMossText, "\"cfg\": 4.0", "\"cfg\": 3.0");
+  quiet = Replace(quiet, "\"text\": \"blurry\"", "\"text\": \"\"");
+  assert(PlanOf(quiet.c_str()).warnings.empty());
+  // TextEncodeQwenImage21 without references is a prompt for MOSS too.
+  const std::string moss_qwen_text =
+      Replace(kQwenText, "qwen_image_2.1_int8_convrot.safetensors",
+              "moss_image_sft.safetensors");
+  assert(std::get<comfy::ImageTask>(PlanOf(moss_qwen_text.c_str()).tasks[0].spec)
+             .model == "moss-image");
+  // What MOSS-Image cannot run fails at the sampler with the reason ...
+  const comfy::PlanError edit = ErrorOf(
+      Replace(kQwenCanvas, "qwen_image_2.1_int8_convrot.safetensors",
+              "moss_image_sft.safetensors"));
+  assert(edit.node_errors.find("6") != nullptr);
+  assert(edit.message.find("MOSS-Image (moss-image) runs text to image only") !=
+         std::string::npos);
+  const std::string lora = Replace(
+      Replace(kMossText, "\"model\": [\"4\", 0]", "\"model\": [\"l\", 0]"),
+      " \"5\": {",
+      " \"l\": {\"class_type\": \"LoraLoaderModelOnly\", \"inputs\": "
+      "{\"model\": [\"4\", 0], \"lora_name\": \"winkel.safetensors\", "
+      "\"strength_model\": 1.0}},\n \"5\": {");
+  assert(ErrorOf(lora).message.find("takes no LoRAs") != std::string::npos);
+  const comfy::PlanError small =
+      ErrorOf(Replace(kMossText, "\"width\": 1024", "\"width\": 128"));
+  assert(small.message.find("256..2048") != std::string::npos);
+  assert(ErrorOf(Replace(kMossText, "\"cfg\": 4.0,",
+                         "\"cfg\": 4.0, \"guidance_steps\": 5,"))
+             .message.find("guidance_steps") != std::string::npos);
+  // ... never a silent fallback to Qwen-Image. Not served: at the loader.
+  comfy::ModelIds qwen_only;
+  qwen_only.available = {"qwen-image-2.1", "qwen-image-2.1-turbo"};
+  comfy::Plan p;
+  comfy::PlanError e;
+  assert(!comfy::BuildPlan(json::parse(kMossText), qwen_only, &p, &e));
+  assert(e.node_errors.find("4") != nullptr);
+  assert(e.node_errors.find("4")->find("errors")->items()[0].member_str(
+             "type") == "value_not_in_list");
+  assert(e.message.find("[external/moss-image]") != std::string::npos);
+  // CheckpointLoaderSimple names the ckpt_name input.
+  const std::string checkpoint = Replace(
+      Replace(kQwenText, "\"UNETLoader\"", "\"CheckpointLoaderSimple\""),
+      "\"unet_name\": \"qwen_image_2.1_int8_convrot.safetensors\"",
+      "\"ckpt_name\": \"sdxl/juggernautXL_v9.safetensors\"");
+  const comfy::PlanError sdxl = ErrorOf(checkpoint);
+  assert(sdxl.node_errors.find("4") != nullptr);
+  assert(sdxl.message.find("ckpt_name: 'sdxl/juggernautXL_v9.safetensors' not "
+                           "in ['qwen-image-2.1'") != std::string::npos);
 }
 
 void TestRife() {
@@ -4370,6 +4520,7 @@ int main() {
   TestQwenTurbo();
   TestQwenGuidanceSteps();
   TestQwenLoaderName();
+  TestImageModelChoice();
   TestRife();
   TestRifeOnly();
   TestRifeSourceFps();

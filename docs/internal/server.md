@@ -783,14 +783,31 @@ steps only, see [Qwen-Image-2.1](../models/qwen-image-2.1.md)); other
 values fail validation at the sampler, and on video or music samplers the
 input is ignored with a `gufo_warning`. A worker that does not know the
 field fails the task with its message (no fallback to full CFG). The
-`UNETLoader` `unet_name` only chooses Turbo (`*turbo*`, model
-`qwen-image-2.1-turbo`) or not: gufo always runs its registered BF16
-Qwen-Image 2.1 checkpoint. A name without `qwen` fails validation
-(`value_not_in_list` at the loader); a Qwen-Image name without 2.1, or with
-another precision (`int8`, `fp8`, `gguf`, `convrot`, `fp16`, ...), runs with
-a `gufo_warning` that the file's weights are not loaded, so
-`qwen_image_2.1_bf16.safetensors` and `..._int8_convrot.safetensors` give
-the same image.
+`UNETLoader` `unet_name` / `CheckpointLoaderSimple` `ckpt_name` of an image
+graph picks the gufo image model (one table in
+`src/cli/serve/router/comfy_image_models.cpp`; a new model is one more row):
+
+| Name contains (folders, extension, case and `_` `-` `.` ignored) | Model | Runs |
+| --- | --- | --- |
+| `qwen image` | `qwen-image-2.1` | everything below |
+| `qwen image` + `turbo` / `lightning` / `distill` | `qwen-image-2.1-turbo` | exactly 8 steps, no denoise < 1 |
+| `moss image` | `moss-image` | text to image only, sides 256..2048 |
+
+The router id itself (`qwen-image-2.1-turbo`) selects its row too, and
+`/object_info` offers the served ids as the `unet_name` / `ckpt_name`
+combo. A name of no row, or of a model the preset lacks, fails validation at
+the loader like ComfyUI: `value_not_in_list` with "Value not in list:
+unet_name: 'flux1-dev.safetensors' not in ['qwen-image-2.1',
+'qwen-image-2.1-turbo', 'moss-image'] (...)". A graph the model cannot run
+fails at the sampler with the reason (MOSS-Image: reference images,
+denoise < 1, masks, ControlNet, regions, LoRAs, `guidance_steps`), never on
+another model; MOSS-Image ignores a negative prompt and a cfg other than its
+own 3.0 with a `gufo_warning`. gufo always runs its registered weights: a
+Qwen-Image name without 2.1 warns, and a precision tag (`int8`, `fp8`,
+`gguf`, `Q4_K_M`, `convrot`, `fp16`, ...) runs with a `gufo_warning` that the
+file's weights are not loaded, so `qwen_image_2.1_bf16.safetensors` and
+`..._int8_convrot.safetensors` give the same image. Video and music graphs
+do not read this table.
 ComfyUI Wan 2.2 Animate chains (2.2.9): `WanAnimateToVideo` chunks
 chained the ComfyUI way (Regie 19.11., `pipeline/mehrsprecher.py`: each next
 node takes the previous chunk's decoded frames as `continue_motion` and its
