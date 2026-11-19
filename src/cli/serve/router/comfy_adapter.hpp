@@ -87,12 +87,20 @@ struct AdapterOptions {
   std::chrono::milliseconds video_busy_limit{std::chrono::hours(6)};
   /// A task's request that gets the router's passing 507 (IsMemoryNotFreeYet:
   /// "not enough free memory yet", memory held outside the router or still
-  /// being released) is sent again every `memory_free_retry`, for at most
-  /// `memory_free_limit` in a row (0 = until the prompt is interrupted),
-  /// instead of failing the prompt. Any task kind; nothing was started
-  /// (Regie 19.11.: vace over the .56 -> .198, 507 after 14x memory_busy).
+  /// being released) or, since 2.2.12, 503 memory_busy (MemoryWaitOf) is
+  /// sent again every `memory_free_retry` (a longer Retry-After of the
+  /// answer wins), for at most `memory_free_limit` in a row (0 = until the
+  /// prompt is interrupted), instead of failing the prompt. Any task kind
+  /// and any request (creates, video content reads); nothing was started
+  /// (Regie 19.11.: vace over the .56 -> .198, 507 after 14x memory_busy;
+  /// a wan2.2 clip ended as GufoBusy when its content read had to reload
+  /// the model beside a busy 27B). Only after the limit does memory_busy
+  /// still end the prompt as GufoBusy.
   std::chrono::milliseconds memory_free_retry{std::chrono::seconds(30)};
   std::chrono::milliseconds memory_free_limit{std::chrono::hours(6)};
+  /// How long one second of an answer's Retry-After (retry_after_s) lasts
+  /// here; tests shorten it.
+  std::chrono::milliseconds retry_after_unit{std::chrono::seconds(1)};
   /// A status poll of a running video that fails with a passing error
   /// (no answer, 429, 502, 503, 504) is tried again for this long before
   /// the prompt fails; the video job on the worker goes on meanwhile.
@@ -163,6 +171,19 @@ struct MemoryBusyError : std::runtime_error {
 /// for any other answer.
 [[nodiscard]] std::optional<std::string> MemoryNotFreeOf(
     const FetchResult& result);
+
+/// An answer after which the same request may simply be sent again later
+/// (2.2.12): nothing was started, the memory may be free then.
+struct MemoryWait {
+  /// "memory_busy" (503) or "insufficient_memory" (the passing 507).
+  std::string code;
+  std::string message;
+  /// The answer's retry_after_s (memory_busy), 0 when it gives none.
+  int retry_after_s{0};
+};
+
+/// MemoryBusyOf or MemoryNotFreeOf of an answer, nullopt for anything else.
+[[nodiscard]] std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result);
 
 /// A status poll failure that may pass (no answer, 429, 502, 503, 504).
 [[nodiscard]] inline bool IsPassingPollFailure(int status) {

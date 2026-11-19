@@ -1,8 +1,10 @@
 // 2.2.3: how the ComfyUI adapter reports a model that cannot load because
 // another, busy model holds the memory (the router's 503 memory_busy):
-//  - in /history/<id> as execution_error with exception_type "GufoBusy",
-//    "code": "memory_busy", "retry_after_s" and error {code, message,
-//    retry_after_s} when a task's request gets it;
+//  - 2.2.12: a task's request that gets it waits (Retry-After) and is sent
+//    again, like the passing 507; only after memory_free_limit does the
+//    prompt end in /history/<id> as execution_error with exception_type
+//    "GufoBusy", "code": "memory_busy", "retry_after_s" and error {code,
+//    message, retry_after_s};
 //  - as 503 with Retry-After on POST /prompt when the adapter's own queue
 //    is empty and the router's memory check says the first model must wait.
 // The router is a fake fetch; no model, no GPU.
@@ -108,6 +110,10 @@ void TestHistoryMark(const std::filesystem::path& root) {
   std::atomic<int> image_posts{0};
   comfy::AdapterOptions options;
   options.root = root / "history";
+  // 2.2.12: memory_busy is waited for; past the limit it is GufoBusy.
+  options.memory_free_retry = std::chrono::milliseconds(10);
+  options.memory_free_limit = std::chrono::milliseconds(80);
+  options.retry_after_unit = std::chrono::milliseconds(1);
   options.fetch = [&](const HttpRequest& request) {
     if (request.path == "/v1/images/generations" ||
         request.path == "/v1/images/edits") {
@@ -150,7 +156,7 @@ void TestHistoryMark(const std::filesystem::path& root) {
       CHECK(error->member_str("node_id") == "6");
     }
   }
-  CHECK(image_posts.load() == 1);  // no retry inside the adapter
+  CHECK(image_posts.load() >= 2);  // waited and asked again first
   adapter.Stop();
 }
 
@@ -511,6 +517,129 @@ void TestMemoryNotFreeLimit(const std::filesystem::path& root) {
   adapter.Stop();
 }
 
+// 2.2.12 (19.11., wan2.2-i2v over the pool): memory_busy on the video
+// create, on a status poll and on the content read is waited for (with the
+// answer's Retry-After), and the clip goes on. Before, the first one ended
+// the prompt as GufoBusy.
+void TestMemoryBusyWait(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  std::atomic<int> polls{0};
+  std::atomic<int> contents{0};
+  comfy::AdapterOptions options;
+  options.root = root / "busy-wait";
+  options.memory_free_retry = std::chrono::milliseconds(5);
+  options.retry_after_unit = std::chrono::milliseconds(1);  // 30 s -> 30 ms
+  options.video_poll = std::chrono::milliseconds(5);
+  options.video_poll_grace = std::chrono::milliseconds(1);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      if (++posts <= 2)
+        return comfy::FetchResult{.status = 503, .body = kBusyBody};
+      return comfy::FetchResult{.status = 202,
+                                .body = R"({"id":"video_mb","status":"queued"})",
+                                .content_type = "application/json"};
+    }
+    if (request.method == "GET" && request.path == "/v1/videos/video_mb") {
+      // Longer than video_poll_grace: memory waits do not count to it.
+      if (++polls <= 4) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        return comfy::FetchResult{.status = 503, .body = kBusyBody};
+      }
+      return comfy::FetchResult{
+          .status = 200,
+          .body = R"({"id":"video_mb","status":"completed","progress":100})"};
+    }
+    if (request.method == "GET" &&
+        request.path == "/v1/videos/video_mb/content") {
+      if (++contents == 1)
+        return comfy::FetchResult{.status = 503, .body = kBusyBody};
+      return comfy::FetchResult{.status = 200,
+                                .body = "not really an mp4",
+                                .content_type = "video/mp4"};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry) {
+    // It got the content; what ends this fake prompt is saving frames
+    // without ffmpeg, never memory_busy.
+    bool busy = false;
+    for (const json::Value& message :
+         entry->find("status")->find("messages")->items())
+      busy = busy || (message.items()[0].str() == "execution_error" &&
+                      message.items()[1].member_str("exception_type") ==
+                          "GufoBusy");
+    CHECK(!busy);
+    CHECK(ErrorText(*entry).find("memory") == std::string::npos);
+  }
+  CHECK(posts.load() == 3);
+  CHECK(polls.load() == 5);
+  CHECK(contents.load() == 2);
+  adapter.Stop();
+}
+
+// memory_busy waits until /interrupt, like the full video queue.
+void TestMemoryBusyInterrupted(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "busy-interrupt";
+  options.memory_free_retry = std::chrono::milliseconds(5);
+  options.memory_free_limit = std::chrono::milliseconds(0);  // no limit
+  options.retry_after_unit = std::chrono::milliseconds(1);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      ++posts;
+      return comfy::FetchResult{.status = 503, .body = kBusyBody};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  for (int i = 0; i < 300 && posts.load() < 4; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(posts.load() >= 4);  // still waiting, not failed
+  CHECK(adapter.QueueRemaining() == 1);
+  HttpRequest interrupt;
+  interrupt.method = "POST";
+  interrupt.path = "/interrupt";
+  interrupt.body = "{}";
+  interrupt.headers.emplace_back("Content-Type", "application/json");
+  (void)adapter.Handle(interrupt);
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry) {
+    bool interrupted = false;
+    for (const json::Value& message :
+         entry->find("status")->find("messages")->items())
+      interrupted = interrupted ||
+                    message.items()[0].str() == "execution_interrupted";
+    CHECK(interrupted);
+  }
+  adapter.Stop();
+}
+
+void TestMemoryWaitOf() {
+  const auto busy = comfy::MemoryWaitOf({.status = 503, .body = kBusyBody});
+  CHECK(busy && busy->code == "memory_busy" && busy->retry_after_s == 30);
+  const auto not_free =
+      comfy::MemoryWaitOf({.status = 507, .body = kNotFreeBody});
+  CHECK(not_free && not_free->code == "insufficient_memory" &&
+        not_free->retry_after_s == 0);
+  CHECK(!comfy::MemoryWaitOf({.status = 507, .body = kRanLowBody}));
+  CHECK(!comfy::MemoryWaitOf({.status = 503, .body = kOverloadedBody}));
+}
+
 }  // namespace
 
 int main() {
@@ -529,6 +658,9 @@ int main() {
   TestMemoryNotFreeImage(root);
   TestMemoryRanLowFails(root);
   TestMemoryNotFreeLimit(root);
+  TestMemoryWaitOf();
+  TestMemoryBusyWait(root);
+  TestMemoryBusyInterrupted(root);
   std::filesystem::remove_all(root);
   if (failures != 0) {
     std::cerr << failures << " comfy memory_busy checks failed.\n";

@@ -110,12 +110,16 @@ struct Cancelled : std::runtime_error {
 
 /// A failed job with an HTTP status from the router's API.
 struct JobFailure : std::runtime_error {
-  JobFailure(std::string message, std::string code, int status)
+  JobFailure(std::string message, std::string code, int status,
+             int retry_after_s = 0)
       : std::runtime_error(std::move(message)),
         code(std::move(code)),
-        status(status) {}
+        status(status),
+        retry_after_s(retry_after_s) {}
   std::string code;
   int status;
+  /// The answer's retry_after_s (503 memory_busy), 0 when it gives none.
+  int retry_after_s;
 };
 
 constexpr std::size_t kMaxInlineResponse = 256 * 1024;
@@ -3466,6 +3470,48 @@ FetchResult JobQueue::Call(const std::shared_ptr<Job>& job, std::string method,
   FetchResult result = options_.fetch(request);
   if (job->cancel.load())
     throw Cancelled();
+  // 2.2.12: once the worker job exists (upstream_id) the job cannot go back
+  // to the queue. A read of it (status, /content) that gets 503 memory_busy
+  // or the passing 507 had to reload the evicted worker beside a busy
+  // model: wait here and ask again (Retry-After, memory_busy_limit) instead
+  // of failing the finished work. Before that, the job is put back instead
+  // (JobFailure below Run).
+  bool started = false;
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    started = !job->upstream_id.empty();
+  }
+  std::optional<comfy::MemoryWait> wait;
+  if (started)
+    wait = comfy::MemoryWaitOf(result);
+  if (!wait)
+    return result;
+  const auto began = std::chrono::steady_clock::now();
+  int tries = 1;
+  Logger::Warn("jobs", "event=job_memory_wait id=" + job->id + " path=" +
+                           request.path + " code=" + wait->code +
+                           " error=\"" + wait->message + "\"");
+  while (wait && (options_.memory_busy_limit.count() == 0 ||
+                  std::chrono::steady_clock::now() - began <
+                      options_.memory_busy_limit)) {
+    const auto until =
+        std::chrono::steady_clock::now() +
+        std::max<std::chrono::milliseconds>(
+            options_.memory_busy_retry,
+            options_.retry_after_unit * wait->retry_after_s);
+    while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (job->cancel.load())
+      throw Cancelled();
+    result = options_.fetch(request);
+    ++tries;
+    if (job->cancel.load())
+      throw Cancelled();
+    wait = comfy::MemoryWaitOf(result);
+  }
+  Logger::Info("jobs", "event=job_memory_wait_end id=" + job->id +
+                           " status=" + std::to_string(result.status) +
+                           " tries=" + std::to_string(tries));
   return result;
 }
 
@@ -3619,8 +3665,11 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     } else {
       result = Post(job, payload);
     }
-    if (result.status < 200 || result.status >= 300)
-      throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status);
+    if (result.status < 200 || result.status >= 300) {
+      const auto wait = comfy::MemoryWaitOf(result);
+      throw JobFailure(ErrorMessage(result), ErrorCode(result), result.status,
+                       wait ? wait->retry_after_s : 0);
+    }
     if (job->path == "/v1/videos" || job->path == "/v1/videos/upscale")
       RunVideo(job, result);  // both answer 202 with a worker video job
     else if (job->path == "/v1/3d/generations")
@@ -3669,7 +3718,11 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->preview_id.clear();
           job->pulled_by.clear();
           job->side = job->pin_local ? "local" : "";
-          job->retry_at = now + options_.memory_busy_retry;
+          // A longer Retry-After of the answer wins (2.2.12).
+          job->retry_at =
+              now + std::max<std::chrono::milliseconds>(
+                        options_.memory_busy_retry,
+                        options_.retry_after_unit * failure.retry_after_s);
           job->memory_wait = failure.what();
           job->memory_wait_code = failure.code;
           InsertPendingLocked(job, /*front=*/true);
@@ -3750,6 +3803,8 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
   json::Value final_status;
   // First failed poll of the current run of passing failures (2.2.8).
   std::optional<std::chrono::steady_clock::time_point> poll_trouble;
+  // First poll of the current run of memory waits (2.2.12).
+  std::optional<std::chrono::steady_clock::time_point> poll_memory;
   for (;;) {
     const auto until = std::chrono::steady_clock::now() + options_.video_poll;
     while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
@@ -3771,9 +3826,23 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
     poll.request_id = job->id;
     const FetchResult state = options_.fetch(poll);
     if (state.status != 200) {
+      const auto now = std::chrono::steady_clock::now();
+      // 2.2.12: the read had to reload the evicted video worker beside a
+      // busy model (memory_busy, or the passing 507): wait for it within
+      // memory_busy_limit, not within the short poll grace.
+      if (const auto wait = comfy::MemoryWaitOf(state)) {
+        if (!poll_memory) {
+          poll_memory = now;
+          Logger::Warn("jobs", "event=video_poll_memory_wait id=" + job->id +
+                                   " video=" + video_id + " code=" +
+                                   wait->code);
+        }
+        if (options_.memory_busy_limit.count() == 0 ||
+            now - *poll_memory < options_.memory_busy_limit)
+          continue;
+      }
       // 2.2.8: a full router (503 connection limit) or a short gap on the
       // way to the worker does not fail a video that keeps running there.
-      const auto now = std::chrono::steady_clock::now();
       if (comfy::IsPassingPollFailure(state.status) &&
           (!poll_trouble || now - *poll_trouble < options_.video_poll_grace)) {
         if (!poll_trouble) {
@@ -3788,6 +3857,7 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
                        ErrorCode(state), state.status);
     }
     poll_trouble.reset();
+    poll_memory.reset();
     json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     {

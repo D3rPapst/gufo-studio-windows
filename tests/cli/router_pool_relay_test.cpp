@@ -9,6 +9,12 @@
 // process ended with 0xc0000409. Here the partner always answers 503 with
 // a JSON body; the request must be served by the local worker and the
 // router must stay up.
+//
+// 2.2.12: a video create is not tried again after a partner failure (it
+// may have started there), except after 503 memory_busy, which says nothing
+// started (19.11.: wan2.2-i2v clips of the .56 adapter ended as GufoBusy).
+// The partner answers POST /v1/videos with memory_busy; the clip must run
+// on the local worker.
 
 #include <atomic>
 #include <chrono>
@@ -220,13 +226,25 @@ int main(int argc, char** argv) {
   // timed out).
   std::atomic<int> listings{0};
   std::atomic<int> chats{0};
+  std::atomic<int> videos{0};
   Listener partner(0, [&](const std::string& request) {
     if (StartsWith(request, "GET /v1/models")) {
       ++listings;
       return Answer(200, "OK",
                     "{\"object\":\"list\",\"data\":[{\"id\":\"twin\","
                     "\"object\":\"model\",\"loaded\":true,\"status\":"
-                    "{\"value\":\"loaded\",\"args\":[]}}]}");
+                    "{\"value\":\"loaded\",\"args\":[]}},"
+                    "{\"id\":\"clip\",\"object\":\"model\",\"loaded\":true,"
+                    "\"status\":{\"value\":\"loaded\",\"args\":[]}}]}");
+    }
+    if (StartsWith(request, "POST /v1/videos")) {
+      ++videos;
+      return Answer(503, "Service Unavailable",
+                    "{\"error\":{\"message\":\"cannot load 'clip' now: "
+                    "memory is in use by big (busy); retry in 30 s\","
+                    "\"type\":\"server_error\",\"code\":\"memory_busy\","
+                    "\"retry_after_s\":30,\"blocked_by\":\"big (busy)\","
+                    "\"model\":\"clip\"}}");
     }
     if (StartsWith(request, "POST /v1/chat/completions")) {
       ++chats;
@@ -250,6 +268,10 @@ int main(int argc, char** argv) {
     out << "[external/twin]\ncommand = " << self.string()
         << "\nargs = --fake-worker\n\n"
         << "[remote/twin]\nurl = http://127.0.0.1:" << partner.port()
+        << "\nqueue-timeout-seconds = 20\nplacement = pool\n\n"
+        << "[external/clip]\ncommand = " << self.string()
+        << "\nargs = --fake-worker\n\n"
+        << "[remote/clip]\nurl = http://127.0.0.1:" << partner.port()
         << "\nqueue-timeout-seconds = 20\nplacement = pool\n";
   }
 
@@ -329,6 +351,18 @@ int main(int argc, char** argv) {
   CHECK(again.status == 200);
   CHECK(again_body.find("\"where\":\"local\"") != std::string::npos);
   CHECK(chats.load() == 1);
+  CHECK(!router_gone());
+
+  // 2.2.12: a video create the partner turns down with memory_busy runs
+  // here instead of reaching the client as 503.
+  HttpResponse video =
+      Ask(port, "POST", "/v1/videos", "{\"model\":\"clip\",\"prompt\":\"x\"}");
+  const std::string video_body = Drain(video);
+  CHECK(videos.load() == 1);
+  CHECK(video.status == 200);
+  CHECK(video_body.find("\"where\":\"local\"") != std::string::npos);
+  if (video.status != 200)
+    std::cerr << "video answer " << video.status << ": " << video_body << "\n";
   CHECK(!router_gone());
 
   // Stopping the router ends its worker (job object / PDEATHSIG).
