@@ -751,6 +751,103 @@ bool RunWan21TalkJob(const JobRequest& request, const JobCallbacks& callbacks,
   return true;
 }
 
+// gufo.animate "fps" (all videos; default 16, Animate's rate; 0 = frame by
+// frame) and "video_load"[input] {"fps", "skip_first_frames",
+// "select_every_nth", "frame_load_cap"} (VHS_LoadVideo's options).
+AnimateFrameRate AnimateInputRate(const json::Value& options,
+                                  const char* input) {
+  const json::Value* load = options.find("video_load");
+  const json::Value* own =
+      load != nullptr && load->is_object() ? load->find(input) : nullptr;
+  const auto number = [&](const char* key, double fallback) {
+    if (own != nullptr && own->is_object() && own->find(key) != nullptr)
+      return own->member_double(key, fallback);
+    return fallback;
+  };
+  const double fps = number("fps", options.member_double("fps", 16.0));
+  AnimateFrameRate rate;
+  rate.target_num = std::llround(std::max(0.0, fps) * 1000.0);
+  rate.target_den = rate.target_num == 0 ? 1 : 1000;
+  rate.skip_first_frames =
+      static_cast<int>(std::lround(number("skip_first_frames", 0)));
+  rate.select_every_nth =
+      static_cast<int>(std::lround(number("select_every_nth", 1)));
+  rate.frame_load_cap =
+      static_cast<int>(std::lround(number("frame_load_cap", 0)));
+  return rate;
+}
+
+// ReadFittedVideo on the animation's time line (AnimateFrameIndices): the
+// file's frames resampled to `rate` by time, at most `max_frames`.
+bool ReadAnimateVideo(const std::filesystem::path& path, int width, int height,
+                      int max_frames, AnimateFrameRate rate,
+                      std::vector<std::uint8_t>* frames, int* count,
+                      std::string* error) {
+  video_io::VideoInfo info;
+  if (!video_io::ProbeVideo(path, &info, error))
+    return false;
+  if (info.fps_num > 0 && info.fps_den > 0) {
+    rate.source_num = info.fps_num;
+    rate.source_den = info.fps_den;
+  } else {
+    // No frame rate in the file: its frames are taken as they are.
+    rate.target_num = 0;
+  }
+  if (AnimateFrameRateIsIdentity(rate))
+    return ReadFittedVideo(path, width, height, max_frames, frames, count,
+                           error);
+  const std::vector<int> indices = AnimateFrameIndices(rate, max_frames, -1);
+  if (indices.empty()) {
+    SetError(error, "a video input has no frames at the requested frame rate "
+                    "and frame options");
+    return false;
+  }
+  if (info.width < 16 || info.height < 16 || info.width > 4096 ||
+      info.height > 4096) {
+    SetError(error, "a video input has an unsupported size");
+    return false;
+  }
+  video_io::FrameReader reader;
+  if (!reader.Open(path, info.width, info.height, error))
+    return false;
+  const std::size_t frame = static_cast<std::size_t>(width) * height * 3;
+  std::vector<std::uint8_t> source(static_cast<std::size_t>(info.width) *
+                                   info.height * 3);
+  std::vector<std::uint8_t> fitted;
+  frames->clear();
+  *count = 0;
+  int read = -1;  // index of the frame in `source`
+  for (const int index : indices) {
+    bool end = false;
+    while (read < index) {
+      if (!reader.Read(source.data(), &end, error)) {
+        if (!end)
+          return false;
+        break;
+      }
+      ++read;
+      fitted.clear();
+    }
+    if (end)
+      break;
+    if (fitted.empty()) {
+      fitted = FitImage(source, info.width, info.height, width, height);
+      if (fitted.size() != frame) {
+        SetError(error, "cannot scale a video input");
+        return false;
+      }
+    }
+    frames->insert(frames->end(), fitted.begin(), fitted.end());
+    ++*count;
+  }
+  reader.Close();
+  if (*count == 0) {
+    SetError(error, "a video input has no frames");
+    return false;
+  }
+  return true;
+}
+
 bool RunWan22AnimateJob(const JobRequest& request,
                         const JobCallbacks& callbacks,
                         ext::VideoTelemetry* telemetry, std::string* error) {
@@ -782,6 +879,23 @@ bool RunWan22AnimateJob(const JobRequest& request,
   if (const json::Value* lora = options.find("lora");
       lora != nullptr && lora->is_bool() && !lora->as_bool())
     job.lora_file.clear();
+  // gufo.animate.relight_lora: true (the bundle's strength) or a strength;
+  // without it (or false / 0) no relight LoRA.
+  if (const json::Value* relight = options.find("relight_lora");
+      relight != nullptr &&
+      (relight->is_bool() ? relight->as_bool()
+                          : relight->as_double(0.0) != 0.0)) {
+    job.relight_lora_file = Part(request, manifest, "relight_lora");
+    if (job.relight_lora_file.empty()) {
+      SetError(error, "gufo.animate.relight_lora: the Animate bundle names no "
+                      "relight LoRA ('relight_lora' in gufo-animate.json)");
+      return false;
+    }
+    job.relight_lora_strength = static_cast<float>(
+        relight->is_bool()
+            ? manifest.member_double("relight_lora_strength", 1.0)
+            : relight->as_double(1.0));
+  }
   job.shift = static_cast<float>(
       options.member_double("shift", manifest.member_double("shift", 5.0)));
   job.sampler =
@@ -822,28 +936,32 @@ bool RunWan22AnimateJob(const JobRequest& request,
   }
   std::vector<std::uint8_t> pose, face, background, previous;
   if (!request.pose_video_path.empty()) {
-    if (!ReadFittedVideo(request.pose_video_path, w, h, needed, &pose,
-                         &job.pose_frames, error))
+    if (!ReadAnimateVideo(request.pose_video_path, w, h, needed,
+                          AnimateInputRate(options, "pose_video"), &pose,
+                          &job.pose_frames, error))
       return false;
     job.pose = pose;
   }
   if (!request.face_video_path.empty()) {
-    if (!ReadFittedVideo(request.face_video_path, kAnimateFaceSize,
-                         kAnimateFaceSize, needed, &face, &job.face_frames,
-                         error))
+    if (!ReadAnimateVideo(request.face_video_path, kAnimateFaceSize,
+                          kAnimateFaceSize, needed,
+                          AnimateInputRate(options, "face_video"), &face,
+                          &job.face_frames, error))
       return false;
     job.face = face;
   }
   if (!request.background_video_path.empty()) {
-    if (!ReadFittedVideo(request.background_video_path, w, h, needed,
-                         &background, &job.background_frames, error))
+    if (!ReadAnimateVideo(request.background_video_path, w, h, needed,
+                          AnimateInputRate(options, "background_video"),
+                          &background, &job.background_frames, error))
       return false;
     job.background = background;
   }
   if (!request.continue_video_path.empty()) {
     // The node keeps the last continue_motion_max_frames frames.
-    if (!ReadFittedVideo(request.continue_video_path, w, h, 481, &previous,
-                         &job.continue_motion_frames, error))
+    if (!ReadAnimateVideo(request.continue_video_path, w, h, 481,
+                          AnimateInputRate(options, "continue_motion"),
+                          &previous, &job.continue_motion_frames, error))
       return false;
     job.continue_motion = previous;
   }
@@ -879,8 +997,9 @@ bool RunWan22AnimateJob(const JobRequest& request,
         return false;
       }
       job.mask_frames = 1;
-    } else if (!ReadFittedVideo(request.mask_path, w, h, needed, &rgb,
-                                &job.mask_frames, error)) {
+    } else if (!ReadAnimateVideo(request.mask_path, w, h, needed,
+                                 AnimateInputRate(options, "character_mask"),
+                                 &rgb, &job.mask_frames, error)) {
       return false;
     }
     mask.resize(frame_pixels * job.mask_frames);

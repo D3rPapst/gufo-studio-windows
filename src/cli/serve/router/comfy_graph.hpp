@@ -93,6 +93,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -490,6 +491,17 @@ std::optional<std::string> FrameRunFilter(const std::vector<FrameRun>& runs,
 std::string AnimateMergeFilter(int width, int height,
                                const std::string& channel, bool invert);
 
+/// VHS_LoadVideo's frame options (ComfyUI-VideoHelperSuite): force_rate
+/// (0 = the file's rate), skip_first_frames, select_every_nth,
+/// frame_load_cap.
+struct VideoLoad {
+  double force_rate{0};
+  int skip_first_frames{0};
+  int select_every_nth{1};
+  int frame_load_cap{0};
+  bool operator==(const VideoLoad&) const = default;
+};
+
 struct VideoTask {
   VideoFamily family{VideoFamily::kH3};
   std::string model;
@@ -681,6 +693,14 @@ struct VideoTask {
   int continue_motion_max_frames{5};
   /// ImageFromBatch on trim_image drops the continue_motion frames.
   bool animate_trim_continue{false};
+  /// LoraLoaderModelOnly with Kijai's relight LoRA (a name containing
+  /// "relight") on the model path: its strength (gufo.animate.relight_lora).
+  std::optional<double> animate_relight;
+  /// VHS_LoadVideo options of the Animate inputs (key: the gufo.animate
+  /// input, e.g. "pose_video"), sent as gufo.animate.video_load; inputs
+  /// without an entry take every frame as loaded (gufo.animate.fps 0, as
+  /// ComfyUI's LoadVideo and frames built in the graph).
+  std::map<std::string, VideoLoad> animate_loads;
   /// Chained WanAnimateToVideo chunks as one job: frames per chunk
   /// (gufo.animate.length; 0 = `frames`, one chunk) and the continue_motion
   /// frames each next chunk takes from the one before

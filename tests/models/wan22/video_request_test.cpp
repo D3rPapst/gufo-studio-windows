@@ -4,7 +4,8 @@
 // the runner as options + attachments, and decode into the job the HIP
 // runners take. Ports the Wan cases of the fork's tests/cli/video_api_test
 // (Wan 2.2 options, VACE, Uni3C camera) and adds InfiniteTalk (one and two
-// speakers, add / para / auto, video to video, 896x512) and provider probing.
+// speakers, add / para / auto, video to video, 896x512), Wan 2.2 Animate
+// (relight LoRA, input frame rates) and provider probing.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -878,6 +879,82 @@ void TestPostSteps(const std::filesystem::path& root) {
            "invalid_source_video", "a too short source_video");
 }
 
+// Wan 2.2 Animate 14B: gufo.animate reaches the runner (pose video next to
+// the output, the reference as first_frame), with the 2.2.12 options:
+// relight_lora (true or a strength), fps and video_load (VHS_LoadVideo's
+// force_rate and frame options); family kWan22Animate.
+void TestAnimate(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobService service(Options(root, "wan2.2-animate-14b", &runner));
+  Check(service.ready(), service.initialization_error());
+  Check(service.model_id() == "wan2.2-animate-14b", "Animate model id");
+  const std::string mp4(96, 'A');
+  const std::string prefix =
+      R"({"model":"wan2.2-animate-14b","prompt":"dance","size":"832x480","seconds":"1","gufo":{"animate":{"pose_video":"data:video/mp4;base64,)" +
+      mp4 + R"(",)";
+  int calls = 0;
+  const wan22::JobRequest job = Accept(
+      service, runner, &calls, wan22::Family::kWan22Animate,
+      prefix + R"("reference_image":")" + std::string(kPng) +
+          R"(","relight_lora":true,"fps":24,"video_load":{"pose_video":{"fps":16,"skip_first_frames":2,"select_every_nth":2,"frame_load_cap":10},"character_mask":{}}}}})");
+  Check(job.frames == 17 && job.width == 832 && job.height == 480 &&
+            job.steps == 4,
+        "Animate size, frames and steps reach the runner");
+  Check(!job.pose_video_path.empty() &&
+            std::filesystem::file_size(job.pose_video_path) == 72 &&
+            job.first_frame.width == 1 && job.face_video_path.empty(),
+        "Animate pose video and reference image reach the runner");
+  const gufo::json::Value animate = gufo::json::parse(job.animate_json);
+  Check(animate.find("relight_lora")->is_bool() &&
+            animate.find("relight_lora")->as_bool() &&
+            animate.member_double("fps") == 24,
+        "Animate relight_lora and fps reach the runner: " + job.animate_json);
+  const gufo::json::Value* pose =
+      animate.find("video_load") == nullptr
+          ? nullptr
+          : animate.find("video_load")->find("pose_video");
+  Check(pose != nullptr && pose->member_double("fps") == 16 &&
+            pose->member_double("skip_first_frames") == 2 &&
+            pose->member_double("select_every_nth") == 2 &&
+            pose->member_double("frame_load_cap") == 10 &&
+            animate.find("video_load")->find("character_mask") != nullptr,
+        "Animate video_load reaches the runner: " + job.animate_json);
+
+  const wan22::JobRequest strength =
+      Accept(service, runner, &calls, wan22::Family::kWan22Animate,
+             prefix + R"("relight_lora":0.5,"fps":0}}})");
+  const gufo::json::Value strength_animate =
+      gufo::json::parse(strength.animate_json);
+  Check(strength_animate.member_double("relight_lora") == 0.5 &&
+            strength_animate.member_double("fps", -1) == 0,
+        "Animate relight strength and fps 0 reach the runner: " +
+            strength.animate_json);
+
+  const wan22::JobRequest plain =
+      Accept(service, runner, &calls, wan22::Family::kWan22Animate,
+             prefix + R"("sampler":"euler"}}})");
+  const gufo::json::Value plain_animate = gufo::json::parse(plain.animate_json);
+  Check(plain_animate.find("relight_lora") == nullptr &&
+            plain_animate.find("fps") == nullptr &&
+            plain_animate.find("video_load") == nullptr,
+        "Animate without the options: no relight LoRA, default rate: " +
+            plain.animate_json);
+
+  for (const std::string& bad :
+       {prefix + R"("relight_lora":"yes"}}})",
+        prefix + R"("relight_lora":11}}})", prefix + R"("fps":-1}}})",
+        prefix + R"("fps":121}}})", prefix + R"("fps":"16"}}})",
+        prefix + R"("video_load":[]}}})",
+        prefix + R"("video_load":{"audio":{}}}}})",
+        prefix + R"("video_load":{"pose_video":3}}}})",
+        prefix + R"("video_load":{"pose_video":{"fps":200}}}}})",
+        prefix + R"("video_load":{"pose_video":{"select_every_nth":0}}}}})",
+        prefix + R"("video_load":{"pose_video":{"skip_first_frames":-1}}}}})",
+        prefix + R"("video_load":{"pose_video":{"frame_load_cap":1.5}}}}})",
+        prefix + R"("video_load":{"pose_video":{"force_rate":16}}}}})"})
+    Rejected(service, bad, "invalid_animate", "invalid Animate request " + bad);
+}
+
 void TestProbe(const std::filesystem::path& root) {
   gufo::ext::RegisterVideoProvider({
       .id = "generic-test",
@@ -944,6 +1021,7 @@ int main() {
   TestI2V22(base / "i2v22");
   TestUni3C(base / "uni3c");
   TestTalk(base / "talk");
+  TestAnimate(base / "animate");
   TestPostSteps(base / "post");
   TestProbe(base / "probe");
   std::filesystem::remove_all(base, ignored);

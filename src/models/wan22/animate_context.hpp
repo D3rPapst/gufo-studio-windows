@@ -94,6 +94,31 @@ struct AnimateChunkSlot {
 [[nodiscard]] std::vector<AnimateChunkSlot> PlanAnimateChunks(
     int total_frames, int length, int continue_frames);
 
+/// How an input video is loaded onto the animation's time line, as
+/// ComfyUI-VideoHelperSuite's VHS_LoadVideo (cv_frame_generator) does it:
+/// resampled to `force_rate` by time (frames dropped or repeated; 0 = the
+/// file's own rate, every frame once), then skip_first_frames,
+/// select_every_nth and frame_load_cap on the resampled frames. Rates are
+/// fractions (ffprobe's r_frame_rate; force_rate as n / 1000).
+struct AnimateFrameRate {
+  std::int64_t source_num{16}, source_den{1};  // the file's frame rate
+  std::int64_t target_num{0}, target_den{1};   // force_rate; 0 = source
+  int skip_first_frames{0};
+  int select_every_nth{1};
+  int frame_load_cap{0};  // 0 = no cap
+};
+
+/// True when `rate` takes every frame of the file once, in order.
+[[nodiscard]] bool AnimateFrameRateIsIdentity(const AnimateFrameRate& rate);
+
+/// The source frame index of each loaded frame, at most `max_frames` of
+/// them, for a file of `source_frames` frames (-1: unknown; the reader
+/// stops at the file's end). Non-decreasing. Empty on invalid arguments.
+/// Frame times are summed as doubles in VHS's order, so ties between a file
+/// frame and a loaded frame fall as in ComfyUI.
+[[nodiscard]] std::vector<int> AnimateFrameIndices(
+    const AnimateFrameRate& rate, int max_frames, int source_frames);
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_ANIMATE_CONTEXT_HPP_

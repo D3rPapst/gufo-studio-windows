@@ -3,6 +3,7 @@
 #include "src/cli/serve/media/vision_api.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -147,9 +148,12 @@ void WritePng(png_structp png, png_bytep data, png_size_t size) {
 
 void FlushPng(png_structp) {}
 
-/// Grey PNG from 8- or 16-bit samples (16 bit as big-endian pairs).
-std::vector<std::uint8_t> GreyPng(const std::vector<std::uint8_t>& samples,
-                                  int width, int height, int bits) {
+/// PNG from 8- or 16-bit samples (16 bit as big-endian pairs) of
+/// `color_type` (PNG_COLOR_TYPE_GRAY: 1 sample per pixel, _RGBA: 4).
+std::vector<std::uint8_t> Png(const std::vector<std::uint8_t>& samples,
+                              int width, int height, int bits,
+                              int color_type) {
+  const int channels = color_type == PNG_COLOR_TYPE_RGBA ? 4 : 1;
   std::vector<std::uint8_t> out;
   png_structp png =
       png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
@@ -162,16 +166,23 @@ std::vector<std::uint8_t> GreyPng(const std::vector<std::uint8_t>& samples,
   }
   png_set_write_fn(png, &out, WritePng, FlushPng);
   png_set_IHDR(png, info, static_cast<png_uint_32>(width),
-               static_cast<png_uint_32>(height), bits, PNG_COLOR_TYPE_GRAY,
+               static_cast<png_uint_32>(height), bits, color_type,
                PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
                PNG_FILTER_TYPE_DEFAULT);
   png_write_info(png, info);
-  const std::size_t row = static_cast<std::size_t>(width) * (bits / 8);
+  const std::size_t row =
+      static_cast<std::size_t>(width) * channels * (bits / 8);
   for (int y = 0; y < height; ++y)
     png_write_row(png, const_cast<png_bytep>(samples.data() + row * y));
   png_write_end(png, nullptr);
   png_destroy_write_struct(&png, &info);
   return out;
+}
+
+/// Grey PNG from 8- or 16-bit samples (16 bit as big-endian pairs).
+std::vector<std::uint8_t> GreyPng(const std::vector<std::uint8_t>& samples,
+                                  int width, int height, int bits) {
+  return Png(samples, width, height, bits, PNG_COLOR_TYPE_GRAY);
 }
 
 std::string MaskPng(const VisionMask& mask) {
@@ -180,6 +191,61 @@ std::string MaskPng(const VisionMask& mask) {
     samples[i] = mask.mask[i] != 0 ? 255 : 0;
   return core::EncodeBase64(std::span<const std::uint8_t>(
       GreyPng(samples, mask.width, mask.height, 8)));
+}
+
+/// Segment "format": "rgba" (with "crop"): `target` gets "rgba_b64", the
+/// input image as RGBA PNG with the mask as alpha (255 = region, 0 =
+/// transparent), cut to the mask's bounding box with `crop` ("crop_box":
+/// [x0, y0, x1, y1] in image pixels, x1 / y1 exclusive). An empty mask
+/// with `crop`, or a mask of another size: null.
+void AddRgba(const core::Image& image, const VisionMask& mask, bool crop,
+             json::Value* target) {
+  const int W = static_cast<int>(image.width), H = static_cast<int>(image.height);
+  const auto none = [&] {
+    (*target)["rgba_b64"] = json::Value();
+    if (crop)
+      (*target)["crop_box"] = json::Value();
+  };
+  if (mask.width != W || mask.height != H ||
+      mask.mask.size() != static_cast<std::size_t>(W) * H ||
+      image.pixels.size() != static_cast<std::size_t>(W) * H * 3) {
+    none();
+    return;
+  }
+  std::array<int, 4> box{0, 0, W, H};
+  if (crop) {
+    box = {W, H, 0, 0};
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x)
+        if (mask.mask[static_cast<std::size_t>(y) * W + x] != 0) {
+          box[0] = std::min(box[0], x);
+          box[1] = std::min(box[1], y);
+          box[2] = std::max(box[2], x + 1);
+          box[3] = std::max(box[3], y + 1);
+        }
+    if (box[2] <= box[0]) {
+      none();
+      return;
+    }
+  }
+  const int w = box[2] - box[0], h = box[3] - box[1];
+  std::vector<std::uint8_t> samples(static_cast<std::size_t>(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const std::size_t source =
+          static_cast<std::size_t>(box[1] + y) * W + (box[0] + x);
+      std::uint8_t* out = samples.data() + (static_cast<std::size_t>(y) * w + x) * 4;
+      std::copy_n(image.pixels.data() + source * 3, 3, out);
+      out[3] = mask.mask[source] != 0 ? 255 : 0;
+    }
+  (*target)["rgba_b64"] = core::EncodeBase64(std::span<const std::uint8_t>(
+      Png(samples, w, h, 8, PNG_COLOR_TYPE_RGBA)));
+  if (crop) {
+    json::Value crop_box = json::Value::array();
+    for (int v : box)
+      crop_box.push_back(v);
+    (*target)["crop_box"] = std::move(crop_box);
+  }
 }
 
 json::Value ParseBodyOrError(const HttpRequest& request, HttpResponse* error) {
@@ -459,6 +525,23 @@ HttpResponse VisionModelService::Segment(const json::Value& body) {
     return BadRequest(std::string("image: ") + e.what(), "invalid_media");
   }
   const int W = static_cast<int>(image.width), H = static_cast<int>(image.height);
+  // "format": "mask" (the grey PNG masks, default) or "rgba" (also the
+  // image with the mask as alpha); "crop": cut that to the mask's box.
+  const json::Value* format_value = body.find("format");
+  if (format_value != nullptr && !format_value->is_null() &&
+      (!format_value->is_string() ||
+       (format_value->str() != "mask" && format_value->str() != "rgba")))
+    return BadRequest("format must be mask (grey PNG, default) or rgba (also "
+                      "the image with the mask as alpha, PNG)");
+  const bool rgba = format_value != nullptr && format_value->is_string() &&
+                    format_value->str() == "rgba";
+  const json::Value* crop_value = body.find("crop");
+  if (crop_value != nullptr && !crop_value->is_null() && !crop_value->is_bool())
+    return BadRequest("crop must be a boolean");
+  const bool crop = crop_value != nullptr && crop_value->is_bool() &&
+                    crop_value->as_bool();
+  if (crop && !rgba)
+    return BadRequest("crop needs \"format\": \"rgba\"");
   const auto started = std::chrono::steady_clock::now();
   json::Value out = json::Value::object();
   out["object"] = "vision.segment";
@@ -531,6 +614,11 @@ HttpResponse VisionModelService::Segment(const json::Value& body) {
     out["boxes"] = std::move(used);
     if (prompt.boxes.empty()) {
       out["mask"] = json::Value();
+      if (rgba) {
+        out["rgba_b64"] = json::Value();
+        if (crop)
+          out["crop_box"] = json::Value();
+      }
       out["seconds"] = Seconds(started);
       return Json(200, "OK", out);
     }
@@ -546,6 +634,8 @@ HttpResponse VisionModelService::Segment(const json::Value& body) {
       for (std::size_t i = 0; i < all.mask.size() && i < m.mask.size(); ++i)
         all.mask[i] |= m.mask[i];
     out["mask"] = MaskPng(all);
+    if (rgba)
+      AddRgba(image, all, crop, &out);
     if (backends_.describe) {
       json::Value source = json::Value::object();
       source["find"] = backends_.describe("find", DetectorName(backends_, request));
@@ -597,6 +687,8 @@ HttpResponse VisionModelService::Segment(const json::Value& body) {
     json::Value item = json::Value::object();
     item["b64_json"] = MaskPng(m);
     item["score"] = static_cast<double>(m.score);
+    if (rgba)
+      AddRgba(image, m, crop, &item);
     list.push_back(std::move(item));
   }
   out["masks"] = std::move(list);

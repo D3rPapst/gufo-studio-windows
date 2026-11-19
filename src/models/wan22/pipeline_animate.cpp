@@ -193,8 +193,10 @@ bool GenerateAnimate22(const Animate22Request& request,
 
   // 4. Transformer (Animate 14B: I2V 14B keys) + Animate additions.
   auto start = Clock::now();
-  auto dit = Transformer21::Load(request.dit_file, request.lora_file,
-                                 request.lora_strength, error);
+  const Transformer21Lora loras[] = {
+      {request.lora_file, request.lora_strength},
+      {request.relight_lora_file, request.relight_lora_strength}};
+  auto dit = Transformer21::Load(request.dit_file, loras, error);
   if (!dit)
     return false;
   if (dit->text_only() || dit->in_channels() != Transformer21::kInChannels) {

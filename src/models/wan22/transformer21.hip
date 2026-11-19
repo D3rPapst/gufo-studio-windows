@@ -463,6 +463,7 @@ struct Fp8Linear {
   int rows{0}, columns{0};
   DeviceBuffer up, down;  // BF16 [rows, rank], [rank, columns]
   int rank{0};
+  float strength{1};  // of the product up . down
 };
 
 struct Block {
@@ -510,8 +511,10 @@ struct Transformer21::Impl {
       (void)hipStreamDestroy(stream);
   }
 
+  // `prefix`: the keys to keep (LoRA files: "diffusion_model."), stored as
+  // `tag` + the rest of the name (LoRA i: LoraTag(i)).
   bool Index(const std::filesystem::path& path, int file, std::string prefix,
-             std::string* error);
+             const std::string& tag, std::string* error);
   const TensorLocation* Find(const std::string& name) const {
     const auto it = tensors.find(name);
     return it == tensors.end() ? nullptr : &it->second;
@@ -533,9 +536,15 @@ struct Transformer21::Impl {
   bool LoadDense(DeviceBuffer& buffer, const std::string& name,
                  std::size_t rows, std::size_t columns, bool bf16,
                  std::string* error);
+  // The LoRA product of `base` (rank 0: none) and its strength.
   bool LoadLora(const std::string& base, std::size_t rows, std::size_t columns,
                 DeviceBuffer& up, DeviceBuffer& down, int* rank,
-                std::string* error);
+                float* strength, std::string* error);
+  // Host FP32 factors of LoRA `lora` for `base`, `up` scaled by alpha / rank
+  // and `scale`; *rank 0 when the LoRA does not touch `base`.
+  bool HostLora(int lora, const std::string& base, std::size_t rows,
+                std::size_t columns, float scale, std::vector<float>* up,
+                std::vector<float>* down, int* rank, std::string* error);
   bool LoadFp8(Fp8Linear& linear, const std::string& base, int rows,
                int columns, std::string* error);
   // Unpacks `linear` (with its LoRA) into BF16 `target`.
@@ -553,7 +562,12 @@ struct Transformer21::Impl {
 
   std::vector<platform::PlatformFile> files;
   std::map<std::string, TensorLocation, std::less<>> tensors;
-  float lora_strength{1};
+  // Strength of LoRA i (keys tagged LoraTag(i)).
+  std::vector<float> lora_strengths;
+  static std::string LoraTag(int lora) {
+    return lora == 0 ? std::string("lora:")
+                     : "lora" + std::to_string(lora) + ":";
+  }
   std::vector<Block> blocks;
   DeviceBuffer patch_weight, patch_bias;               // BF16
   DeviceBuffer time1, time1_bias, time2, time2_bias;  // FP32
@@ -602,7 +616,8 @@ struct Transformer21::Impl {
 };
 
 bool Transformer21::Impl::Index(const std::filesystem::path& path, int file,
-                                std::string prefix, std::string* error) {
+                                std::string prefix, const std::string& tag,
+                                std::string* error) {
   std::string open_error;
   files.push_back(platform::OpenReadFile(path, &open_error));
   if (!platform::FileValid(files.back())) {
@@ -672,7 +687,7 @@ bool Transformer21::Impl::Index(const std::filesystem::path& path, int file,
       if (!prefix.empty()) {
         if (key.rfind(prefix, 0) != 0)
           continue;
-        key = "lora:" + key.substr(prefix.size());
+        key = tag + key.substr(prefix.size());
       }
       tensors[key] = std::move(location);
     }
@@ -727,19 +742,21 @@ bool Transformer21::Impl::ReadHost(const std::string& name, std::size_t count,
   const auto dot = name.rfind('.');
   const std::string base = name.substr(0, dot);
   const std::string kind = name.substr(dot + 1);
-  const TensorLocation* diff = nullptr;
-  if (kind == "weight")
-    diff = Find("lora:" + base + ".diff");
-  else if (kind == "bias")
-    diff = Find("lora:" + base + ".diff_b");
-  if (diff != nullptr) {
+  for (int lora = 0; lora < static_cast<int>(lora_strengths.size()); ++lora) {
+    const TensorLocation* diff = nullptr;
+    if (kind == "weight")
+      diff = Find(LoraTag(lora) + base + ".diff");
+    else if (kind == "bias")
+      diff = Find(LoraTag(lora) + base + ".diff_b");
+    if (diff == nullptr)
+      continue;
     std::vector<float> values;
     if (diff->count != count || !read(*diff, &values)) {
       SetError(error, "misshaped LoRA difference for " + name);
       return false;
     }
     for (std::size_t i = 0; i < count; ++i)
-      (*out)[i] += lora_strength * values[i];
+      (*out)[i] += lora_strengths[lora] * values[i];
   }
   return true;
 }
@@ -803,15 +820,91 @@ bool Transformer21::Impl::LoadVector(DeviceBuffer& buffer,
                : UploadF32(buffer, host, error));
 }
 
+bool Transformer21::Impl::HostLora(int lora, const std::string& base,
+                                   std::size_t rows, std::size_t columns,
+                                   float scale, std::vector<float>* up,
+                                   std::vector<float>* down, int* rank,
+                                   std::string* error) {
+  *rank = 0;
+  const std::string tag = LoraTag(lora);
+  const TensorLocation* u = Find(tag + base + ".lora_up.weight");
+  const TensorLocation* d = Find(tag + base + ".lora_down.weight");
+  if (u == nullptr && d == nullptr)
+    return true;
+  const auto half = [](const TensorLocation* t) {
+    return t->dtype == DType::kBF16 || t->dtype == DType::kF16;
+  };
+  if (u == nullptr || d == nullptr || u->shape.size() != 2 ||
+      d->shape.size() != 2 || u->shape[0] != rows || d->shape[1] != columns ||
+      u->shape[1] != d->shape[0] || !half(u) || !half(d)) {
+    SetError(error, "unsupported LoRA tensors for " + base);
+    return false;
+  }
+  const int r = static_cast<int>(u->shape[1]);
+  if (Find(tag + base + ".alpha") != nullptr) {
+    std::vector<float> value;
+    if (!ReadHost(tag + base + ".alpha", 1, &value, error))
+      return false;
+    scale *= value[0] / static_cast<float>(r);
+  }
+  if (!ReadHost(tag + base + ".lora_up.weight", u->count, up, error) ||
+      !ReadHost(tag + base + ".lora_down.weight", d->count, down, error))
+    return false;
+  if (scale != 1.0F)
+    for (float& v : *up)
+      v *= scale;
+  *rank = r;
+  return true;
+}
+
 bool Transformer21::Impl::LoadLora(const std::string& base, std::size_t rows,
                                    std::size_t columns, DeviceBuffer& up,
                                    DeviceBuffer& down, int* rank,
-                                   std::string* error) {
+                                   float* strength, std::string* error) {
   *rank = 0;
+  *strength = lora_strengths.empty() ? 1.0F : lora_strengths[0];
+  const int loras = static_cast<int>(lora_strengths.size());
+  int touching = 0;
+  for (int lora = 0; lora < loras; ++lora)
+    if (Find(LoraTag(lora) + base + ".lora_up.weight") != nullptr ||
+        Find(LoraTag(lora) + base + ".lora_down.weight") != nullptr)
+      ++touching;
+  if (touching == 0)
+    return true;
+  if (touching > 1 || Find("lora:" + base + ".lora_up.weight") == nullptr) {
+    // Several LoRAs (or only a later one): concatenated factors
+    // [s_1 up_1 | s_2 up_2 ...] . [down_1; down_2 ...] at strength 1.
+    std::vector<std::vector<float>> ups;
+    std::vector<int> ranks;
+    std::vector<float> all_down;
+    for (int lora = 0; lora < loras; ++lora) {
+      std::vector<float> host_up, host_down;
+      int lora_rank = 0;
+      if (!HostLora(lora, base, rows, columns, lora_strengths[lora], &host_up,
+                    &host_down, &lora_rank, error))
+        return false;
+      if (lora_rank == 0)
+        continue;
+      ups.push_back(std::move(host_up));
+      ranks.push_back(lora_rank);
+      all_down.insert(all_down.end(), host_down.begin(), host_down.end());
+      *rank += lora_rank;
+    }
+    const auto total = static_cast<std::size_t>(*rank);
+    std::vector<float> all_up(rows * total, 0.0F);
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < ups.size(); ++i) {
+      const auto r = static_cast<std::size_t>(ranks[i]);
+      for (std::size_t row = 0; row < rows; ++row)
+        std::copy_n(ups[i].begin() + row * r, r,
+                    all_up.begin() + row * total + at);
+      at += r;
+    }
+    *strength = 1.0F;
+    return UploadBf16(up, all_up, error) && UploadBf16(down, all_down, error);
+  }
   const TensorLocation* u = Find("lora:" + base + ".lora_up.weight");
   const TensorLocation* d = Find("lora:" + base + ".lora_down.weight");
-  if (u == nullptr && d == nullptr)
-    return true;
   const auto half = [](const TensorLocation* t) {
     return t->dtype == DType::kBF16 || t->dtype == DType::kF16;
   };
@@ -880,13 +973,14 @@ bool Transformer21::Impl::LoadDense(DeviceBuffer& buffer,
     return false;
   DeviceBuffer full, up, down;
   int rank = 0;
+  float strength = 1.0F;
   const std::size_t before = weight_bytes;
   if (!UploadF32(full, host, error) ||
-      !LoadLora(name, rows, columns, up, down, &rank, error))
+      !LoadLora(name, rows, columns, up, down, &rank, &strength, error))
     return false;
   if (rank > 0 &&
       !AddLowRank(blas, up.raw(), down.raw(), rank, static_cast<int>(rows),
-                  static_cast<int>(columns), lora_strength, full.raw(), true,
+                  static_cast<int>(columns), strength, full.raw(), true,
                   error))
     return false;
   weight_bytes = before + host.size() * (bf16 ? 2 : 4);
@@ -921,7 +1015,7 @@ bool Transformer21::Impl::LoadFp8(Fp8Linear& linear, const std::string& base,
   return linear.weight.Allocate(w->bytes, error) &&
          UploadRaw(*w, linear.weight.raw(), error) &&
          LoadLora(base, rows, columns, linear.up, linear.down, &linear.rank,
-                  error);
+                  &linear.strength, error);
 }
 
 bool Transformer21::Impl::Unpack(const Fp8Linear& linear,
@@ -933,7 +1027,7 @@ bool Transformer21::Impl::Unpack(const Fp8Linear& linear,
       linear.scale, target);
   return linear.rank == 0 ||
          AddLowRank(blas, linear.up.raw(), linear.down.raw(), linear.rank,
-                    linear.rows, linear.columns, lora_strength, target, false,
+                    linear.rows, linear.columns, linear.strength, target, false,
                     error);
 }
 
@@ -1053,13 +1147,26 @@ std::unique_ptr<Transformer21> Transformer21::Load(
     const std::filesystem::path& dit_file,
     const std::filesystem::path& lora_file, float lora_strength,
     std::string* error) {
+  const Transformer21Lora lora{lora_file, lora_strength};
+  return Load(dit_file, std::span<const Transformer21Lora>(&lora, 1), error);
+}
+
+std::unique_ptr<Transformer21> Transformer21::Load(
+    const std::filesystem::path& dit_file,
+    std::span<const Transformer21Lora> loras, std::string* error) {
   auto impl = std::make_unique<Impl>();
   Impl& m = *impl;
-  m.lora_strength = lora_strength;
-  if (!m.Index(dit_file, 0, "", error) ||
-      (!lora_file.empty() &&
-       !m.Index(lora_file, 1, "diffusion_model.", error)))
+  if (!m.Index(dit_file, 0, "", "", error))
     return nullptr;
+  for (const Transformer21Lora& lora : loras) {
+    if (lora.file.empty())
+      continue;
+    const int index = static_cast<int>(m.lora_strengths.size());
+    m.lora_strengths.push_back(lora.strength);
+    if (!m.Index(lora.file, index + 1, "diffusion_model.",
+                 Impl::LoraTag(index), error))
+      return nullptr;
+  }
   m.text_only = m.Find("blocks.0.cross_attn.k_img.weight") == nullptr;
   const TensorLocation* patch = m.Find("patch_embedding.weight");
   if (patch != nullptr && patch->shape.size() == 5)

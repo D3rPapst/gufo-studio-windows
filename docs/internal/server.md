@@ -824,6 +824,32 @@ pose / face / background / mask / reference); another seed is a
 alone fails validation. Without `wan2.2-animate-14b` in the preset the
 chain still fails (no VACE fallback). `comfy_graph.cpp` `AnimateChain`,
 `ApplyAnimateChain`, `ChainOutputCut`.
+Wan 2.2 Animate relight LoRA (2.2.12): `gufo.animate.relight_lora` (`true`
+= the bundle's `relight_lora_strength`, or a strength -10..10; default
+none) adds Kijai's `WanAnimate_relight_lora` (path `relight_lora` in
+`gufo-animate.json`) on top of the lightx2v LoRA; where both touch a matrix
+their low-rank factors are concatenated (`Transformer21::Load` with several
+`Transformer21Lora`). A `LoraLoaderModelOnly` whose name contains `relight`
+on the Animate model path sends its `strength_model` as `relight_lora`
+(before 2.2.12: ignored with a `gufo_warning`). A request for it on a bundle
+without `relight_lora` fails the job.
+Wan 2.2 Animate input frame rates (2.2.12): the pose, face, background,
+mask and continue_motion videos are resampled by time to
+`gufo.animate.fps` (default 16 = the model's rate; 0 = every frame as it
+is, the behaviour before 2.2.12) the way VHS_LoadVideo's `force_rate` does
+it (cv_frame_generator: frames dropped or repeated, then
+`skip_first_frames`, `select_every_nth`, `frame_load_cap`; frame times
+summed as doubles in VHS's order; `AnimateFrameIndices`). Per input
+`gufo.animate.video_load` = {"pose_video": {"fps", "skip_first_frames",
+"select_every_nth", "frame_load_cap"}, ...} overrides it. The Comfy adapter
+sends `fps` 0 (ComfyUI takes LoadVideo frames and frames built in the graph
+as they are) and a VHS_LoadVideo's options as `video_load` (before 2.2.12
+they were ignored with a `gufo_warning`). The result stays 16 fps.
+An `ImageFromBatch` between such a VHS_LoadVideo and the Animate input
+cuts the resampled frames as in ComfyUI: gufo folds the cut into
+`video_load` (skip + batch_index x select_every_nth, cap = length) instead
+of cutting the file; a batch_index behind `frame_load_cap` is refused.
+With default VHS options the cut stays a file cut (`FileRef::cuts`).
 ComfyUI Wan I2V chains (after 2.2.9): `WanImageToVideo` chunks chained the
 ComfyUI way (Regie 19.11., FilmStudio `mehrsprecher.py` bewegung_wf: Wan
 2.1 I2V 480p + lightx2v, e.g. 81 + 81 + 25 frames; each next

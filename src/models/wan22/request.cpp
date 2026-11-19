@@ -1083,6 +1083,14 @@ bool MaskFile(std::vector<std::uint8_t>* file, std::string* format,
 // per chunk, 4k + 1, 5..81, default 77), "continue_frames" (overlap of
 // chained chunks, 4k + 1, default 5), "sampler" ("lcm" | "euler"), "shift"
 // (1..20), "lora" (false: without the bundle's step-distill LoRA),
+// "relight_lora" (true: the bundle's relight LoRA at its
+// relight_lora_strength, or a strength -10..10; default none), "fps" (the
+// time line the videos are resampled to by time, as VHS_LoadVideo's
+// force_rate: frames dropped or repeated; 0..120, default 16 = Animate's
+// rate; 0 = every frame as it is), "video_load" ({"pose_video" |
+// "face_video" | "background_video" | "character_mask" | "continue_motion":
+// {"fps", "skip_first_frames", "select_every_nth", "frame_load_cap"}}: per
+// video, VHS_LoadVideo's options on the resampled frames),
 // "trim_continue" (true: drop the continue_motion frames from the result,
 // as ImageFromBatch on trim_image)}}}.
 // Multipart uploads may carry "reference_image", "pose_video",
@@ -1148,14 +1156,16 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                         "invert_mask", "continue_motion",
                         "continue_motion_max_frames", "video_frame_offset",
                         "length", "continue_frames", "sampler", "shift",
-                        "lora", "trim_continue"})))
+                        "lora", "relight_lora", "trim_continue", "fps",
+                        "video_load"})))
     return Fail(error, "invalid_animate",
                 "'gufo.animate' may contain only 'reference_image', "
                 "'pose_video', 'face_video', 'background_video', "
                 "'character_mask', 'mask_channel', 'invert_mask', "
                 "'continue_motion', 'continue_motion_max_frames', "
                 "'video_frame_offset', 'length', 'continue_frames', "
-                "'sampler', 'shift', 'lora' and 'trim_continue'");
+                "'sampler', 'shift', 'lora', 'relight_lora', "
+                "'trim_continue', 'fps' and 'video_load'");
   const auto member = [&](const char* name) -> const json::Value* {
     return animate == nullptr ? nullptr : animate->find(name);
   };
@@ -1238,6 +1248,77 @@ bool PrepareAnimate(const Body& body, ext::VideoPreparedRequest* prepared,
                         "' must be a boolean");
       animate_options[flag] = value->as_bool();
     }
+  if (const json::Value* relight = member("relight_lora")) {
+    const double strength =
+        relight->is_number() ? relight->as_double(100.0) : 100.0;
+    if (!relight->is_bool() &&
+        !(std::isfinite(strength) && strength >= -10.0 && strength <= 10.0))
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.relight_lora' must be a boolean or a "
+                  "strength in -10..10");
+    if (relight->is_bool())
+      animate_options["relight_lora"] = relight->as_bool();
+    else
+      animate_options["relight_lora"] = strength;
+  }
+  // Input frame rates (VHS_LoadVideo force_rate and frame options).
+  const auto rate = [](const json::Value& value) {
+    const double fps = value.is_number() ? value.as_double(-1.0) : -1.0;
+    return std::isfinite(fps) && fps >= 0.0 && fps <= 120.0 ? fps : -1.0;
+  };
+  if (const json::Value* fps = member("fps")) {
+    if (rate(*fps) < 0)
+      return Fail(error, "invalid_animate",
+                  "'gufo.animate.fps' must be a number in 0..120 (0 = every "
+                  "frame as it is)");
+    animate_options["fps"] = rate(*fps);
+  }
+  if (const json::Value* load = member("video_load")) {
+    static constexpr const char* kInputs[] = {
+        "pose_video", "face_video", "background_video", "character_mask",
+        "continue_motion"};
+    const char* const usage =
+        "'gufo.animate.video_load' maps 'pose_video', 'face_video', "
+        "'background_video', 'character_mask' or 'continue_motion' to "
+        "{'fps' 0..120, 'skip_first_frames' 0..100000, 'select_every_nth' "
+        "1..1000, 'frame_load_cap' 0..100000}";
+    if (!load->is_object() ||
+        !HasOnlyMembers(*load, {"pose_video", "face_video",
+                                "background_video", "character_mask",
+                                "continue_motion"}))
+      return Fail(error, "invalid_animate", usage);
+    json::Value loads = json::Value::object();
+    for (const char* input : kInputs) {
+      const json::Value* entry = load->find(input);
+      if (entry == nullptr)
+        continue;
+      if (!entry->is_object() ||
+          !HasOnlyMembers(*entry, {"fps", "skip_first_frames",
+                                   "select_every_nth", "frame_load_cap"}))
+        return Fail(error, "invalid_animate", usage);
+      json::Value checked = json::Value::object();
+      if (const json::Value* fps = entry->find("fps")) {
+        if (rate(*fps) < 0)
+          return Fail(error, "invalid_animate", usage);
+        checked["fps"] = rate(*fps);
+      }
+      const std::pair<const char*, std::pair<int, int>> counts[] = {
+          {"skip_first_frames", {0, 100000}},
+          {"select_every_nth", {1, 1000}},
+          {"frame_load_cap", {0, 100000}}};
+      for (const auto& [name, range] : counts) {
+        const json::Value* value = entry->find(name);
+        if (value == nullptr)
+          continue;
+        const auto parsed = JsonFrame(value);
+        if (!parsed || *parsed < range.first || *parsed > range.second)
+          return Fail(error, "invalid_animate", usage);
+        checked[name] = *parsed;
+      }
+      loads[input] = std::move(checked);
+    }
+    animate_options["video_load"] = std::move(loads);
+  }
   // 4k + 1 frame counts and the seek.
   const auto frame_count = [&](const char* name, int low, int high,
                                bool four_k_plus_one) {
