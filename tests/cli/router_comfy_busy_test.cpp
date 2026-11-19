@@ -228,6 +228,37 @@ void TestRetryLaterOf() {
         !comfy::IsPassingPollFailure(500));
 }
 
+// The router's two 507 insufficient_memory answers (router.cpp AdmitLocked):
+// the passing one (memory.cpp PlanAdmission, Wait::kOutside) and the load
+// stopped by low memory.
+constexpr const char* kNotFreeBody =
+    R"({"error":{"message":"cannot load 'wan2.1-vace-14b': not enough free memory yet (held outside the router or still being released); need 46.0 GB gpu + 2.0 GB host; free gpu 47.1+7.7 GB, host 5.7 GB, commit 2.9 GB","type":"server_error","code":"insufficient_memory"}})";
+constexpr const char* kExclusiveNotFreeBody =
+    R"({"error":{"message":"cannot load 'x': exclusive, not enough free memory yet (held outside the router or still being released); free gpu 1.0 GB","type":"server_error","code":"insufficient_memory"}})";
+constexpr const char* kRanLowBody =
+    R"({"error":{"message":"loading 'x' was stopped because memory ran low","type":"server_error","code":"insufficient_memory"}})";
+
+void TestMemoryNotFreeOf() {
+  const auto message =
+      comfy::MemoryNotFreeOf({.status = 507, .body = kNotFreeBody});
+  CHECK(message && message->find("46.0 GB gpu") != std::string::npos);
+  CHECK(comfy::MemoryNotFreeOf({.status = 507, .body = kExclusiveNotFreeBody}));
+  CHECK(!comfy::MemoryNotFreeOf({.status = 507, .body = kRanLowBody}));
+  CHECK(!comfy::MemoryNotFreeOf({.status = 503, .body = kNotFreeBody}));
+  CHECK(!comfy::MemoryNotFreeOf({.status = 507, .body = "not json"}));
+  CHECK(!comfy::MemoryNotFreeOf(
+      {.status = 507,
+       .body = R"({"error":{"message":"not enough free memory yet","code":"other"}})"}));
+  CHECK(comfy::IsMemoryNotFreeYet(507, "insufficient_memory",
+                                  "x: not enough free memory yet (held"));
+  CHECK(!comfy::IsMemoryNotFreeYet(
+      507, "insufficient_memory",
+      "loading 'x' was stopped because memory ran low"));
+  // Neither a video "come back later" nor memory_busy.
+  CHECK(!comfy::RetryLaterOf({.status = 507, .body = kNotFreeBody}));
+  CHECK(!comfy::MemoryBusyOf({.status = 507, .body = kNotFreeBody}));
+}
+
 std::string ErrorText(const json::Value& entry) {
   const json::Value* status = entry.find("status");
   if (status == nullptr || status->member_str("status_str") != "error")
@@ -355,6 +386,131 @@ void TestVideoWaitInterrupted(const std::filesystem::path& root) {
   adapter.Stop();
 }
 
+// A video task (vace in the Regie's case) and an image task wait through
+// the passing 507 and go on; another 507 fails the prompt at once.
+void TestMemoryNotFreeWait(const std::filesystem::path& root) {
+  std::atomic<int> video_posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "not-free-video";
+  options.memory_free_retry = std::chrono::milliseconds(20);
+  options.video_poll = std::chrono::milliseconds(10);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      const int n = ++video_posts;
+      if (n <= 3)
+        return comfy::FetchResult{.status = 507, .body = kNotFreeBody};
+      return comfy::FetchResult{.status = 202,
+                                .body = R"({"id":"video_nf","status":"queued"})",
+                                .content_type = "application/json"};
+    }
+    if (request.method == "GET" && request.path == "/v1/videos/video_nf")
+      return comfy::FetchResult{
+          .status = 200,
+          .body = R"({"id":"video_nf","status":"failed","progress":3,"error":{"message":"fake end"}})"};
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry) {
+    const std::string error = ErrorText(*entry);
+    CHECK(error.find("fake end") != std::string::npos);
+    CHECK(error.find("507") == std::string::npos);
+  }
+  CHECK(video_posts.load() == 4);
+  adapter.Stop();
+}
+
+void TestMemoryNotFreeImage(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "not-free-image";
+  options.memory_free_retry = std::chrono::milliseconds(10);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.path == "/v1/images/generations" ||
+        request.path == "/v1/images/edits") {
+      const int n = ++posts;
+      if (n == 1)
+        return comfy::FetchResult{.status = 507, .body = kNotFreeBody};
+      // Then a hard failure: the prompt ends with it (not with the 507).
+      return comfy::FetchResult{
+          .status = 500,
+          .body = R"({"error":{"message":"fake image end","code":"x"}})"};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kQwenText + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry)
+    CHECK(ErrorText(*entry).find("fake image end") != std::string::npos);
+  CHECK(posts.load() == 2);
+  adapter.Stop();
+}
+
+void TestMemoryRanLowFails(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "ran-low";
+  options.memory_free_retry = std::chrono::milliseconds(10);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      ++posts;
+      return comfy::FetchResult{.status = 507, .body = kRanLowBody};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry)
+    CHECK(ErrorText(*entry).find("HTTP 507") != std::string::npos);
+  CHECK(posts.load() == 1);
+  adapter.Stop();
+}
+
+void TestMemoryNotFreeLimit(const std::filesystem::path& root) {
+  std::atomic<int> posts{0};
+  comfy::AdapterOptions options;
+  options.root = root / "not-free-limit";
+  options.memory_free_retry = std::chrono::milliseconds(10);
+  options.memory_free_limit = std::chrono::milliseconds(60);
+  options.fetch = [&](const HttpRequest& request) {
+    if (request.method == "POST" && request.path == "/v1/videos") {
+      ++posts;
+      return comfy::FetchResult{.status = 507, .body = kNotFreeBody};
+    }
+    return comfy::FetchResult{.status = 404, .body = "{}"};
+  };
+  comfy::Adapter adapter(std::move(options));
+  adapter.Start();
+  const HttpResponse accepted =
+      Post(adapter, std::string(R"({"prompt":)") + kH3Text + "}");
+  CHECK(accepted.status == 200);
+  const std::string id = json::parse(accepted.body).member_str("prompt_id");
+  const auto entry = History(adapter, id);
+  CHECK(entry.has_value());
+  if (entry)
+    CHECK(ErrorText(*entry).find("HTTP 507") != std::string::npos);
+  CHECK(posts.load() >= 2);
+  adapter.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -368,6 +524,11 @@ int main() {
   TestVideoWaits(root);
   TestVideoWaitLimit(root);
   TestVideoWaitInterrupted(root);
+  TestMemoryNotFreeOf();
+  TestMemoryNotFreeWait(root);
+  TestMemoryNotFreeImage(root);
+  TestMemoryRanLowFails(root);
+  TestMemoryNotFreeLimit(root);
   std::filesystem::remove_all(root);
   if (failures != 0) {
     std::cerr << failures << " comfy memory_busy checks failed.\n";

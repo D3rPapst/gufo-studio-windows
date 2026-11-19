@@ -781,6 +781,22 @@ std::optional<std::string> RetryLaterOf(const FetchResult& result) {
   return std::nullopt;
 }
 
+std::optional<std::string> MemoryNotFreeOf(const FetchResult& result) {
+  if (result.status != 507)
+    return std::nullopt;
+  try {
+    const json::Value body = json::parse(result.body);
+    const json::Value* error = body.find("error");
+    if (error == nullptr || !error->is_object())
+      return std::nullopt;
+    std::string message = error->member_str("message");
+    if (IsMemoryNotFreeYet(result.status, error->member_str("code"), message))
+      return message;
+  } catch (const std::exception&) {
+  }
+  return std::nullopt;
+}
+
 std::string RestrictedUser(const HttpRequest& request) {
   const std::string user = request.header("X-Gufo-User");
   if (user.empty())
@@ -2062,6 +2078,46 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
   FetchResult result = options_.fetch(request);
   if (job->cancel.load())
     throw Interrupted();
+  // The router's passing 507 (memory held outside it or still being
+  // released, after its own 45 s wait): nothing was started, so the task
+  // waits here and sends the request again, as for a full video queue,
+  // instead of failing the prompt. A memory_busy meanwhile still ends the
+  // prompt as GufoBusy below.
+  if (auto not_free = MemoryNotFreeOf(result)) {
+    const auto began = std::chrono::steady_clock::now();
+    int tries = 1;
+    Logger::Warn("comfy", "event=memory_free_wait prompt_id=" + job->id +
+                              " path=" + request.path + " retry_ms=" +
+                              std::to_string(options_.memory_free_retry.count()) +
+                              " error=\"" + *not_free + "\"");
+    while (not_free && (options_.memory_free_limit.count() == 0 ||
+                        std::chrono::steady_clock::now() - began <
+                            options_.memory_free_limit)) {
+      const auto until =
+          std::chrono::steady_clock::now() + options_.memory_free_retry;
+      while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
+        std::this_thread::sleep_for(
+            std::min<std::chrono::steady_clock::duration>(
+                until - std::chrono::steady_clock::now(),
+                std::chrono::milliseconds(200)));
+      if (job->cancel.load())
+        throw Interrupted();
+      result = options_.fetch(request);
+      ++tries;
+      if (job->cancel.load())
+        throw Interrupted();
+      not_free = MemoryNotFreeOf(result);
+    }
+    Logger::Info(
+        "comfy",
+        "event=memory_free_wait_end prompt_id=" + job->id +
+            " status=" + std::to_string(result.status) +
+            " tries=" + std::to_string(tries) + " waited_ms=" +
+            std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - began)
+                    .count()));
+  }
   // The model could not load because another, busy model holds the memory
   // (2.2.3): the prompt ends as GufoBusy, whatever the task would do with
   // other errors.

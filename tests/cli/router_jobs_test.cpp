@@ -200,6 +200,11 @@ struct FakeApi {
   int video_full{0};
   int video_poll_overloaded{0};
   int video_posts{0};
+  /// POST /v1/videos answers the router's passing 507 ("not enough free
+  /// memory yet") this many times; `video_ran_low` answers the other 507
+  /// ("was stopped because memory ran low") instead.
+  int video_not_free{0};
+  bool video_ran_low{false};
   bool objekt_deleted = false;
   int objekt_polls = 0;
   /// 3D status polls answered 503 before the real answer (a reloading
@@ -419,6 +424,19 @@ struct FakeApi {
         result.status = 429;
         result.body =
             R"({"error":{"message":"video queue is full","code":"video_queue_full"}})";
+        return result;
+      }
+      if (video_not_free > 0) {
+        --video_not_free;
+        result.status = 507;
+        result.body =
+            R"({"error":{"message":"cannot load 'vace': not enough free memory yet (held outside the router or still being released); need 46.0 GB gpu + 2.0 GB host; free gpu 47.1+7.7 GB, host 5.7 GB, commit 2.9 GB","type":"server_error","code":"insufficient_memory"}})";
+        return result;
+      }
+      if (video_ran_low) {
+        result.status = 507;
+        result.body =
+            R"({"error":{"message":"loading 'vace' was stopped because memory ran low","type":"server_error","code":"insufficient_memory"}})";
         return result;
       }
       result.status = 202;
@@ -931,6 +949,55 @@ void TestVideoQueueFull() {
   const std::lock_guard<std::mutex> lock(h.api->mutex);
   CHECK(h.api->video_posts == 3);
   CHECK(h.api->video_poll_overloaded == 0);
+}
+
+void TestMemoryNotFreeYet() {
+  // Regie 19.11.: the router's 507 "not enough free memory yet" (memory held
+  // outside it or still being released) puts the job back like
+  // memory_busy; memory_wait.code is insufficient_memory.
+  Harness h("memory-not-free", /*start=*/false);
+  h.memory_busy_retry = std::chrono::milliseconds(200);
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    h.api->video_not_free = 2;
+  }
+  h.Open(true);
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")
+          .member_str("id");
+  json::Value view;
+  for (int i = 0; i < 200; ++i) {
+    view = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+    if (view.find("memory_wait") != nullptr)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const json::Value* wait = view.find("memory_wait");
+  CHECK(view.member_str("status") == "queued");
+  CHECK(wait != nullptr && wait->member_str("code") == "insufficient_memory");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_str("video_id") == "video_1");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->video_posts == 3);
+}
+
+void TestMemoryRanLow() {
+  // Any other 507 fails the job at once (no wait).
+  Harness h("memory-ran-low", /*start=*/false);
+  h.memory_busy_retry = std::chrono::milliseconds(50);
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    h.api->video_ran_low = true;
+  }
+  h.Open(true);
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "failed");
+  CHECK(done.find("error") != nullptr &&
+        done.find("error")->member_str("code") == "insufficient_memory");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->video_posts == 1);
 }
 
 void TestVideo() {
@@ -3090,6 +3157,8 @@ int main() {
   TestCancel();
   TestVideo();
   TestVideoQueueFull();
+  TestMemoryNotFreeYet();
+  TestMemoryRanLow();
   TestVideoCancel();
   TestObjekt();
   TestObjektCancel();

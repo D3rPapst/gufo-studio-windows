@@ -85,6 +85,14 @@ struct AdapterOptions {
   /// queue of one).
   std::chrono::milliseconds video_busy_retry{std::chrono::seconds(10)};
   std::chrono::milliseconds video_busy_limit{std::chrono::hours(6)};
+  /// A task's request that gets the router's passing 507 (IsMemoryNotFreeYet:
+  /// "not enough free memory yet", memory held outside the router or still
+  /// being released) is sent again every `memory_free_retry`, for at most
+  /// `memory_free_limit` in a row (0 = until the prompt is interrupted),
+  /// instead of failing the prompt. Any task kind; nothing was started
+  /// (Regie 19.11.: vace over the .56 -> .198, 507 after 14x memory_busy).
+  std::chrono::milliseconds memory_free_retry{std::chrono::seconds(30)};
+  std::chrono::milliseconds memory_free_limit{std::chrono::hours(6)};
   /// A status poll of a running video that fails with a passing error
   /// (no answer, 429, 502, 503, 504) is tried again for this long before
   /// the prompt fails; the video job on the worker goes on meanwhile.
@@ -137,6 +145,23 @@ struct MemoryBusyError : std::runtime_error {
 /// (2.2.8): 429 video_queue_full (the video worker's queue is full) or 503
 /// overloaded (a router's connection limit); nullopt for anything else.
 [[nodiscard]] std::optional<std::string> RetryLaterOf(
+    const FetchResult& result);
+
+/// The router's 507 insufficient_memory for a load that may fit later:
+/// memory "held outside the router or still being released" (memory.cpp
+/// PlanAdmission, Wait::kOutside, answered after the router's own 45 s
+/// wait). Not the other 507s ("loading ... was stopped because memory ran
+/// low", a partner's or worker's own refusals). A model larger than the
+/// machine never gets this answer: the planner spawns it alone instead.
+[[nodiscard]] inline bool IsMemoryNotFreeYet(int status, std::string_view code,
+                                             std::string_view message) {
+  return status == 507 && code == "insufficient_memory" &&
+         message.find("not enough free memory yet") != std::string_view::npos;
+}
+
+/// IsMemoryNotFreeYet of an answer's body: the router's message, nullopt
+/// for any other answer.
+[[nodiscard]] std::optional<std::string> MemoryNotFreeOf(
     const FetchResult& result);
 
 /// A status poll failure that may pass (no answer, 429, 502, 503, 504).

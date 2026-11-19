@@ -3571,10 +3571,14 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     // waits in the queue (not in an open request) and is tried again after
     // memory_busy_retry, for at most memory_busy_limit in a row.
     // 2.2.8: 429 video_queue_full (the video worker's queue is full) and 503
-    // overloaded (a router's connection limit) wait the same way.
+    // overloaded (a router's connection limit) wait the same way, and so
+    // does the router's passing 507 (memory held outside it or still being
+    // released, comfy::IsMemoryNotFreeYet; Regie 19.11.).
     if (((failure.status == 503 && failure.code == "memory_busy") ||
          (failure.status == 429 && failure.code == "video_queue_full") ||
-         (failure.status == 503 && failure.code == "overloaded")) &&
+         (failure.status == 503 && failure.code == "overloaded") ||
+         comfy::IsMemoryNotFreeYet(failure.status, failure.code,
+                                   failure.what())) &&
         job->upstream_id.empty()) {
       bool requeued = false;
       {

@@ -1771,6 +1771,28 @@ The callers wait instead:
   like `memory_busy` (`memory_wait.code` names which); the video status
   poll has the same 10 min grace (`Options::video_poll_grace`).
 
+**Memory not free yet (2.2.9).** The router's `507 insufficient_memory`
+whose message says `not enough free memory yet (held outside the router
+or still being released)` (`AdmissionPlan::Wait::kOutside`, answered after
+the router's own 45 s wait) is passing: nothing was started and the load
+may fit a little later (Regie 19.11.: vace over the .56 on the .198, four
+such 507s after 14 memory_busy, then the prompt was given up). The
+callers wait (`comfy::IsMemoryNotFreeYet`):
+
+- ComfyUI adapter: any task's request (image, video, music, ...) that gets
+  it is sent again every 30 s (`AdapterOptions::memory_free_retry`) for at
+  most 6 h in a row (`memory_free_limit`), as long as the prompt is not
+  interrupted; logged as `event=memory_free_wait` /
+  `event=memory_free_wait_end`. A `503 memory_busy` meanwhile still ends
+  the prompt as GufoBusy.
+- Job API: the job goes back like `memory_busy`, `memory_wait.code` is
+  `insufficient_memory`.
+
+Other 507s still fail at once: `loading 'X' was stopped because memory ran
+low` (the load was aborted) and a worker's own refusal. A model larger than
+the machine never gets the passing 507: the planner spawns it alone
+(`alone (estimate exceeds the machine)`).
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
