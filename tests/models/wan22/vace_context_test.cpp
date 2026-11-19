@@ -193,6 +193,52 @@ int main() {
          "second job on the .198 (0.3 GB free): release the experts");
   Expect(!wan22::VaceJobFitsBesideExperts(UINT64_MAX, UINT64_MAX - kGb),
          "no overflow beside the experts");
+  // Fun VACE per phase (.198 preset): experts 35.3 GiB of files, umT5
+  // 10.6 GiB of files of which 2.0 GiB embedding stay on the host, VAE
+  // 0.5 GiB, sampling 832x480x81 one expert ~5.2 GiB (no CFG).
+  {
+    const std::uint64_t umt5_files = 11361874539ULL;
+    const std::uint64_t umt5 = wan22::VaceTextEncoderDeviceBytes(umt5_files);
+    Expect(umt5 == umt5_files - wan22::kUmt5EmbeddingBytes,
+           "umT5 on the device: without its token embedding");
+    Expect(wan22::VaceTextEncoderDeviceBytes(kGb) == kGb,
+           "umT5 smaller than its embedding: the files as given");
+    const std::uint64_t sampling = wan22::VaceSamplingBytes(21, 60, 104, 1, 8);
+    Expect(sampling > 5 * kGb && sampling < 11 * kGb / 2,
+           "sampling 832x480x81 one slot: ~5.2 GiB");
+    Expect(wan22::VaceSamplingBytes(21, 60, 104, 2, 8) > sampling,
+           "CFG: a second context slot");
+    Expect(wan22::VaceSamplingBytes(21, 90, 160, 1, 8) > umt5,
+           "1280x720: sampling is the largest phase");
+    Expect(wan22::VaceSamplingBytes(0, 60, 104, 1, 8) == 0,
+           "no frames: nothing");
+    const std::uint64_t vae = kGb / 2 + wan22::kVaceVaeWorkBytes;
+    const std::uint64_t peak = wan22::VaceJobPeakBytes(umt5, vae, sampling);
+    Expect(peak == umt5, "832x480: umT5 is the largest phase");
+    const std::uint64_t experts = 37945510536ULL;  // 35.3 GiB
+    const std::uint64_t free = wan22::VaceDeviceFreeBytes(
+        53 * kGb, true, 47 * kGb + 6 * kGb / 10, kGb);  // 46.6 GiB
+    Expect(wan22::VaceExpertsFit(free, experts, peak),
+           ".198: both experts resident beside the largest phase");
+    Expect(wan22::VaceExpertsFit(experts + peak + wan22::kVaceReserveBytes,
+                                 experts, peak),
+           "resident exactly at the limit");
+    Expect(!wan22::VaceExpertsFit(
+               experts + peak + wan22::kVaceReserveBytes - 1, experts, peak),
+           "one byte short: one after the other");
+    Expect(!wan22::VaceExpertsFit(200 * kGb, 0, peak),
+           "unknown expert size: one after the other");
+    Expect(!wan22::VaceExpertsFit(UINT64_MAX, UINT64_MAX - kGb, 2 * kGb),
+           "no overflow (experts)");
+    // Next job: experts loaded, their job buffers released (~12 GiB free).
+    Expect(wan22::VaceJobFitsBesideResident(12 * kGb, peak),
+           "second job: umT5 fits beside the resident experts");
+    Expect(!wan22::VaceJobFitsBesideResident(kGb / 2, peak),
+           "2.2.6 leftovers (0.3 GB free): release the experts");
+    Expect(!wan22::VaceJobFitsBesideResident(UINT64_MAX, UINT64_MAX - 1),
+           "no overflow (beside resident)");
+  }
+
   // Wan 2.2 I2V A14B: boundary 0.900 (t >= 900 runs the high-noise
   // expert). 8 steps at shift 5: sigmas 1, .972, .9375, .893, ... -> the
   // low-noise expert from step 3 (with T2V's 0.875 it would be step 4).

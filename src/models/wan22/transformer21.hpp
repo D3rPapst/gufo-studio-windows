@@ -164,6 +164,14 @@ public:
   bool Forward(const Transformer21Input& input, std::vector<float>* noise,
                Transformer21Probes* probes, std::string* error);
 
+  /// Frees what a job left on the device beside the weights: the
+  /// activations Forward reserved for its token count and the
+  /// cross-attention keys and values of both context slots (prepare them
+  /// again before the next Forward). The weights and the unpack scratch
+  /// stay. For experts kept over jobs (Wan 2.2 Fun VACE), whose buffers would
+  /// otherwise block the next job's umT5.
+  void ReleaseJobBuffers();
+
   [[nodiscard]] std::size_t weight_bytes() const;
   [[nodiscard]] std::size_t activation_bytes() const;
   /// 36 (image-to-video) or 16 (text-to-video checkpoint).

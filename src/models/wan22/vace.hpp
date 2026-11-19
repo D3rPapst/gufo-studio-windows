@@ -56,6 +56,9 @@ public:
   void set_probe(bool probe);
   [[nodiscard]] const std::vector<float>& hint_first() const;
   [[nodiscard]] std::size_t weight_bytes() const;
+  /// Frees the job's device buffers (context, context stream, text keys and
+  /// values); the weights stay. SetContext again before the next Forward.
+  void ReleaseJobBuffers();
 
   bool Begin(const float* input, int frames, int height, int width,
              const float* temb, hipStream_t stream,

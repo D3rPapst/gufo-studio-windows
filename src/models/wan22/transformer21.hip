@@ -1008,6 +1008,28 @@ Transformer21::~Transformer21() = default;
 std::size_t Transformer21::weight_bytes() const {
   return impl_->weight_bytes;
 }
+
+void Transformer21::ReleaseJobBuffers() {
+  Impl& m = *impl_;
+  (void)hipStreamSynchronize(m.stream);  // no kernel still reads them
+  for (DeviceBuffer* buffer :
+       {&m.latent, &m.patches, &m.hidden, &m.normed, &m.acc, &m.query, &m.key,
+        &m.value, &m.packed, &m.attention, &m.attention_image, &m.ffn, &m.rope,
+        &m.noise})
+    buffer->Release();
+  m.reserved_tokens = 0;
+  m.rope_frames = m.rope_height = m.rope_width = 0;
+  m.activation_bytes = 2 * std::size_t{kFeedForward} * kWidth * 2;  // scratch
+  for (Impl::ContextCache& cache : m.contexts) {
+    cache.text_key.Release();
+    cache.text_packed.Release();
+    cache.image_key.Release();
+    cache.image_packed.Release();
+    cache.text_states.Release();
+    cache.text_rows = 0;
+    cache.serial = 0;
+  }
+}
 std::size_t Transformer21::activation_bytes() const {
   return impl_->activation_bytes;
 }

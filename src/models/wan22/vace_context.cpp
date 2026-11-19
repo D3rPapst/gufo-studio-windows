@@ -139,4 +139,62 @@ bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
   return need >= job_bytes && need <= free_bytes;  // no overflow
 }
 
+std::uint64_t VaceTextEncoderDeviceBytes(std::uint64_t text_encoder_files) {
+  return text_encoder_files > kUmt5EmbeddingBytes
+             ? text_encoder_files - kUmt5EmbeddingBytes
+             : text_encoder_files;
+}
+
+std::uint64_t VaceSamplingBytes(int frames, int latent_height,
+                                int latent_width, int slots,
+                                int vace_blocks) {
+  if (frames <= 0 || latent_height <= 0 || latent_width <= 0)
+    return 0;
+  constexpr std::uint64_t W = 5120, F = 13824, kPatchIn = 144,
+                          kPatchOut = 64, kRopePairs = 64, kChunk = 8192,
+                          kLayers = 40, kText = 512;
+  const auto padded = [](std::uint64_t rows) { return (rows + 31) & ~31ULL; };
+  const std::uint64_t T = static_cast<std::uint64_t>(frames) *
+                          (latent_height / 2) * (latent_width / 2);
+  const std::uint64_t S = static_cast<std::uint64_t>(std::max(slots, 0));
+  const std::uint64_t B = static_cast<std::uint64_t>(std::max(vace_blocks, 0));
+  // Transformer21::Impl::Reserve.
+  std::uint64_t bytes = T * kPatchIn * 4 + T * kPatchIn * 2 + T * W * 4 +
+                        T * W * 2 + T * 3 * W * 2 + 3 * T * W * 2 +
+                        padded(T) * W * 2 + 2 * T * W * 2 +
+                        std::min(T, kChunk) * F * 2 + T * kRopePairs * 8 +
+                        T * kPatchOut * 4;
+  // Context slots: keys, packed values, embedded text.
+  bytes += S * (kLayers * kText * W * 2 + kLayers * padded(kText) * W * 2 +
+                kText * W * 2);
+  // VACE: context [96, frames, h, w] FP32, stream [T, W] FP32, text keys /
+  // values per slot, text scratch.
+  bytes += 96ULL * frames * latent_height * latent_width * 4 + T * W * 4 +
+           S * (B * kText * W * 2 + B * padded(kText) * W * 2) +
+           2 * kText * W * 2;
+  return bytes;
+}
+
+std::uint64_t VaceJobPeakBytes(std::uint64_t text_encoder_bytes,
+                               std::uint64_t vae_bytes,
+                               std::uint64_t sampling_bytes) {
+  return std::max({text_encoder_bytes, vae_bytes, sampling_bytes});
+}
+
+bool VaceExpertsFit(std::uint64_t free_bytes, std::uint64_t expert_bytes,
+                    std::uint64_t peak_bytes) {
+  if (expert_bytes == 0)
+    return false;
+  const std::uint64_t job = peak_bytes + kVaceReserveBytes;
+  const std::uint64_t need = expert_bytes + job;
+  return job >= peak_bytes && need >= expert_bytes &&
+         need <= free_bytes;  // no overflow
+}
+
+bool VaceJobFitsBesideResident(std::uint64_t free_bytes,
+                               std::uint64_t peak_bytes) {
+  const std::uint64_t need = peak_bytes + kVaceReserveBytes;
+  return need >= peak_bytes && need <= free_bytes;  // no overflow
+}
+
 }  // namespace gufo::models::wan22

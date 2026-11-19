@@ -67,8 +67,8 @@ void SplitVaceControl(std::span<const std::uint8_t> video, int video_frames,
 inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
                                                         << 30;
 
-/// Wan 2.2 Fun VACE A14B: whether both experts (DiT + VACE module each) are
-/// loaded together and stay in the worker over jobs. `requested`
+/// Wan 2.2 I2V A14B (Fun VACE counts per phase, see VaceExpertsFit): whether
+/// both experts (DiT + VACE module each) are loaded together and stay in the worker over jobs. `requested`
 /// (gufo-vace22.json experts_resident, default true); `free_bytes` what the
 /// device can still give with nothing of this model loaded (the admission
 /// reading); `expert_bytes` the weights of both experts; `job_bytes` what
@@ -97,6 +97,60 @@ inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
 /// and the worker runs them one after the other from then on.
 [[nodiscard]] bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
                                             std::uint64_t job_bytes);
+
+/// Wan 2.2 Fun VACE residency, counted per phase of a job instead of with
+/// file sizes and a flat margin. A job loads umT5, then the VAE encoder,
+/// then samples, then loads the VAE decoder: these never sit on the device
+/// together, so beside resident experts only the largest of them needs room
+/// (every expert frees its job buffers after its steps, see
+/// Transformer21::ReleaseJobBuffers / Vace::ReleaseJobBuffers).
+
+/// Room kept free on top of the largest phase: HIP / rocBLAS / hipBLASLt
+/// workspaces, umT5 activations (~0.1 GB), allocator rounding.
+inline constexpr std::uint64_t kVaceReserveBytes = std::uint64_t{3} << 29;
+
+/// umT5-XXL token embedding [256384, 4096] BF16: read from its shard per
+/// prompt, never on the device.
+inline constexpr std::uint64_t kUmt5EmbeddingBytes =
+    std::uint64_t{256384} * 4096 * 2;
+
+/// The VAE encoder / decoder activations of one job beside their weights
+/// (estimate for 832x480x81; the untiled causal Wan 2.1 VAE).
+inline constexpr std::uint64_t kVaceVaeWorkBytes = std::uint64_t{4} << 30;
+
+/// Device bytes umT5 holds while it encodes: its `text_encoder/` files
+/// without the token embedding.
+[[nodiscard]] std::uint64_t VaceTextEncoderDeviceBytes(
+    std::uint64_t text_encoder_files);
+
+/// One expert's job buffers while it samples a latent of `frames` (incl.
+/// reference frames) x `latent_height` x `latent_width`: the Transformer21
+/// activations of that token count (as its Reserve), `slots` prepared
+/// context slots (1 without CFG, 2 with), and the VACE module's context,
+/// context stream and text keys / values of `vace_blocks` blocks.
+[[nodiscard]] std::uint64_t VaceSamplingBytes(int frames, int latent_height,
+                                              int latent_width, int slots,
+                                              int vace_blocks);
+
+/// The largest phase of a job beside the experts: umT5, VAE (weights +
+/// work) or one expert sampling.
+[[nodiscard]] std::uint64_t VaceJobPeakBytes(std::uint64_t text_encoder_bytes,
+                                             std::uint64_t vae_bytes,
+                                             std::uint64_t sampling_bytes);
+
+/// Both experts (`expert_bytes`, their files incl. LoRA: slightly more than
+/// they take on the device) and the largest job phase `peak_bytes` plus
+/// kVaceReserveBytes fit in `free_bytes` (read with nothing of this model
+/// loaded).
+[[nodiscard]] bool VaceExpertsFit(std::uint64_t free_bytes,
+                                  std::uint64_t expert_bytes,
+                                  std::uint64_t peak_bytes);
+
+/// Before a job on resident experts (`free_bytes` read with them loaded and
+/// their job buffers released): the largest job phase plus
+/// kVaceReserveBytes fits.
+[[nodiscard]] bool VaceJobFitsBesideResident(std::uint64_t free_bytes,
+                                             std::uint64_t peak_bytes);
 
 }  // namespace gufo::models::wan22
 

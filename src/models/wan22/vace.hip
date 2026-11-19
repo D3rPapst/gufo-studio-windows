@@ -314,11 +314,14 @@ public:
       (void)hipFree(data_);
   }
   bool Allocate(std::size_t bytes, std::string* error) {
+    Release();
+    return Check(hipMalloc(&data_, std::max<std::size_t>(bytes, 256)),
+                 "device allocation", error);
+  }
+  void Release() {
     if (data_ != nullptr)
       (void)hipFree(data_);
     data_ = nullptr;
-    return Check(hipMalloc(&data_, std::max<std::size_t>(bytes, 256)),
-                 "device allocation", error);
   }
   std::uint16_t* get() const { return static_cast<std::uint16_t*>(data_); }
   float* f32() const { return static_cast<float*>(data_); }
@@ -640,6 +643,26 @@ const std::vector<float>& Vace::hint_first() const {
 }
 std::size_t Vace::weight_bytes() const {
   return impl_->weight_bytes;
+}
+
+void Vace::ReleaseJobBuffers() {
+  Impl& m = *impl_;
+  if (m.stream != nullptr)
+    (void)hipStreamSynchronize(m.stream);  // no kernel still reads them
+  m.context.Release();
+  m.frames = m.height = m.width = 0;
+  m.hidden.Release();
+  m.reserved = 0;
+  for (TextCache& cache : m.text) {
+    cache.key.Release();
+    cache.packed.Release();
+    cache.rows = 0;
+    cache.serial = 0;
+  }
+  m.text_linear.Release();
+  m.text_values.Release();
+  m.text_reserved = 0;
+  m.active = false;
 }
 
 std::unique_ptr<Vace> Vace::Load(const std::filesystem::path& path,
