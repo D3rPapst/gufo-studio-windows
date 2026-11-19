@@ -79,6 +79,25 @@ inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
                                            std::uint64_t expert_bytes,
                                            std::uint64_t job_bytes);
 
+/// The free device memory the Wan 2.2 Fun VACE residency checks count on:
+/// the admission reading `admission_free`, capped by the dedicated (DXGI
+/// local) budget left when the OS reports one (`has_local`). On a Windows
+/// iGPU (Strix Halo, 48 GB carve-out) hipMemGetInfo also counts the shared
+/// segment (system RAM behind the commit limit), which the umT5 of the next
+/// job cannot get once the experts fill the dedicated memory (2.2.6:
+/// "Wan umT5 device allocation: out of memory" on the second job).
+[[nodiscard]] std::uint64_t VaceDeviceFreeBytes(std::uint64_t admission_free,
+                                                bool has_local,
+                                                std::uint64_t local_budget,
+                                                std::uint64_t local_usage);
+
+/// Before a job on resident Fun VACE experts: whether the per-job loads
+/// (`job_bytes`, umT5 + VAE) and the margin still fit in `free_bytes` (read
+/// with the experts loaded). False: the experts are released for this job
+/// and the worker runs them one after the other from then on.
+[[nodiscard]] bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
+                                            std::uint64_t job_bytes);
+
 }  // namespace gufo::models::wan22
 
 #endif  // GUFO_MODELS_WAN22_VACE_CONTEXT_HPP_

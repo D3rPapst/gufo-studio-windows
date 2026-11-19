@@ -61,6 +61,9 @@ struct ExpertKey {
 /// exit (the HIP runtime may be gone by then); ReleaseVaceExperts frees it.
 struct ResidentExperts {
   bool loaded{false};
+  /// Set once a job found no room beside the resident experts: this worker
+  /// runs them one after the other from then on (Reset keeps it).
+  bool refused{false};
   ExpertKey high_key, low_key;
   Expert high, low;
   void Reset() {
@@ -102,11 +105,15 @@ std::uint64_t DirectoryBytes(const std::filesystem::path& directory) {
   return total;
 }
 
-/// What this process can still allocate on the device, as the admission
-/// check reads it (DXGI budget on a Windows iGPU, else hipMemGetInfo).
+/// What this process can still allocate on the device: the admission
+/// reading, capped by the dedicated (DXGI local) budget left on a Windows
+/// iGPU, whose shared segment the next job's umT5 cannot count on.
 std::uint64_t DeviceFreeBytes() {
   if (const auto memory = gufo::hip::QueryAdmissionMemory())
-    return memory->free_bytes;
+    return VaceDeviceFreeBytes(
+        memory->free_bytes, memory->local.has_value(),
+        memory->local ? memory->local->budget_bytes : 0,
+        memory->local ? memory->local->usage_bytes : 0);
   return 0;
 }
 
@@ -119,6 +126,25 @@ std::string Gib(std::uint64_t bytes) {
 
 void LogVace(const std::string& message) {
   gufo::server::Logger::Info("video", "wan22-fun-vace " + message);
+}
+
+/// What every job loads beside the experts (umT5, VAE).
+std::uint64_t JobBytes(const Vace21Request& request) {
+  return DirectoryBytes(request.t5_root / "text_encoder") +
+         DirectoryBytes(request.vae_root / "vae");
+}
+
+/// Releases the resident experts for this job and keeps the worker on one
+/// expert at a time from then on. True when experts were loaded.
+bool ReleaseResidentExperts(const std::string& reason) {
+  const std::lock_guard<std::mutex> lock(ResidentMutex());
+  ResidentExperts& kept = Resident();
+  if (!kept.loaded)
+    return false;
+  kept.refused = true;
+  kept.Reset();
+  LogVace("event=experts_released reason=" + reason);
+  return true;
 }
 
 bool LoadExpert(const ExpertKey& key, Expert* expert, std::string* error) {
@@ -224,6 +250,27 @@ bool GenerateVace21(const Vace21Request& request,
                                     static_cast<std::size_t>(lw)};
   };
 
+  // 0. Resident experts from an earlier job: the umT5 and VAE of this job
+  // load beside them, so they need room now, not only when the experts
+  // loaded (the first job ran umT5 before them). No room: release them.
+  if (two_experts) {
+    bool fits = true;
+    std::string numbers;
+    {
+      const std::lock_guard<std::mutex> lock(ResidentMutex());
+      if (Resident().loaded) {
+        const std::uint64_t job_bytes = JobBytes(request);
+        const std::uint64_t free_bytes = DeviceFreeBytes();
+        fits = VaceJobFitsBesideExperts(free_bytes, job_bytes);
+        numbers = " free_gib=" + Gib(free_bytes) + " job_gib=" +
+                  Gib(job_bytes) + " margin_gib=" +
+                  Gib(kVaceExpertMarginBytes);
+      }
+    }
+    if (!fits)
+      (void)ReleaseResidentExperts("low_memory_before_job" + numbers);
+  }
+
   // 1. Prompts (umT5, 512 rows: the states of the real tokens, then zeros).
   std::vector<float> text, negative;
   {
@@ -233,6 +280,11 @@ bool GenerateVace21(const Vace21Request& request,
     if (!tokenizer)
       return false;
     auto encoder = TextEncoder::Load(request.t5_root / "text_encoder", error);
+    if (!encoder && two_experts &&
+        ReleaseResidentExperts("text_encoder_load_failed")) {
+      (void)hipGetLastError();  // the failed allocation, not sticky
+      encoder = TextEncoder::Load(request.t5_root / "text_encoder", error);
+    }
     if (!encoder)
       return false;
     TrackDevice(&tel.peak_device_bytes);
@@ -276,6 +328,11 @@ bool GenerateVace21(const Vace21Request& request,
     SplitVaceControl(request.control, std::min(request.control_frames, n),
                      mask, n, h, w, &inactive_rgb, &reactive_rgb);
     auto encoder = VaeEncoder::Load(request.vae_root / "vae", error);
+    if (!encoder && two_experts &&
+        ReleaseResidentExperts("vae_load_failed")) {
+      (void)hipGetLastError();  // the failed allocation, not sticky
+      encoder = VaeEncoder::Load(request.vae_root / "vae", error);
+    }
     if (!encoder)
       return false;
     std::vector<float> inactive, reactive;
@@ -353,14 +410,16 @@ bool GenerateVace21(const Vace21Request& request,
                                                      : "experts_resident_off"));
       }
       tel.experts_reused = kept.loaded;
-      if (request.experts_resident && !kept.loaded) {
-        // LoRAs are merged into the DiT weights at load: no extra room.
+      if (request.experts_resident && !kept.loaded && kept.refused) {
+        LogVace("event=experts_sequential reason=low_memory_earlier_job");
+      } else if (request.experts_resident && !kept.loaded) {
+        // The FP8 linears keep their LoRA factors on the device (added
+        // when each matrix is unpacked): they count with the experts.
         const std::uint64_t expert_bytes =
             FileBytes(high_key.dit) + FileBytes(high_key.vace) +
-            FileBytes(low_key.dit) + FileBytes(low_key.vace);
-        const std::uint64_t job_bytes =
-            DirectoryBytes(request.t5_root / "text_encoder") +
-            DirectoryBytes(request.vae_root / "vae");
+            FileBytes(high_key.lora) + FileBytes(low_key.dit) +
+            FileBytes(low_key.vace) + FileBytes(low_key.lora);
+        const std::uint64_t job_bytes = JobBytes(request);
         const std::uint64_t free_bytes = DeviceFreeBytes();
         const std::string numbers =
             " free_gib=" + Gib(free_bytes) + " experts_gib=" +

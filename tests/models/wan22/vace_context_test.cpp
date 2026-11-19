@@ -165,6 +165,34 @@ int main() {
   Expect(!wan22::KeepVaceExpertsResident(true, UINT64_MAX, UINT64_MAX - kGb,
                                          2 * kGb),
          "no overflow");
+  // The .198 on 2.2.6: hipMemGetInfo 53.7 GiB (dedicated + shared), DXGI
+  // local budget left ~46.6 GiB; the experts (DiT + VACE + LoRA) 35.3,
+  // umT5 + VAE 11.1. Counted on the dedicated memory they run one after
+  // the other (the second job's umT5 ran out of memory).
+  Expect(wan22::VaceDeviceFreeBytes(53 * kGb, false, 0, 0) == 53 * kGb,
+         "no DXGI budget: the admission reading");
+  Expect(wan22::VaceDeviceFreeBytes(53 * kGb, true, 47 * kGb, kGb) ==
+             46 * kGb,
+         "dedicated budget left caps the reading");
+  Expect(wan22::VaceDeviceFreeBytes(40 * kGb, true, 47 * kGb, kGb) ==
+             40 * kGb,
+         "a smaller admission reading stands");
+  Expect(wan22::VaceDeviceFreeBytes(53 * kGb, true, kGb, 2 * kGb) == 0,
+         "usage above the budget: nothing free");
+  Expect(!wan22::KeepVaceExpertsResident(
+             true, wan22::VaceDeviceFreeBytes(53 * kGb, true, 47 * kGb, kGb),
+             35 * kGb, 11 * kGb),
+         ".198 dedicated memory: one after the other");
+  Expect(wan22::VaceJobFitsBesideExperts(
+             11 * kGb + wan22::kVaceExpertMarginBytes, 11 * kGb),
+         "job fits beside the experts exactly at the limit");
+  Expect(!wan22::VaceJobFitsBesideExperts(
+             11 * kGb + wan22::kVaceExpertMarginBytes - 1, 11 * kGb),
+         "one byte short: release the experts");
+  Expect(!wan22::VaceJobFitsBesideExperts(kGb / 2, 11 * kGb),
+         "second job on the .198 (0.3 GB free): release the experts");
+  Expect(!wan22::VaceJobFitsBesideExperts(UINT64_MAX, UINT64_MAX - kGb),
+         "no overflow beside the experts");
   // Wan 2.2 I2V A14B: boundary 0.900 (t >= 900 runs the high-noise
   // expert). 8 steps at shift 5: sigmas 1, .972, .9375, .893, ... -> the
   // low-noise expert from step 3 (with T2V's 0.875 it would be step 4).

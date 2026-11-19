@@ -123,4 +123,20 @@ bool KeepVaceExpertsResident(bool requested, std::uint64_t free_bytes,
   return need >= expert_bytes && need <= free_bytes;  // no overflow
 }
 
+std::uint64_t VaceDeviceFreeBytes(std::uint64_t admission_free, bool has_local,
+                                  std::uint64_t local_budget,
+                                  std::uint64_t local_usage) {
+  if (!has_local)
+    return admission_free;
+  const std::uint64_t local_left =
+      local_budget > local_usage ? local_budget - local_usage : 0;
+  return std::min(admission_free, local_left);
+}
+
+bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
+                              std::uint64_t job_bytes) {
+  const std::uint64_t need = job_bytes + kVaceExpertMarginBytes;
+  return need >= job_bytes && need <= free_bytes;  // no overflow
+}
+
 }  // namespace gufo::models::wan22
