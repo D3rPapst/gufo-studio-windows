@@ -807,6 +807,27 @@ pose / face / background / mask / reference); another seed is a
 alone fails validation. Without `wan2.2-animate-14b` in the preset the
 chain still fails (no VACE fallback). `comfy_graph.cpp` `AnimateChain`,
 `ApplyAnimateChain`, `ChainOutputCut`.
+ComfyUI Wan I2V chains (after 2.2.9): `WanImageToVideo` chunks chained the
+ComfyUI way (Regie 19.11., FilmStudio `mehrsprecher.py` bewegung_wf: Wan
+2.1 I2V 480p + lightx2v, e.g. 81 + 81 + 25 frames; each next
+`WanImageToVideo` takes `start_image` from `ImageFromBatch` over the
+previous chunk's `VAEDecode`, `ImageBatch` joins the decodes, one
+`SaveImage`) run as one task of separate jobs: the adapter renders chunk 1,
+takes the chosen frame of its video (ffmpeg) as `first_frame` of chunk 2,
+and so on. Each chunk keeps its own prompt, negative prompt, seed, length,
+steps, LoRA check and camera (routed as a lone `WanImageToVideo`:
+`wan2.1-uni3c`, or `wan2.2-i2v-a14b` for KSamplerAdvanced stages / a Wan
+2.2 checkpoint); the chunks must share the model and size. The outputs
+receive exactly the frames ComfyUI's `ImageBatch` (image1 + image2 + ...)
+and `ImageFromBatch` (`[min(n-1, batch_index), +min(n-index, length))`)
+give, so `ImageFromBatch(batch_index 1)` that drops a repeated start frame
+drops it here too; image outputs are joined losslessly, video outputs as
+H.264 (crf 18). A `start_image` must be exactly one frame; at most 16
+chunks and 4096 frames; outputs of the first chunks alone share the task.
+Branches (two chunks continuing one) and independent videos joined in one
+output fail validation, as do RIFE / upscale nodes behind a chain and sound
+outputs. Needs `--comfy-ffmpeg`. `comfy_graph.cpp` `I2VChain`,
+`ApplyI2VChain`, `ChainFramesOf`; `comfy_adapter.cpp` `RunI2VChain`.
 ComfyUI Wan 2.2 I2V A14B and Fun VACE A14B LoRA per expert (2.2.9): the
 step-distill LoRA (lightx2v / Lightning) is taken per expert from the
 `KSamplerAdvanced` stages: the high-noise expert has it when a stage

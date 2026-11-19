@@ -3353,6 +3353,182 @@ void TestAnimateChain() {
   assert(vace_error.message.find("chained generators") != std::string::npos);
 }
 
+// Chained Wan 2.1 I2V chunks as the Regie's FilmStudio builds them
+// (mehrsprecher.py bewegung_wf, 19.11.): 81 + 81 + 25 frames, each next
+// WanImageToVideo starting from the last frame of the chunk before
+// (ImageFromBatch over its VAEDecode; batch_index 80, then 4095 = clamped to
+// the last), the decodes joined by ImageBatch with the repeated start frame
+// dropped (ImageFromBatch batch_index 1), one SaveImage. Before: "output
+// depends on more than one generating node". The graph is
+// tests/fixtures/comfy/i2v_kette_regie.json.
+std::string I2VChainGraph() {
+  const std::filesystem::path file =
+      std::filesystem::path(__FILE__).parent_path().parent_path() /
+      "fixtures" / "comfy" / "i2v_kette_regie.json";
+  std::ifstream in(file, std::ios::binary);
+  assert(in && "tests/fixtures/comfy/i2v_kette_regie.json");
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+void TestI2VChain() {
+  comfy::ModelIds models;
+  models.available = {"wan2.1-uni3c", "wan2.1-vace-14b"};
+  const auto plan_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(json::parse(text), models, &plan, &error);
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return plan;
+  };
+  const auto error_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    assert(!comfy::BuildPlan(json::parse(text), models, &plan, &error));
+    return error;
+  };
+  const auto frame = [](int chunk, int index) {
+    return comfy::ChainFrame{chunk, index};
+  };
+  const std::string regie = I2VChainGraph();
+
+  // One task of three chunks on wan2.1-uni3c, each with its own prompt,
+  // seed and length; the start frames are the last frames before.
+  const comfy::Plan plan = plan_of(regie);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "c0_k");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kCamera);
+  assert(video.model == "wan2.1-uni3c");
+  assert(video.frames == 81 && video.seed == 11 && video.steps == 4);
+  assert(video.prompt == "Ulrika turns her head to the window");
+  assert((video.first_frame == comfy::FileRef{"mehrsprecher_kf0.png", "input"}));
+  assert(video.i2v_chunks.size() == 2 && video.i2v_starts.size() == 2);
+  const comfy::VideoTask& c1 = video.i2v_chunks[0];
+  const comfy::VideoTask& c2 = video.i2v_chunks[1];
+  assert(c1.frames == 81 && c1.seed == 12 && !c1.first_frame);
+  assert(c1.prompt == "Ulrika stands up and walks to the window");
+  assert(c2.frames == 25 && c2.seed == 13 && !c2.first_frame);
+  assert(c2.prompt == "Ulrika looks out of the window");
+  assert(c1.model == "wan2.1-uni3c" && c2.width == 832 && c2.height == 480);
+  assert(video.i2v_starts[0] == frame(0, 80));
+  assert(video.i2v_starts[1] == frame(1, 80));  // 4095 clamps to the last
+  const json::Value c2_body = comfy::VideoRequestBody(c2);
+  assert(c2_body.find("seconds")->as_double() == 1.5);
+  assert(c2_body.find("gufo")->find("frames")->as_double() == 25);
+  assert(c2_body.find("gufo")->find("seed")->as_double() == 13);
+  assert(c2_body.member_str("prompt") == "Ulrika looks out of the window");
+  // The SaveImage: 81 + 80 + 24 frames, the repeated start frames dropped
+  // as ImageFromBatch(batch_index 1) does in ComfyUI.
+  assert(plan.tasks[0].outputs.size() == 1);
+  const auto& frames = plan.tasks[0].outputs[0].chain_frames;
+  assert(plan.tasks[0].outputs[0].kind == comfy::OutputKind::kImage);
+  assert(frames.size() == 185);
+  assert(frames[0] == frame(0, 0) && frames[80] == frame(0, 80));
+  assert(frames[81] == frame(1, 1) && frames[160] == frame(1, 80));
+  assert(frames[161] == frame(2, 1) && frames[184] == frame(2, 24));
+
+  // Without ImageFromBatch in the join: every frame, the start frames twice.
+  std::string whole = Replace(regie, "\"image2\": [\"c1_rest\", 0]",
+                              "\"image2\": [\"c1_dec\", 0]");
+  whole = Replace(whole, "\"image2\": [\"c2_rest\", 0]",
+                  "\"image2\": [\"c2_dec\", 0]");
+  const comfy::Plan whole_plan = plan_of(whole);
+  const auto& all = whole_plan.tasks[0].outputs[0].chain_frames;
+  assert(all.size() == 187);
+  assert(all[80] == frame(0, 80) && all[81] == frame(1, 0));
+  assert(all[162] == frame(2, 0) && all[186] == frame(2, 24));
+
+  // A cut after the join (ImageFromBatch(0, 100)) and a SaveVideo
+  // (CreateVideo) of the joined frames.
+  const comfy::Plan cut_plan = plan_of(Replace(
+      regie, " \"save\":",
+      " \"cut\": {\"class_type\": \"ImageFromBatch\", \"inputs\": {\"image\": "
+      "[\"join2\", 0], \"batch_index\": 0, \"length\": 100}},\n"
+      " \"cv\": {\"class_type\": \"CreateVideo\", \"inputs\": {\"images\": "
+      "[\"join2\", 0], \"fps\": 16}},\n"
+      " \"sv\": {\"class_type\": \"SaveVideo\", \"inputs\": {\"video\": "
+      "[\"cv\", 0], \"filename_prefix\": \"mehrsprecher/bewegung\", "
+      "\"format\": \"mp4\", \"codec\": \"h264\"}},\n"
+      " \"save_cut\": {\"class_type\": \"SaveImage\", \"inputs\": {\"images\": "
+      "[\"cut\", 0], \"filename_prefix\": \"cut\"}},\n \"save\":"));
+  assert(cut_plan.tasks.size() == 1);
+  for (const comfy::OutputTarget& target : cut_plan.tasks[0].outputs) {
+    if (target.node_id == "save_cut")
+      assert(target.chain_frames.size() == 100 &&
+             target.chain_frames[99] == frame(1, 19));
+    else
+      assert(target.chain_frames.size() == 185);
+    if (target.node_id == "sv")
+      assert(target.kind == comfy::OutputKind::kVideo);
+  }
+  assert(cut_plan.tasks[0].outputs.size() == 3);
+
+  // An output of the first chunk alone shares the chain's task.
+  const comfy::Plan first_plan = plan_of(Replace(
+      regie, " \"save\":",
+      " \"save0\": {\"class_type\": \"SaveImage\", \"inputs\": {\"images\": "
+      "[\"c0_dec\", 0], \"filename_prefix\": \"teil0\"}},\n \"save\":"));
+  assert(first_plan.tasks.size() == 1 &&
+         first_plan.tasks[0].outputs.size() == 2);
+  for (const comfy::OutputTarget& target : first_plan.tasks[0].outputs)
+    assert(target.chain_frames.size() ==
+           (target.node_id == "save0" ? 81u : 185u));
+
+  // The LoRA is checked per chunk: chunk 3 on a foreign LoRA fails.
+  std::string lora = Replace(
+      regie, "\"model\": [\"ms\", 0], \"positive\": [\"c2_i2v\", 0]",
+      "\"model\": [\"lora2\", 0], \"positive\": [\"c2_i2v\", 0]");
+  lora = Replace(lora, " \"clip\":",
+                 " \"lora2\": {\"class_type\": \"LoraLoaderModelOnly\", "
+                 "\"inputs\": {\"model\": [\"unet\", 0], \"lora_name\": "
+                 "\"anime_style.safetensors\", \"strength_model\": 1.0}},\n"
+                 " \"clip\":");
+  assert(error_of(lora).message.find("anime_style") != std::string::npos);
+
+  // A real branch: chunks 2 and 3 both continue chunk 1, one output joins
+  // all three.
+  const comfy::PlanError branch = error_of(
+      Replace(regie, "\"image\": [\"c1_dec\", 0], \"batch_index\": 4095",
+              "\"image\": [\"c0_dec\", 0], \"batch_index\": 4095"));
+  assert(branch.message.find("no single chain") != std::string::npos);
+  // ... and as two outputs (chunk 1 + 2, chunk 1 + 3).
+  std::string two_outputs =
+      Replace(regie, "\"image\": [\"c1_dec\", 0], \"batch_index\": 4095",
+              "\"image\": [\"c0_dec\", 0], \"batch_index\": 4095");
+  two_outputs = Replace(two_outputs, "\"image1\": [\"join1\", 0]",
+                        "\"image1\": [\"c0_dec\", 0]");
+  two_outputs = Replace(
+      two_outputs, " \"save\":",
+      " \"save1\": {\"class_type\": \"SaveImage\", \"inputs\": {\"images\": "
+      "[\"join1\", 0], \"filename_prefix\": \"a\"}},\n \"save\":");
+  assert(error_of(two_outputs).message.find("same chunk") !=
+         std::string::npos);
+  // Two independent videos in one output (chunk 2 from the LoadImage).
+  std::string independent =
+      Replace(regie, "\"start_image\": [\"c1_start\", 0]",
+              "\"start_image\": [\"img\", 0]");
+  independent = Replace(independent, "\"image\": [\"c1_start\", 0]",
+                        "\"image\": [\"img\", 0]");
+  assert(error_of(independent).message.find("no single chain") !=
+         std::string::npos);
+  // A start_image of two frames, another size, RIFE behind the chain.
+  assert(error_of(Replace(regie, "\"batch_index\": 80, \"length\": 1",
+                          "\"batch_index\": 79, \"length\": 2"))
+             .message.find("one frame") != std::string::npos);
+  assert(error_of(Replace(regie,
+                          "\"width\": 832, \"height\": 480, \"length\": 25",
+                          "\"width\": 480, \"height\": 832, \"length\": 25"))
+             .message.find("one size") != std::string::npos);
+  const std::string rife = Replace(
+      Replace(regie, "\"images\": [\"join2\", 0]", "\"images\": [\"rife\", 0]"),
+      " \"save\":",
+      " \"rife\": {\"class_type\": \"RIFE VFI\", \"inputs\": {\"frames\": "
+      "[\"join2\", 0], \"multiplier\": 2}},\n \"save\":");
+  assert(error_of(rife).message.find("RIFE") != std::string::npos);
+}
+
 void TestInfiniteTalk() {
   const comfy::Plan plan = PlanOf(kTalk);
   assert(plan.tasks.size() == 1);
@@ -4195,6 +4371,7 @@ int main() {
   TestAnimate();
   TestAnimateNative();
   TestAnimateChain();
+  TestI2VChain();
   TestPoseAnimationScaled();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();

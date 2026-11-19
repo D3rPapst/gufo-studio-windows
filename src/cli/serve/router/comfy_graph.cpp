@@ -1987,10 +1987,13 @@ CameraMove WanCameraEmbeddingOf(const Graph& graph, const std::string& id,
   return move;
 }
 
-/// Wan 2.1 I2V + Uni3C camera moves (wan2.1-uni3c, 16 fps).
+/// Wan 2.1 I2V + Uni3C camera moves (wan2.1-uni3c, 16 fps). `chained`: a
+/// later chunk of an I2V chain, whose start_image is a frame of an earlier
+/// chunk (ApplyI2VChain reads it).
 VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
                       const ModelIds& models, const Link& latent,
-                      std::vector<std::string>* warnings) {
+                      std::vector<std::string>* warnings,
+                      bool chained = false) {
   const std::string video = latent.node;
   const std::string video_class = graph.Class(video);
   VideoTask task;
@@ -2018,7 +2021,8 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
   if (!start)
     throw NodeFailure(video, "required_input_missing",
                       "gufo wan2.1-uni3c needs a start_image");
-  task.first_frame = ImageFile(graph, video, "start_image", *start);
+  if (!chained)
+    task.first_frame = ImageFile(graph, video, "start_image", *start);
   const Conditioning positive = FollowConditioning(graph, sampler, "positive");
   if (positive.encoder.empty() ||
       graph.Class(positive.encoder) != "CLIPTextEncode")
@@ -3063,7 +3067,8 @@ bool IsWan22I2VFile(const std::string& file) {
 VideoTask BuildI2V22(const Graph& graph, const std::string& first,
                      const ModelIds& models, const Link& latent,
                      std::vector<std::string>* warnings,
-                     const std::vector<std::string>& stages = {}) {
+                     const std::vector<std::string>& stages = {},
+                     bool chained = false) {
   const std::string video = latent.node;
   const std::vector<std::string> all_stages =
       stages.empty() ? std::vector<std::string>{first} : stages;
@@ -3102,7 +3107,8 @@ VideoTask BuildI2V22(const Graph& graph, const std::string& first,
   if (!start)
     throw NodeFailure(video, "required_input_missing",
                       gufo_model + " needs a start_image");
-  task.first_frame = ImageFile(graph, video, "start_image", *start);
+  if (!chained)  // a later chunk of an I2V chain: see ApplyI2VChain
+    task.first_frame = ImageFile(graph, video, "start_image", *start);
   if (graph.LinkOf(video, "ref_pad_image"))
     warnings->push_back("node " + video +
                         ": ref_pad_image is not applied (gufo pads the "
@@ -3640,6 +3646,282 @@ std::optional<int> ChainOutputCut(const Graph& graph,
                       "gufo keeps the frames of a chain of WanAnimateToVideo "
                       "chunks from the first one (batch_index 0)");
   return WholeInput(graph, link->node, "length", 4096, 1, 4096);
+}
+
+/// Chunks of one Wan I2V chain: gufo renders each as its own job.
+constexpr int kI2VChainMaxChunks = 16;
+
+/// One chunk of a Wan I2V chain: its WanImageToVideo and the samplers on
+/// it (one, or a KSamplerAdvanced chain, first stage first).
+struct I2VChunk {
+  std::string head;
+  std::vector<std::string> stages;
+};
+
+/// The node a sampler's latent comes from, through earlier sampler stages.
+std::string LatentHead(const Graph& graph, const std::string& sampler) {
+  std::string node = sampler;
+  for (int guard = 0; guard < 16 && IsSampler(graph.Class(node)); ++guard) {
+    const auto latent = graph.LinkOf(node, "latent_image");
+    if (!latent)
+      return "";
+    node = latent->node;
+  }
+  return node;
+}
+
+bool IsI2VHead(std::string_view cls) {
+  return cls == "WanImageToVideo" || cls == "WanCameraImageToVideo";
+}
+
+/// The samplers of `generators` grouped by their WanImageToVideo /
+/// WanCameraImageToVideo; empty when one is no sampler on such a node.
+std::map<std::string, std::vector<std::string>> I2VGroups(
+    const Graph& graph, const std::vector<std::string>& generators) {
+  std::map<std::string, std::vector<std::string>> groups;
+  for (const std::string& generator : generators) {
+    if (!IsSampler(graph.Class(generator)))
+      return {};
+    const std::string head = LatentHead(graph, generator);
+    if (!IsI2VHead(graph.Class(head)))
+      return {};
+    groups[head].push_back(generator);
+  }
+  return groups;
+}
+
+/// Chained Wan I2V chunks (Regie 19.11., FilmStudio mehrsprecher
+/// bewegung_wf): KSampler <- WanImageToVideo per chunk, each next one's
+/// start_image taken from the decode of the chunk before. The chunks in
+/// chain order (each one's WanImageToVideo has exactly the chunks before
+/// it upstream), nullopt when `generators` is not such a chain (a branch,
+/// independent videos, other generators).
+std::optional<std::vector<I2VChunk>> I2VChain(
+    const Graph& graph, const std::vector<std::string>& generators) {
+  const auto groups = I2VGroups(graph, generators);
+  if (groups.size() < 2)
+    return std::nullopt;
+  std::vector<std::pair<std::size_t, I2VChunk>> order;
+  for (const auto& [head, samplers] : groups) {
+    I2VChunk chunk{head, samplers};
+    if (samplers.size() > 1) {
+      auto stages = SamplerChain(graph, samplers, {"WanImageToVideo"});
+      if (!stages)
+        return std::nullopt;
+      chunk.stages = std::move(*stages);
+    }
+    const std::set<std::string> before = graph.Ancestors(head);
+    std::size_t earlier = 0;
+    for (const auto& [other, other_samplers] : groups)
+      if (other != head &&
+          std::any_of(other_samplers.begin(), other_samplers.end(),
+                      [&](const std::string& s) { return before.contains(s); }))
+        ++earlier;
+    order.emplace_back(earlier, std::move(chunk));
+  }
+  std::sort(order.begin(), order.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<I2VChunk> chain;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (order[i].first != i)
+      return std::nullopt;
+    chain.push_back(std::move(order[i].second));
+  }
+  return chain;
+}
+
+/// One chunk's task, routed as BuildPlan routes a lone WanImageToVideo: a
+/// KSamplerAdvanced chain or a Wan 2.2 I2V checkpoint on wan2.2-i2v-a14b
+/// when served, otherwise wan2.1-uni3c (Wan 2.1 I2V, lightx2v built in).
+VideoTask BuildI2VChunk(const Graph& graph, const ModelIds& models,
+                        const I2VChunk& chunk,
+                        std::vector<std::string>* warnings, bool chained) {
+  const std::string& first = chunk.stages.front();
+  const Link latent = graph.RequireLink(first, "latent_image");
+  const bool wan_i2v = graph.Class(chunk.head) == "WanImageToVideo";
+  if (chunk.stages.size() > 1) {
+    if (!I2V22Available(models))
+      throw NodeFailure(
+          chunk.head, "unsupported_link",
+          "a KSamplerAdvanced chain after WanImageToVideo (Wan 2.2 I2V A14B "
+          "high / low noise) runs only on " +
+              (models.i2v22.empty() ? std::string("wan2.2-i2v-a14b")
+                                    : models.i2v22) +
+              ", which this router does not serve");
+    return BuildI2V22(graph, first, models, latent, warnings, chunk.stages,
+                      chained);
+  }
+  const ModelChain model = FollowModel(graph, first);
+  if (wan_i2v && I2V22Available(models) && model.uni3c.empty() &&
+      IsWan22I2VFile(model.loader))
+    return BuildI2V22(graph, first, models, latent, warnings, {}, chained);
+  return BuildCamera(graph, first, models, latent, warnings, chained);
+}
+
+/// A chunk's decoded frames as the chain knows them: the last sampler stage
+/// and the chunk's length.
+struct DecodedChunk {
+  std::string sampler;
+  int frames{0};
+};
+
+/// The frames IMAGE input `key` of node `id` holds of a chain's decoded
+/// chunks, with ComfyUI's semantics: VAEDecode (/ VAEDecodeTiled) of a
+/// chunk's last sampler = all its frames, ImageBatch = image1 + image2 (+
+/// image3 ...), ImageFromBatch = [min(n - 1, batch_index), + min(n -
+/// index, length)).
+std::vector<ChainFrame> ChainFramesOf(const Graph& graph,
+                                      const std::string& id,
+                                      const std::string& key, const Link& link,
+                                      const std::vector<DecodedChunk>& decoded,
+                                      int depth = 0) {
+  if (depth > 64)
+    throw NodeFailure(id, "unsupported_link",
+                      "the frames of the WanImageToVideo chain pass too many "
+                      "ImageBatch / ImageFromBatch nodes");
+  const std::string& node = link.node;
+  const std::string cls = graph.Class(node);
+  std::vector<ChainFrame> frames;
+  if (cls == "VAEDecode" || cls == "VAEDecodeTiled") {
+    const Link samples = graph.RequireLink(node, "samples");
+    for (std::size_t c = 0; c < decoded.size(); ++c)
+      if (decoded[c].sampler == samples.node && samples.slot == 0) {
+        for (int f = 0; f < decoded[c].frames; ++f)
+          frames.push_back({static_cast<int>(c), f});
+        return frames;
+      }
+    throw NodeFailure(node, "unsupported_link",
+                      "a decode in a chain of WanImageToVideo chunks must "
+                      "decode the last sampler of an earlier chunk");
+  }
+  if (cls == "ImageBatch") {
+    for (int i = 1;; ++i) {
+      const std::string input = "image" + std::to_string(i);
+      const auto part = graph.LinkOf(node, input);
+      if (!part) {
+        if (i <= 2)
+          throw NodeFailure(node, "required_input_missing",
+                            "required input '" + input + "' is not connected");
+        break;
+      }
+      const auto more =
+          ChainFramesOf(graph, node, input, *part, decoded, depth + 1);
+      frames.insert(frames.end(), more.begin(), more.end());
+      if (frames.size() > static_cast<std::size_t>(kMaxBatchFrames))
+        throw NodeFailure(node, "unsupported_value",
+                          "a chain of WanImageToVideo chunks joins at most " +
+                              std::to_string(kMaxBatchFrames) + " frames");
+    }
+    return frames;
+  }
+  if (cls == "ImageFromBatch") {
+    const std::vector<ChainFrame> source =
+        ChainFramesOf(graph, node, "image", graph.RequireLink(node, "image"),
+                      decoded, depth + 1);
+    const int count = static_cast<int>(source.size());
+    int index = WholeInput(graph, node, "batch_index", 0, 0, 4095);
+    int length = WholeInput(graph, node, "length", 1, 1, 4096);
+    if (count == 0)
+      return frames;
+    index = std::min(count - 1, index);
+    length = std::min(count - index, length);
+    return {source.begin() + index, source.begin() + index + length};
+  }
+  throw NodeFailure(id, "unsupported_link",
+                    "input '" + key +
+                        "' of a chain of WanImageToVideo chunks takes the "
+                        "chunks' frames through VAEDecode, ImageBatch and "
+                        "ImageFromBatch only, not " +
+                        cls);
+}
+
+/// Adds the later chunks of an I2V chain to the first chunk's task: each
+/// chunk's own task (prompt, seed, length, steps, LoRA, camera) in
+/// i2v_chunks, the frame its start_image takes in i2v_starts. The chunks
+/// must run on one model at one size (ImageBatch would rescale), each
+/// start_image must be exactly one frame of an earlier chunk. Returns the
+/// decoded chunks for the outputs' frames.
+std::vector<DecodedChunk> ApplyI2VChain(const Graph& graph,
+                                        const ModelIds& models,
+                                        const std::vector<I2VChunk>& chain,
+                                        VideoTask* task,
+                                        std::vector<std::string>* warnings) {
+  if (chain.size() > static_cast<std::size_t>(kI2VChainMaxChunks))
+    throw NodeFailure(chain.back().head, "unsupported_value",
+                      "gufo runs at most " +
+                          std::to_string(kI2VChainMaxChunks) +
+                          " chained WanImageToVideo chunks in one workflow, "
+                          "not " +
+                          std::to_string(chain.size()));
+  std::vector<DecodedChunk> decoded{{chain.front().stages.back(),
+                                     task->frames}};
+  int total = task->frames;
+  for (std::size_t i = 1; i < chain.size(); ++i) {
+    const std::string& head = chain[i].head;
+    VideoTask chunk = BuildI2VChunk(graph, models, chain[i], warnings, true);
+    if (chunk.model != task->model || chunk.family != task->family)
+      throw NodeFailure(head, "unsupported_value",
+                        "chained WanImageToVideo chunks must run on one model "
+                        "(gufo renders them one after another); node " +
+                            chain.front().head + " runs on " + task->model +
+                            ", this one on " + chunk.model);
+    if (chunk.width != task->width || chunk.height != task->height)
+      throw NodeFailure(head, "unsupported_value",
+                        "chained WanImageToVideo chunks must have one size "
+                        "(node " +
+                            chain.front().head + ": " +
+                            std::to_string(task->width) + "x" +
+                            std::to_string(task->height) + ")");
+    const std::vector<ChainFrame> start = ChainFramesOf(
+        graph, head, "start_image", graph.RequireLink(head, "start_image"),
+        decoded);
+    if (start.size() != 1)
+      throw NodeFailure(head, "unsupported_value",
+                        "the start_image of a chained WanImageToVideo must be "
+                        "one frame of an earlier chunk (ImageFromBatch with "
+                        "length 1, e.g. batch_index = length - 1 for the last "
+                        "frame), not " +
+                            std::to_string(start.size()) + " frames");
+    total += chunk.frames;
+    decoded.push_back({chain[i].stages.back(), chunk.frames});
+    task->i2v_starts.push_back(start.front());
+    task->i2v_chunks.push_back(std::move(chunk));
+  }
+  if (total > kMaxBatchFrames)
+    throw NodeFailure(chain.back().head, "unsupported_value",
+                      "a chain of WanImageToVideo chunks renders at most " +
+                          std::to_string(kMaxBatchFrames) + " frames, not " +
+                          std::to_string(total));
+  return decoded;
+}
+
+/// The frames output `output` saves of an I2V chain: its images (SaveImage,
+/// PreviewImage, VHS_VideoCombine) or the images of the CreateVideo behind
+/// a SaveVideo.
+std::vector<ChainFrame> ChainOutputFrames(
+    const Graph& graph, const std::string& output,
+    const std::vector<DecodedChunk>& decoded) {
+  std::string node = output;
+  std::string key = "images";
+  if (graph.Class(output) == "SaveVideo") {
+    const Link video = graph.RequireLink(output, "video");
+    if (graph.Class(video.node) != "CreateVideo")
+      throw NodeFailure(output, "unsupported_link",
+                        "a SaveVideo of a chain of WanImageToVideo chunks "
+                        "needs CreateVideo, not " +
+                            graph.Class(video.node));
+    if (graph.LinkOf(video.node, "audio"))
+      throw NodeFailure(video.node, "unsupported_link",
+                        "gufo writes a chain of WanImageToVideo chunks without "
+                        "a sound track");
+    node = video.node;
+  }
+  std::vector<ChainFrame> frames =
+      ChainFramesOf(graph, node, key, graph.RequireLink(node, key), decoded);
+  if (frames.empty())
+    throw NodeFailure(output, "unsupported_value",
+                      "this output receives no frames of the chain");
+  return frames;
 }
 
 /// A DynamicCombo sub-input: ComfyUI names it "<combo>.<input>" in the API
@@ -5209,8 +5491,42 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
   std::map<std::size_t, std::vector<std::pair<std::size_t, std::optional<int>>>>
       chain_outputs;
   std::vector<std::pair<std::string, std::string>> single_outputs;
+  // Chained Wan I2V chunks by the first chunk's (first) sampler: the
+  // longest chain any output takes; per chain task its decoded chunks.
+  std::map<std::string, std::vector<I2VChunk>> i2v_chain_of;
+  std::map<std::size_t, std::vector<DecodedChunk>> i2v_decoded;
   bool any_output = false;
   try {
+    // Outputs of one chain take its first chunks (a chunk's decode, or the
+    // chunks joined so far); they share the longest chain as one task.
+    for (const auto& [id, node] : prompt.members()) {
+      if (!IsOutputClass(node.member_str("class_type")))
+        continue;
+      std::vector<std::string> samplers;
+      for (const std::string& up : graph.Ancestors(id))
+        if (IsSampler(graph.Class(up)))
+          samplers.push_back(up);
+      auto chain = samplers.size() > 1 ? I2VChain(graph, samplers)
+                                       : std::nullopt;
+      if (!chain)
+        continue;
+      auto& known = i2v_chain_of[chain->front().stages.front()];
+      const auto prefix = [](const std::vector<I2VChunk>& a,
+                             const std::vector<I2VChunk>& b) {
+        return a.size() <= b.size() &&
+               std::equal(a.begin(), a.end(), b.begin(),
+                          [](const I2VChunk& x, const I2VChunk& y) {
+                            return x.head == y.head;
+                          });
+      };
+      if (known.empty() || prefix(known, *chain))
+        known = std::move(*chain);
+      else if (!prefix(*chain, known))
+        throw NodeFailure(id, "unsupported_link",
+                          "two chains of WanImageToVideo chunks continue the "
+                          "same chunk; gufo renders one linear chain (each "
+                          "chunk continued by at most one other)");
+    }
     for (const auto& [id, node] : prompt.members()) {
       const std::string cls = node.member_str("class_type");
       if (!IsOutputClass(cls))
@@ -5270,6 +5586,20 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           }
         }
         if (last.empty()) {
+          // Wan I2V chunks, each next one starting from a frame of the one
+          // before (Regie 19.11.): one task, the chunks run one after
+          // another; the first chunk's first sampler stands for the chain.
+          if (auto chain = I2VChain(graph, generators))
+            last = chain->front().stages.front();
+          else if (I2VGroups(graph, generators).size() > 1)
+            throw NodeFailure(
+                id, "unsupported_link",
+                "output joins WanImageToVideo videos that are no single "
+                "chain (each next chunk must start from a frame of the "
+                "chunk before; branches or independent videos are not "
+                "supported)");
+        }
+        if (last.empty()) {
           // A VACE schedule split over KSamplerAdvanced stages (Wan 2.2
           // high / low noise): the first stage stands for the chain.
           if (auto stages = VaceSamplerChain(graph, generators)) {
@@ -5303,6 +5633,9 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
         generators = {last};
       }
       const std::string& generator = generators.front();
+      // Also an output of the first chunk alone, or of the first chunks of
+      // a longer chain: it shares the chain's task.
+      const bool i2v_chained = i2v_chain_of.contains(generator);
       OutputTarget target;
       target.node_id = id;
       target.class_type = cls;
@@ -5339,6 +5672,13 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           task.spec = BuildDialogue(graph, generator, models, &plan->warnings);
         } else if (tts) {
           task.spec = BuildSpeech(graph, generator, models, &plan->warnings);
+        } else if (i2v_chained) {
+          const std::vector<I2VChunk>& chain = i2v_chain_of.at(generator);
+          VideoTask first = BuildI2VChunk(graph, models, chain.front(),
+                                          &plan->warnings, false);
+          i2v_decoded[plan->tasks.size()] =
+              ApplyI2VChain(graph, models, chain, &first, &plan->warnings);
+          task.spec = std::move(first);
         } else {
           const Link latent = graph.RequireLink(generator, "latent_image");
           const std::string latent_class = graph.Class(latent.node);
@@ -5410,6 +5750,12 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
           if (const auto chain = stages_of.find(generator);
               chain != stages_of.end() && !chain->second.empty())
             samplers = chain->second;
+          if (i2v_chained) {
+            samplers.clear();
+            for (const I2VChunk& chunk : i2v_chain_of.at(generator))
+              samplers.insert(samplers.end(), chunk.stages.begin(),
+                              chunk.stages.end());
+          }
           for (const std::string& sampler : samplers)
             if (IsSampler(graph.Class(sampler)) &&
                 graph.Raw(sampler, "guidance_steps") != nullptr)
@@ -5491,6 +5837,22 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
       if (animate_chained)
         chain_outputs[found->second].emplace_back(task.outputs.size(),
                                                   ChainOutputCut(graph, id));
+      if (i2v_chained) {
+        // Each chunk is its own gufo job: RIFE / upscaling the joined
+        // frames has no job to ride on.
+        if (video != nullptr &&
+            (video->interpolate != 1 || video->upscale || video->fps_num > 0))
+          throw NodeFailure(id, "unsupported_link",
+                            "RIFE VFI / ImageUpscaleWithModel behind a chain "
+                            "of WanImageToVideo chunks is not supported (gufo "
+                            "renders each chunk as its own job); interpolate "
+                            "or upscale the saved video in a second workflow");
+        if (target.kind == OutputKind::kAudio)
+          throw NodeFailure(id, "unsupported_link",
+                            "a chain of WanImageToVideo chunks has no sound");
+        target.chain_frames =
+            ChainOutputFrames(graph, id, i2v_decoded.at(found->second));
+      }
       task.outputs.push_back(std::move(target));
     }
     // An output of a single chunk of an Animate chain: gufo renders the

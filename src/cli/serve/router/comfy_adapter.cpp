@@ -444,44 +444,50 @@ void CollectFiles(const Plan& plan, std::vector<FileRef>* files) {
       for (const SpeechTask& line : dialogue->lines)
         if (line.reference_audio)
           files->push_back(*line.reference_audio);
-    } else if (const auto* video = std::get_if<VideoTask>(&task.spec)) {
-      if (video->first_frame)
-        files->push_back(*video->first_frame);
-      if (video->last_frame)
-        files->push_back(*video->last_frame);
-      for (const auto& [frame, ref] : video->keyframes)
-        files->push_back(ref);
-      if (video->audio_reference)
-        files->push_back(*video->audio_reference);
-      if (video->render_video)
-        files->push_back(*video->render_video);
-      if (video->source_video)
-        files->push_back(*video->source_video);
-      if (video->guide_video)
-        files->push_back(*video->guide_video);
-      if (video->control_video)
-        files->push_back(*video->control_video);
-      if (video->talk_video)
-        files->push_back(*video->talk_video);
-      if (video->vace_mask)
-        files->push_back(*video->vace_mask);
-      if (video->animate_background)
-        files->push_back(*video->animate_background);
-      for (const auto* animate :
-           {&video->pose_video, &video->face_video, &video->background_video,
-            &video->continue_motion})
-        if (*animate)
-          files->push_back(**animate);
-      for (const auto* runs :
-           {&video->control_runs, &video->mask_runs,
-            &video->animate_background_runs, &video->pose_runs,
-            &video->face_runs, &video->background_runs,
-            &video->continue_runs})
-        for (const FrameRun& run : *runs)
-          if (run.image)
-            files->push_back(*run.image);
-      files->insert(files->end(), video->reference_images.begin(),
-                    video->reference_images.end());
+    } else if (const auto* chained = std::get_if<VideoTask>(&task.spec)) {
+      // A chain of I2V chunks: every chunk's files (e.g. a Uni3C guide).
+      std::vector<const VideoTask*> videos{chained};
+      for (const VideoTask& chunk : chained->i2v_chunks)
+        videos.push_back(&chunk);
+      for (const VideoTask* video : videos) {
+        if (video->first_frame)
+          files->push_back(*video->first_frame);
+        if (video->last_frame)
+          files->push_back(*video->last_frame);
+        for (const auto& [frame, ref] : video->keyframes)
+          files->push_back(ref);
+        if (video->audio_reference)
+          files->push_back(*video->audio_reference);
+        if (video->render_video)
+          files->push_back(*video->render_video);
+        if (video->source_video)
+          files->push_back(*video->source_video);
+        if (video->guide_video)
+          files->push_back(*video->guide_video);
+        if (video->control_video)
+          files->push_back(*video->control_video);
+        if (video->talk_video)
+          files->push_back(*video->talk_video);
+        if (video->vace_mask)
+          files->push_back(*video->vace_mask);
+        if (video->animate_background)
+          files->push_back(*video->animate_background);
+        for (const auto* animate :
+             {&video->pose_video, &video->face_video, &video->background_video,
+              &video->continue_motion})
+          if (*animate)
+            files->push_back(**animate);
+        for (const auto* runs :
+             {&video->control_runs, &video->mask_runs,
+              &video->animate_background_runs, &video->pose_runs,
+              &video->face_runs, &video->background_runs,
+              &video->continue_runs})
+          for (const FrameRun& run : *runs)
+            if (run.image)
+              files->push_back(*run.image);
+        files->insert(files->end(), video->reference_images.begin(),
+                      video->reference_images.end());
+      }
     } else if (const auto* foley = std::get_if<FoleyTask>(&task.spec)) {
       if (foley->video)
         files->push_back(*foley->video);
@@ -2565,6 +2571,132 @@ json::Value Adapter::RunFoley(const std::shared_ptr<Job>& job,
 
 json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
                               const VideoTask& spec) {
+  if (!spec.i2v_chunks.empty())
+    return RunI2VChain(job, task, spec);
+  const std::string content =
+      RenderVideo(job, task, spec, VideoBody(job, task, spec).dump(), 0, 1);
+  const fs::path mp4 = WorkFile("mp4");
+  WriteAll(mp4, content);
+  json::Value ui = json::Value::object();
+  try {
+    for (const OutputTarget& target : task.outputs)
+      ui[target.node_id] = SaveVideoOutput(target, spec, content, mp4);
+  } catch (...) {
+    std::error_code ec;
+    fs::remove(mp4, ec);
+    throw;
+  }
+  std::error_code ec;
+  fs::remove(mp4, ec);
+  return ui;
+}
+
+json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
+                                 const Task& task, const VideoTask& spec) {
+  if (options_.ffmpeg.empty())
+    throw std::runtime_error(
+        "a chain of WanImageToVideo chunks passes frames from chunk to chunk "
+        "and joins them; start the router with --comfy-ffmpeg");
+  std::vector<fs::path> made;  // the chunks' and joined videos
+  struct RemoveFiles {
+    std::vector<fs::path>* files;
+    ~RemoveFiles() {
+      std::error_code ignored;
+      for (const fs::path& file : *files)
+        fs::remove(file, ignored);
+    }
+  } cleanup{&made};
+  const int count = 1 + static_cast<int>(spec.i2v_chunks.size());
+  std::vector<fs::path> parts;
+  for (int c = 0; c < count; ++c) {
+    const VideoTask& chunk = c == 0 ? spec : spec.i2v_chunks[c - 1];
+    json::Value body = VideoBody(job, task, chunk);
+    if (c > 0) {
+      // ComfyUI: ImageFromBatch(VAEDecode of the chunk before) ->
+      // start_image. gufo: that frame of the chunk's video as first_frame.
+      const ChainFrame& start = spec.i2v_starts[c - 1];
+      const fs::path png = WorkFile("png");
+      made.push_back(png);
+      std::string error;
+      if (!RunFfmpeg({"-i", parts[start.chunk], "-vf",
+                      "select=eq(n\\," + std::to_string(start.frame) +
+                          "),setpts=PTS-STARTPTS",
+                      "-frames:v", "1", png},
+                     &error) ||
+          !fs::exists(png))
+        throw std::runtime_error(
+            "cannot take frame " + std::to_string(start.frame) +
+            " of chunk " + std::to_string(start.chunk + 1) +
+            " as the start image of chunk " + std::to_string(c + 1) + ": " +
+            (error.empty() ? "no such frame" : error));
+      body["first_frame"] = "data:image/png;base64," + Base64Encode(ReadAll(png));
+    }
+    Logger::Info("comfy", "event=i2v_chunk prompt_id=" + job->id + " node=" +
+                              task.node_id + " chunk=" + std::to_string(c + 1) +
+                              "/" + std::to_string(count) + " frames=" +
+                              std::to_string(chunk.frames) +
+                              " model=" + chunk.model);
+    const std::string content =
+        RenderVideo(job, task, chunk, body.dump(), c, count);
+    parts.push_back(WorkFile("mp4"));
+    made.push_back(parts.back());
+    WriteAll(parts.back(), content);
+  }
+  json::Value ui = json::Value::object();
+  for (const OutputTarget& target : task.outputs) {
+    // The output's frames as runs of one chunk each, joined by ffmpeg:
+    // lossless RGB for image outputs (SaveVideoFrames extracts them as they
+    // were decoded), H.264 for videos.
+    std::vector<fs::path> args;
+    std::string filter;
+    std::string labels;
+    int runs = 0;
+    const std::vector<ChainFrame>& frames = target.chain_frames;
+    for (std::size_t i = 0; i < frames.size();) {
+      std::size_t j = i + 1;
+      while (j < frames.size() && frames[j].chunk == frames[i].chunk &&
+             frames[j].frame == frames[j - 1].frame + 1)
+        ++j;
+      args.push_back("-i");
+      args.push_back(parts[frames[i].chunk]);
+      const std::string label = "[r" + std::to_string(runs) + "]";
+      filter += "[" + std::to_string(runs) + ":v]trim=start_frame=" +
+                std::to_string(frames[i].frame) +
+                ":end_frame=" + std::to_string(frames[j - 1].frame + 1) +
+                ",setpts=PTS-STARTPTS,setsar=1" + label + ";";
+      labels += label;
+      ++runs;
+      i = j;
+    }
+    if (runs == 0)
+      throw std::runtime_error("node " + target.node_id +
+                               " receives no frames of the chain");
+    filter += labels + "concat=n=" + std::to_string(runs) +
+              ":v=1:a=0,setpts=N/" + std::to_string(spec.fps) + "/TB[out]";
+    const bool image = target.kind == OutputKind::kImage;
+    args.insert(args.end(),
+                {"-filter_complex", filter, "-map", "[out]", "-an", "-r",
+                 std::to_string(spec.fps), "-c:v",
+                 image ? "libx264rgb" : "libx264"});
+    if (image)
+      args.insert(args.end(), {"-qp", "0", "-pix_fmt", "rgb24"});
+    else
+      args.insert(args.end(), {"-crf", "18", "-pix_fmt", "yuv420p"});
+    const fs::path joined = WorkFile("mp4");
+    made.push_back(joined);
+    args.push_back(joined);
+    std::string error;
+    if (!RunFfmpeg(args, &error))
+      throw std::runtime_error("cannot join the chunks for node " +
+                               target.node_id + ": " + error);
+    ui[target.node_id] =
+        SaveVideoOutput(target, spec, ReadAll(joined), joined);
+  }
+  return ui;
+}
+
+json::Value Adapter::VideoBody(const std::shared_ptr<Job>& job,
+                               const Task& task, const VideoTask& spec) {
   json::Value body = VideoRequestBody(spec);
   // ComfyUI stretches H3 guide images to the canvas; gufo centre-crops.
   // Stretch here (ffmpeg) so both give the same picture.
@@ -2845,6 +2977,13 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     }
     body["gufo"]["audio_mask"]["audio"] = std::move(url);
   }
+  return body;
+}
+
+std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
+                                 const Task& task, const VideoTask& spec,
+                                 const std::string& payload, int part,
+                                 int parts) {
   // Sleeps `total` unless the prompt is interrupted meanwhile.
   const auto pause = [&job](std::chrono::milliseconds total) {
     const auto until = std::chrono::steady_clock::now() + total;
@@ -2857,7 +2996,6 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     }
     throw Interrupted();
   };
-  const std::string payload = body.dump();
   FetchResult created =
       Call(job, "POST", "/v1/videos", payload, "application/json");
   // 2.2.8: the video worker's queue (or a router's connection limit) is
@@ -2939,7 +3077,11 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
     poll_trouble.reset();
     const json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
-    const int progress = static_cast<int>(parsed.member_double("progress", 0));
+    // A chain of I2V chunks: the parts share the bar (part of parts).
+    const int progress =
+        (part * 100 +
+         static_cast<int>(parsed.member_double("progress", 0))) /
+        std::max(1, parts);
     if (progress != last_progress) {
       last_progress = progress;
       json::Value data = json::Value::object();
@@ -2963,46 +3105,38 @@ json::Value Adapter::RunVideo(const std::shared_ptr<Job>& job, const Task& task,
   if (content.status != 200 || content.body.empty())
     throw std::runtime_error("gufo video content failed (HTTP " +
                              std::to_string(content.status) + ")");
-  const fs::path mp4 = WorkFile("mp4");
-  WriteAll(mp4, content.body);
-  json::Value ui = json::Value::object();
-  try {
-    for (const OutputTarget& target : task.outputs) {
-      if (target.kind == OutputKind::kVideo &&
-          target.class_type == "VHS_VideoCombine") {
-        // VideoHelperSuite reports its file under "gifs" with the format
-        // and frame rate.
-        json::Value saved = SaveBytes(target, "mp4", content.body);
-        json::Value entry = saved["images"].items().front();
-        entry["format"] = "video/h264-mp4";
-        entry["frame_rate"] =
-            spec.fps_num > 0
-                ? static_cast<double>(spec.fps_num) / spec.fps_den
-                : static_cast<double>(spec.fps);
-        json::Value gifs = json::Value::array();
-        gifs.push_back(std::move(entry));
-        json::Value node = json::Value::object();
-        node["gifs"] = std::move(gifs);
-        ui[target.node_id] = std::move(node);
-      } else if (target.kind == OutputKind::kVideo) {
-        json::Value saved = SaveBytes(target, "mp4", content.body);
-        saved["animated"] = json::Value::array();
-        saved["animated"].push_back(true);
-        ui[target.node_id] = std::move(saved);
-      } else if (target.kind == OutputKind::kAudio) {
-        ui[target.node_id] = SaveAudioTrack(target, mp4);
-      } else {
-        ui[target.node_id] = SaveVideoFrames(target, mp4);
-      }
-    }
-  } catch (...) {
-    std::error_code ec;
-    fs::remove(mp4, ec);
-    throw;
+  return content.body;
+}
+
+json::Value Adapter::SaveVideoOutput(const OutputTarget& target,
+                                     const VideoTask& spec,
+                                     const std::string& bytes,
+                                     const fs::path& mp4) {
+  if (target.kind == OutputKind::kVideo &&
+      target.class_type == "VHS_VideoCombine") {
+    // VideoHelperSuite reports its file under "gifs" with the format and
+    // frame rate.
+    json::Value saved = SaveBytes(target, "mp4", bytes);
+    json::Value entry = saved["images"].items().front();
+    entry["format"] = "video/h264-mp4";
+    entry["frame_rate"] = spec.fps_num > 0
+                              ? static_cast<double>(spec.fps_num) / spec.fps_den
+                              : static_cast<double>(spec.fps);
+    json::Value gifs = json::Value::array();
+    gifs.push_back(std::move(entry));
+    json::Value node = json::Value::object();
+    node["gifs"] = std::move(gifs);
+    return node;
   }
-  std::error_code ec;
-  fs::remove(mp4, ec);
-  return ui;
+  if (target.kind == OutputKind::kVideo) {
+    json::Value saved = SaveBytes(target, "mp4", bytes);
+    saved["animated"] = json::Value::array();
+    saved["animated"].push_back(true);
+    return saved;
+  }
+  if (target.kind == OutputKind::kAudio)
+    return SaveAudioTrack(target, mp4);
+  return SaveVideoFrames(target, mp4);
 }
 
 fs::path Adapter::WorkFile(std::string_view extension) {
