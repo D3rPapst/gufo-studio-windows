@@ -26,7 +26,7 @@ option(GUFO_ENABLE_ONNXRUNTIME
   "Load ONNX Runtime at run time for the NPU / CPU upscaler"
   ${GUFO_ENABLE_ONNXRUNTIME_DEFAULT})
 
-add_subdirectory(src/models/rife)
+# RIFE (src/models/rife) is a library extension, built with the extensions.
 add_subdirectory(src/models/ace_step)
 # YuE2-3B songs (`gufo serve music --yue2`), on the ACE-Step stack.
 add_subdirectory(src/models/yue2)
