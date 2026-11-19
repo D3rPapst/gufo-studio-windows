@@ -4,6 +4,7 @@
 // row map the denoiser derives from it. With GUFO_H3_IMAGE_ROOT also the
 // release's own config files against the compiled constants.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/minimax_h3/image_generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
@@ -181,6 +183,60 @@ void TestScheduleAndRowMap() {
   }
 }
 
+void TestLanczos() {
+  // 8x6 pattern, resized with PIL Image.resize(..., Image.LANCZOS) (11.x).
+  constexpr int kWidth = 8;
+  constexpr int kHeight = 6;
+  std::vector<std::uint8_t> source(kWidth * kHeight * 3);
+  for (int y = 0; y < kHeight; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      const std::size_t base = (static_cast<std::size_t>(y) * kWidth + x) * 3;
+      source[base + 0] = static_cast<std::uint8_t>((x * 37 + y * 11) % 256);
+      source[base + 1] = static_cast<std::uint8_t>((x * x * 7 + y * 29) % 256);
+      source[base + 2] =
+          static_cast<std::uint8_t>(((255 - x * 13 - y * 17) % 256 + 256) % 256);
+    }
+  }
+  const std::vector<int> expected_5x4 = {
+      14,  8,   247, 73,  31,  227, 128, 95,  206, 208, 183, 184, 91,  125, 164,
+      30,  51,  222, 89,  72,  202, 142, 149, 181, 232, 156, 159, 117, 83,  139,
+      47,  97,  195, 105, 118, 175, 168, 196, 154, 216, 68,  132, 88,  145, 112,
+      63,  135, 170, 118, 177, 150, 199, 140, 129, 170, 60,  107, 17,  197, 87};
+  std::vector<std::uint8_t> output;
+  std::string error;
+  CHECK(gufo::minimax_h3::ResizeRgb8Lanczos(source, kWidth, kHeight, 5, 4,
+                                            &output, &error));
+  CHECK(output.size() == expected_5x4.size());
+  int worst = 0;
+  for (std::size_t index = 0;
+       index < std::min(output.size(), expected_5x4.size()); ++index) {
+    worst = std::max(worst, std::abs(static_cast<int>(output[index]) -
+                                     expected_5x4[index]));
+  }
+  // PIL accumulates in 22-bit fixed point; one step of 8-bit rounding.
+  CHECK(worst <= 1);
+  // Upscale 13x9: first row of the PIL result.
+  const std::vector<int> expected_row = {0,   0,   255, 10,  0,   252, 38,  5,
+                                         242, 62,  18,  234, 82,  33,  227, 106,
+                                         57,  218, 129, 85,  211, 150, 115, 203,
+                                         167, 145, 194, 220, 229, 187, 227, 255,
+                                         179, 84,  162, 169, 0,   62,  164};
+  CHECK(gufo::minimax_h3::ResizeRgb8Lanczos(source, kWidth, kHeight, 13, 9,
+                                            &output, &error));
+  CHECK(output.size() == 13U * 9U * 3U);
+  worst = 0;
+  for (std::size_t index = 0; index < expected_row.size(); ++index) {
+    worst = std::max(worst, std::abs(static_cast<int>(output[index]) -
+                                     expected_row[index]));
+  }
+  CHECK(worst <= 1);
+  CHECK(gufo::minimax_h3::ResizeRgb8Lanczos(source, kWidth, kHeight, kWidth,
+                                            kHeight, &output, &error));
+  CHECK(output == source);
+  CHECK(!gufo::minimax_h3::ResizeRgb8Lanczos(source, 7, kHeight, 5, 4, &output,
+                                             &error));
+}
+
 void TestReleaseConfig(const std::filesystem::path& root) {
   const auto pdd = h3::json::ParseFile(root / "pdd_config.json", 1U << 20U);
   CHECK(pdd.Find("num_inference_steps")->AsUint64() ==
@@ -222,6 +278,7 @@ int main() {
   TestCanvas();
   TestLayout();
   TestScheduleAndRowMap();
+  TestLanczos();
   if (const char* root = std::getenv("GUFO_H3_IMAGE_ROOT")) {
     TestReleaseConfig(root);
   } else {

@@ -221,15 +221,19 @@ std::vector<std::uint8_t> EncodePng(const ext::ImageBuffer& image) {
   return std::move(output->bytes);
 }
 
-void ValidateRequest(const ext::ImageRequest& request) {
+void ValidateRequest(const ext::ImageRequest& request,
+                     const ext::ImageCapabilities& capabilities) {
   if (request.prompt.size() > (64U << 10U))
     throw std::invalid_argument("image prompt exceeds 64 KiB");
   if (request.width < 32 || request.height < 32 || request.width % 32 ||
-      request.height % 32 || request.width > 4096 || request.height > 4096 ||
-      static_cast<std::uint64_t>(request.width) * request.height > 4194304)
+      request.height % 32 || request.width > capabilities.max_side ||
+      request.height > capabilities.max_side ||
+      static_cast<std::uint64_t>(request.width) * request.height >
+          capabilities.max_pixels)
     throw std::invalid_argument(
-        "image size must be multiples of 32, at most 4096 per side and 4 "
-        "megapixels");
+        "image size must be multiples of 32, at most " +
+        std::to_string(capabilities.max_side) + " per side and " +
+        std::to_string(capabilities.max_pixels) + " pixels");
   if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
     throw std::invalid_argument("image steps must be between 2 and 100");
   if (request.images.size() > 10)
@@ -657,7 +661,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
                (static_cast<std::uint64_t>(entropy()) << 21) ^ entropy(), 0,
                (1ULL << 53) - 1);
     const auto count = Number(fields, "n", 1, 1, 10);
-    ValidateRequest(generation);
+    ValidateRequest(generation, service.capabilities());
     service.Validate(generation);
     // Live preview ("gufo": {"preview": {"id": ...}}): rendered while someone
     // watches /v1/previews/{id} (or always, when asked); 1.4.9 behaviour.

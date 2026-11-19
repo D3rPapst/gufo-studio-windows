@@ -23,6 +23,43 @@
       ],
       "target": "gufo_minimax_h3_hip",
       "entry": "minimax_h3_provider_register"
+    },
+    {
+      "id": "minimax-h3-image",
+      "capability": "image_generation",
+      "keys": [
+        "safetensors:minimax_h3_image",
+        "safetensors:MiniMaxH3ImagePipeline"
+      ],
+      "model_ids": [
+        "minimax-h3-image"
+      ],
+      "target": "gufo_minimax_h3_hip",
+      "entry": "minimax_h3_image_provider_register"
+    }
+  ],
+  "options": [
+    {
+      "name": "--h3-root",
+      "type": "path",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "minimax-h3-image"
+      ],
+      "help": "MiniMax H3 (FL2VA) model root; its FL2VA/text_encoder is the shared Qwen3-VL conditioner of MiniMax-H3-Image (default: GUFO_H3_ROOT)"
+    },
+    {
+      "name": "--h3-manifest",
+      "type": "path",
+      "commands": [
+        "serve image"
+      ],
+      "providers": [
+        "minimax-h3-image"
+      ],
+      "help": "Pinned MiniMax H3 source manifest for --h3-root (default: GUFO_H3_SOURCE_MANIFEST, then the build's manifest)"
     }
   ],
   "targets": {
