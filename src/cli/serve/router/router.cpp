@@ -1641,6 +1641,9 @@ public:
     /// Requests that made way for a load waiting for this model (2.2.4,
     /// pool_yield_for_load: partner work turned back, own work sent over).
     long long load_yields{0};
+    /// Requests held for a load waiting for this model (2.2.9, load
+    /// fairness, router-load-fair-seconds).
+    long long load_fair_holds{0};
     /// Last decision ("remote: warm").
     std::string last;
   };
@@ -1664,6 +1667,27 @@ public:
   /// empty (no --memory-guard: nothing waits).
   std::string LoadWaitingForLocked(const std::string& model_id) const {
     if (residency == nullptr || !residency->enabled())
+      return {};
+    return residency->LoadWaitingFor(model_id);
+  }
+
+  /// Load fairness (2.2.9, router::LoadFairHold): the cold load whose wait
+  /// keeps new local requests of `model_id` off its worker right now, or
+  /// empty. Only for a model whose preset sets router-load-fair-seconds;
+  /// its running requests finish, so it becomes idle and the load evicts
+  /// it. The hold runs in phases (held W, free W, ...): the model is never
+  /// held longer than W in a row.
+  std::string LoadFairHoldLocked(const std::string& model_id) const {
+    if (residency == nullptr || !residency->enabled())
+      return {};
+    const router::PresetModel* preset = registry.Find(model_id);
+    if (preset == nullptr || preset->hints.load_fair_seconds <= 0)
+      return {};
+    const auto since = residency->LoadWaitingSince(model_id);
+    if (!since ||
+        !router::LoadFairHold(
+            *since, std::chrono::steady_clock::now(),
+            std::chrono::seconds(preset->hints.load_fair_seconds)))
       return {};
     return residency->LoadWaitingFor(model_id);
   }
@@ -2038,6 +2062,12 @@ public:
     // How long this request has let a higher priority go first (2.0.3):
     // only real yield stretches count, not busy waits in between.
     router::PoolYieldClock yield_clock;
+    // 2.2.9 load fairness: how long this request was held for a load
+    // (LoadFairHoldLocked); held time does not count toward the B5
+    // fallback, so the request still looks for the partner afterwards.
+    std::chrono::milliseconds fair_held{0};
+    std::optional<std::chrono::steady_clock::time_point> fair_since;
+    bool fair_logged = false;
     std::optional<HttpResponse> local_failure;
     const auto stop_waiting = [&] {
       if (waiting) {
@@ -2097,8 +2127,14 @@ public:
       // B5 "never stuck" (Fabian 13.11.): after pool-wait-seconds on the
       // partner a request this router can run stops waiting for it.
       if (fallback == nullptr) {
+        auto held = fair_held;
+        if (fair_since)
+          held += std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - *fair_since);
+        const auto counted =
+            std::max(std::chrono::milliseconds(0), waited - held);
         fallback = router::PoolFallbackReason(
-            {waited, pool_wait, forwarded, forced == "remote", local_capable});
+            {counted, pool_wait, forwarded, forced == "remote", local_capable});
         if (fallback != nullptr) {
           ++pool_[model_id].fallbacks;
           Logger::Warn("router", "event=pool_fallback model=" + model_id +
@@ -2164,6 +2200,33 @@ public:
                                    " side=own waited_ms=" +
                                    std::to_string(waited.count()));
         decision = {router::PoolChoice::kRemote, "makes way for a load"};
+      }
+      // 2.2.9 load fairness: no new local request for this model while a
+      // cold load waits for it (router-load-fair-seconds, in phases); the
+      // request waits here (the partner may still take it above) and its
+      // running ones finish, so the load gets the memory (Regie 19.11.:
+      // minimax-h3 starved behind one 27B agent request after the other).
+      if (decision.choice == router::PoolChoice::kLocal && !forwarded) {
+        const std::string fair_load = LoadFairHoldLocked(model_id);
+        const auto now = std::chrono::steady_clock::now();
+        if (!fair_load.empty()) {
+          if (!fair_since)
+            fair_since = now;
+          if (!fair_logged) {
+            fair_logged = true;
+            ++pool_[model_id].load_fair_holds;
+            Logger::Info("router", "event=load_fair_hold model=" + model_id +
+                                       " waiting=" + fair_load +
+                                       " waited_ms=" +
+                                       std::to_string(waited.count()));
+          }
+          decision = {router::PoolChoice::kWait,
+                      "makes way for a load (load fairness)"};
+        } else if (fair_since) {
+          fair_held += std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - *fair_since);
+          fair_since.reset();
+        }
       }
       if (decision.choice == router::PoolChoice::kLocal) {
         stop_waiting();
@@ -2364,6 +2427,7 @@ public:
       out["retried_local"] = pool.retried_local;
       out["fallbacks"] = pool.fallbacks;
       out["load_yields"] = pool.load_yields;
+      out["load_fair_holds"] = pool.load_fair_holds;
       out["last"] = pool.last;
       if (pool.local_failed) {
         out["local_failed_s_ago"] = static_cast<long long>(
@@ -4108,6 +4172,15 @@ private:
     }
   }
 
+  /// Whether one of `blockers` is held for a waiting load right now
+  /// (2.2.9, LoadFairHoldLocked).
+  bool FairHeldForLocked(const std::vector<std::string>& blockers) const {
+    for (const std::string& id : blockers)
+      if (!LoadFairHoldLocked(id).empty())
+        return true;
+    return false;
+  }
+
   enum class Gate { kSpawn, kWait, kEvicted };
 
   /// Memory admission for a cold start of `model_id` (state mutex held; it
@@ -4446,7 +4519,11 @@ private:
             // request until the load timeout (504), answer 503 memory_busy
             // with Retry-After so the client (the job queue, the ComfyUI
             // adapter, a pipeline) retries later.
-            if (verdict == router::MemoryWaitVerdict::kGiveUpBusy) {
+            // 2.2.9 load fairness: a blocker held for this load takes no
+            // new requests, so it becomes idle; wait on while it is held
+            // (at most its router-load-fair-seconds in a row).
+            if (verdict == router::MemoryWaitVerdict::kGiveUpBusy &&
+                !FairHeldForLocked(plan.blocker_ids)) {
               registry.MarkUnloaded(model_id);
               residency->Event("gave up loading " + model_id +
                                ": memory busy, " + plan.reason);

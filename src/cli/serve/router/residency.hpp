@@ -86,6 +86,10 @@ public:
   /// A cold load that waits for `model` to become idle (recently), or
   /// empty. Relayed pool requests of `model` make way for it.
   [[nodiscard]] std::string LoadWaitingFor(std::string_view model) const;
+  /// Since when a cold load has waited for `model` without a break, or
+  /// nullopt (2.2.9, load fairness).
+  [[nodiscard]] std::optional<Clock::time_point> LoadWaitingSince(
+      std::string_view model) const;
 
   [[nodiscard]] json::Value Status(
       const std::vector<Registry::ResidentEntry>& residents,

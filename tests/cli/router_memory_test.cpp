@@ -576,7 +576,8 @@ void TestPresetHintsAndIdleOverride() {
     std::ofstream out(file);
     out << "[external/a]\ncommand = " << exe.string()
         << "\nmodel = m\nrouter-gpu-gb = 19.5\nrouter-host-gb = 3\n"
-           "router-exclusive = true\nrouter-idle-seconds = 60\n";
+           "router-exclusive = true\nrouter-idle-seconds = 60\n"
+           "router-load-fair-seconds = 300\n";
   }
   std::vector<gufo::router::PresetModel> models;
   std::string error;
@@ -586,6 +587,7 @@ void TestPresetHintsAndIdleOverride() {
     const auto& model = models[0];
     CHECK(model.hints.gpu_gb == 19.5 && model.hints.host_gb == 3.0);
     CHECK(model.hints.exclusive == 1 && model.hints.idle_seconds == 60);
+    CHECK(model.hints.load_fair_seconds == 300);
     for (const auto& arg : model.argv) {
       CHECK(arg.find("router") == std::string::npos);
     }
@@ -610,6 +612,19 @@ void TestPresetHintsAndIdleOverride() {
   }
   CHECK(!gufo::router::LoadPreset(file, {}, &models, &error));
   CHECK(error.find("router-bogus") != std::string::npos);
+  {
+    std::ofstream out(file);
+    out << "[external/a]\ncommand = " << exe.string()
+        << "\nrouter-load-fair-seconds = -5\n";
+  }
+  CHECK(!gufo::router::LoadPreset(file, {}, &models, &error));
+  CHECK(error.find("router-load-fair-seconds") != std::string::npos);
+  {
+    std::ofstream out(file);
+    out << "[external/a]\ncommand = " << exe.string() << "\nmodel = m\n";
+  }
+  CHECK(gufo::router::LoadPreset(file, {}, &models, &error));
+  CHECK(models.size() == 1 && models[0].hints.load_fair_seconds == -1);
   std::error_code ignored;
   std::filesystem::remove(file, ignored);
   std::filesystem::remove(exe, ignored);
@@ -792,6 +807,71 @@ void TestLoadWaitBook() {
   CHECK(book.WaitingFor("chat", at(401)).empty());
 }
 
+void TestLoadFairness() {
+  // 2.2.9 (Regie 19.11. 09:57): minimax-h3 waits for the busy 27B; with
+  // router-load-fair-seconds = W the 27B takes no new requests for W, then
+  // W normally again, and so on, counted from the start of the wait.
+  using gufo::router::LoadFairHold;
+  const auto at = [](int s) {
+    return Clock::time_point{} + std::chrono::seconds(s);
+  };
+  const std::chrono::seconds w(300);
+  CHECK(LoadFairHold(at(0), at(0), w));
+  CHECK(LoadFairHold(at(0), at(299), w));
+  CHECK(!LoadFairHold(at(0), at(300), w));  // the 27B's turn
+  CHECK(!LoadFairHold(at(0), at(599), w));
+  CHECK(LoadFairHold(at(0), at(600), w));  // the load's turn again
+  CHECK(!LoadFairHold(at(0), at(900), w));
+  CHECK(!LoadFairHold(at(0), at(10), std::chrono::seconds(0)));  // off
+  CHECK(!LoadFairHold(at(0), at(10), std::chrono::seconds(-1)));
+  CHECK(!LoadFairHold(at(20), at(10), w));  // clock before the wait
+
+  ResidentView chat = Resident("27b", 20, 20, 10, /*busy=*/true);
+  const AdmissionPlan busy = PlanAdmission(
+      Machine(22, 1, 20), {chat}, "h3", Need(40), /*exclusive=*/true,
+      MemoryPolicy{});
+  CHECK(busy.wait == AdmissionPlan::Wait::kBusy);
+  LoadWaitBook book;
+  CHECK(!book.WaitingSince("27b", at(0)).has_value());
+  book.Note("h3", busy, at(10));
+  CHECK(book.WaitingSince("27b", at(11)) == at(10));
+  CHECK(!book.WaitingSince("other", at(11)).has_value());
+  CHECK(!book.WaitingSince("h3", at(11)).has_value());
+  // The admission plans every 500 ms: the start stays, the wait is active.
+  for (int s = 11; s <= 70; ++s)
+    book.Note("h3", busy, at(s));
+  CHECK(book.WaitingSince("27b", at(71)) == at(10));
+  // Gave up (503 memory_busy) and waits for the job's retry: nothing
+  // would take the memory, so the 27B is not held (relayed partner work
+  // still makes way, WaitingFor, as in 2.2.4).
+  CHECK(!book.WaitingSince("27b", at(75)).has_value());
+  CHECK(book.WaitingFor("27b", at(75)) == "h3");
+  // The retry within the linger keeps the start: the phases go on.
+  book.Note("h3", busy, at(160));
+  CHECK(book.WaitingSince("27b", at(161)) == at(10));
+  // The 27B became idle: the admission evicts it and waits for the
+  // release; still loading, still active.
+  AdmissionPlan evict;
+  evict.action = Action::kEvict;
+  evict.evict = {"27b"};
+  book.Note("h3", evict, at(164));
+  CHECK(book.WaitingSince("27b", at(168)) == at(10));
+  // The load starts: no hold any more.
+  AdmissionPlan spawn;
+  spawn.action = Action::kSpawn;
+  book.Note("h3", spawn, at(170));
+  CHECK(!book.WaitingSince("27b", at(171)).has_value());
+  // A new wait after the linger starts its own phases.
+  book.Note("h3", busy, at(1000));
+  book.Note("h3", busy, at(1200));  // until was 1120: lingered out
+  CHECK(book.WaitingSince("27b", at(1201)) == at(1200));
+  // Two loads wait for the 27B: the earlier start counts.
+  book.Note("vace", busy, at(1201));
+  CHECK(book.WaitingSince("27b", at(1203)) == at(1200));
+  book.Clear("h3");
+  CHECK(book.WaitingSince("27b", at(1203)) == at(1201));
+}
+
 int main() {
   TestEmptyFits();
   TestBuiltInFloor();
@@ -820,6 +900,7 @@ int main() {
   TestUnmeasuredIdleEvictedInsteadOfOutsideWait();
   TestMemoryWaitClock();
   TestLoadWaitBook();
+  TestLoadFairness();
   if (failures != 0) {
     std::cerr << failures << " router memory checks failed.\n";
     return 1;

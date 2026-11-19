@@ -131,7 +131,7 @@ bool ParseHint(const std::string& key, std::string_view value,
                PresetHints* hints, std::string* error) {
   double number = 0.0;
   if (key == "router-gpu-gb" || key == "router-host-gb" ||
-      key == "router-idle-seconds") {
+      key == "router-idle-seconds" || key == "router-load-fair-seconds") {
     if (!ParseNumber(value, &number)) {
       *error = "'" + key + "' needs a non-negative number";
       return false;
@@ -140,8 +140,10 @@ bool ParseHint(const std::string& key, std::string_view value,
       hints->gpu_gb = number;
     } else if (key == "router-host-gb") {
       hints->host_gb = number;
-    } else {
+    } else if (key == "router-idle-seconds") {
       hints->idle_seconds = static_cast<long long>(number);
+    } else {
+      hints->load_fair_seconds = static_cast<long long>(number);
     }
     return true;
   }

@@ -211,14 +211,42 @@ public:
   /// A load still waiting for `model`, or empty (the first by id).
   [[nodiscard]] std::string WaitingFor(std::string_view model,
                                        Clock::time_point now) const;
+  /// A load waits for `model` right now (an admission planned within
+  /// kActive): since when it has waited without a break (the earliest of
+  /// them; a wait that lingered out starts anew), or nullopt (2.2.9, load
+  /// fairness: LoadFairHold). A load that gave up and waits for its retry
+  /// (job queue, ComfyUI) holds nothing: nobody would take the memory.
+  [[nodiscard]] std::optional<Clock::time_point> WaitingSince(
+      std::string_view model, Clock::time_point now) const;
+  /// An admission plans every 500 ms while it waits.
+  static constexpr std::chrono::seconds kActive{5};
 
 private:
   struct Entry {
     std::vector<std::string> blockers;
     Clock::time_point until{};
+    Clock::time_point since{};
+    Clock::time_point noted{};
   };
   std::map<std::string, Entry, std::less<>> waits_;
 };
+
+/// Load fairness (2.2.9, Regie 19.11. 09:57: minimax-h3 on the .56 was put
+/// back 12 times with memory_busy while one agent request of the 27B after
+/// the other kept it busy). A model X with `router-load-fair-seconds = W`
+/// in its preset section stops taking new local requests while a cold load
+/// has waited for X: its running requests finish, X becomes idle, the load
+/// evicts it. So that X (the chat) never starves in turn, the hold runs in
+/// phases from the start of that wait: held during [0, W), free during
+/// [W, 2W), held during [2W, 3W), ... W <= 0: never held (default).
+[[nodiscard]] inline bool LoadFairHold(
+    std::chrono::steady_clock::time_point since,
+    std::chrono::steady_clock::time_point now, std::chrono::seconds window) {
+  if (window <= std::chrono::seconds(0) || now < since)
+    return false;
+  const auto phase = (now - since) / window;
+  return phase % 2 == 0;
+}
 
 /// Seconds a client should wait before it retries a memory_busy load.
 constexpr int kMemoryBusyRetryAfterSeconds = 30;

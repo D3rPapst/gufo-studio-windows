@@ -275,14 +275,22 @@ void LoadWaitBook::Note(std::string_view id, const AdmissionPlan& plan,
   }
   if (plan.action != AdmissionPlan::Action::kWait ||
       plan.wait != AdmissionPlan::Wait::kBusy || plan.blocker_ids.empty()) {
+    // Evicting or waiting for released memory: still loading (2.2.9).
+    if (const auto it = waits_.find(id); it != waits_.end()) {
+      it->second.noted = now;
+    }
     return;
   }
   auto it = waits_.find(id);
   if (it == waits_.end()) {
     it = waits_.emplace(std::string(id), Entry{}).first;
+    it->second.since = now;
+  } else if (now >= it->second.until) {
+    it->second.since = now;  // lingered out: a new wait
   }
   it->second.blockers = plan.blocker_ids;
   it->second.until = now + kLinger;
+  it->second.noted = now;
 }
 
 void LoadWaitBook::Clear(std::string_view id) {
@@ -304,6 +312,22 @@ std::string LoadWaitBook::WaitingFor(std::string_view model,
     }
   }
   return {};
+}
+
+std::optional<LoadWaitBook::Clock::time_point> LoadWaitBook::WaitingSince(
+    std::string_view model, Clock::time_point now) const {
+  std::optional<Clock::time_point> earliest;
+  for (const auto& [id, entry] : waits_) {
+    if (now >= entry.until || now - entry.noted >= kActive || id == model) {
+      continue;
+    }
+    if (std::find(entry.blockers.begin(), entry.blockers.end(), model) !=
+            entry.blockers.end() &&
+        (!earliest || entry.since < *earliest)) {
+      earliest = entry.since;
+    }
+  }
+  return earliest;
 }
 
 std::int64_t SystemMemory::DedicatedFree() const {

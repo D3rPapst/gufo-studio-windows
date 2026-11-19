@@ -286,6 +286,12 @@ std::string Residency::LoadWaitingFor(std::string_view model) const {
   return load_waits_.WaitingFor(model, Clock::now());
 }
 
+std::optional<Residency::Clock::time_point> Residency::LoadWaitingSince(
+    std::string_view model) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return load_waits_.WaitingSince(model, Clock::now());
+}
+
 void Residency::Event(std::string text) {
   server::Logger::Info("router", "event=residency " + text);
   const std::lock_guard<std::mutex> lock(mutex_);

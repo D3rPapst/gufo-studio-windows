@@ -686,6 +686,7 @@ section (`ParseHint`) and never reach the worker. They tune
 | `router-host-gb` | number >= 0 | Expected host RAM in GB; used together with `router-gpu-gb` (without it the value is not applied). |
 | `router-exclusive` | `true` or `false` | `true`: nothing else may stay loaded beside this model; the guard evicts the others first. |
 | `router-idle-seconds` | number >= 0 | Idle unload for this model instead of `--sleep-idle-seconds`. |
+| `router-load-fair-seconds` | number >= 0 | Load fairness (2.2.9, `0` or unset = off): while a cold load waits for this busy model, its new pool requests are held, in phases of this many seconds (held, free, held, ...). See [Load fairness](#load-fairness-229). A router older than 2.2.9 refuses the key at start. |
 
 Any other `router-*` key is `unknown router key` and stops the start.
 In `[remote/<id>]` sections router hints are rejected.
@@ -1803,6 +1804,55 @@ callers wait (`comfy::IsMemoryNotFreeYet`):
   the prompt as GufoBusy.
 - Job API: the job goes back like `memory_busy`, `memory_wait.code` is
   `insufficient_memory`.
+
+**Making way for a load (2.2.4).** While a cold load of Y waits for a busy
+model X (`LoadWaitBook` in `memory.hpp`, kept 120 s after its last plan, so
+across the 503 and the client's retry), pool requests of X relayed by the
+partner are turned back with `503 pool_busy` (`event=pool_yield_for_load
+side=partner`; the partner runs them itself), and this router's own pool
+requests of X go to the partner when it has X warm and free right now
+(`side=own`). Own requests otherwise still start on X. `/router/status`
+counts both in the pool model's `"load_yields"`.
+
+#### Load fairness (2.2.9)
+
+Regie 19.11. 09:57 (.56, 2.2.8): a `minimax-h3` job was put back 12 times
+with `memory_busy`, each time after 0-3 min of "running". That time was
+waiting, nothing ran: the job's request waited in the pool
+(`pool-wait-seconds`, 60 s, while the 27B had requests in flight the
+machine was not idle, and the partner most likely was not idle either), then the cold load
+waited `--memory-wait-seconds` (60 s) for the busy 27B, then 503 and the
+job's 30 s retry. With `sessions` = 2 and many agents the 27B was never
+idle: every new agent request started beside the running one.
+
+`router-load-fair-seconds = W` in the busy model's section (e.g. the 27B
+on the .56) turns on a hold: while a cold load is **actively** waiting
+for that model (its admission planned within the last 5 s,
+`LoadWaitBook::WaitingSince`), new own pool requests of the model do not
+start on the local worker (`event=load_fair_hold`, decision `wait`
+"makes way for a load (load fairness)", counted in `"load_fair_holds"`).
+They still go to the partner when it has the model warm and free (2.2.4),
+otherwise they wait in the pool. Running requests finish; the model
+becomes idle and the waiting load evicts it as any idle holder. While one
+of its blockers is held the waiting load does not give up after
+`--memory-wait-seconds`.
+
+Bound against the other starvation (the chat): the hold runs in phases
+counted from the start of the load's wait (`router::LoadFairHold`): held
+for W, free for W, held for W, ... So the model is never held more than W
+in a row, and a load that waits longer than W gets its next chance after
+another W. The start survives the job's retries (the wait lingers 120 s);
+a load that gave up and waits for its retry holds nothing (nobody would
+take the memory then). Held time does not count toward the pool's B5
+fallback (`pool-wait-seconds`), so a held request still looks for the
+partner afterwards.
+
+Cost: once the load got the memory, the held model is evicted; its next
+requests go to the partner (pool) or wait for the memory like any cold
+load (503 `memory_busy` after `--memory-wait-seconds`). Only pool requests
+are held (placement `pool`); a model placed `local` and requests relayed
+by the partner (those are turned back anyway) are not. Leave the key off
+where an interactive chat must keep its model (the .198).
 
 Other 507s still fail at once: `loading 'X' was stopped because memory ran
 low` (the load was aborted) and a worker's own refusal. A model larger than

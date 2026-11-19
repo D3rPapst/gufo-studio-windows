@@ -14,12 +14,16 @@ namespace gufo::router {
 /// Router-only keys (`router-*`), never passed to the worker:
 /// router-gpu-gb / router-host-gb: peak memory estimate (GB, < 0 = unset),
 /// router-exclusive: nothing else may stay loaded beside this model,
-/// router-idle-seconds: idle unload override (< 0 = router default).
+/// router-idle-seconds: idle unload override (< 0 = router default),
+/// router-load-fair-seconds: while a cold load waits for this busy model,
+/// it takes no new local requests, in phases of this length (LoadFairHold,
+/// 2.2.9; < 0 = unset = off).
 struct PresetHints {
   double gpu_gb{-1.0};
   double host_gb{-1.0};
   int exclusive{-1};  // -1 unset, 0 false, 1 true
   long long idle_seconds{-1};
+  long long load_fair_seconds{-1};
 };
 
 /// `http://<IPv4>:<port>[/path]`: a remote gufo router or a busy-check
