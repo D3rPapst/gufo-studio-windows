@@ -35,6 +35,12 @@
 //          WanUni3CControlnetApply (render_video from LoadVideo or a
 //          GufoCameraMove node), or WanCameraImageToVideo <- WanCameraEmbedding
 //          / GufoCameraMove -> /v1/videos (wan2.1-uni3c, gufo.camera)
+//   i2v chain  WanImageToVideo chunks (camera / i2v22 as above) whose
+//          start_image is one frame of an earlier chunk's VAEDecode
+//          (ImageFromBatch, also over ImageBatch): one task, the executor
+//          renders the chunks one after another (each with its own prompt,
+//          seed, length, LoRA) and joins the frames the outputs take
+//          through ImageBatch / ImageFromBatch (ComfyUI semantics)
 //   vace   KSampler <- WanVaceToVideo (control_video from LoadVideo /
 //          VHS_LoadVideo or a frame batch built in the graph from
 //          EmptyImage / LoadImage / ImageScale / ImageBatch /
@@ -150,6 +156,15 @@ struct FileRef {
 
 enum class OutputKind { kImage, kAudio, kVideo };
 
+/// One frame of a chain of Wan I2V chunks (VideoTask::i2v_chunks): the
+/// chunk (0 = the task's own video, n = i2v_chunks[n - 1]) and the frame in
+/// that chunk's video, counted from 0.
+struct ChainFrame {
+  int chunk{0};
+  int frame{0};
+  bool operator==(const ChainFrame&) const = default;
+};
+
 /// One Save*/Preview* node that receives the task's media.
 struct OutputTarget {
   std::string node_id;
@@ -161,6 +176,10 @@ struct OutputTarget {
   /// WanAnimateToVideo chunks cut by ImageFromBatch(batch_index 0, length
   /// n) when the job renders more (gufo renders 4k+1 frames).
   int max_frames{0};
+  /// A chain of Wan I2V chunks: the frames this output receives, in order,
+  /// as the graph's ImageBatch / ImageFromBatch nodes put them together
+  /// (ComfyUI semantics). The executor joins them from the chunks' videos.
+  std::vector<ChainFrame> chain_frames;
 };
 
 enum class SizeSource {
@@ -606,6 +625,16 @@ struct VideoTask {
   /// (gufo.animate.continue_frames; 0 = not sent).
   int animate_length{0};
   int animate_continue_frames{0};
+  /// Chained Wan I2V chunks (Regie 19.11., mehrsprecher bewegung_wf): each
+  /// next WanImageToVideo starts from one frame of an earlier chunk's
+  /// decode (ImageFromBatch over VAEDecode / ImageBatch). This task is
+  /// chunk 0; `i2v_chunks` are the later ones with their own prompt, seed,
+  /// length and sampler settings (same model and size), `i2v_starts[i]` the
+  /// start frame of i2v_chunks[i]. The executor renders the chunks one
+  /// after another as separate /v1/videos jobs, passes each start frame on
+  /// as first_frame and joins the outputs' OutputTarget::chain_frames.
+  std::vector<VideoTask> i2v_chunks;
+  std::vector<ChainFrame> i2v_starts;
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

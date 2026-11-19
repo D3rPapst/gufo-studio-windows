@@ -5183,8 +5183,14 @@ int RunRouter(std::span<const char* const> args) {
                                                   router::comfy::VideoTask>) {
                 item.area = "video";
                 item.model = spec.model;
-                item.counts = 2;
+                // A chain of I2V chunks: one video job per chunk, each with
+                // its own prompts.
+                item.counts = 2 * (1 + static_cast<int>(spec.i2v_chunks.size()));
                 item.texts = {spec.prompt, spec.negative_prompt};
+                for (const auto& chunk : spec.i2v_chunks) {
+                  item.texts.push_back(chunk.prompt);
+                  item.texts.push_back(chunk.negative_prompt);
+                }
               } else if constexpr (std::is_same_v<Spec,
                                                   router::comfy::SpeechTask>) {
                 item.area = "stimme";

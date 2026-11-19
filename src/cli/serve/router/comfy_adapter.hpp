@@ -276,7 +276,26 @@ private:
   json::Value SaveSpeech(const Task& task,
                          const std::vector<std::string>& wavs);
   json::Value RunVideo(const std::shared_ptr<Job>& job, const Task& task,
-                       const VideoTask& spec);  json::Value RunMusic(const std::shared_ptr<Job>& job, const Task& task,
+                       const VideoTask& spec);
+  /// Chained Wan I2V chunks (VideoTask::i2v_chunks): one /v1/videos job
+  /// per chunk, each next one started from its i2v_starts frame (ffmpeg),
+  /// the outputs' chain_frames joined from the chunks' videos.
+  json::Value RunI2VChain(const std::shared_ptr<Job>& job, const Task& task,
+                          const VideoTask& spec);
+  /// The /v1/videos body of `spec` with its media as data URLs.
+  json::Value VideoBody(const std::shared_ptr<Job>& job, const Task& task,
+                        const VideoTask& spec);
+  /// POSTs `payload`, waits for the video (progress `part` of `parts`) and
+  /// returns its MP4 bytes. Throws on errors and interrupts.
+  std::string RenderVideo(const std::shared_ptr<Job>& job, const Task& task,
+                          const VideoTask& spec, const std::string& payload,
+                          int part, int parts);
+  /// Stores a video job's result (`bytes`, also written to `mp4`) for one
+  /// output; returns its ui entry.
+  json::Value SaveVideoOutput(const OutputTarget& target,
+                              const VideoTask& spec, const std::string& bytes,
+                              const std::filesystem::path& mp4);
+  json::Value RunMusic(const std::shared_ptr<Job>& job, const Task& task,
                        const MusicTask& spec);
   json::Value RunFoley(const std::shared_ptr<Job>& job, const Task& task,
                        const FoleyTask& spec);
