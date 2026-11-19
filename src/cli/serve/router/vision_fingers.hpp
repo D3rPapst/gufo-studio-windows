@@ -63,6 +63,7 @@
 
 #include "ccip/image_ops.hpp"
 #include "src/cli/serve/http_server.hpp"
+#include "src/cli/serve/router/vision_chat.hpp"  // GenerationStarted
 #include "src/core/json.hpp"
 
 namespace gufo::router::vision {
@@ -135,16 +136,6 @@ json::Value FingerChatBody(const HandFingersRequest& options, const std::string&
 /// the object are tolerated) with every field of the schema. Throws
 /// std::runtime_error with the reason.
 HandVerdict ParseFingerAnswer(std::string_view chat_body);
-
-/// Whether the stream text `body`, from byte `*scanned` on, holds a whole
-/// "data:" line that shows the generation running: a non-empty delta
-/// content, reasoning_content or tool_calls, a finish_reason or an error.
-/// The role chunk ({"delta": {"role": "assistant"}}) and prompt_progress
-/// chunks do not count: a gufo worker sends the role chunk already when the
-/// request has waited stream_start_delay (5 s) in its queue behind another
-/// chat, long before the model works on it. `*scanned` moves past the whole
-/// lines looked at (an unfinished last line is looked at again later).
-bool GenerationStarted(std::string_view body, std::size_t* scanned);
 
 /// detections.hand_fingers for `hands` (in this order) on `image`: one chat
 /// per hand through `serve`, the caller's Authorization / Cookie copied

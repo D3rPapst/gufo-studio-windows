@@ -24,9 +24,10 @@ the requests instead of letting several processes compete for the cores.
 - `image`: a `data:` URL, plain base64, a public `https://` URL or an Ablage path
   `/v1/jobs/{id}/files/{name}` of one of your own jobs. PNG, JPEG or WebP, at most
   20 MB. An alpha channel is dropped.
-- `tasks`: any of `person`, `head`, `face`, `hand`, `hand_fingers`, `ocr`, `wd14_tags`, `pose`,
-  `pose_wholebody`; the four detectors when left out (the others only when asked for).
-  `hand_fingers`: see [Finger count](#finger-count).
+- `tasks`: any of `person`, `head`, `face`, `hand`, `hand_fingers`, `person_count`, `ocr`,
+  `wd14_tags`, `pose`, `pose_wholebody`; the four detectors when left out (the others only when
+  asked for). `hand_fingers`: see [Hand check](#hand-check); `person_count`: see
+  [Person check](#person-check).
   `pose_options`: `min_score` (0.35) and `max_persons` (4) for the pose person search.
 - `thresholds`: optional `conf` (minimum score) and `iou` (overlap above which the
   weaker box is dropped) per detector; for `ocr` `heat` and `box`. Each in (0, 1].
@@ -151,6 +152,67 @@ entry per hand box, in score order:
   on the four good hands and found the see-through ghost arm (40 to 170 s per hand). Without
   thinking (5 s per hand) it missed the ghost arm and once reported six fingers on a good
   hand. LFM3-VL-2B (1 s) answers the schema but sees almost nothing (see the prompt test). Treat `sicher: false` and small hands as "look at it", not as a finding.
+
+## Person check
+
+`person_count` checks the persons of a film frame for the film direction: how many are there,
+and is each of them possible? A vision chat model on this router looks at the whole picture
+once, lists every person it sees and reports:
+
+- `extra_limb`: an arm, hand, leg or head that belongs to no person, a third arm, or a faint,
+  see-through body part or ghost figure (the background shows through it),
+- `duplicate_person`: the same person (face, hair, clothes) twice in the picture, also as a
+  see-through ghost double,
+- `count_mismatch`: more or fewer persons than `expected`,
+- `sonstiges`: anything else impossible about the persons (two bodies merged into one).
+
+Hidden body parts are no finding: a person behind a desk, another person or an object, cut off
+by the frame, hands behind the back, legs under a table. People on posters, screens, in mirrors
+or windows are not counted. The task runs the `person` detector too (also answered); its count
+is given as `detektor_personen` for comparison, the model does not see it.
+
+```json
+{"image": "...", "tasks": ["person_count"],
+ "person_count_options": {"expected": 1,
+                          "references": [{"name": "Bernd", "image": "/v1/jobs/j1/files/bernd.png"}],
+                          "model": "qwen3.8-27b", "thinking": true, "timeout_seconds": 300,
+                          "wait_seconds": 600, "max_tokens": 4096}}
+```
+
+All options are optional (`model`, `thinking`, the times and `max_tokens` as for
+`hand_fingers`). `expected` (0 to 20, also `erwartet`): the persons the scene should show;
+without it there is no `count_mismatch`. `references` (also `referenzen`): up to 4 reference
+pictures of the film's characters, each `{"name", "image"}` or just the image (named
+`Figur 1`, ...); images like `image` (data URL, base64, `https://`, Ablage path). The model
+then names each person after them (`wer`) and reports the same character twice as
+`duplicate_person`. The picture is sent at most 1536 px on its long side, references at most
+768 px. The answer is one object:
+
+```json
+"person_count": {
+  "personen": 1, "erwartet": 1, "detektor_personen": 2,
+  "liste": [{"stelle": "Mitte am Tisch", "wer": "Bernd"}],
+  "befunde": [{"art": "extra_limb", "stelle": "rechts hinter Bernd, durchscheinender Arm",
+               "sicherheit": "hoch", "quelle": "modell"}],
+  "sicher": true, "befund": "durchscheinender Doppelgänger mit zusätzlichem Arm rechts",
+  "urteil": "fehler", "seconds": 84.1, "waited_seconds": 1.2}
+```
+
+- `personen` is the number of persons in `liste` (`stelle`: where; `wer`: the reference name,
+  `unbekannt`, or without references a short description).
+- Each finding has `art`, `stelle`, `sicherheit` (`hoch` clearly visible, `mittel` probably,
+  `niedrig` possible but unclear) and `quelle`: `modell`, or `gufo` for the `count_mismatch`
+  gufo adds itself when `expected` is given, the list has a different number and the model
+  did not report one (`sicherheit` `hoch`, `mittel` when the model is unsure). Without
+  `expected` a `count_mismatch` of the model is dropped.
+- `urteil`: `fehler` when a finding has `sicherheit` `hoch`; `pruefen` when there are only
+  `mittel` / `niedrig` findings or `sicher` is `false` (dark, blurred, crowded picture, unsure
+  count); else `ok`.
+- When the question failed (model refused, timeout, no valid JSON) the object has `fehler`
+  instead of the verdict (with `erwartet` and `detektor_personen`); the other tasks are
+  answered normally. `models.person_count` names the model; `person_count_seconds` is the time
+  of the question. Like `hand_fingers` it is an ordinary chat under your own token, runs after
+  the CPU part and waits for the model the same way.
 
 ## Models
 
