@@ -67,7 +67,7 @@ struct Vace21Request {
   /// low-noise one [switch, steps) (see VaceSwitchStep). With
   /// `experts_resident` both load together and stay in the worker over jobs
   /// (same files, LoRAs and strengths: no reload) when the device has room
-  /// (KeepVaceExpertsResident); otherwise one is on the device at a time
+  /// (VaceExpertsFit: the experts plus the largest job phase); otherwise one is on the device at a time
   /// (each ~18 GB with its VACE module), loaded from disk every job.
   std::filesystem::path high_dit_file;
   std::filesystem::path high_vace_file;
