@@ -2284,6 +2284,25 @@ public:
             DispatchRemoteLocked(req, model_id, *preset.remote, lock);
         if (!lock.owns_lock())
           lock.lock();
+        // 2.2.12: a video, music or 3D create is not tried again after a
+        // partner failure (it may have started there), but 503 memory_busy
+        // says nothing started: the partner could not load the model beside
+        // its own busy one (19.11.: wan2.2-i2v clips of the .56 adapter got
+        // it on the .198 beside a loading 27B and ended as GufoBusy). Read
+        // the small error body to tell (with the lock released: the relay's
+        // closure holds a RemoteHold) and decide again like for other
+        // requests: this machine, or wait in the pool for one.
+        bool partner_memory_busy = false;
+        if (response.status == 503 && !forwarded && !may_retry &&
+            !remote_failed && (forced != "remote" || local_capable)) {
+          lock.unlock();
+          std::string body = ReadSmallBody(response);
+          lock.lock();
+          partner_memory_busy =
+              router::comfy::MemoryBusyOf(
+                  {.status = response.status, .body = std::move(body)})
+                  .has_value();
+        }
         // 507 from the partner: it could not load the model (memory held
         // outside its router). This machine may still fit it after evicting
         // its own idle residents, so it tries once itself instead of handing
@@ -2315,8 +2334,9 @@ public:
                                      std::to_string(
                                          router::kPoolRemoteFailHold.count()));
         }
-        if (may_retry && !remote_failed && !forwarded &&
-            answer != router::PoolRemoteAnswer::kPass) {
+        if (((may_retry && answer != router::PoolRemoteAnswer::kPass) ||
+             partner_memory_busy) &&
+            !remote_failed && !forwarded) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
@@ -2328,7 +2348,8 @@ public:
           Logger::Warn(
               "router",
               "event=pool_fallback model=" + model_id + " reason=\"" +
-                  (answer == router::PoolRemoteAnswer::kRetryUnreachable
+                  (partner_memory_busy ? "partner memory busy"
+                   : answer == router::PoolRemoteAnswer::kRetryUnreachable
                        ? "partner unreachable"
                    : answer == router::PoolRemoteAnswer::kRetryMemory
                        ? "partner out of memory"
@@ -4630,6 +4651,25 @@ private:
   /// (another model, busy or loading) holds the memory. Retry-After and
   /// error.retry_after_s say when to try again; error.blocked_by names the
   /// models.
+  /// The body of a relayed answer (at most kSmallBodyMax; an error answer
+  /// is a few hundred bytes). A lazy body is read and its relay closure is
+  /// replaced with one that writes the same bytes, so the answer can still
+  /// go to the client unchanged (headers, Content-Length). Call with the
+  /// state mutex released: the old closure may hold a RemoteHold.
+  static std::string ReadSmallBody(HttpResponse& response) {
+    if (!response.streaming_body)
+      return response.body;
+    constexpr std::size_t kSmallBodyMax = 64 * 1024;
+    std::string body;
+    response.streaming_body([&body](std::string_view chunk) {
+      body.append(chunk);
+      return body.size() <= kSmallBodyMax;
+    });
+    response.streaming_body =
+        [body](const HttpResponse::BodyWriter& write) { (void)write(body); };
+    return body;
+  }
+
   static HttpResponse MemoryBusyErr(const std::string& model_id,
                                     const std::string& blocked_by) {
     const int retry = router::kMemoryBusyRetryAfterSeconds;

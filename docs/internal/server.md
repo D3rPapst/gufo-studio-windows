@@ -1723,7 +1723,9 @@ adapter rendered on the .198 with `preview_published=0`).
 `pool_busy`, ...) or `504` (its load timed out), nothing has reached the
 client yet, so the pool decides once more without the partner (this
 machine, or wait for it), like it already did for `507` and for `503
-remote_unavailable`. Video, music and 3D creates are not retried;
+remote_unavailable`. Video, music and 3D creates are not retried, except
+after `503 memory_busy` (2.2.12, see [Memory busy is waited
+for](#memory-busy-is-waited-for-2212)): nothing started on the partner;
 requests pinned with `X-Gufo-Pool: remote` only when this router has
 the model and every LoRA they name (2.0.2). The partner then gets no
 pool request of that model for 60 s, also when it could not be reached
@@ -1915,7 +1917,7 @@ ComfyUI adapter (`/prompt`):
 | When | What the client sees |
 | --- | --- |
 | `POST /prompt` while no prompt of the adapter runs or waits, and the router's plan for the prompt's first model waits for a busy or loading model (`RouterState::MemoryBusyFor`; not for loaded, remote or pool models) | HTTP `503`, `Retry-After: 30`, `{"error": {"type": "memory_busy", "code": "memory_busy", "message": "...", "retry_after_s": 30, "details": "", "extra_info": {}}, "node_errors": {}}`; nothing is queued |
-| A task's request gets `503 memory_busy` while the prompt runs (also a prompt accepted behind others) | `/history/<id>`: `status.status_str` `"error"`, message `execution_error` with `"exception_type": "GufoBusy"`, `"code": "memory_busy"`, `"retry_after_s": 30`, `"error": {"code": "memory_busy", "message", "retry_after_s"}`, `exception_message` = the router's message, `node_id` = the task's node; the same over `/ws` |
+| A task's request gets `503 memory_busy` while the prompt runs (also a prompt accepted behind others) | Since 2.2.12 the task waits and sends it again (see [Memory busy is waited for](#memory-busy-is-waited-for-2212)). Only after `memory_free_limit` (6 h) of such answers in a row: `/history/<id>`: `status.status_str` `"error"`, message `execution_error` with `"exception_type": "GufoBusy"`, `"code": "memory_busy"`, `"retry_after_s": 30`, `"error": {"code": "memory_busy", "message", "retry_after_s"}`, `exception_message` = the router's message, `node_id` = the task's node; the same over `/ws` |
 
 Nothing of a GufoBusy prompt's failing task ran; outputs of earlier
 tasks of the same prompt are kept in the history entry as usual.
@@ -1954,10 +1956,68 @@ callers wait (`comfy::IsMemoryNotFreeYet`):
   it is sent again every 30 s (`AdapterOptions::memory_free_retry`) for at
   most 6 h in a row (`memory_free_limit`), as long as the prompt is not
   interrupted; logged as `event=memory_free_wait` /
-  `event=memory_free_wait_end`. A `503 memory_busy` meanwhile still ends
-  the prompt as GufoBusy.
+  `event=memory_free_wait_end`. Since 2.2.12 a `503 memory_busy` waits
+  on the same clock (see below).
 - Job API: the job goes back like `memory_busy`, `memory_wait.code` is
   `insufficient_memory`.
+
+#### Memory busy is waited for (2.2.12)
+
+Measured 19.11. (2.2.11, four `wan2.2-i2v-a14b` prompts at once over the
+.56 adapter, the model needs about 54.8 GB and loads alone): a 27B
+request relayed by the partner evicted the idle I2V model on the .198
+(`memory_evict model=wan2.2-i2v-a14b for=qwen3.8-27b`). The next read of
+a finished clip (`GET /v1/videos/<id>/content`, which reloads the owner
+worker) waited `--memory-wait-seconds` for the busy 27B and got `503
+memory_busy`; the prompt ended as GufoBusy at the client (twice), and the
+clip ran only about 690 s later. An answer `memory_busy` means: nothing
+started, the memory may be free later. So nobody hands it on while the
+request may still wait:
+
+- ComfyUI adapter (`Adapter::Call`, every task request: image, video,
+  music, 3D creates and the video `/content` read): `503 memory_busy` is
+  handled like the passing 507 (`comfy::MemoryWaitOf`): sent again every
+  `memory_free_retry` (30 s), or after the answer's `retry_after_s` when
+  that is longer, for at most `memory_free_limit` (6 h) in a row; the
+  prompt's `/interrupt` ends the wait. Logged as `event=memory_free_wait
+  code=memory_busy` / `event=memory_free_wait_end`. Each new try goes
+  through the router's pool again, so it may run on the partner then. A
+  video status poll that gets `memory_busy` or the passing 507 waits on
+  the same limit instead of the 10 min poll grace
+  (`event=video_poll_memory_wait`). Only after the limit does the prompt
+  end as GufoBusy. Unchanged: `POST /prompt` with an empty adapter queue
+  may still answer `503 memory_busy` at once (the pre-check; never for
+  pool models).
+- Job API: the job's requeue after `memory_busy` honours a longer
+  `retry_after_s` (`Options::retry_after_unit`). Once the worker job exists
+  (`upstream_id`), the job cannot go back to the queue: a status poll or
+  `/content` read (video, 3D, music) that gets `memory_busy` or the
+  passing 507 now waits in place (`JobQueue::Call`, `memory_busy_retry`,
+  `memory_busy_limit`; `event=job_memory_wait`) instead of failing the
+  finished work.
+- Pool: a video, music or 3D create that the partner answers with `503
+  memory_busy` is decided again without the partner, like other requests
+  after a partner failure (`event=pool_fallback reason="partner memory
+  busy"`): this machine, or wait in the pool for it. The router reads the
+  small error body for that (`ReadSmallBody`, lock released) and still
+  hands an unchanged answer on in every other case. Other 503s of a create
+  are passed on as before (the create may have started there). Pinned
+  requests (`X-Gufo-Pool: remote`) only when this router can run them. A
+  local `memory_busy` already let the pool try the partner when it is
+  available (`pool_local_failed`, 60 s hold); with the partner out the
+  request gets the `memory_busy` and the caller waits as above.
+
+Not built (only described): a relayed partner text request (here the 27B)
+could leave an idle large video model alone while a request of that video
+model waits on this machine, to avoid the ping-pong evict/reload. The
+residency planner (`PlanAdmission`) does not know whether a load serves a
+relayed request, and a waiting `/content` read is not a pool waiter; it
+would need the forwarded flag through `AdmitLocked` into the plan and a
+"wanted soon" mark per model (pool waiters, adapter tasks, recent job
+reads). The cheaper real fix for the case above: serve the `/content` of
+a finished video job without reloading its worker (the router reads the
+worker's stored result), so an evicted video model is no longer needed
+for it at all.
 
 **Making way for a load (2.2.4).** While a cold load of Y waits for a busy
 model X (`LoadWaitBook` in `memory.hpp`, kept 120 s after its last plan, so

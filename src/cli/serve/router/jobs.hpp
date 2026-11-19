@@ -280,8 +280,14 @@ struct Options {
   /// and is tried again after `memory_busy_retry`; other jobs may run
   /// meanwhile. After `memory_busy_limit` of such waits in a row it fails
   /// with memory_busy. Zero limit = no limit.
+  /// 2.2.12: a longer Retry-After of the answer wins over the retry; a
+  /// read of a started worker job (status, /content) that gets memory_busy
+  /// or the passing 507 waits in place the same way (JobQueue::Call).
   std::chrono::milliseconds memory_busy_retry{std::chrono::seconds(30)};
   std::chrono::milliseconds memory_busy_limit{std::chrono::hours(6)};
+  /// How long one second of an answer's retry_after_s lasts; tests shorten
+  /// it.
+  std::chrono::milliseconds retry_after_unit{std::chrono::seconds(1)};
   /// Whole-job limit of a 3D job's status polls (gufo serve objekt; up to
   /// ~2 min per object measured): past it the worker job is cancelled and
   /// the job fails with objekt_timeout. Zero = no limit.

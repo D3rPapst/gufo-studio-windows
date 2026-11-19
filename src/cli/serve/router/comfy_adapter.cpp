@@ -817,6 +817,14 @@ std::optional<std::string> MemoryNotFreeOf(const FetchResult& result) {
   return std::nullopt;
 }
 
+std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result) {
+  if (auto busy = MemoryBusyOf(result))
+    return MemoryWait{"memory_busy", busy->what(), busy->retry_after_s};
+  if (auto not_free = MemoryNotFreeOf(result))
+    return MemoryWait{"insufficient_memory", std::move(*not_free), 0};
+  return std::nullopt;
+}
+
 std::string RestrictedUser(const HttpRequest& request) {
   const std::string user = request.header("X-Gufo-User");
   if (user.empty())
@@ -2149,22 +2157,27 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
   if (job->cancel.load())
     throw Interrupted();
   // The router's passing 507 (memory held outside it or still being
-  // released, after its own 45 s wait): nothing was started, so the task
-  // waits here and sends the request again, as for a full video queue,
-  // instead of failing the prompt. A memory_busy meanwhile still ends the
-  // prompt as GufoBusy below.
-  if (auto not_free = MemoryNotFreeOf(result)) {
+  // released, after its own 45 s wait) and, since 2.2.12, 503 memory_busy
+  // (another model of the router is busy and holds the memory): nothing was
+  // started, so the task waits here and sends the request again, as for a
+  // full video queue, instead of failing the prompt. A Retry-After longer
+  // than memory_free_retry is honoured. Each new try goes through the
+  // router's pool again, so it may run on the partner then.
+  if (auto wait = MemoryWaitOf(result)) {
     const auto began = std::chrono::steady_clock::now();
     int tries = 1;
     Logger::Warn("comfy", "event=memory_free_wait prompt_id=" + job->id +
-                              " path=" + request.path + " retry_ms=" +
+                              " path=" + request.path + " code=" + wait->code +
+                              " retry_ms=" +
                               std::to_string(options_.memory_free_retry.count()) +
-                              " error=\"" + *not_free + "\"");
-    while (not_free && (options_.memory_free_limit.count() == 0 ||
-                        std::chrono::steady_clock::now() - began <
-                            options_.memory_free_limit)) {
-      const auto until =
-          std::chrono::steady_clock::now() + options_.memory_free_retry;
+                              " error=\"" + wait->message + "\"");
+    while (wait && (options_.memory_free_limit.count() == 0 ||
+                    std::chrono::steady_clock::now() - began <
+                        options_.memory_free_limit)) {
+      const auto pause = std::max<std::chrono::milliseconds>(
+          options_.memory_free_retry,
+          options_.retry_after_unit * wait->retry_after_s);
+      const auto until = std::chrono::steady_clock::now() + pause;
       while (!job->cancel.load() && std::chrono::steady_clock::now() < until)
         std::this_thread::sleep_for(
             std::min<std::chrono::steady_clock::duration>(
@@ -2176,7 +2189,7 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
       ++tries;
       if (job->cancel.load())
         throw Interrupted();
-      not_free = MemoryNotFreeOf(result);
+      wait = MemoryWaitOf(result);
     }
     Logger::Info(
         "comfy",
@@ -2188,9 +2201,8 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
                     std::chrono::steady_clock::now() - began)
                     .count()));
   }
-  // The model could not load because another, busy model holds the memory
-  // (2.2.3): the prompt ends as GufoBusy, whatever the task would do with
-  // other errors.
+  // Still memory_busy after memory_free_limit (2.2.3): the prompt ends as
+  // GufoBusy, whatever the task would do with other errors.
   if (auto busy = MemoryBusyOf(result))
     throw *busy;
   return result;
@@ -3205,6 +3217,8 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
   int last_progress = -1;
   // First failed poll of the current run of passing failures (2.2.8).
   std::optional<std::chrono::steady_clock::time_point> poll_trouble;
+  // First poll of the current run of memory waits (2.2.12).
+  std::optional<std::chrono::steady_clock::time_point> poll_memory;
   for (;;) {
     if (job->cancel.load()) {
       HttpRequest cancel;
@@ -3219,9 +3233,23 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
     poll.path = "/v1/videos/" + video_id;
     const FetchResult state = options_.fetch(poll);
     if (state.status != 200) {
+      const auto now = std::chrono::steady_clock::now();
+      // 2.2.12: the read had to reload the evicted video worker and its
+      // memory is busy (or not free yet): wait for it like a task's request
+      // (memory_free_limit), not within the short poll grace.
+      if (const auto wait = MemoryWaitOf(state)) {
+        if (!poll_memory) {
+          poll_memory = now;
+          Logger::Warn("comfy", "event=video_poll_memory_wait prompt_id=" +
+                                    job->id + " video=" + video_id +
+                                    " code=" + wait->code);
+        }
+        if (options_.memory_free_limit.count() == 0 ||
+            now - *poll_memory < options_.memory_free_limit)
+          continue;
+      }
       // A full router (503 connection limit) or a short gap on the way to
       // the worker does not end a video that keeps running there.
-      const auto now = std::chrono::steady_clock::now();
       if (IsPassingPollFailure(state.status) &&
           (!poll_trouble || now - *poll_trouble < options_.video_poll_grace)) {
         if (!poll_trouble) {
@@ -3238,6 +3266,7 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
                                "): " + ErrorMessage(state));
     }
     poll_trouble.reset();
+    poll_memory.reset();
     const json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     // A chain of I2V chunks: the parts share the bar (part of parts).

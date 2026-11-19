@@ -205,6 +205,11 @@ struct FakeApi {
   /// ("was stopped because memory ran low") instead.
   int video_not_free{0};
   bool video_ran_low{false};
+  /// 2.2.12: status polls and content reads of video_1 answer 503
+  /// memory_busy this many times (the evicted worker had to reload).
+  int video_poll_membusy{0};
+  int video_content_membusy{0};
+  int video_content_reads{0};
   bool objekt_deleted = false;
   int objekt_polls = 0;
   /// 3D status polls answered 503 before the real answer (a reloading
@@ -451,6 +456,12 @@ struct FakeApi {
     }
     if (request.method == "GET" && request.path == "/v1/videos/video_1") {
       const std::lock_guard<std::mutex> lock(mutex);
+      if (video_poll_membusy > 0) {
+        --video_poll_membusy;
+        result.status = 503;
+        result.body = R"x({"error":{"message":"cannot load 'wan' now: memory is in use by qwen3 (busy); retry in 30 s","type":"server_error","code":"memory_busy","retry_after_s":30,"blocked_by":"qwen3 (busy)","model":"wan"}})x";
+        return result;
+      }
       if (video_poll_overloaded > 0) {
         --video_poll_overloaded;
         result.status = 503;
@@ -467,6 +478,14 @@ struct FakeApi {
       return result;
     }
     if (request.path == "/v1/videos/video_1/content") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++video_content_reads;
+      if (video_content_membusy > 0) {
+        --video_content_membusy;
+        result.status = 503;
+        result.body = R"x({"error":{"message":"cannot load 'wan' now: memory is in use by qwen3 (busy); retry in 30 s","type":"server_error","code":"memory_busy","retry_after_s":30,"blocked_by":"qwen3 (busy)","model":"wan"}})x";
+        return result;
+      }
       result.content_type = "video/mp4";
       result.body = "FAKEMP4";
       return result;
@@ -582,6 +601,8 @@ struct Harness {
   /// Set before Open(true): the memory_busy retry wait and limit.
   std::chrono::milliseconds memory_busy_retry{30};
   std::chrono::milliseconds memory_busy_limit{std::chrono::hours(6)};
+  /// Set before Open(true): the video poll grace (zero keeps the default).
+  std::chrono::milliseconds video_poll_grace{0};
 
   explicit Harness(const std::string& name, bool start = true,
                    bool keep_dir = false) {
@@ -633,6 +654,10 @@ struct Harness {
       options.objekt_deadline = objekt_deadline;
     options.memory_busy_retry = memory_busy_retry;
     options.memory_busy_limit = memory_busy_limit;
+    // retry_after_s 30 of the fake answers = 30 ms.
+    options.retry_after_unit = std::chrono::milliseconds(1);
+    if (video_poll_grace.count() > 0)
+      options.video_poll_grace = video_poll_grace;
     queue = std::make_unique<jobs::JobQueue>(std::move(options));
     if (start)
       queue->Start();
@@ -979,6 +1004,34 @@ void TestMemoryNotFreeYet() {
   CHECK(done.member_str("video_id") == "video_1");
   const std::lock_guard<std::mutex> lock(h.api->mutex);
   CHECK(h.api->video_posts == 3);
+}
+
+void TestVideoMemoryBusyAfterStart() {
+  // 2.2.12 (19.11.): once the worker video exists the job cannot go back to
+  // the queue. A status poll or the content read that gets memory_busy (the
+  // finished, evicted worker had to reload beside a busy model) waits and
+  // asks again instead of failing the finished clip, also past the short
+  // poll grace.
+  Harness h("video-membusy-read", /*start=*/false);
+  h.memory_busy_retry = std::chrono::milliseconds(10);
+  h.video_poll_grace = std::chrono::milliseconds(1);
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    h.api->video_poll_membusy = 3;
+    h.api->video_content_membusy = 2;
+  }
+  h.Open(true);
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_str("video_id") == "video_1");
+  const auto& files = done.find("result")->find("files")->items();
+  CHECK(h.Call("GET", files[0].member_str("url")).body == "FAKEMP4");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->video_posts == 1);
+  CHECK(h.api->video_poll_membusy == 0);
+  CHECK(h.api->video_content_reads == 3);
 }
 
 void TestMemoryRanLow() {
@@ -3158,6 +3211,7 @@ int main() {
   TestVideo();
   TestVideoQueueFull();
   TestMemoryNotFreeYet();
+  TestVideoMemoryBusyAfterStart();
   TestMemoryRanLow();
   TestVideoCancel();
   TestObjekt();
