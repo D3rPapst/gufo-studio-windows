@@ -12,7 +12,10 @@
 //          regional prompts through ConditioningCombine / ConditioningSetMask
 //          / ConditioningSetArea(Percentage) with SolidMask / MaskComposite
 //          masks -> gufo.regions (each region with its own references);
-//          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only)
+//          a Turbo UNETLoader file -> qwen-image-2.1-turbo (8 steps only);
+//          other unet_names run the BF16 qwen-image-2.1 (a warning for
+//          int8 / fp8 / ... names, an error for non-Qwen names); the
+//          optional KSampler input guidance_steps -> gufo.guidance_steps
 //   h3     KSampler <- MiniMaxH3ImageToVideo, or EmptyMiniMaxH3LatentAV
 //          with a CLIPTextEncode positive (+ MiniMaxH3AddGuide, whose
 //          image / audio may come from LoadVideo -> GetVideoComponents as a
@@ -206,6 +209,9 @@ struct ImageTask {
   std::uint64_t seed{0};
   int steps{0};
   std::optional<double> guidance;  // KSampler cfg -> gufo.guidance
+  /// gufo's optional KSampler / KSamplerAdvanced input `guidance_steps`
+  /// (0..100): CFG on the first N steps only -> gufo.guidance_steps.
+  std::optional<int> guidance_steps;
   /// denoise < 1: image to image from `init_image` with gufo.strength.
   std::optional<double> strength;
   FileRef init_image;

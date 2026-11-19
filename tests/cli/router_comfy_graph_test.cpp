@@ -631,6 +631,16 @@ comfy::Plan PlanOf(const char* text) {
   return plan;
 }
 
+/// The plan's warnings without the note that gufo runs its BF16 Qwen-Image
+/// transformer for the fixtures' int8 UNETLoader file.
+std::vector<std::string> OtherWarnings(const comfy::Plan& plan) {
+  std::vector<std::string> out;
+  for (const std::string& warning : plan.warnings)
+    if (warning.find("weights are not loaded") == std::string::npos)
+      out.push_back(warning);
+  return out;
+}
+
 comfy::PlanError ErrorOf(const std::string& text) {
   comfy::Plan plan;
   comfy::PlanError error;
@@ -1383,7 +1393,7 @@ void TestQwenLoras() {
   const auto& merged = std::get<comfy::ImageTask>(summed.tasks[0].spec);
   assert(merged.loras.size() == 1 && merged.loras[0].first == "a" &&
          merged.loras[0].second == 0.75);
-  assert(summed.warnings.empty());
+  assert(OtherWarnings(summed).empty());
 
   // Out-of-range strength fails at the node.
   const comfy::PlanError error = ErrorOf(Replace(
@@ -1472,6 +1482,89 @@ void TestQwenTurbo() {
       ErrorOf(Replace(canvas, "\"denoise\": 1.0", "\"denoise\": 0.6"));
   assert(denoise.node_errors.find("6") != nullptr);
   assert(denoise.message.find("denoise") != std::string::npos);
+}
+
+void TestQwenGuidanceSteps() {
+  // gufo's optional KSampler input guidance_steps -> gufo.guidance_steps.
+  const std::string text =
+      Replace(kQwenText, "\"cfg\": 2.5,", "\"cfg\": 2.5, \"guidance_steps\": 12,");
+  const comfy::Plan plan = PlanOf(text.c_str());
+  const auto& image = std::get<comfy::ImageTask>(plan.tasks[0].spec);
+  assert(image.guidance_steps && *image.guidance_steps == 12);
+  const json::Value extension = comfy::ImageExtension(image);
+  assert(extension.find("guidance")->as_double() == 2.5);
+  assert(extension.find("guidance_steps")->as_double() == 12);
+  // Without the input nothing is sent (the worker guides every step).
+  const auto& plain =
+      std::get<comfy::ImageTask>(PlanOf(kQwenText).tasks[0].spec);
+  assert(!plain.guidance_steps);
+  assert(comfy::ImageExtension(plain).find("guidance_steps") == nullptr);
+  // 0 is sent as 0 (every step).
+  const auto& zero = std::get<comfy::ImageTask>(
+      PlanOf(Replace(text, "\"guidance_steps\": 12", "\"guidance_steps\": 0")
+                 .c_str())
+          .tasks[0]
+          .spec);
+  assert(zero.guidance_steps && *zero.guidance_steps == 0);
+  // KSamplerAdvanced takes it too.
+  std::string advanced = Replace(text, "\"KSampler\"", "\"KSamplerAdvanced\"");
+  advanced = Replace(advanced, "\"seed\": 1769224114", "\"noise_seed\": 1769224114");
+  const auto& adv =
+      std::get<comfy::ImageTask>(PlanOf(advanced.c_str()).tasks[0].spec);
+  assert(adv.guidance_steps && *adv.guidance_steps == 12);
+  // Out of range, fractional or text: a validation error at the sampler.
+  for (const char* bad : {"\"guidance_steps\": 101", "\"guidance_steps\": -1",
+                          "\"guidance_steps\": 2.5",
+                          "\"guidance_steps\": \"12\""}) {
+    const comfy::PlanError error =
+        ErrorOf(Replace(text, "\"guidance_steps\": 12", bad));
+    assert(error.node_errors.find("6") != nullptr);
+    assert(error.message.find("guidance_steps") != std::string::npos);
+  }
+  // Other families have no gufo.guidance_steps: a warning, not a failure.
+  const std::string wan =
+      Replace(kWan, "\"cfg\": 5", "\"cfg\": 5, \"guidance_steps\": 4");
+  assert(wan != kWan);
+  bool warned = false;
+  for (const auto& warning : PlanOf(wan.c_str()).warnings)
+    warned = warned || warning.find("guidance_steps is ignored") !=
+                           std::string::npos;
+  assert(warned);
+}
+
+void TestQwenLoaderName() {
+  // gufo runs its BF16 Qwen-Image 2.1 transformer whatever unet_name says;
+  // the name only picks Turbo. A non-BF16 file name warns ...
+  const comfy::Plan int8 = PlanOf(kQwenText);
+  assert(std::get<comfy::ImageTask>(int8.tasks[0].spec).model ==
+         "qwen-image-2.1");
+  assert(int8.warnings.size() == 1);
+  assert(int8.warnings[0].find("node 4") != std::string::npos);
+  assert(int8.warnings[0].find("BF16") != std::string::npos);
+  assert(int8.warnings[0].find("int8") != std::string::npos);
+  // ... the BF16 file is what runs: no warning, same model.
+  const comfy::Plan bf16 = PlanOf(
+      Replace(kQwenText, "qwen_image_2.1_int8_convrot", "qwen_image_2.1_bf16")
+          .c_str());
+  assert(bf16.warnings.empty());
+  assert(std::get<comfy::ImageTask>(bf16.tasks[0].spec).model ==
+         "qwen-image-2.1");
+  // Another Qwen-Image release runs on 2.1 with a warning.
+  const comfy::Plan other = PlanOf(
+      Replace(kQwenText, "qwen_image_2.1_int8_convrot", "qwen_image_2512_bf16")
+          .c_str());
+  assert(other.warnings.size() == 1 &&
+         other.warnings[0].find("does not name Qwen-Image 2.1") !=
+             std::string::npos);
+  // Not a Qwen-Image file at all: a validation error at the loader.
+  const comfy::PlanError error = ErrorOf(
+      Replace(kQwenText, "qwen_image_2.1_int8_convrot", "flux1-dev"));
+  const json::Value* node = error.node_errors.find("4");
+  assert(node != nullptr);
+  assert(node->member_str("class_type") == "UNETLoader");
+  assert(node->find("errors")->items()[0].member_str("type") ==
+         "value_not_in_list");
+  assert(error.message.find("flux1-dev") != std::string::npos);
 }
 
 void TestRife() {
@@ -3762,6 +3855,8 @@ int main() {
   TestMaskComposite();
   TestQwenLoras();
   TestQwenTurbo();
+  TestQwenGuidanceSteps();
+  TestQwenLoaderName();
   TestRife();
   TestRifeOnly();
   TestRifeSourceFps();
