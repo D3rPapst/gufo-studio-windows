@@ -705,6 +705,100 @@ void TestHandFingers() {
       };
   const json::Value late = vision::CountFingers(quick, image, {hands[0]}, slow, outer);
   assert(late.items()[0].member_str("fehler").find("s of generation") != std::string::npos);
+
+  // GenerationStarted: the role chunk, prompt_progress, pings and usage do
+  // not start the generation clock; content, reasoning, a finish or an
+  // error do; a line counts only when it is whole.
+  const std::string role_chunk =
+      "data: {\"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}}]}\n\n";
+  const std::string reasoning_chunk =
+      "data: {\"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"Die\"}}]}\n\n";
+  {
+    std::size_t at = 0;
+    std::string stream = ": ping\n\n" + role_chunk;
+    assert(!vision::GenerationStarted(stream, &at) && at == stream.size());
+    stream += "data: {\"choices\": [{\"index\": 0, \"delta\": {}, \"prompt_progress\": "
+              "{\"processed\": 10}}]}\n\ndata: {\"choices\": [], \"usage\": {}}\n\n";
+    stream += "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"\"}}]}\n\n";
+    assert(!vision::GenerationStarted(stream, &at));
+    stream += reasoning_chunk.substr(0, 30);  // half a line
+    assert(!vision::GenerationStarted(stream, &at));
+    stream += reasoning_chunk.substr(30);
+    assert(vision::GenerationStarted(stream, &at));
+    std::size_t zero = 0;
+    assert(vision::GenerationStarted(StreamAnswer("{"), &zero));
+    zero = 0;
+    assert(vision::GenerationStarted("data: {\"error\": {\"message\": \"x\"}}\n\n", &zero));
+    zero = 0;
+    assert(vision::GenerationStarted(
+        "data: {\"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n",
+        &zero));
+  }
+
+  // The 2.2.10 timeouts: the 27B busy with another chat. The worker sends
+  // the role chunk after 5 s in its queue (stream_start_delay), then only
+  // pings until the model takes the hand. That wait counts against
+  // wait_seconds, not timeout_seconds; the generation then has its own
+  // clock. Scaled down: queue `queued_ms`, generation `generating_ms`.
+  const auto queued_worker = [&](int queued_ms, int generating_ms) {
+    return std::function<HttpResponse(const HttpRequest&)>(
+        [=](const HttpRequest& inner) {
+          HttpResponse streamed;
+          streamed.headers = {{"Content-Type", "text/event-stream"}};
+          streamed.streaming_body = [=](const HttpResponse::BodyWriter& write) {
+            const auto begin = std::chrono::steady_clock::now();
+            if (!write(role_chunk))
+              return;
+            // Queued: pings, the proxy checks is_cancelled between chunks.
+            while (std::chrono::steady_clock::now() - begin <
+                   std::chrono::milliseconds(queued_ms)) {
+              if (inner.is_cancelled() || !write(": ping\n\n"))
+                return;
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            // Thinking, then the verdict.
+            const auto thinking = std::chrono::steady_clock::now();
+            do {
+              if (inner.is_cancelled() || !write(reasoning_chunk))
+                return;
+              std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } while (std::chrono::steady_clock::now() - thinking <
+                     std::chrono::milliseconds(generating_ms));
+            (void)write(StreamAnswer(Verdict(true, true, 5, "", "", "Hand normal")));
+          };
+          return streamed;
+        });
+  };
+  // Queued 2.5 s, thinking 0.3 s, timeout_seconds 1, wait_seconds 10: the
+  // hand gets its verdict (before the fix: "timeout after 1 s of
+  // generation", as the direction's three hands after 300 s).
+  vision::HandFingersRequest busy_27b;
+  busy_27b.timeout_seconds = 1;  // below the option range, for the test
+  busy_27b.wait_seconds = 10;
+  const json::Value waited =
+      vision::CountFingers(busy_27b, image, {hands[0]}, queued_worker(2500, 300), outer);
+  assert(waited.items()[0].find("fehler") == nullptr);
+  assert(waited.items()[0].member_str("befund") == "Hand normal");
+  assert(waited.items()[0].member_double("waited_seconds") >= 2.4);
+  assert(waited.items()[0].member_double("seconds") >= 2.7);
+  // Still queued when wait_seconds ends: the wait error, the later hands
+  // are not asked.
+  vision::HandFingersRequest short_wait;
+  short_wait.timeout_seconds = 10;
+  short_wait.wait_seconds = 1;
+  const json::Value not_started = vision::CountFingers(
+      short_wait, image, {hands[0], hands[1]}, queued_worker(3000, 0), outer);
+  assert(not_started.items()[0].member_str("fehler").find("did not start within wait_seconds") !=
+         std::string::npos);
+  assert(not_started.items()[0].member_double("seconds") < 2.5);
+  assert(not_started.items()[1].member_str("fehler").starts_with("not checked: model"));
+  // Started at once but thinking longer than timeout_seconds: the
+  // generation error.
+  const json::Value too_long =
+      vision::CountFingers(busy_27b, image, {hands[0]}, queued_worker(0, 3000), outer);
+  assert(too_long.items()[0].member_str("fehler").find("timeout after 1 s of generation") !=
+         std::string::npos);
+  assert(too_long.items()[0].member_double("seconds") < 2.5);
   // models.hand_fingers names the model.
   assert(vision::HandFingersModelInfo(defaults).member_str("model") == "qwen3.8-27b");
   assert(vision::HandFingersModelInfo(defaults).member_double("wait_seconds") == 600);

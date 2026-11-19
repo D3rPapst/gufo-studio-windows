@@ -446,6 +446,54 @@ HandVerdict ParseFingerAnswer(std::string_view chat_body) {
   return out;
 }
 
+bool GenerationStarted(std::string_view body, std::size_t* scanned) {
+  while (*scanned < body.size()) {
+    const std::size_t end = body.find('\n', *scanned);
+    if (end == std::string_view::npos)
+      return false;  // the line is not whole yet
+    std::string_view line = body.substr(*scanned, end - *scanned);
+    *scanned = end + 1;
+    if (!line.empty() && line.back() == '\r')
+      line.remove_suffix(1);
+    if (!line.starts_with("data:"))
+      continue;  // ": ping", event names, blank lines
+    line.remove_prefix(5);
+    while (!line.empty() && line.front() == ' ')
+      line.remove_prefix(1);
+    if (line == "[DONE]")
+      return true;
+    json::Value chunk;
+    try {
+      chunk = json::parse(std::string(line));
+    } catch (const std::exception&) {
+      return true;  // not ours to judge: ParseFingerAnswer reports it
+    }
+    if (!chunk.is_object())
+      return true;
+    if (chunk.find("error") != nullptr)
+      return true;
+    const json::Value* choices = chunk.find("choices");
+    if (choices == nullptr || !choices->is_array() || choices->empty())
+      continue;  // usage-only chunk
+    const json::Value& choice = choices->items()[0];
+    if (!choice.member_str("finish_reason").empty())
+      return true;
+    const json::Value* delta = choice.find("delta");
+    if (delta == nullptr || !delta->is_object())
+      continue;
+    for (const char* name : {"content", "reasoning_content"}) {
+      const json::Value* text = delta->find(name);
+      if (text != nullptr && text->is_string() && !text->str().empty())
+        return true;
+    }
+    const json::Value* calls = delta->find("tool_calls");
+    if (calls != nullptr && calls->is_array() && !calls->empty())
+      return true;
+    // The role chunk, prompt_progress: the chat may still be queued.
+  }
+  return false;
+}
+
 namespace {
 
 /// The pause a 503 memory_busy asks for (Retry-After, else
@@ -543,9 +591,9 @@ json::Value CountFingers(const HandFingersRequest& options, const models::ccip::
       list.push_back(std::move(entry));
       continue;
     }
-    // Two clocks: until the first streamed chunk (queue, load, prefill) the
-    // hand may wait wait_seconds; from it on the generation has
-    // timeout_seconds.
+    // Two clocks: until the first generated token (router and worker
+    // queue, load, prefill) the hand may wait wait_seconds; from it on the
+    // generation has timeout_seconds.
     const auto wait_deadline = started + std::chrono::seconds(options.wait_seconds);
     const auto generation_limit = std::chrono::seconds(options.timeout_seconds);
     const auto first_chunk = std::make_shared<std::atomic<Clock::rep>>(0);
@@ -581,13 +629,19 @@ json::Value CountFingers(const HandFingersRequest& options, const models::ccip::
         response = serve(inner);
         body.clear();
         if (response.streaming_body) {
+          // The generation clock starts with the first generated token,
+          // not with the first "data:" line: a gufo worker sends the role
+          // chunk already after 5 s in its queue (stream_start_delay), and
+          // a busy 27B then spent the whole timeout_seconds in that queue
+          // (2.2.6-2.2.10: "timeout after 300 s of generation").
+          std::size_t scanned = 0;
           response.streaming_body([&](std::string_view chunk) {
-            if (first_chunk->load() == 0 && chunk.find("data:") != std::string_view::npos)
-              first_chunk->store(Clock::now().time_since_epoch().count());
-            if (body.size() + chunk.size() > kChatAnswerLimit || over())
+            if (body.size() + chunk.size() > kChatAnswerLimit)
               return false;
             body.append(chunk);
-            return true;
+            if (first_chunk->load() == 0 && GenerationStarted(body, &scanned))
+              first_chunk->store(Clock::now().time_since_epoch().count());
+            return !over();
           });
         } else {
           body = std::move(response.body);
