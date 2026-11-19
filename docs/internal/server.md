@@ -775,6 +775,21 @@ only in the worker's memory, so a read for a job whose worker is no longer
 loaded returns 404 `not_found` instead of starting the model. With
 `--comfy-dir`, ComfyUI's `GET /embeddings` answers `[]`; a `POST
 /embeddings` goes to the embedding model named in its body.
+ComfyUI Qwen-Image graphs (2.2.8): a `KSampler` / `KSamplerAdvanced` may
+carry gufo's own optional input `guidance_steps` (whole number 0..100, a
+value or a Primitive), sent as `gufo.guidance_steps` (CFG on the first N
+steps only, see [Qwen-Image-2.1](../models/qwen-image-2.1.md)); other
+values fail validation at the sampler, and on video or music samplers the
+input is ignored with a `gufo_warning`. A worker that does not know the
+field fails the task with its message (no fallback to full CFG). The
+`UNETLoader` `unet_name` only chooses Turbo (`*turbo*`, model
+`qwen-image-2.1-turbo`) or not: gufo always runs its registered BF16
+Qwen-Image 2.1 checkpoint. A name without `qwen` fails validation
+(`value_not_in_list` at the loader); a Qwen-Image name without 2.1, or with
+another precision (`int8`, `fp8`, `gguf`, `convrot`, `fp16`, ...), runs with
+a `gufo_warning` that the file's weights are not loaded, so
+`qwen_image_2.1_bf16.safetensors` and `..._int8_convrot.safetensors` give
+the same image.
 ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
 previews under an id known from the answer on: `extra_data.gufo_preview_id`
 (1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with

@@ -2236,7 +2236,10 @@ json::Value Adapter::RunImage(const std::shared_ptr<Job>& job, const Task& task,
   relay.join();
   if (result.status == 400 && !extension.empty() && !spec.strength &&
       spec.mask.name.empty() && spec.regions.empty() && !spec.control &&
+      !spec.guidance_steps &&
       ErrorMessage(result).find("gufo") != std::string::npos) {
+    // (guidance_steps was asked for explicitly: a worker without it fails
+    // the task with its own message instead of rendering full CFG.)
     // An image worker without the gufo fields (negative prompt, guidance):
     // render without them and say so, as before.
     job->warnings.push_back("node " + task.node_id +

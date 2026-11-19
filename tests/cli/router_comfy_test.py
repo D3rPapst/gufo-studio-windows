@@ -676,10 +676,19 @@ def check_qwen(router):
                               "gufo": {"negative_prompt": "chibi", "guidance": 2.5}}, call
     messages = [m[0] for m in entry["status"]["messages"]]
     assert messages[0] == "execution_start" and messages[-1] == "execution_success"
-    assert "gufo_warning" not in messages, messages
+    # Only the note that gufo runs BF16 weights for the int8 unet_name.
+    warnings = [m[1]["message"] for m in entry["status"]["messages"] if m[0] == "gufo_warning"]
+    assert len(warnings) == 1 and "weights are not loaded" in warnings[0], warnings
     # The counter continues after existing files.
     again = router.run(qwen_graph())
     assert again["outputs"]["8"]["images"][0]["filename"] == "demo_00002_.png"
+    # gufo's optional KSampler input guidance_steps -> gufo.guidance_steps.
+    graph = qwen_graph(prefix="film/stil/guidance_steps")
+    graph["6"]["inputs"]["guidance_steps"] = 12
+    router.run(graph)
+    call = router.fake_entries()[-1]
+    assert call["fields"]["gufo"] == {"negative_prompt": "chibi", "guidance": 2.5,
+                                      "guidance_steps": 12}, call
 
 
 def check_qwen_references(router):
@@ -717,7 +726,7 @@ def check_qwen_references(router):
     calls = router.fake_entries()[-2:]
     assert "gufo" in calls[0]["fields"] and "gufo" not in calls[1]["fields"], calls
     warnings = [m[1]["message"] for m in entry["status"]["messages"] if m[0] == "gufo_warning"]
-    assert warnings and "rejected" in warnings[0], entry["status"]
+    assert any("rejected" in w for w in warnings), entry["status"]
     # Without a canvas the latent follows the first reference (64x48 -> ~1024^2).
     router.run(qwen_graph(refs=["ref.png"], prefix="film/keyframes/kf1"))
     assert router.fake_entries()[-1]["fields"]["size"] == "1184x896"
