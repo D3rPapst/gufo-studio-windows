@@ -542,16 +542,25 @@ struct VideoTask {
   /// (`guidance`) -> gufo.vace.high_guidance.
   std::optional<int> vace_switch_step;
   std::optional<double> vace_high_guidance;
+  /// Wan 2.2 Fun VACE: the low-noise expert's LoRA when its stages differ
+  /// from the high-noise ones (`vace_lora`); unset = `vace_lora`. Sent as
+  /// gufo.vace.lora_high / lora_low.
+  std::optional<bool> vace_lora_low;
   /// Wan 2.2 I2V A14B (kI2V22, gufo.i2v): the first step of the low-noise
   /// expert (its KSamplerAdvanced start_at_step; unset: gufo's boundary),
   /// the high-noise stage's cfg when it differs from `guidance`, the
   /// sampler ("euler" | "lcm"), the ModelSamplingSD3 shift and whether the
-  /// bundle's step-distill LoRAs apply (false: the graph has no LoRA).
+  /// bundle's step-distill LoRAs apply per expert (false: no LoRA on that
+  /// expert's stages; the high-noise expert runs the stages before the
+  /// switch). Equal: gufo.i2v.lora; different: gufo.i2v.lora_high /
+  /// lora_low (e.g. lightx2v on the high-noise expert only, the low-noise
+  /// one with real CFG).
   std::optional<int> i2v_switch_step;
   std::optional<double> i2v_high_guidance;
   std::string i2v_sampler;
   std::optional<double> i2v_shift;
-  bool i2v_lora{true};
+  bool i2v_lora_high{true};
+  bool i2v_lora_low{true};
   /// Talk family (InfiniteTalk): the speakers' audio (one or two LoadAudio
   /// files), with two speakers their masks and the mask channel ("red",
   /// "green", "blue", or "inverted_alpha": ComfyUI's alpha masks), sent

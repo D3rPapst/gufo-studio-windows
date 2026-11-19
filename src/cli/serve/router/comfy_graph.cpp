@@ -2922,7 +2922,21 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     throw NodeFailure(chain.uni3c, "unsupported_link",
                       "Uni3C does not combine with VACE in gufo");
   task.vace_lora = !chain.loras.empty();
-  for (const auto& [name, lora_strength] : chain.loras) {
+  // Wan 2.2 Fun VACE: the low-noise expert takes its own stages' LoRA
+  // (lightning on the high-noise stages only, the low-noise ones without
+  // LoRA at real CFG); its LoRAs are checked like the high-noise ones.
+  std::vector<std::pair<std::string, std::vector<std::pair<std::string,
+                                                          double>>>>
+      lora_stages{{sampler, chain.loras}};
+  if (experts > 0) {
+    const ModelChain low_chain = FollowModel(graph, low);
+    if (low_chain.loras.empty() != chain.loras.empty())
+      task.vace_lora_low = !low_chain.loras.empty();
+    if (low != sampler)
+      lora_stages.emplace_back(low, low_chain.loras);
+  }
+  for (const auto& [lora_stage, loras] : lora_stages)
+  for (const auto& [name, lora_strength] : loras) {
     const std::string lower = Lower(name);
     const bool lightning = lower.find("lightning") != std::string::npos;
     if (lower.find("lightx2v") == std::string::npos &&
@@ -2931,11 +2945,11 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
         !(experts > 0 && lightning)) {
       // Wan 2.2 Animate LoRAs (e.g. relight) have no VACE counterpart.
       if (animate) {
-        warnings->push_back("node " + sampler + ": LoRA " + name +
+        warnings->push_back("node " + lora_stage + ": LoRA " + name +
                             " is ignored (no Wan 2.2 Animate model in gufo)");
         continue;
       }
-      throw NodeFailure(sampler, "unsupported_value",
+      throw NodeFailure(lora_stage, "unsupported_value",
                         gufo_model +
                             (experts > 0
                                  ? " has its step-distill LoRAs (Wan 2.2 "
@@ -2947,12 +2961,12 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
     }
     if (experts > 0) {
       if (!lightning || lora_strength != 1.0)
-        warnings->push_back("node " + sampler + ": LoRA " + name +
+        warnings->push_back("node " + lora_stage + ": LoRA " + name +
                             " runs as gufo's built-in Wan 2.2 Lightning "
                             "LoRAs at strength 1");
     } else if (lower.find("lightx2v") == std::string::npos ||
                lora_strength != 1.0) {
-      warnings->push_back("node " + sampler + ": LoRA " + name +
+      warnings->push_back("node " + lora_stage + ": LoRA " + name +
                           " runs as gufo's built-in lightx2v T2V LoRA at "
                           "strength 1");
     }
@@ -2983,10 +2997,16 @@ VideoTask BuildVace(const Graph& graph, const std::string& first,
                           stage_chain.loader + " runs as gufo " + models.vace +
                           " (Wan 2.1 VACE 14B)");
     }
-    if (stage != sampler && stage_chain.loras.empty() != chain.loras.empty())
+    // Two experts: each expert's stages follow its first stage.
+    const bool low_group = experts > 0 && index >= experts;
+    const std::string& head = low_group ? low : sampler;
+    const bool head_lora =
+        low_group ? task.vace_lora_low.value_or(task.vace_lora)
+                  : task.vace_lora;
+    if (stage != head && stage_chain.loras.empty() == head_lora)
       warnings->push_back("node " + stage +
-                          ": LoRAs differ from node " + sampler +
-                          ", gufo uses node " + sampler + "'s");
+                          ": LoRAs differ from node " + head +
+                          ", gufo uses node " + head + "'s");
   }
   // ModelSamplingSD3 shift on the model path -> gufo.vace.shift (two
   // experts: the high-noise stage's; the low-noise one should match).
@@ -3137,15 +3157,33 @@ VideoTask BuildI2V22(const Graph& graph, const std::string& first,
     throw NodeFailure(sampler, "unsupported_value",
                       gufo_model + " samples with denoise 1");
   // LoRAs: gufo's bundle carries the step-distill LoRAs (lightx2v /
-  // Lightning I2V) for both experts; no others.
-  bool any_lora = false;
+  // Lightning I2V) for both experts; no others. Each expert takes its own
+  // when any of its stages has one (the high-noise expert: the stages
+  // before low_index; one stage alone: both), so the "anti_talk" pattern
+  // (lightx2v on the high-noise expert at cfg 1, the low-noise one without
+  // LoRA at real CFG) runs as the graph means it.
+  bool lora_high = false, lora_low = false;
+  bool lora_mixed_high = false, lora_mixed_low = false;
   for (std::size_t index = 0; index < all_stages.size(); ++index) {
     const std::string& stage = all_stages[index];
     const ModelChain chain = FollowModel(graph, stage);
     if (!chain.uni3c.empty())
       throw NodeFailure(chain.uni3c, "unsupported_link",
                         "Uni3C needs gufo wan2.1-uni3c, not " + task.model);
-    any_lora = any_lora || !chain.loras.empty();
+    const bool has_lora = !chain.loras.empty();
+    const bool high_stage = low_index == 0 || index < low_index;
+    const bool low_stage = low_index == 0 || index >= low_index;
+    const bool group_head = index == 0 || index == low_index;
+    if (high_stage) {
+      if (!group_head && has_lora != lora_high)
+        lora_mixed_high = true;
+      lora_high = lora_high || has_lora;
+    }
+    if (low_stage) {
+      if (!group_head && has_lora != lora_low)
+        lora_mixed_low = true;
+      lora_low = lora_low || has_lora;
+    }
     for (const auto& [name, strength] : chain.loras) {
       const std::string lower = Lower(name);
       if (lower.find("lightx2v") == std::string::npos &&
@@ -3156,19 +3194,40 @@ VideoTask BuildI2V22(const Graph& graph, const std::string& first,
                               " has its step-distill LoRAs (lightx2v) built "
                               "in and takes no other LoRA, not " +
                               name);
-      if (strength != 1.0 || lower.find("i2v") == std::string::npos)
+      if (strength != 1.0 || lower.find("i2v") == std::string::npos) {
         warnings->push_back("node " + stage + ": LoRA " + name +
                             " runs as gufo's built-in Wan 2.2 I2V "
                             "step-distill LoRA at strength 1");
+      } else if (low_index > 0) {
+        // A high-noise LoRA on the low-noise stages (or the reverse) runs
+        // as gufo's LoRA of the expert those stages belong to.
+        std::string flat = lower;
+        std::replace(flat.begin(), flat.end(), '-', '_');
+        const bool named_high = flat.find("high_noise") != std::string::npos;
+        const bool named_low = flat.find("low_noise") != std::string::npos;
+        if ((high_stage && named_low && !named_high) ||
+            (!high_stage && named_high && !named_low))
+          warnings->push_back(
+              "node " + stage + ": LoRA " + name + " runs as gufo's " +
+              (high_stage ? "high" : "low") +
+              "-noise step-distill LoRA (the expert of this stage)");
+      }
     }
-    const bool expert_head = index == 0 || index == low_index;
-    if (expert_head && !chain.loader.empty() && !IsWan22I2VFile(chain.loader))
+    if (group_head && !chain.loader.empty() && !IsWan22I2VFile(chain.loader))
       warnings->push_back("node " + chain.loader_node + ": " + chain.loader +
                           " runs as " + gufo_model + " (Wan 2.2 I2V A14B, " +
                           (index == 0 && low_index > 0 ? "high" : "low") +
                           " noise)");
   }
-  task.i2v_lora = any_lora;
+  for (const bool high : {true, false})
+    if (high ? lora_mixed_high : lora_mixed_low)
+      warnings->push_back(
+          "node " + (high ? sampler : low) + ": the " +
+          (high ? "high" : "low") +
+          "-noise stages differ in their LoRAs, gufo applies its "
+          "step-distill LoRA to all of them (one expert, one load)");
+  task.i2v_lora_high = lora_high;
+  task.i2v_lora_low = lora_low;
   // Two checkpoints: ExpertSplit warned about a low / high mix-up already.
   if (experts == 0 && all_stages.size() > 1) {
     warnings->push_back("node " + sampler +
@@ -4551,8 +4610,14 @@ json::Value VideoRequestBody(const VideoTask& task) {
       vace["sampler"] = task.vace_sampler;
     if (task.vace_shift)
       vace["shift"] = *task.vace_shift;
-    if (!task.vace_lora)
+    // Wan 2.2 Fun VACE: LoRA per expert only when they differ (a worker
+    // before 2.2.9 knows only the plain flag).
+    if (task.vace_lora_low && *task.vace_lora_low != task.vace_lora) {
+      vace["lora_high"] = task.vace_lora;
+      vace["lora_low"] = *task.vace_lora_low;
+    } else if (!task.vace_lora) {
       vace["lora"] = false;
+    }
     // Wan 2.2 Fun VACE A14B: the high / low noise KSamplerAdvanced split.
     if (task.vace_switch_step)
       vace["switch_step"] = *task.vace_switch_step;
@@ -4578,8 +4643,13 @@ json::Value VideoRequestBody(const VideoTask& task) {
       i2v["sampler"] = task.i2v_sampler;
     if (task.i2v_shift)
       i2v["shift"] = *task.i2v_shift;
-    if (!task.i2v_lora)
+    // Equal: the plain flag (a worker before 2.2.9 knows only it).
+    if (task.i2v_lora_high != task.i2v_lora_low) {
+      i2v["lora_high"] = task.i2v_lora_high;
+      i2v["lora_low"] = task.i2v_lora_low;
+    } else if (!task.i2v_lora_high) {
       i2v["lora"] = false;
+    }
     gufo["i2v"] = std::move(i2v);
   } else if (task.family == VideoFamily::kAnimate) {
     // 16 fps, one chunk of the node's length, or a chain of chunks that

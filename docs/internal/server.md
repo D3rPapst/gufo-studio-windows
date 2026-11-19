@@ -807,6 +807,23 @@ pose / face / background / mask / reference); another seed is a
 alone fails validation. Without `wan2.2-animate-14b` in the preset the
 chain still fails (no VACE fallback). `comfy_graph.cpp` `AnimateChain`,
 `ApplyAnimateChain`, `ChainOutputCut`.
+ComfyUI Wan 2.2 I2V A14B and Fun VACE A14B LoRA per expert (2.2.9): the
+step-distill LoRA (lightx2v / Lightning) is taken per expert from the
+`KSamplerAdvanced` stages: the high-noise expert has it when a stage
+before the switch has a LoRA, the low-noise one when a stage from the
+switch on has one. The Regie's "anti_talk" graph (19.11.: lightx2v on the
+high-noise stage at cfg 1, steps 0..3 of 6; the low-noise stage without
+LoRA at cfg 3.5 with the anti-talk negative prompt) runs with the LoRA on
+the high-noise expert only; before, gufo applied it to both. Equal
+experts are sent as `gufo.i2v.lora` / `gufo.vace.lora` (false when
+neither has one), different ones as `lora_high` / `lora_low` (booleans;
+each defaults to `lora`, a worker before 2.2.9 rejects them with
+`invalid_i2v` / `invalid_vace`). A high-noise LoRA file on a low-noise
+stage (or the reverse) runs as gufo's LoRA of that stage's expert, with a
+`gufo_warning`; stages of one expert that differ warn and get the LoRA.
+With `experts_resident` (I2V) another LoRA choice reloads only the expert
+that changed; the room check counts each expert's LoRA file (its factors
+stay on the device), so an expert without LoRA needs a little less.
 ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
 previews under an id known from the answer on: `extra_data.gufo_preview_id`
 (1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with

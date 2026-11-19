@@ -597,7 +597,10 @@ bool PrepareWan21(const Body& body, ext::VideoPreparedRequest* prepared,
 // default from the boundary), "boundary" (0..1, default the bundle's,
 // 0.900), "high_guidance" (1..20: CFG of the high-noise expert; default
 // "gufo.guidance"), "sampler" ("euler" | "lcm"), "shift" (1..20), "lora"
-// (false: without the bundle's step-distill LoRAs)}}}.
+// (false: without the bundle's step-distill LoRAs), "lora_high" /
+// "lora_low" (booleans: the high- / low-noise expert's LoRA alone, e.g.
+// lightx2v on the high-noise expert at cfg 1 and the low-noise one without
+// it at real CFG; each defaults to "lora", default true)}}}.
 bool PrepareI2V22(const Body& body, ext::VideoPreparedRequest* prepared,
                   ext::VideoRequestError* error) {
   constexpr Family family = Family::kWan22I2V;
@@ -658,20 +661,25 @@ bool PrepareI2V22(const Body& body, ext::VideoPreparedRequest* prepared,
   if (i2v != nullptr &&
       (!i2v->is_object() ||
        !HasOnlyMembers(*i2v, {"switch_step", "boundary", "high_guidance",
-                              "sampler", "shift", "lora"})))
+                              "sampler", "shift", "lora", "lora_high",
+                              "lora_low"})))
     return Fail(error, "invalid_i2v",
                 "'gufo.i2v' may contain only 'switch_step', 'boundary', "
-                "'high_guidance', 'sampler', 'shift' and 'lora'");
+                "'high_guidance', 'sampler', 'shift', 'lora', 'lora_high' "
+                "and 'lora_low'");
   const auto member = [&](const char* name) -> const json::Value* {
     return i2v == nullptr ? nullptr : i2v->find(name);
   };
   const auto number = [](const json::Value* value) {
     return value->is_number() ? value->as_double(-1) : -1.0;
   };
-  if (const json::Value* lora = member("lora")) {
-    if (!lora->is_bool())
-      return Fail(error, "invalid_i2v", "'gufo.i2v.lora' must be a boolean");
-    i2v_options["lora"] = lora->as_bool();
+  for (const char* name : {"lora", "lora_high", "lora_low"}) {
+    if (const json::Value* lora = member(name)) {
+      if (!lora->is_bool())
+        return Fail(error, "invalid_i2v",
+                    std::string("'gufo.i2v.") + name + "' must be a boolean");
+      i2v_options[name] = lora->as_bool();
+    }
   }
   if (const json::Value* sampler = member("sampler")) {
     if (!sampler->is_string() ||
@@ -740,7 +748,8 @@ bool PrepareI2V22(const Body& body, ext::VideoPreparedRequest* prepared,
 // low-noise expert, as ComfyUI's KSamplerAdvanced end_at_step; default from
 // the boundary), "boundary" (0..1, default the bundle's, 0.875) and
 // "high_guidance" (1..20: CFG of the high-noise expert; default
-// "gufo.guidance").
+// "gufo.guidance"), "lora_high" / "lora_low" (booleans: one expert's
+// step-distill LoRA; each defaults to "lora").
 bool PrepareVace(Family family, const Body& body,
                  ext::VideoPreparedRequest* prepared,
                  ext::VideoRequestError* error) {
@@ -834,7 +843,8 @@ bool PrepareVace(Family family, const Body& body,
                                 {"control_video", "mask", "mask_channel",
                                  "invert_mask", "reference_images", "strength",
                                  "sampler", "shift", "lora", "switch_step",
-                                 "boundary", "high_guidance"})
+                                 "boundary", "high_guidance", "lora_high",
+                                 "lora_low"})
                : HasOnlyMembers(*vace, {"control_video", "mask", "mask_channel",
                                         "invert_mask", "reference_images",
                                         "strength", "sampler", "shift",
@@ -843,8 +853,8 @@ bool PrepareVace(Family family, const Body& body,
                 fun22 ? "'gufo.vace' may contain only 'control_video', "
                         "'mask', 'mask_channel', 'invert_mask', "
                         "'reference_images', 'strength', 'sampler', 'shift', "
-                        "'lora', 'switch_step', 'boundary' and "
-                        "'high_guidance'"
+                        "'lora', 'switch_step', 'boundary', "
+                        "'high_guidance', 'lora_high' and 'lora_low'"
                       : "'gufo.vace' may contain only 'control_video', "
                         "'mask', 'mask_channel', 'invert_mask', "
                         "'reference_images', 'strength', 'sampler', 'shift' "
@@ -903,10 +913,13 @@ bool PrepareVace(Family family, const Body& body,
                   "'gufo.vace.invert_mask' must be a boolean");
     vace_options["invert_mask"] = invert->as_bool();
   }
-  if (const json::Value* lora = member("lora")) {
-    if (!lora->is_bool())
-      return Fail(error, "invalid_vace", "'gufo.vace.lora' must be a boolean");
-    vace_options["lora"] = lora->as_bool();
+  for (const char* name : {"lora", "lora_high", "lora_low"}) {
+    if (const json::Value* lora = member(name)) {
+      if (!lora->is_bool())
+        return Fail(error, "invalid_vace",
+                    std::string("'gufo.vace.") + name + "' must be a boolean");
+      vace_options[name] = lora->as_bool();
+    }
   }
   if (const json::Value* strength = member("strength")) {
     const double value = strength->is_number() ? strength->as_double(-1) : -1;
@@ -1971,6 +1984,14 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
       }
     }
   }
+  return true;
+}
+
+bool ExpertLoraEnabled(const json::Value& options, const char* key) {
+  for (const char* name : {key, "lora"})
+    if (const json::Value* lora = options.find(name);
+        lora != nullptr && lora->is_bool())
+      return lora->as_bool();
   return true;
 }
 

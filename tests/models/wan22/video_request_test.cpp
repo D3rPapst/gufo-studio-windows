@@ -425,6 +425,8 @@ void TestVace(const std::filesystem::path& root) {
   // The Wan 2.2 Fun VACE options belong to its own model.
   Rejected(service, prefix + R"("switch_step":2}}})", "invalid_vace",
            "a Wan 2.2 expert switch on Wan 2.1 VACE");
+  Rejected(service, prefix + R"("lora_low":false}}})", "invalid_vace",
+           "a LoRA per expert on Wan 2.1 VACE (one model)");
 }
 
 // Wan 2.2 Fun VACE A14B: the Wan 2.1 VACE request plus the expert switch
@@ -448,6 +450,13 @@ void TestFunVace(const std::filesystem::path& root) {
             vace.member_double("high_guidance") == 3.5 &&
             vace.member_str("sampler") == "euler",
         "Fun VACE expert options reach the runner: " + job.vace_json);
+  const wan22::JobRequest fun_lora = Accept(
+      service, runner, &calls, wan22::Family::kWan22FunVace,
+      prefix + R"("lora_high":true,"lora_low":false}}})");
+  const gufo::json::Value fun_lora_vace = gufo::json::parse(fun_lora.vace_json);
+  Check(wan22::ExpertLoraEnabled(fun_lora_vace, "lora_high") &&
+            !wan22::ExpertLoraEnabled(fun_lora_vace, "lora_low"),
+        "Fun VACE LoRA per expert reaches the runner: " + fun_lora.vace_json);
   const wan22::JobRequest plain = Accept(
       service, runner, &calls, wan22::Family::kWan22FunVace,
       R"({"model":"wan2.2-fun-vace-a14b","prompt":"walk","seconds":"1"})");
@@ -456,6 +465,7 @@ void TestFunVace(const std::filesystem::path& root) {
   for (const std::string& bad :
        {prefix + R"("switch_step":5}}})", prefix + R"("switch_step":1.5}}})",
         prefix + R"("boundary":1.5}}})", prefix + R"("high_guidance":0.5}}})",
+        prefix + R"("lora_low":0}}})",
         std::string(
             R"({"model":"wan2.2-fun-vace-a14b","prompt":"x","size":"1920x1080","seconds":"1"})")})
     Rejected(service, bad, "", "invalid Fun VACE request " + bad);
@@ -496,8 +506,33 @@ void TestI2V22(const std::filesystem::path& root) {
         "boundary");
   Rejected(service, R"({"model":"wan2.2-i2v-a14b","prompt":"x","seconds":"1"})",
            "invalid_input_reference", "I2V A14B without a start image");
+  // LoRA per expert (the Regie's anti_talk graph): lightx2v on the
+  // high-noise expert only; each flag defaults to "lora", then true.
+  const wan22::JobRequest per_expert = Accept(
+      service, runner, &calls, wan22::Family::kWan22I2V,
+      prefix + R"("guidance":3.5,"steps":6,"i2v":{"switch_step":3,"lora_high":true,"lora_low":false}}})");
+  const gufo::json::Value per_expert_i2v =
+      gufo::json::parse(per_expert.i2v_json);
+  Check(wan22::ExpertLoraEnabled(per_expert_i2v, "lora_high") &&
+            !wan22::ExpertLoraEnabled(per_expert_i2v, "lora_low") &&
+            !per_expert_i2v.contains("lora"),
+        "I2V A14B LoRA per expert reaches the runner: " +
+            per_expert.i2v_json);
+  Check(!wan22::ExpertLoraEnabled(i2v, "lora_high") &&
+            !wan22::ExpertLoraEnabled(i2v, "lora_low"),
+        "I2V A14B lora false: neither expert");
+  Check(wan22::ExpertLoraEnabled(gufo::json::parse("{}"), "lora_low") &&
+            !wan22::ExpertLoraEnabled(
+                gufo::json::parse(R"({"lora":false,"lora_high":true})"),
+                "lora_low") &&
+            wan22::ExpertLoraEnabled(
+                gufo::json::parse(R"({"lora":false,"lora_high":true})"),
+                "lora_high"),
+        "I2V A14B LoRA defaults: the expert's flag, then lora, then true");
   for (const std::string& bad :
-       {prefix + R"("i2v":{"switch_step":5}}})",
+       {prefix + R"("i2v":{"lora_low":1}}})",
+        prefix + R"("i2v":{"lora_high":"no"}}})",
+        prefix + R"("i2v":{"switch_step":5}}})",
         prefix + R"("i2v":{"switch_step":1.5}}})",
         prefix + R"("i2v":{"boundary":1.5}}})",
         prefix + R"("i2v":{"high_guidance":0.5}}})",

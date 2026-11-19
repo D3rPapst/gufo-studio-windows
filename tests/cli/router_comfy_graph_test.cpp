@@ -2178,6 +2178,33 @@ void TestVaceKeyframes() {
   const json::Value* fun_vace = fun_body.find("gufo")->find("vace");
   assert(fun_vace->find("switch_step")->as_double() == 10);
   assert(fun_vace->find("high_guidance") == nullptr);
+  assert(fun_vace->find("lora") && !fun_vace->find("lora")->as_bool());
+  assert(fun_vace->find("lora_high") == nullptr);
+  // LoRA per expert: Lightning on the high-noise stage only ->
+  // gufo.vace.lora_high true, lora_low false; on both -> the plain flag.
+  const std::string high_lora = Replace(
+      Replace(kVaceKeyframes,
+              "   \"model\": [\n    \"mh\",\n    0\n   ],\n   \"shift\"",
+              "   \"model\": [\n    \"lh\",\n    0\n   ],\n   \"shift\""),
+      " \"sl\": {",
+      " \"lh\": {\"class_type\": \"LoraLoaderModelOnly\", \"inputs\": "
+      "{\"model\": [\"mh\", 0], \"lora_name\": "
+      "\"Wan2.2-Fun-A14B-Lightning-high_noise.safetensors\", "
+      "\"strength_model\": 1.0}},\n \"sl\": {");
+  const comfy::Plan high_only = plan_with(high_lora, served);
+  const auto& high_only_video =
+      std::get<comfy::VideoTask>(high_only.tasks[0].spec);
+  assert(high_only_video.vace_lora && high_only_video.vace_lora_low &&
+         !*high_only_video.vace_lora_low);
+  for (const std::string& warning : high_only.warnings)
+    std::cerr << "unexpected warning: " << warning << "\n";
+  assert(high_only.warnings.empty());
+  const json::Value high_only_body = comfy::VideoRequestBody(high_only_video);
+  const json::Value* high_only_vace =
+      high_only_body.find("gufo")->find("vace");
+  assert(high_only_vace->find("lora") == nullptr);
+  assert(high_only_vace->find("lora_high")->as_bool() &&
+         !high_only_vace->find("lora_low")->as_bool());
   // Per-expert cfg (high 3.5, low 1) -> guidance 1 + high_guidance 3.5; a
   // different low-noise shift warns.
   const std::string low_cfg = Replace(
@@ -2277,7 +2304,7 @@ void TestWan22I2V() {
   assert(video.i2v_switch_step && *video.i2v_switch_step == 2);
   assert(video.i2v_sampler == "euler");
   assert(video.i2v_shift && *video.i2v_shift == 5.0);
-  assert(video.i2v_lora);
+  assert(video.i2v_lora_high && video.i2v_lora_low);
   for (const std::string& warning : plan.warnings)
     std::cerr << "unexpected warning: " << warning << "\n";
   assert(plan.warnings.empty());
@@ -2293,6 +2320,7 @@ void TestWan22I2V() {
   assert(i2v->member_str("sampler") == "euler");
   assert(i2v->find("shift")->as_double() == 5.0);
   assert(i2v->find("lora") == nullptr && i2v->find("high_guidance") == nullptr);
+  assert(i2v->find("lora_high") == nullptr && i2v->find("lora_low") == nullptr);
 
   // Per-expert cfg (high 3.5, low 1): guidance stays 1, high_guidance 3.5.
   const comfy::Plan cfg = plan_with(Replace(
@@ -2333,7 +2361,7 @@ void TestWan22I2V() {
   const comfy::Plan no_lora = plan_with(plain);
   const auto& no_lora_video =
       std::get<comfy::VideoTask>(no_lora.tasks[0].spec);
-  assert(!no_lora_video.i2v_lora);
+  assert(!no_lora_video.i2v_lora_high && !no_lora_video.i2v_lora_low);
   assert(comfy::VideoRequestBody(no_lora_video)
              .find("gufo")
              ->find("i2v")
@@ -2366,6 +2394,76 @@ void TestWan22I2V() {
   const comfy::Plan camera = plan_with(wan21);
   assert(std::get<comfy::VideoTask>(camera.tasks[0].spec).family ==
          comfy::VideoFamily::kCamera);
+
+  // LoRA per expert: the low-noise LoRA alone (the reverse of anti_talk).
+  const comfy::Plan low_only = plan_with(
+      Replace(kWan22I2V, "\"model\": [\"91\", 0], \"shift\"",
+              "\"model\": [\"37\", 0], \"shift\""));
+  const auto& low_only_video =
+      std::get<comfy::VideoTask>(low_only.tasks[0].spec);
+  assert(!low_only_video.i2v_lora_high && low_only_video.i2v_lora_low);
+  assert(low_only.warnings.empty());
+  const json::Value low_only_body = comfy::VideoRequestBody(low_only_video);
+  const json::Value* low_only_i2v = low_only_body.find("gufo")->find("i2v");
+  assert(low_only_i2v->find("lora") == nullptr);
+  assert(!low_only_i2v->find("lora_high")->as_bool() &&
+         low_only_i2v->find("lora_low")->as_bool());
+  // The high-noise LoRA file on the low-noise stage warns (it runs as the
+  // low-noise expert's LoRA).
+  const comfy::Plan swapped = plan_with(
+      Replace(kWan22I2V, "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise",
+              "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise"));
+  assert(swapped.warnings.size() == 1 &&
+         swapped.warnings[0].find("node 58") != std::string::npos &&
+         swapped.warnings[0].find("low-noise step-distill LoRA") !=
+             std::string::npos);
+  assert(std::get<comfy::VideoTask>(swapped.tasks[0].spec).i2v_lora_low);
+}
+
+// The Regie's "anti_talk" Wan 2.2 I2V graph (19.11., seed 151490467):
+// lightx2v on the high-noise expert at cfg 1 (steps 0..3 of 6), the
+// low-noise expert WITHOUT LoRA at cfg 3.5 with the anti-talk negative
+// prompt. Before 2.2.9 gufo ran the LoRA on both experts (one
+// gufo.i2v.lora flag). The graph is tests/fixtures/comfy/
+// i2v_anti_talk_regie.json.
+void TestI2VAntiTalk() {
+  const std::filesystem::path file =
+      std::filesystem::path(__FILE__).parent_path().parent_path() /
+      "fixtures" / "comfy" / "i2v_anti_talk_regie.json";
+  std::ifstream in(file, std::ios::binary);
+  assert(in && "tests/fixtures/comfy/i2v_anti_talk_regie.json");
+  const std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  comfy::ModelIds served;
+  served.available = {"wan2.2-i2v-a14b"};
+  comfy::Plan plan;
+  comfy::PlanError error;
+  const bool ok = comfy::BuildPlan(json::parse(text), served, &plan, &error);
+  if (!ok)
+    std::cerr << "unexpected plan error: " << error.message << "\n";
+  assert(ok && plan.tasks.size() == 1 && plan.tasks[0].node_id == "11");
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kI2V22);
+  assert(video.width == 896 && video.height == 512 && video.frames == 73);
+  assert(video.steps == 6 && video.seed == 151490467);
+  assert(video.i2v_switch_step && *video.i2v_switch_step == 3);
+  assert(video.guidance && *video.guidance == 3.5);
+  assert(video.i2v_high_guidance && *video.i2v_high_guidance == 1.0);
+  assert(video.i2v_shift && *video.i2v_shift == 5.0);
+  assert(video.negative_prompt.find("talking, speaking") == 0);
+  assert(video.i2v_lora_high && !video.i2v_lora_low);
+  for (const std::string& warning : plan.warnings)
+    std::cerr << "unexpected warning: " << warning << "\n";
+  assert(plan.warnings.empty());
+  const json::Value body = comfy::VideoRequestBody(video);
+  const json::Value* gufo = body.find("gufo");
+  assert(gufo->find("guidance")->as_double() == 3.5);
+  const json::Value* i2v = gufo->find("i2v");
+  assert(i2v->find("switch_step")->as_double() == 3);
+  assert(i2v->find("high_guidance")->as_double() == 1.0);
+  assert(i2v->find("lora") == nullptr);
+  assert(i2v->find("lora_high")->as_bool() &&
+         !i2v->find("lora_low")->as_bool());
 }
 
 // Wan 2.1 FLF2V as ComfyUI's template wires it (CLIP vision of the start
@@ -4021,6 +4119,7 @@ int main() {
   TestVace();
   TestVaceKeyframes();
   TestWan22I2V();
+  TestI2VAntiTalk();
   TestFirstLastFrame();
   TestAnimate();
   TestAnimateNative();

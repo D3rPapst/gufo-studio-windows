@@ -33,9 +33,12 @@ namespace gufo::models::wan22 {
 ///    first step with 1000 * sigma < boundary * 1000 (0.900 for I2V);
 ///  - Wan 2.1 VAE decode.
 /// Each expert is a Kijai FP8 scaled checkpoint (~15 GB) with an optional
-/// LoRA (lightx2v / Lightning I2V, merged at load). With `experts_resident`
-/// both load together and stay in the worker over jobs (same files, LoRAs
-/// and strengths: no reload) when the device has room
+/// LoRA of its own (lightx2v / Lightning I2V; its factors stay on the
+/// device and are added at unpack): one expert may run with it and the
+/// other without (high_lora_file / low_lora_file empty). With
+/// `experts_resident` both load together and stay in the worker over jobs
+/// (same files, LoRAs and strengths: no reload; another LoRA choice on
+/// either expert reloads both) when the device has room
 /// (KeepVaceExpertsResident); otherwise one is on the device at a time,
 /// loaded from disk every job.
 struct I2V22Request {

@@ -164,6 +164,12 @@ struct JobRequest {
                                    const ext::VideoRequest& request,
                                    JobRequest* job, std::string* error);
 
+/// Whether one expert's step-distill LoRA applies, from the normalized
+/// "gufo.i2v" / "gufo.vace" options: `key` ("lora_high" / "lora_low") when
+/// set, else "lora" (both experts), else true. `key` "lora": that flag only.
+[[nodiscard]] bool ExpertLoraEnabled(const json::Value& options,
+                                     const char* key);
+
 /// parameters.json of a job: preset, size, frames, steps, seed, prompt hash.
 [[nodiscard]] std::string ParametersJson(const ext::VideoParameters& parameters,
                                          std::uint64_t seed,

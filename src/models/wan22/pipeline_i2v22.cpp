@@ -269,19 +269,40 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
                             request.low_lora_strength};
     resident_lock.lock();
     ResidentExperts& kept = Resident();
-    if (kept.loaded &&
-        (!request.experts_resident ||
-         !(kept.high_key == high_key && kept.low_key == low_key))) {
+    if (kept.loaded && !request.experts_resident) {
       kept.Reset();
-      LogI2V("event=experts_released reason=" +
-             std::string(request.experts_resident ? "other_files"
-                                                  : "experts_resident_off"));
+      LogI2V("event=experts_released reason=experts_resident_off");
+    } else if (kept.loaded &&
+               !(kept.high_key == high_key && kept.low_key == low_key)) {
+      // Another file or LoRA choice (gufo.i2v.lora_high / lora_low): only
+      // the expert that differs is released and loaded again.
+      const bool high_differs = !(kept.high_key == high_key);
+      const bool low_differs = !(kept.low_key == low_key);
+      if (high_differs) {
+        kept.high.reset();
+        kept.high_key = {};
+      }
+      if (low_differs) {
+        kept.low.reset();
+        kept.low_key = {};
+      }
+      kept.loaded = false;
+      LogI2V("event=experts_released reason=other_files experts=" +
+             std::string(high_differs && low_differs ? "both"
+                         : high_differs              ? "high"
+                                                     : "low"));
     }
     tel.experts_reused = kept.loaded;
     if (request.experts_resident && !kept.loaded) {
-      // LoRAs are merged into the weights at load: no extra room.
-      const std::uint64_t expert_bytes =
-          FileBytes(high_key.dit) + FileBytes(low_key.dit);
+      // The FP8 linears keep their LoRA factors on the device (added at
+      // unpack, as in GenerateVace21): an expert without its LoRA
+      // (gufo.i2v.lora_high / lora_low false) needs that much less. An
+      // expert still resident (same file and LoRA) needs no more room.
+      const auto bytes_of = [](const ExpertKey& key) {
+        return FileBytes(key.dit) + FileBytes(key.lora);
+      };
+      const std::uint64_t expert_bytes = (kept.high ? 0 : bytes_of(high_key)) +
+                                         (kept.low ? 0 : bytes_of(low_key));
       const std::uint64_t job_bytes =
           DirectoryBytes(request.t5_root / "text_encoder") +
           DirectoryBytes(request.vae_root / "vae");
@@ -289,13 +310,18 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
       const std::string numbers =
           " free_gib=" + Gib(free_bytes) + " experts_gib=" +
           Gib(expert_bytes) + " job_gib=" + Gib(job_bytes) +
-          " margin_gib=" + Gib(kVaceExpertMarginBytes);
+          " margin_gib=" + Gib(kVaceExpertMarginBytes) +
+          " lora_high=" + (high_key.lora.empty() ? "0" : "1") +
+          " lora_low=" + (low_key.lora.empty() ? "0" : "1") +
+          " kept=" + (kept.high ? (kept.low ? "both" : "high")
+                                : (kept.low ? "low" : "none"));
       if (KeepVaceExpertsResident(true, free_bytes, expert_bytes,
                                   job_bytes)) {
         const auto start = Clock::now();
         std::string load_error;
-        kept.high = LoadExpert(high_key, &load_error);
-        if (kept.high)
+        if (!kept.high)
+          kept.high = LoadExpert(high_key, &load_error);
+        if (kept.high && !kept.low)
           kept.low = LoadExpert(low_key, &load_error);
         if (kept.high && kept.low) {
           kept.high_key = high_key;
@@ -310,6 +336,8 @@ bool GenerateI2V22(const I2V22Request& request, const I2V21Callbacks& callbacks,
                  " error=\"" + load_error + "\"");
         }
       } else {
+        // Sequential: an expert still kept would take the room.
+        kept.Reset();
         LogI2V("event=experts_sequential reason=low_memory" + numbers);
       }
     }

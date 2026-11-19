@@ -357,11 +357,12 @@ bool RunWan21VaceJob(const JobRequest& request, const JobCallbacks& callbacks,
     job.lora_strength =
         static_cast<float>(manifest.member_double("lora_strength", 1.0));
   }
-  if (const json::Value* lora = options.find("lora");
-      lora != nullptr && lora->is_bool() && !lora->as_bool()) {
+  // "lora" for both experts; Wan 2.2 Fun VACE also "lora_high" / "lora_low"
+  // (the low-noise expert is in the single-model fields).
+  if (!ExpertLoraEnabled(options, fun22 ? "lora_low" : "lora"))
     job.lora_file.clear();
+  if (!ExpertLoraEnabled(options, "lora_high"))
     job.high_lora_file.clear();
-  }
   job.shift = static_cast<float>(
       options.member_double("shift", manifest.member_double("shift", 5.0)));
   job.sampler =
@@ -514,11 +515,11 @@ bool RunWan22I2VJob(const JobRequest& request, const JobCallbacks& callbacks,
     SetError(error, "gufo-i2v22.json needs vae, t5, dit_high and dit_low");
     return false;
   }
-  if (const json::Value* lora = options.find("lora");
-      lora != nullptr && lora->is_bool() && !lora->as_bool()) {
+  // "lora" for both experts, "lora_high" / "lora_low" for one.
+  if (!ExpertLoraEnabled(options, "lora_high"))
     job.high_lora_file.clear();
+  if (!ExpertLoraEnabled(options, "lora_low"))
     job.low_lora_file.clear();
-  }
   job.boundary = options.member_double(
       "boundary", manifest.member_double("boundary", kI2V22Boundary));
   job.switch_step = static_cast<int>(options.member_double("switch_step", -1.0));
