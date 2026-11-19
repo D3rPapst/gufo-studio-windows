@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "name": "realesrgan",
+  "kind": "library",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "depends": [
+    "rife"
+  ],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "targets": {
+    "gufo_realesrgan_post": {
+      "requires": []
+    },
+    "gufo_realesrgan_cpu": {
+      "requires": []
+    },
+    "gufo_realesrgan": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "tests": [
+    {
+      "target": "realesrgan_cpu_post_test",
+      "ctest": "realesrgan_cpu_post_test",
+      "check_pr": false,
+      "windows_build": true
+    },
+    {
+      "target": "realesrgan_tile_plan_test",
+      "ctest": "realesrgan_tile_plan_test",
+      "check_pr": false,
+      "windows_build": true
+    },
+    {
+      "target": "realesrgan_srvgg_weights_test",
+      "ctest": "realesrgan_srvgg_weights_test",
+      "check_pr": false,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "realesrgan"
+  ]
+}
