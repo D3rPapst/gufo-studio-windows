@@ -2071,10 +2071,35 @@ VideoTask BuildCamera(const Graph& graph, const std::string& sampler,
 
 /// A video an IMAGE input receives: GetVideoComponents <- LoadVideo, or
 /// VHS_LoadVideo (gufo decodes and fits the file itself).
+/// `load` (Wan 2.2 Animate): receives VHS_LoadVideo's frame options, which
+/// gufo then applies; without it they are not applied (a warning).
 FileRef VideoFile(const Graph& graph, const std::string& id,
                   const std::string& key, const Link& link,
-                  std::vector<std::string>* warnings, int fps = 16) {
+                  std::vector<std::string>* warnings, int fps = 16,
+                  VideoLoad* load = nullptr) {
   const std::string source = graph.Class(link.node);
+  if (source == "VHS_LoadVideo" && load != nullptr) {
+    const double rate = graph.Num(link.node, "force_rate", 0);
+    if (!(rate >= 0 && rate <= 120))
+      throw NodeFailure(link.node, "unsupported_value",
+                        "force_rate must be 0..120 in gufo");
+    const auto whole = [&](const char* option, double fallback, double low,
+                           double high) {
+      const double value = graph.Num(link.node, option, fallback);
+      if (value != std::floor(value) || value < low || value > high)
+        throw NodeFailure(link.node, "unsupported_value",
+                          std::string(option) + " must be a whole number in " +
+                              std::to_string(static_cast<long long>(low)) +
+                              ".." +
+                              std::to_string(static_cast<long long>(high)));
+      return static_cast<int>(value);
+    };
+    load->force_rate = rate;
+    load->skip_first_frames = whole("skip_first_frames", 0, 0, 100000);
+    load->select_every_nth = whole("select_every_nth", 1, 1, 1000);
+    load->frame_load_cap = whole("frame_load_cap", 0, 0, 100000);
+    return ParseFileRef(graph.Str(link.node, "video"), "input");
+  }
   if (source == "VHS_LoadVideo") {
     // gufo reads the file's frames in order from the start.
     for (const char* option :
@@ -2316,7 +2341,8 @@ void VaceFrames(const Graph& graph, const std::string& id,
                 const std::string& key, const Link& link,
                 std::vector<std::string>* warnings,
                 std::optional<FileRef>* file, std::vector<FrameRun>* runs,
-                std::vector<FrameFit>* video_fits = nullptr) {
+                std::vector<FrameFit>* video_fits = nullptr,
+                VideoLoad* load = nullptr) {
   const std::string cls = graph.Class(link.node);
   if (IsScaleNode(cls)) {
     std::vector<FrameFit> fits;
@@ -2328,7 +2354,7 @@ void VaceFrames(const Graph& graph, const std::string& id,
                           "input '" + key +
                               "': ImageScale on a loaded video is not "
                               "supported here by gufo");
-      *file = VideoFile(graph, id, key, source, warnings);
+      *file = VideoFile(graph, id, key, source, warnings, 16, load);
       *video_fits = std::move(fits);
       return;
     }
@@ -2338,7 +2364,7 @@ void VaceFrames(const Graph& graph, const std::string& id,
     return;
   }
   if (cls == "VHS_LoadVideo" || cls == "GetVideoComponents") {
-    *file = VideoFile(graph, id, key, link, warnings);
+    *file = VideoFile(graph, id, key, link, warnings, 16, load);
     return;
   }
   throw NodeFailure(id, "unsupported_link",
@@ -2596,7 +2622,8 @@ std::optional<std::vector<std::string>> VaceSamplerChain(
 void VaceMaskInput(const Graph& graph, const std::string& vace,
                    const std::string& key, const Link& mask,
                    bool still_for_all, VideoTask* task,
-                   std::vector<std::string>* warnings) {
+                   std::vector<std::string>* warnings,
+                   VideoLoad* load = nullptr) {
   Link link = mask;
   for (int guard = 0; guard < 8 && graph.Class(link.node) == "InvertMask";
        ++guard) {
@@ -2611,7 +2638,7 @@ void VaceMaskInput(const Graph& graph, const std::string& vace,
     channel = graph.Str(link.node, "channel", "red");
     VaceFrames(graph, link.node, "image",
                graph.RequireLink(link.node, "image"), warnings,
-               &task->vace_mask, &task->mask_runs);
+               &task->vace_mask, &task->mask_runs, nullptr, load);
   } else if (source == "LoadImageMask") {
     channel = graph.Str(link.node, "channel", "alpha");
     task->vace_mask = ParseFileRef(graph.Str(link.node, "image"), "input");
@@ -3236,10 +3263,12 @@ bool AnimateAvailable(const ModelIds& models) {
 /// A video input of WanAnimateToVideo for wan2.2-animate-14b: a loaded
 /// video (LoadVideo / VHS_LoadVideo) or frames built in the graph (rendered
 /// whole by the executor; gufo seeks video_frame_offset itself).
+/// VHS_LoadVideo frame options go to `loads` (gufo.animate.video_load).
 void AnimateVideo(const Graph& graph, const std::string& node,
                   const std::string& key, std::vector<std::string>* warnings,
                   std::optional<FileRef>* file, std::vector<FrameRun>* runs,
-                  std::vector<FrameFit>* video_fits) {
+                  std::vector<FrameFit>* video_fits,
+                  std::map<std::string, VideoLoad>* loads) {
   const auto link = graph.LinkOf(node, key);
   if (!link)
     return;
@@ -3252,7 +3281,11 @@ void AnimateVideo(const Graph& graph, const std::string& node,
                           "gufo; use one WanAnimateToVideo with the whole "
                           "length (gufo chains the chunks itself) or load "
                           "the frames to continue from as a video");
-  VaceFrames(graph, node, key, *link, warnings, file, runs, video_fits);
+  VideoLoad load;
+  VaceFrames(graph, node, key, *link, warnings, file, runs, video_fits,
+             &load);
+  if (load != VideoLoad{})
+    (*loads)[key] = load;
 }
 
 /// Wan 2.2 Animate 14B (wan2.2-animate-14b, 16 fps): KSampler <-
@@ -3305,16 +3338,16 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
     throw NodeFailure(node, "unsupported_value",
                       "continue_motion_max_frames must be 4k+1");
   AnimateVideo(graph, node, "pose_video", warnings, &task.pose_video,
-               &task.pose_runs, &task.pose_video_fits);
+               &task.pose_runs, &task.pose_video_fits, &task.animate_loads);
   AnimateVideo(graph, node, "face_video", warnings, &task.face_video,
-               &task.face_runs, &task.face_video_fits);
+               &task.face_runs, &task.face_video_fits, &task.animate_loads);
   AnimateVideo(graph, node, "background_video", warnings,
                &task.background_video, &task.background_runs,
-               &task.background_video_fits);
+               &task.background_video_fits, &task.animate_loads);
   if (!chunk)
     AnimateVideo(graph, node, "continue_motion", warnings,
                  &task.continue_motion, &task.continue_runs,
-                 &task.continue_motion_fits);
+                 &task.continue_motion_fits, &task.animate_loads);
   // ImageFromBatch(batch_index = trim_image) behind the decode drops the
   // continue_motion frames; gufo does that itself.
   task.animate_trim_continue =
@@ -3326,9 +3359,13 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
       warnings->push_back("node " + node +
                           ": character_mask is ignored without "
                           "background_video");
-    else
+    else {
+      VideoLoad load;
       VaceMaskInput(graph, node, "character_mask", *mask, true, &task,
-                    warnings);
+                    warnings, &load);
+      if (load != VideoLoad{})
+        task.animate_loads["character_mask"] = load;
+    }
   }
   if (background && !task.vace_mask && task.mask_runs.empty())
     throw NodeFailure(node, "missing_input",
@@ -3496,6 +3533,13 @@ std::string AnimateChunkDiffers(const VideoTask& a, const VideoTask& b) {
   if (a.reference_images != b.reference_images ||
       a.reference_fits != b.reference_fits)
     return "reference_image";
+  // continue_motion is the first chunk's own input (later chunks continue
+  // from the chunk before).
+  auto loads_a = a.animate_loads, loads_b = b.animate_loads;
+  loads_a.erase("continue_motion");
+  loads_b.erase("continue_motion");
+  if (loads_a != loads_b)
+    return "the video loaders' frame options";
   return "";
 }
 
@@ -4955,6 +4999,25 @@ json::Value VideoRequestBody(const VideoTask& task) {
       animate["lora"] = false;
     if (task.animate_relight && *task.animate_relight != 0.0)
       animate["relight_lora"] = *task.animate_relight;
+    // ComfyUI takes the frames as loaded (LoadVideo, frames built in the
+    // graph); VHS_LoadVideo's force_rate / frame options per input.
+    animate["fps"] = 0;
+    if (!task.animate_loads.empty()) {
+      json::Value loads = json::Value::object();
+      for (const auto& [input, load] : task.animate_loads) {
+        json::Value entry = json::Value::object();
+        if (load.force_rate > 0)
+          entry["fps"] = load.force_rate;
+        if (load.skip_first_frames > 0)
+          entry["skip_first_frames"] = load.skip_first_frames;
+        if (load.select_every_nth > 1)
+          entry["select_every_nth"] = load.select_every_nth;
+        if (load.frame_load_cap > 0)
+          entry["frame_load_cap"] = load.frame_load_cap;
+        loads[input] = std::move(entry);
+      }
+      animate["video_load"] = std::move(loads);
+    }
     gufo["animate"] = std::move(animate);
   } else if (task.family == VideoFamily::kTalk) {
     // 25 fps: gufo maps seconds back to round(25 s) frames.

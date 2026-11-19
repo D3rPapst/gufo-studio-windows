@@ -833,6 +833,18 @@ their low-rank factors are concatenated (`Transformer21::Load` with several
 on the Animate model path sends its `strength_model` as `relight_lora`
 (before 2.2.12: ignored with a `gufo_warning`). A request for it on a bundle
 without `relight_lora` fails the job.
+Wan 2.2 Animate input frame rates (2.2.12): the pose, face, background,
+mask and continue_motion videos are resampled by time to
+`gufo.animate.fps` (default 16 = the model's rate; 0 = every frame as it
+is, the behaviour before 2.2.12) the way VHS_LoadVideo's `force_rate` does
+it (cv_frame_generator: frames dropped or repeated, then
+`skip_first_frames`, `select_every_nth`, `frame_load_cap`; frame times
+summed as doubles in VHS's order; `AnimateFrameIndices`). Per input
+`gufo.animate.video_load` = {"pose_video": {"fps", "skip_first_frames",
+"select_every_nth", "frame_load_cap"}, ...} overrides it. The Comfy adapter
+sends `fps` 0 (ComfyUI takes LoadVideo frames and frames built in the graph
+as they are) and a VHS_LoadVideo's options as `video_load` (before 2.2.12
+they were ignored with a `gufo_warning`). The result stays 16 fps.
 ComfyUI Wan I2V chains (after 2.2.9): `WanImageToVideo` chunks chained the
 ComfyUI way (Regie 19.11., FilmStudio `mehrsprecher.py` bewegung_wf: Wan
 2.1 I2V 480p + lightx2v, e.g. 81 + 81 + 25 frames; each next

@@ -171,4 +171,66 @@ std::vector<AnimateChunkSlot> PlanAnimateChunks(int total_frames, int length,
   return slots;
 }
 
+bool AnimateFrameRateIsIdentity(const AnimateFrameRate& rate) {
+  const bool same_rate =
+      rate.target_num == 0 ||
+      (rate.source_num > 0 && rate.source_den > 0 && rate.target_den > 0 &&
+       rate.target_num * rate.source_den == rate.source_num * rate.target_den);
+  return same_rate && rate.skip_first_frames == 0 &&
+         rate.select_every_nth == 1 && rate.frame_load_cap == 0;
+}
+
+std::vector<int> AnimateFrameIndices(const AnimateFrameRate& rate,
+                                     int max_frames, int source_frames) {
+  std::vector<int> indices;
+  constexpr std::int64_t kMaxRate = 10'000'000;
+  if (rate.source_num <= 0 || rate.source_den <= 0 || rate.target_num < 0 ||
+      rate.target_den <= 0 || rate.source_num > kMaxRate ||
+      rate.source_den > kMaxRate || rate.target_num > kMaxRate ||
+      rate.target_den > kMaxRate || rate.skip_first_frames < 0 ||
+      rate.select_every_nth < 1 || rate.frame_load_cap < 0 || max_frames < 0 ||
+      source_frames == 0)
+    return indices;
+  const std::int64_t target_num =
+      rate.target_num == 0 ? rate.source_num : rate.target_num;
+  const std::int64_t target_den =
+      rate.target_num == 0 ? rate.source_den : rate.target_den;
+  // Frame times in seconds as doubles, summed in VHS's order (Python
+  // floats are doubles), so ties fall the same way: base_frame_time = 1 /
+  // fps, target_frame_time = 1 / force_rate.
+  const double base = 1.0 / (static_cast<double>(rate.source_num) /
+                             static_cast<double>(rate.source_den));
+  const double target = 1.0 / (static_cast<double>(target_num) /
+                               static_cast<double>(target_den));
+  // cv_frame_generator: the first frame is grabbed before the loop and
+  // time_offset starts at one target frame time.
+  int current = 0;
+  double offset = target;
+  int count = 0, evaluated = -1, added = 0;
+  constexpr int kMaxSourceFrames = 10'000'000;
+  while (static_cast<int>(indices.size()) < max_frames) {
+    if (offset < target) {
+      ++current;
+      if ((source_frames > 0 && current >= source_frames) ||
+          current > kMaxSourceFrames)
+        break;
+      offset += base;
+    }
+    if (offset < target)
+      continue;
+    offset -= target;
+    ++count;
+    if (count <= rate.skip_first_frames)
+      continue;
+    ++evaluated;
+    if (evaluated % rate.select_every_nth != 0)
+      continue;
+    if (rate.frame_load_cap > 0 && added >= rate.frame_load_cap)
+      break;
+    indices.push_back(current);
+    ++added;
+  }
+  return indices;
+}
+
 }  // namespace gufo::models::wan22

@@ -301,6 +301,55 @@ void FaceTokens() {
          "size mismatch is rejected");
 }
 
+// Input videos on the animation's time line as VHS_LoadVideo loads them
+// (force_rate, skip_first_frames, select_every_nth, frame_load_cap);
+// expected indices from VHS's cv_frame_generator loop.
+void FrameRates() {
+  const auto indices = [](std::int64_t num, std::int64_t den, double fps,
+                          int source, int skip = 0, int nth = 1, int cap = 0,
+                          int max_frames = 1000) {
+    wan22::AnimateFrameRate rate;
+    rate.source_num = num;
+    rate.source_den = den;
+    rate.target_num = static_cast<std::int64_t>(fps * 1000.0 + 0.5);
+    rate.target_den = rate.target_num == 0 ? 1 : 1000;
+    rate.skip_first_frames = skip;
+    rate.select_every_nth = nth;
+    rate.frame_load_cap = cap;
+    return wan22::AnimateFrameIndices(rate, max_frames, source);
+  };
+  using V = std::vector<int>;
+  Expect(indices(30, 1, 16, 31) ==
+             V{0, 2, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27, 29},
+         "30 fps to 16: frames dropped by time");
+  Expect(indices(24, 1, 16, 25) ==
+             V{0, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23},
+         "24 fps to 16");
+  Expect(indices(12, 1, 16, 13) ==
+             V{0, 1, 2, 3, 4, 4, 5, 6, 7, 7, 8, 9, 10, 10, 11, 12},
+         "12 fps to 16: frames repeated");
+  Expect(indices(16, 1, 16, 10) == V{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+         "same rate: every frame");
+  Expect(indices(30, 1, 0, 5) == V{0, 1, 2, 3, 4},
+         "fps 0: every frame of the file");
+  Expect(indices(30, 1, 16, 31, 2, 2, 4) == V{4, 8, 12, 16},
+         "skip_first_frames, select_every_nth, frame_load_cap after the rate");
+  Expect(indices(30000, 1001, 16, 31) ==
+             V{0, 2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23, 25, 27, 29, 30},
+         "29.97 fps to 16");
+  Expect(indices(30, 1, 16, -1, 0, 1, 0, 5) == V{0, 2, 4, 6, 8},
+         "unknown length: up to max_frames");
+  Expect(indices(30, 1, 16, 0).empty() && indices(0, 1, 16, 10).empty(),
+         "no frames or no rate");
+  wan22::AnimateFrameRate same;
+  same.source_num = 32;
+  same.target_num = 32000;
+  same.target_den = 1000;
+  Expect(wan22::AnimateFrameRateIsIdentity(same), "32 = 32000 / 1000");
+  same.select_every_nth = 2;
+  Expect(!wan22::AnimateFrameRateIsIdentity(same), "every 2nd frame");
+}
+
 }  // namespace
 
 int main() {
@@ -312,6 +361,7 @@ int main() {
   Chunks();
   Directions();
   FaceTokens();
+  FrameRates();
   if (failures == 0)
     std::cout << "wan22_animate_context_test: ok\n";
   return failures == 0 ? 0 : 1;

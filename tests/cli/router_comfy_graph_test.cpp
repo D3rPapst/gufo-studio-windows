@@ -3283,6 +3283,47 @@ void TestAnimateNative() {
          animate->find("shift")->as_double() == 8.0);
   assert(!animate->contains("lora") && !animate->contains("video_frame_offset"));
   assert(animate->find("relight_lora")->as_double() == 1.0);
+  // LoadVideo frames as they are (fps 0), no VHS options.
+  assert(animate->find("fps")->as_double() == 0 &&
+         !animate->contains("video_load") && video.animate_loads.empty());
+
+  // VHS_LoadVideo pose at force_rate 16, every 2nd frame after 3: gufo
+  // resamples the file like VHS (gufo.animate.video_load), no warning.
+  {
+    std::string vhs = Replace(kAnimate, "\"pose_video\": [\"21\", 0]",
+                              "\"pose_video\": [\"29\", 0]");
+    vhs = Replace(vhs, " \"30\":",
+                  " \"29\": {\"class_type\": \"VHS_LoadVideo\", "
+                  "\"inputs\": {\"video\": \"pose_30fps.mp4\", "
+                  "\"force_rate\": 16, \"custom_width\": 0, "
+                  "\"custom_height\": 0, \"frame_load_cap\": 0, "
+                  "\"skip_first_frames\": 3, \"select_every_nth\": 2}},"
+                  "\n \"30\":");
+    const comfy::Plan vhs_plan = plan_of(vhs);
+    const auto& v = std::get<comfy::VideoTask>(vhs_plan.tasks[0].spec);
+    assert((v.pose_video == comfy::FileRef{"pose_30fps.mp4", "input"}));
+    assert(v.animate_loads.size() == 1);
+    const comfy::VideoLoad& load = v.animate_loads.at("pose_video");
+    assert(load.force_rate == 16 && load.skip_first_frames == 3 &&
+           load.select_every_nth == 2 && load.frame_load_cap == 0);
+    assert(!warned(vhs_plan, "not applied"));
+    const json::Value vhs_body = comfy::VideoRequestBody(v);
+    const json::Value* pose = vhs_body.find("gufo")
+                                  ->find("animate")
+                                  ->find("video_load")
+                                  ->find("pose_video");
+    assert(pose->find("fps")->as_double() == 16 &&
+           pose->find("skip_first_frames")->as_double() == 3 &&
+           pose->find("select_every_nth")->as_double() == 2 &&
+           !pose->contains("frame_load_cap"));
+    // force_rate 0 and default options: no entry.
+    const comfy::Plan plain = plan_of(Replace(
+        Replace(Replace(vhs, "\"force_rate\": 16", "\"force_rate\": 0"),
+                "\"skip_first_frames\": 3", "\"skip_first_frames\": 0"),
+        "\"select_every_nth\": 2", "\"select_every_nth\": 1"));
+    assert(std::get<comfy::VideoTask>(plain.tasks[0].spec)
+               .animate_loads.empty());
+  }
   assert(body.find("gufo")->find("frames")->as_double() == 77);
 
   // Without clip_vision_output: a note that gufo uses it anyway.
