@@ -23,9 +23,11 @@ namespace json = gufo::json;
 
 namespace {
 
-// 4 x 2 RGB PNG as base64.
+// 4 x 2 RGB PNG as base64 (sample i = 10 * i).
 std::string TinyPng() {
-  std::vector<unsigned char> rgb(4 * 2 * 3, 128);
+  std::vector<unsigned char> rgb(4 * 2 * 3);
+  for (std::size_t i = 0; i < rgb.size(); ++i)
+    rgb[i] = static_cast<unsigned char>(10 * i);
   png_image image{};
   image.version = PNG_IMAGE_VERSION;
   image.width = 4;
@@ -48,6 +50,24 @@ HttpResponse Post(VisionModelService& service, const std::string& path, const st
 }
 
 json::Value Body(const HttpResponse& response) { return json::parse(response.body); }
+
+// An RGBA PNG (base64) decoded: width, height, RGBA8 samples.
+std::vector<unsigned char> DecodeRgba(const std::string& b64, int* width, int* height) {
+  std::vector<std::uint8_t> bytes;
+  gufo::core::Base64Options options;
+  assert(gufo::core::DecodeBase64(b64, options, bytes) == gufo::core::Base64Status::kOk);
+  png_image image{};
+  image.version = PNG_IMAGE_VERSION;
+  assert(png_image_begin_read_from_memory(&image, bytes.data(), bytes.size()));
+  // A true RGBA PNG (colour type 6), not a palette or grey one.
+  assert(image.format == PNG_FORMAT_RGBA);
+  image.format = PNG_FORMAT_RGBA;
+  std::vector<unsigned char> rgba(PNG_IMAGE_SIZE(image));
+  assert(png_image_finish_read(&image, nullptr, rgba.data(), 0, nullptr));
+  *width = static_cast<int>(image.width);
+  *height = static_cast<int>(image.height);
+  return rgba;
+}
 
 }  // namespace
 
@@ -132,6 +152,66 @@ int main() {
   assert(r.status == 200 && Body(r).find("masks")->items().size() == 2);
   r = Post(service, "/v1/vision/segment", "{\"image\":\"" + image + "\"}");
   assert(r.status == 400);
+
+  // format "rgba": the image with the mask as alpha (box [1,0,2,1] -> the
+  // fake mask is pixel (1, 0)); default stays the grey mask only.
+  r = Post(service, "/v1/vision/segment",
+           "{\"image\":\"" + image + "\",\"boxes\":[[1,0,2,1]]}");
+  assert(r.status == 200 &&
+         !Body(r).find("masks")->items()[0].contains("rgba_b64"));
+  r = Post(service, "/v1/vision/segment",
+           "{\"image\":\"" + image + "\",\"boxes\":[[1,0,2,1]],\"format\":\"rgba\"}");
+  assert(r.status == 200);
+  {
+    const json::Value answer = Body(r);
+    const json::Value& m = answer.find("masks")->items()[0];
+    assert(m.find("b64_json")->is_string() && !m.contains("crop_box"));
+    int w = 0, h = 0;
+    const auto rgba = DecodeRgba(m.member_str("rgba_b64"), &w, &h);
+    assert(w == 4 && h == 2 && rgba.size() == 4 * 2 * 4);
+    for (int p = 0; p < 8; ++p) {
+      for (int c = 0; c < 3; ++c)
+        assert(rgba[4 * p + c] == 10 * (3 * p + c));  // the input pixels
+      assert(rgba[4 * p + 3] == (p == 1 ? 255 : 0));  // the mask as alpha
+    }
+  }
+  // crop: cut to the mask's box, crop_box in image pixels.
+  r = Post(service, "/v1/vision/segment",
+           "{\"image\":\"" + image +
+               "\",\"boxes\":[[1,0,2,1]],\"format\":\"rgba\",\"crop\":true}");
+  assert(r.status == 200);
+  {
+    const json::Value answer = Body(r);
+    const json::Value& m = answer.find("masks")->items()[0];
+    const auto& box = m.find("crop_box")->items();
+    assert(box.size() == 4 && box[0].as_double() == 1 && box[1].as_double() == 0 &&
+           box[2].as_double() == 2 && box[3].as_double() == 1);
+    int w = 0, h = 0;
+    const auto rgba = DecodeRgba(m.member_str("rgba_b64"), &w, &h);
+    assert(w == 1 && h == 1 && rgba[0] == 30 && rgba[1] == 40 && rgba[2] == 50 &&
+           rgba[3] == 255);
+  }
+  // By labels: the union mask (pixels (1, 0) and (2, 0)) as one cut-out.
+  r = Post(service, "/v1/vision/segment",
+           "{\"image\":\"" + image +
+               "\",\"labels\":[\"person\",\"sword\"],\"top\":1,\"format\":\"rgba\","
+               "\"crop\":true}");
+  assert(r.status == 200);
+  body = Body(r);
+  {
+    const auto& box = body.find("crop_box")->items();
+    assert(box[0].as_double() == 1 && box[2].as_double() == 3 && box[3].as_double() == 1);
+    int w = 0, h = 0;
+    const auto rgba = DecodeRgba(body.member_str("rgba_b64"), &w, &h);
+    assert(w == 2 && h == 1 && rgba[3] == 255 && rgba[7] == 255 && rgba[4] == 60);
+    assert(body.find("mask")->is_string());
+  }
+  // Bad format / crop.
+  for (const char* bad : {",\"format\":\"png16\"", ",\"format\":3", ",\"crop\":\"yes\"",
+                          ",\"crop\":true", ",\"format\":\"mask\",\"crop\":true"})
+    assert(Post(service, "/v1/vision/segment",
+                "{\"image\":\"" + image + "\",\"boxes\":[[1,0,2,1]]" + bad + "}")
+               .status == 400);
   r = Post(service, "/v1/vision/segment",
            "{\"image\":\"" + image + "\",\"boxes\":[[1,0,2,1]],\"points\":[[1,1]]}");
   assert(r.status == 400);

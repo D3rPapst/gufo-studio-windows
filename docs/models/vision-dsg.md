@@ -89,6 +89,14 @@ decoded prompt text the box matched.
 - `points` `[[x, y], ...]` with `point_labels` (1 = object, 0 = background; default 1):
   one prompt, one mask; `"multimask": true` answers SAM's three masks.
 
+`"format"`: `"mask"` (default) answers the grey masks above. `"rgba"` (2.2.12) adds
+`rgba_b64` next to each mask (labels: next to `mask`; boxes / points: in each `masks`
+item): the input image as an RGBA PNG with the mask as alpha (255 = region, 0 =
+transparent), e.g. a cut-out person for a blockout room. `"crop": true` (only with
+`rgba`) cuts it to the mask's bounding box and adds `crop_box` `[x0, y0, x1, y1]` in
+image pixels (x1 / y1 exclusive) to place it back. An empty mask with `crop`: both
+`null`.
+
 ## Speed
 
 Measured 14.11.2026 on the 64 GB machine, keyframes 1344 x 768, model already loaded:
@@ -116,7 +124,7 @@ does with `--file-bbox`. Boxes from transformers 5.18 differ from gufo's (up to 
 ## Limits and errors
 
 - One request computes at a time. `400`: bad fields, unreadable image, unknown `size`
-  or `detector`.
+  or `detector`, a segment `format` other than `mask` / `rgba`, `crop` without `rgba`.
 - `501 task_not_available`: the worker was started without that kind of model.
 - `500 depth_failed | find_failed | segment_failed`: the GPU run failed (see message).
 - Find resizes to 800 pixels (short side); its tokenizer lower-cases ASCII only.
