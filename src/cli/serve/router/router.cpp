@@ -33,6 +33,7 @@
 #include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/cli/serve/router/einrichtung.hpp"
 #include "src/cli/serve/router/figuren.hpp"
+#include "src/cli/serve/router/job_files.hpp"
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/mcp.hpp"
 #include "src/cli/serve/router/names.hpp"
@@ -1397,6 +1398,11 @@ public:
     if (preset == nullptr) {
       return ModelNotFoundError();
     }
+    if (auto finished = FinishedJobReadLocked(req, model_id, *preset, lock)) {
+      // 2.2.13: a finished local video/3D job answers from its folder; the
+      // worker is not loaded for it.
+      return std::move(*finished);
+    }
     if (PooledLocked(*preset, req, music_job)) {
       // placement = pool: this machine or the remote, per request.
       return DispatchPoolLocked(req, model_id, *preset, music_job, priority,
@@ -1407,6 +1413,52 @@ public:
       return DispatchRemoteLocked(req, model_id, *preset->remote, lock);
     }
     return DispatchLocalLocked(req, model_id, *preset, music_job, lock);
+  }
+
+  /// 2.2.13: status, /content and (3D) /preview reads of a finished job
+  /// that this machine's worker ran, answered from the worker's job folder
+  /// (`root` of the preset section) without loading the worker. Only for a
+  /// job the registry knows as this model's local job (a job on the
+  /// partner is relayed as before) and only after the gate let the read
+  /// through (same owner check as a relayed read). State mutex held on
+  /// entry and on return; released while the files are read. nullopt: the
+  /// normal route answers (job still running, or not ours).
+  std::optional<HttpResponse> FinishedJobReadLocked(
+      const HttpRequest& req, const std::string& model_id,
+      const router::PresetModel& preset, std::unique_lock<std::mutex>& lock) {
+    const auto target = router::job_files::ParseRead(req.method, req.path);
+    if (!target.has_value() || registry.JobOwner(target->id) != model_id ||
+        registry.JobRemote(target->id))
+      return std::nullopt;
+    const auto root = router::job_files::JobRootOf(preset, target->kind);
+    if (!root.has_value())
+      return std::nullopt;
+    const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+    lock.unlock();
+    std::optional<HttpResponse> answer =
+        router::job_files::ReadFinished(*root, *target, req, now);
+    lock.lock();
+    const std::string part = target->part.empty() ? "status" : target->part;
+    if (answer.has_value()) {
+      // Finished: the open-job record goes, as after a relayed status read.
+      if (registry.JobOwner(target->id) == model_id)
+        registry.CompleteVideoJob(target->id);
+      Logger::Info("router", "event=job_file_read model=" + model_id +
+                                 " job=" + target->id + " part=" + part +
+                                 " status=" + std::to_string(answer->status));
+      return answer;
+    }
+    if (workers.count(model_id) == 0 && stopping.count(model_id) == 0) {
+      // No worker process: a reloaded one reads the same folder and drops
+      // whatever is not finished there, so it could only answer 404.
+      Logger::Info("router", "event=job_file_read model=" + model_id +
+                                 " job=" + target->id + " part=" + part +
+                                 " status=404 reason=not_finished_on_disk");
+      return router::job_files::NotFound(target->kind);
+    }
+    return std::nullopt;
   }
 
   /// A pool request's local claim (PoolEntry::local_claims), dropped once

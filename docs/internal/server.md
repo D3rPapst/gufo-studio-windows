@@ -766,9 +766,12 @@ relay waits for upstream bytes with poll(), not with SO_RCVTIMEO, which
 Winsock leaves "in an indeterminate state" after a timeout.
 Video job ids returned by `POST /v1/videos` are recorded with their
 model: while a tracked job is non-terminal its worker is exempt from
-eviction and idle unload, and a status or content read for a recorded job
-reloads that worker if it died, answering from the persisted `--root`
-job state.
+eviction and idle unload. Since 2.2.13 a status or content read of a
+recorded local job that is finished on disk (`<root>/<id>/job.json`
+`completed`, `failed` or `cancelled`) is answered by the router from that
+folder without loading the worker (see "Finished jobs are read from the
+job folder"); a read of a job that is not finished on disk still goes to
+the worker, which answers from its persisted `--root` state.
 Async music job ids (`POST /v1/audio/music` with `"async": true`) are
 recorded the same way and keep their worker busy until a status read
 reports `completed` or `failed` or the audio is downloaded. Music jobs live
@@ -2040,10 +2043,67 @@ residency planner (`PlanAdmission`) does not know whether a load serves a
 relayed request, and a waiting `/content` read is not a pool waiter; it
 would need the forwarded flag through `AdmitLocked` into the plan and a
 "wanted soon" mark per model (pool waiters, adapter tasks, recent job
-reads). The cheaper real fix for the case above: serve the `/content` of
-a finished video job without reloading its worker (the router reads the
-worker's stored result), so an evicted video model is no longer needed
-for it at all.
+reads). The cheaper fix for the case above is built in 2.2.13 (next
+section): the `/content` of a finished video job no longer needs its
+worker, so an evicted video model is not reloaded for it at all.
+
+#### Finished jobs are read from the job folder (2.2.13)
+
+`gufo serve video` and `gufo serve objekt` keep each job in
+`<root>/<id>/` (`root` of the preset section, the worker's `--root`):
+`job.json` and, once completed, the result (`output.mp4` or `output.ppm`;
+`model.glb` and `preview.png`). Nothing there changes after the job ended.
+The router (`router/job_files.cpp`, `FinishedJobReadLocked` in
+`router.cpp`) therefore answers these reads itself and never loads the
+worker for them:
+
+- `GET /v1/videos/<id>` and `GET /v1/videos/<id>/content`,
+- `GET /v1/3d/generations/<id>`, `.../content` and `.../preview`.
+
+Conditions, all of them: the id has the worker's shape (`video_` or
+`obj_` + 24 lowercase hex digits; anything else never becomes a path and
+takes the old route, which answers 404); the registry knows the job as
+this model's job created **on this machine** (`JobOwner`, not
+`JobRemote`: a job on the pool partner is relayed there as before); the
+preset section runs `serve video` (or is a `[video/<id>]` section) or
+`serve objekt` and has `root`; `job.json` is a plain file inside the
+root (no symlink or junction, real path below the root), at most 1 MiB,
+with the worker's schema (`gufo.video-job.v1`, `gufo.3d-api.v1`), the
+same `id`, a finished `status` (`completed`, `failed`, `cancelled`) and
+an `expires_at` not yet reached.
+
+Answers are the worker's: the video status object (`video_api.cpp`
+`SnapshotValue` shape) or the stored 3D job object; the file with the
+worker's headers, for video with the same single `Range` support (206,
+416); content of a failed or cancelled job is 409 `video_not_ready` /
+`objekt_not_ready`; a completed job whose result file is gone is 404
+(`video_not_found` / `objekt_file_missing`). An answered read closes the
+open-job record (`CompleteVideoJob`), like a relayed status read that saw
+the end. Logged as `event=job_file_read model=... job=... part=status|
+content|preview status=<http>`.
+
+When the folder holds no finished job (no folder, still running,
+expired, unreadable): with a worker process present (loaded, loading or
+stopping) the read goes to the worker as before; without one the router
+answers 404 `video_not_found` / `objekt_not_found` at once, which is what
+a reloaded worker would answer (it drops unfinished and expired jobs when
+it starts) - without the load.
+
+Why always from the folder and not only when the worker is gone: one path
+for every finished read, no race with an eviction between "is it loaded"
+and the relay, and a client that polls a finished job does not keep a
+large model busy or resident. The worker's in-memory state of a finished
+job is exactly what it wrote to `job.json` (written atomically before the
+state changes; a `DELETE` removes the folder).
+
+Access is unchanged: the read reaches `FinishedJobReadLocked` only after
+the gate (`Gate::Refuse`) passed it, with the same owner check as a
+relayed read (a direct video job's owner from the create answer,
+`video:<id>`; another user gets 404, admins and the router's own calls
+pass) and the area/model rights. 3D reads had and have no per-owner check
+in the gate, only the area (unchanged). Music jobs are not affected: they live
+only in the worker's memory and were already answered with 404 without a
+load. DELETE and every create still go to the worker.
 
 **Making way for a load (2.2.4).** While a cold load of Y waits for a busy
 model X (`LoadWaitBook` in `memory.hpp`, kept 120 s after its last plan, so
