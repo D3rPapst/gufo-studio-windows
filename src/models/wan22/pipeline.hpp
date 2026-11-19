@@ -97,6 +97,10 @@ bool GenerateVideo(const VideoRequest& request, const VideoCallbacks& callbacks,
 /// `ffmpeg` beside the executable / on PATH); writes `path` atomically.
 bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
               int fps, std::string* error);
+/// `lossless`: RGB H.264 (libx264rgb -qp 0, rgb24) instead of crf 18
+/// yuv420p, the frames exactly as decoded ("gufo.lossless").
+bool WriteMp4(const std::filesystem::path& path, const DecodedVideo& video,
+              int fps, bool lossless, std::string* error);
 
 /// WriteMp4 with a second input muxed as the audio track (`audio`: a WAV or
 /// any file FFmpeg reads; AAC 192 kb/s, cut to the video with -shortest).

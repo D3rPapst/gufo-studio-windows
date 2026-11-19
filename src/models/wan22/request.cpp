@@ -350,6 +350,19 @@ bool ReadNegativePrompt(const json::Value& extension, json::Value* options,
   return true;
 }
 
+// "gufo.lossless" (boolean): the MP4 as lossless RGB instead of crf 18.
+bool ReadLossless(const json::Value& extension, json::Value* options,
+                  ext::VideoRequestError* error) {
+  if (const json::Value* value = extension.find("lossless")) {
+    if (!value->is_bool())
+      return Fail(error, "invalid_lossless",
+                  "'gufo.lossless' must be a boolean");
+    if (value->as_bool())
+      (*options)["lossless"] = true;
+  }
+  return true;
+}
+
 // Uploads a family accepts (multipart file fields).
 bool CheckUploads(const Body& body, Family family,
                   ext::VideoRequestError* error) {
@@ -536,11 +549,14 @@ bool PrepareWan21(const Body& body, ext::VideoPreparedRequest* prepared,
   if (const json::Value* extension = body.json.find("gufo")) {
     if (!extension->is_object() ||
         !HasOnlyMembers(*extension, {"seed", "steps", "frames", "interpolate",
-                                     "upscale", "camera", "preview"}))
+                                     "upscale", "camera", "preview",
+                                     "lossless"}))
       return Fail(error, "invalid_strix_options",
                   "'gufo' may contain only 'seed', 'steps', 'frames', "
-                  "'interpolate', 'upscale', 'camera' and 'preview'");
+                  "'interpolate', 'upscale', 'camera', 'preview' and "
+                  "'lossless'");
     if (!CheckPostSteps(*extension, error) ||
+        !ReadLossless(*extension, &options, error) ||
         !ParseSeedSteps(*extension, "1..20", &seed, &parameters, error) ||
         !CheckFrames(*extension, *frames, error))
       return false;
@@ -637,12 +653,13 @@ bool PrepareI2V22(const Body& body, ext::VideoPreparedRequest* prepared,
         !HasOnlyMembers(*extension,
                         {"seed", "steps", "frames", "negative_prompt",
                          "guidance", "interpolate", "upscale", "preview",
-                         "i2v"}))
+                         "i2v", "lossless"}))
       return Fail(error, "invalid_strix_options",
                   "'gufo' may contain only 'seed', 'steps', 'frames', "
                   "'negative_prompt', 'guidance', 'interpolate', 'upscale', "
-                  "'preview' and 'i2v'");
+                  "'preview', 'i2v' and 'lossless'");
     if (!CheckPostSteps(*extension, error) ||
+        !ReadLossless(*extension, &options, error) ||
         !ReadNegativePrompt(*extension, &options, error))
       return false;
     if (const json::Value* value = extension->find("guidance")) {
@@ -1916,6 +1933,8 @@ bool BuildJobRequest(Family family, const ext::VideoRequest& request,
   }
   if (const json::Value* camera = options.find("camera"))
     job->camera_json = camera->dump();
+  if (const json::Value* lossless = options.find("lossless"))
+    job->lossless = lossless->is_bool() && lossless->as_bool();
   if (family == Family::kWan22Animate) {
     const json::Value* animate = options.find("animate");
     job->animate_json = animate != nullptr ? animate->dump() : "{}";

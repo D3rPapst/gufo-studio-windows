@@ -3885,8 +3885,13 @@ std::vector<DecodedChunk> ApplyI2VChain(const Graph& graph,
     total += chunk.frames;
     decoded.push_back({chain[i].stages.back(), chunk.frames});
     task->i2v_starts.push_back(start.front());
+    chunk.lossless = true;
     task->i2v_chunks.push_back(std::move(chunk));
   }
+  // Lossless chunks: a start frame or join from crf 18 yuv420p shifted the
+  // colours at every seam (Regie 19.11.: frame 81 darker and bluer).
+  if (!task->i2v_chunks.empty())
+    task->lossless = true;
   if (total > kMaxBatchFrames)
     throw NodeFailure(chain.back().head, "unsupported_value",
                       "a chain of WanImageToVideo chunks renders at most " +
@@ -4883,6 +4888,8 @@ json::Value VideoRequestBody(const VideoTask& task) {
       camera["ease"] = task.camera->ease;
       gufo["camera"] = std::move(camera);
     }
+    if (task.lossless)
+      gufo["lossless"] = true;
   } else if (task.family == VideoFamily::kVace) {
     // 16 fps like the camera family. The executor adds control_video, mask
     // and reference_images to gufo.vace.
@@ -4947,6 +4954,8 @@ json::Value VideoRequestBody(const VideoTask& task) {
       i2v["lora"] = false;
     }
     gufo["i2v"] = std::move(i2v);
+    if (task.lossless)
+      gufo["lossless"] = true;
   } else if (task.family == VideoFamily::kAnimate) {
     // 16 fps, one chunk of the node's length, or a chain of chunks that
     // gufo renders itself (animate_length / animate_continue_frames). The

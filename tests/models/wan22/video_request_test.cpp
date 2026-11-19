@@ -501,9 +501,18 @@ void TestI2V22(const std::filesystem::path& root) {
              R"({"model":"wan2.2-i2v-a14b","prompt":"walk","seconds":"1","first_frame":")" +
                  std::string(kPng) + R"("})");
   Check(plain.guidance == 1.0 && plain.steps == 4 && plain.i2v_json == "{}" &&
-            plain.width == 832 && plain.height == 480,
+            plain.width == 832 && plain.height == 480 && !plain.lossless,
         "I2V A14B defaults: 832x480, no CFG, 4 steps, switch from the "
-        "boundary");
+        "boundary, crf 18");
+  // gufo.lossless (chained I2V chunks of the ComfyUI adapter).
+  Check(Accept(service, runner, &calls, wan22::Family::kWan22I2V,
+               prefix + R"("lossless":true}})")
+            .lossless,
+        "I2V A14B gufo.lossless reaches the runner");
+  Check(!Accept(service, runner, &calls, wan22::Family::kWan22I2V,
+                prefix + R"("lossless":false}})")
+             .lossless,
+        "I2V A14B gufo.lossless false");
   Rejected(service, R"({"model":"wan2.2-i2v-a14b","prompt":"x","seconds":"1"})",
            "invalid_input_reference", "I2V A14B without a start image");
   // LoRA per expert (the Regie's anti_talk graph): lightx2v on the
@@ -538,7 +547,7 @@ void TestI2V22(const std::filesystem::path& root) {
         prefix + R"("i2v":{"high_guidance":0.5}}})",
         prefix + R"("i2v":{"sampler":"dpm"}}})",
         prefix + R"("i2v":{"camera":1}}})", prefix + R"("guidance":0.5}})",
-        prefix + R"("vace":{}}})",
+        prefix + R"("vace":{}}})", prefix + R"("lossless":1}})",
         R"({"model":"wan2.2-i2v-a14b","prompt":"x","size":"1920x1080","seconds":"1","first_frame":")" +
             std::string(kPng) + R"("})"})
     Rejected(service, bad, "", "invalid I2V A14B request " + bad);
@@ -575,8 +584,13 @@ void TestUni3C(const std::filesystem::path& root) {
   job = Accept(service, runner, &calls, wan22::Family::kWan21Uni3C,
                prefix + R"("steps":6}})");
   Check(job.camera_json.empty() && job.guide_video_path.empty() &&
-            job.steps == 6,
+            job.steps == 6 && !job.lossless,
         "Uni3C without a camera is plain image-to-video");
+  job = Accept(service, runner, &calls, wan22::Family::kWan21Uni3C,
+               prefix + R"("lossless":true}})");
+  Check(job.lossless, "Uni3C gufo.lossless reaches the runner");
+  Rejected(service, prefix + R"("lossless":"yes"}})", "invalid_lossless",
+           "Uni3C gufo.lossless not a boolean");
 
   Rejected(service,
            R"({"model":"wan2.1-uni3c","prompt":"x","seconds":"1"})",

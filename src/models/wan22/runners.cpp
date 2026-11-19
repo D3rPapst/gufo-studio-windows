@@ -278,7 +278,8 @@ bool RunWan21Job(const JobRequest& request, const JobCallbacks& callbacks,
     return false;
   Report(callbacks, "media", 0, 1);
   const auto media_start = Clock::now();
-  if (!WriteMp4(request.output_path, video, Fps(Family::kWan21Uni3C), error))
+  if (!WriteMp4(request.output_path, video, Fps(Family::kWan21Uni3C),
+                request.lossless, error))
     return false;
   Report(callbacks, "media", 1, 1);
   if (telemetry != nullptr) {
@@ -555,7 +556,8 @@ bool RunWan22I2VJob(const JobRequest& request, const JobCallbacks& callbacks,
     return false;
   Report(callbacks, "media", 0, 1);
   const auto media_start = Clock::now();
-  if (!WriteMp4(request.output_path, video, Fps(Family::kWan22I2V), error))
+  if (!WriteMp4(request.output_path, video, Fps(Family::kWan22I2V),
+                request.lossless, error))
     return false;
   Report(callbacks, "media", 1, 1);
   if (telemetry != nullptr) {
