@@ -132,9 +132,12 @@ entry per hand box, in score order:
   names the fingers that are hidden (no error). `sicher` is `false` for hidden fingers, a
   fist, overlapping hands, a blurred or very small hand. `befund` is one short German
   sentence.
-- `timeout_seconds` counts from the first generated token. Before that a hand may wait
-  `wait_seconds` for the model (queue, loading; a `503 memory_busy` while another model holds
-  the GPU is asked again after its `Retry-After`). When a hand did not get the model in that
+- `timeout_seconds` counts from the first generated token (thinking included). Before that a
+  hand may wait `wait_seconds` for the model (queue, also behind another chat of the same
+  model, loading; a `503 memory_busy` while another model holds the GPU is asked again after
+  its `Retry-After`). Up to 2.2.10 the clock started already with the empty first stream
+  chunk that the model's worker sends after 5 s in its queue, so a busy 27B ended the hands
+  with `timeout after 300 s of generation` long before `wait_seconds`. When a hand did not get the model in that
   time, the later hands of the image are not asked (`fehler`: `not checked: ...`).
   `waited_seconds` is that wait, `seconds` the hand's whole time.
 - A hand whose question failed (model refused or not loadable, timeout, no valid JSON) gets

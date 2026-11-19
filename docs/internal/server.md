@@ -1189,10 +1189,18 @@ Two clocks per hand (the first 2.2.5 run lost its hands with "timeout after
 120 s": the 27B was waiting to load behind an exclusive minimax-h3 video,
 the router answered 503 `memory_busy` after `--memory-wait-seconds`, the
 hands themselves were already asked one after the other): until the first
-streamed `data:` chunk (queue, load, prefill) the hand may wait
+generated token (queue, load, prefill) the hand may wait
 `wait_seconds` (600); a 503 `memory_busy` is asked again after its
-`Retry-After` (1-30 s) while that clock allows. From the first chunk on the
-generation has `timeout_seconds` (300). Both are polled through the inner
+`Retry-After` (1-30 s) while that clock allows. From the first token on the
+generation has `timeout_seconds` (300). `GenerationStarted` decides on whole
+`data:` lines: a non-empty `content` / `reasoning_content` / `tool_calls`
+delta, a `finish_reason`, an error or `[DONE]`. The role chunk
+(`{"delta": {"role": "assistant"}}`) and `prompt_progress` do not count: the
+worker's `TextGenerationScheduler` starts the stream (role chunk) after
+`stream_start_delay` (5 s) even while the request still waits in its queue
+behind another chat, so keepalives can run. Up to 2.2.10 any `data:` chunk
+started the generation clock; with the 27B busy the direction's hands ended
+with "timeout after 300 s of generation" while they were still queued. Both are polled through the inner
 request's `is_cancelled` (the proxy drops the generation) and the stream
 writer. A hand that did not get the model within `wait_seconds` ends the
 asking: the later hands answer `"fehler": "not checked: model ... not free
