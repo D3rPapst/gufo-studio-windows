@@ -66,6 +66,13 @@ struct DenoiserOptions {
   // Fun-ControlNet patch (needs all 50 blocks); must outlive Create and
   // the session.
   const DenoiserControl* control{nullptr};
+  // MiniMax-H3-Image: one latent frame and no audio rows
+  // (BuildImageTextLayout), the provided unshifted `sigmas` grid (evaluations
+  // = sigmas.size() - 1, no velocity reuse) and per step `i` the PDD output
+  // head `pdd.video_out.{weight,bias}[i]` of an InspectImage inventory in
+  // place of `final_layer.video_out`. No guides, no audio mask.
+  bool image{false};
+  std::span<const float> sigmas;
 };
 
 /// An audio guide (MiniMaxH3AddGuide audio): the normalized AudioVAE

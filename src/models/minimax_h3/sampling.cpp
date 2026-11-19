@@ -719,6 +719,133 @@ std::optional<PackedLayout> BuildReferenceLayout(
   return layout;
 }
 
+std::optional<ImageCanvas> ResolveImageCanvas(int width, int height,
+                                              std::int64_t minimum_area,
+                                              std::string* error) {
+  if (width < 1 || height < 1 || width > kH3ImageMaximumSide ||
+      height > kH3ImageMaximumSide) {
+    SetError(error, "MiniMax-H3-Image size must be 1.." +
+                        std::to_string(kH3ImageMaximumSide) +
+                        " pixels per side");
+    return std::nullopt;
+  }
+  if (minimum_area < kH3ImageMinimumAreaFloor ||
+      minimum_area > kH3ImageMinimumAreaCeiling) {
+    SetError(error, "MiniMax-H3-Image min_generation_area must be within [" +
+                        std::to_string(kH3ImageMinimumAreaFloor) + ", " +
+                        std::to_string(kH3ImageMinimumAreaCeiling) + "]");
+    return std::nullopt;
+  }
+  const double area = static_cast<double>(width) * height;
+  const double scale =
+      std::max(1.0, std::sqrt(static_cast<double>(minimum_area) / area));
+  // Python's round() rounds half to even, as nearbyint does by default.
+  const auto side = [scale](int value) {
+    const double units = std::nearbyint(static_cast<double>(value) * scale /
+                                        kH3CanvasMultiple);
+    return std::max(kH3CanvasMultiple,
+                    static_cast<int>(units) * kH3CanvasMultiple);
+  };
+  ImageCanvas canvas;
+  canvas.output_width = width;
+  canvas.output_height = height;
+  canvas.width = side(width);
+  canvas.height = side(height);
+  if (canvas.width > kH3ImageMaximumSide ||
+      canvas.height > kH3ImageMaximumSide ||
+      static_cast<std::int64_t>(canvas.width) * canvas.height >
+          kH3ImageMaximumPixels) {
+    SetError(error, "MiniMax-H3-Image canvas " + std::to_string(canvas.width) +
+                        "x" + std::to_string(canvas.height) +
+                        " exceeds the supported area");
+    return std::nullopt;
+  }
+  return canvas;
+}
+
+std::optional<GenerationGeometry> ImageGenerationGeometry(
+    const ImageCanvas& canvas, std::string* error) {
+  if (canvas.width < kH3CanvasMultiple || canvas.height < kH3CanvasMultiple ||
+      canvas.width % kH3CanvasMultiple != 0 ||
+      canvas.height % kH3CanvasMultiple != 0) {
+    SetError(error, "MiniMax-H3-Image canvas must be a multiple of 32");
+    return std::nullopt;
+  }
+  GenerationGeometry geometry;
+  geometry.width = canvas.width;
+  geometry.height = canvas.height;
+  geometry.latent_width = canvas.width / kH3VaeSpatialRatio;
+  geometry.latent_height = canvas.height / kH3VaeSpatialRatio;
+  geometry.temporal.frames = 1;
+  geometry.temporal.video_latent_frames = 1;
+  geometry.temporal.audio_latent_frames = 0;
+  return geometry;
+}
+
+std::optional<PackedLayout> BuildImageTextLayout(std::size_t text_rows,
+                                                 int latent_height,
+                                                 int latent_width,
+                                                 std::string* error) {
+  if (text_rows == 0 || latent_height < 2 || latent_width < 2 ||
+      latent_height % 2 != 0 || latent_width % 2 != 0 ||
+      static_cast<std::int64_t>(latent_height) * latent_width *
+              kH3VaeSpatialRatio * kH3VaeSpatialRatio >
+          kH3ImageMaximumPixels) {
+    SetError(error, "invalid MiniMax-H3-Image layout geometry");
+    return std::nullopt;
+  }
+  const std::size_t image_rows = static_cast<std::size_t>(latent_height / 2) *
+                                 static_cast<std::size_t>(latent_width / 2);
+  if (text_rows > std::numeric_limits<std::uint32_t>::max() - image_rows) {
+    SetError(error, "MiniMax-H3-Image packed row count overflows");
+    return std::nullopt;
+  }
+  PackedLayout layout;
+  layout.text_rows = text_rows;
+  layout.video_target_rows = image_rows;
+  layout.video_latent_frames = 1;
+  layout.latent_height = latent_height;
+  layout.latent_width = latent_width;
+  try {
+    layout.positions.reserve(text_rows + image_rows);
+    for (std::size_t row = 0; row < text_rows; ++row) {
+      layout.positions.push_back({static_cast<double>(row), 0.0, 0.0});
+    }
+    const double time = static_cast<double>(text_rows);
+    for (const Position3D& position : FrameGrid(latent_height, latent_width)) {
+      layout.positions.push_back({time, position.height, position.width});
+    }
+    layout.segments = {
+        {0, text_rows, SegmentKind::kText},
+        {text_rows, text_rows, SegmentKind::kAudioTarget},
+        {text_rows, text_rows + image_rows, SegmentKind::kVideoTarget},
+    };
+  } catch (const std::exception&) {
+    SetError(error, "MiniMax-H3-Image layout cannot be allocated");
+    return std::nullopt;
+  }
+  return layout;
+}
+
+std::optional<SigmaSchedule> BuildProvidedSchedule(
+    std::span<const float> sigmas, std::string* error) {
+  if (sigmas.size() < 3 || sigmas.size() > kH3MaximumEvaluations + 1U ||
+      sigmas.front() != 1.0F || sigmas.back() != 0.0F) {
+    SetError(error, "a provided MiniMax H3 sigma grid must run from 1 to 0");
+    return std::nullopt;
+  }
+  for (std::size_t index = 0; index + 1 < sigmas.size(); ++index) {
+    if (!std::isfinite(sigmas[index]) || sigmas[index] <= sigmas[index + 1]) {
+      SetError(error, "a provided MiniMax H3 sigma grid must decrease");
+      return std::nullopt;
+    }
+  }
+  SigmaSchedule schedule;
+  schedule.video.assign(sigmas.begin(), sigmas.end());
+  schedule.audio = schedule.video;
+  return schedule;
+}
+
 std::optional<std::vector<std::uint32_t>> BuildModulationRowMap(
     const TimeRowSchedule& time_rows, int step, const PackedLayout& layout,
     std::span<const std::uint8_t> text_tags, std::string* error) {

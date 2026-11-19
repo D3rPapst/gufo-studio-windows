@@ -713,6 +713,8 @@ int ControlDumpStep() {
 
 struct DenoiserSession::Impl {
   const ModelInventory* inventory{nullptr};
+  // MiniMax-H3-Image: no audio rows, PDD head per step.
+  bool image{false};
   GenerationGeometry geometry;
   PackedLayout layout;
   SigmaSchedule schedule;
@@ -1946,7 +1948,59 @@ struct DenoiserSession::Impl {
     return true;
   }
 
+  // MiniMax-H3-Image: the video patch projection and the shared final norm
+  // of the transformer, and the stacked PDD heads [steps][96][5376] /
+  // [steps][96] in place of final_layer.video_out (the release never uses
+  // that head).
+  bool LoadImageHeads(const CancellationToken* cancellation,
+                      std::string* error) {
+    const std::uint64_t steps =
+        static_cast<std::uint64_t>(schedule.evaluations());
+    const TensorDescriptor* video_weight =
+        RequireTensor(*inventory, "video_patch_proj.weight", DType::kFloat32,
+                      {kDitHiddenSize, kH3VideoPatchWidth}, error);
+    const TensorDescriptor* video_bias =
+        RequireTensor(*inventory, "video_patch_proj.bias", DType::kFloat32,
+                      {kDitHiddenSize}, error);
+    const TensorDescriptor* final_norm =
+        RequireTensor(*inventory, "final_layer.norm.weight", DType::kBFloat16,
+                      {kDitHiddenSize}, error);
+    const TensorDescriptor* heads_weight =
+        RequireTensor(*inventory, "pdd.video_out.weight", DType::kFloat32,
+                      {steps, kH3VideoPatchWidth, kDitHiddenSize}, error);
+    const TensorDescriptor* heads_bias =
+        RequireTensor(*inventory, "pdd.video_out.bias", DType::kFloat32,
+                      {steps, kH3VideoPatchWidth}, error);
+    if (video_weight == nullptr || video_bias == nullptr ||
+        final_norm == nullptr || heads_weight == nullptr ||
+        heads_bias == nullptr) {
+      return false;
+    }
+    if (!Load(*video_weight, &video_patch_weight, cancellation, error) ||
+        !Load(*video_bias, &video_patch_bias, cancellation, error) ||
+        !Load(*final_norm, &final_norm_weight, cancellation, error) ||
+        !Load(*heads_weight, &final_video_weight, cancellation, error) ||
+        !Load(*heads_bias, &final_video_bias, cancellation, error) ||
+        !final_modulation.Allocate(
+            final_modulation_host.size() * sizeof(std::uint16_t), error) ||
+        !CopyAsync(final_modulation.data(), final_modulation_host.data(),
+                   final_modulation.bytes(), hipMemcpyHostToDevice,
+                   "copy H3-Image final modulation", error)) {
+      return false;
+    }
+    base_telemetry.cumulative_allocation_bytes += final_modulation.bytes();
+    const hipError_t status = hipStreamSynchronize(stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("synchronize H3-Image heads", status));
+      return false;
+    }
+    return true;
+  }
+
   bool LoadHeads(const CancellationToken* cancellation, std::string* error) {
+    if (image) {
+      return LoadImageHeads(cancellation, error);
+    }
     const TensorDescriptor* video_weight =
         RequireTensor(*inventory, "video_patch_proj.weight", DType::kFloat32,
                       {kDitHiddenSize, kH3VideoPatchWidth}, error);
@@ -2153,15 +2207,18 @@ struct DenoiserSession::Impl {
                        geometry.temporal.video_latent_frames,
                        geometry.latent_height, geometry.latent_width,
                        video_rows_host, error) ||
-        !PackAudio(audio_latent, kH3AudioLatentChannels,
-                   geometry.temporal.audio_latent_frames, audio_rows_host,
-                   error) ||
+        (!audio_rows_host.empty() &&
+         !PackAudio(audio_latent, kH3AudioLatentChannels,
+                    geometry.temporal.audio_latent_frames, audio_rows_host,
+                    error)) ||
+        (audio_rows_host.empty() && !audio_latent.empty()) ||
         !CopyAsync(video_sample.data(), video_rows_host.data(),
                    video_rows_host.size() * sizeof(float),
                    hipMemcpyHostToDevice, "copy H3 video latent", error) ||
-        !CopyAsync(audio_sample.data(), audio_rows_host.data(),
-                   audio_rows_host.size() * sizeof(float),
-                   hipMemcpyHostToDevice, "copy H3 audio latent", error) ||
+        (!audio_rows_host.empty() &&
+         !CopyAsync(audio_sample.data(), audio_rows_host.data(),
+                    audio_rows_host.size() * sizeof(float),
+                    hipMemcpyHostToDevice, "copy H3 audio latent", error)) ||
         !RestoreKeptAudio(error)) {
       return false;
     }
@@ -2237,17 +2294,19 @@ struct DenoiserSession::Impl {
         hidden_device.As<std::uint16_t>() + video_offset,
         static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
         stream);
-    if (!projection_gemm.Run(
-            audio_patch_weight.As<float>(), audio_sample.As<float>(),
-            projection_scratch_f32.As<float>(), layout.audio_target_rows,
-            kDitHiddenSize, kH3AudioLatentChannels, stream, error)) {
-      return false;
+    if (layout.audio_target_rows != 0) {
+      if (!projection_gemm.Run(
+              audio_patch_weight.As<float>(), audio_sample.As<float>(),
+              projection_scratch_f32.As<float>(), layout.audio_target_rows,
+              kDitHiddenSize, kH3AudioLatentChannels, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
+          hidden_device.As<std::uint16_t>() + audio_offset,
+          static_cast<std::uint32_t>(layout.audio_target_rows),
+          kDitHiddenSize, stream);
     }
-    dit_ops::LaunchAddBiasF32ToBf16(
-        projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
-        hidden_device.As<std::uint16_t>() + audio_offset,
-        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
-        stream);
     const std::size_t text_bytes =
         refined_text_host.size() * sizeof(std::uint16_t);
     if (!CheckLaunch("H3 patch projections", error) ||
@@ -2331,23 +2390,30 @@ struct DenoiserSession::Impl {
       return false;
     }
 
-    dit_ops::LaunchFinalAdaLn(
-        hidden_input + audio_offset, final_norm_weight.As<std::uint16_t>(),
-        final_modulation.As<std::uint16_t>(), time_rows.audio_rows[step],
-        projection_scratch_f32.As<float>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
-        kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
-    if (!CheckLaunch("H3 final audio normalization", error) ||
-        !projection_gemm.Run(
-            final_audio_weight.As<float>(), projection_scratch_f32.As<float>(),
-            audio_velocity_f32.As<float>(), layout.audio_target_rows,
-            kH3AudioLatentChannels, kDitHiddenSize, stream, error)) {
-      return false;
+    if (layout.audio_target_rows != 0) {
+      dit_ops::LaunchFinalAdaLn(
+          hidden_input + audio_offset, final_norm_weight.As<std::uint16_t>(),
+          final_modulation.As<std::uint16_t>(), time_rows.audio_rows[step],
+          projection_scratch_f32.As<float>(),
+          static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
+          kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
+      if (!CheckLaunch("H3 final audio normalization", error) ||
+          !projection_gemm.Run(final_audio_weight.As<float>(),
+                               projection_scratch_f32.As<float>(),
+                               audio_velocity_f32.As<float>(),
+                               layout.audio_target_rows,
+                               kH3AudioLatentChannels, kDitHiddenSize, stream,
+                               error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32(
+          audio_velocity_f32.As<float>(), final_audio_bias.As<float>(),
+          static_cast<std::uint32_t>(layout.audio_target_rows),
+          kH3AudioLatentChannels, stream);
     }
-    dit_ops::LaunchAddBiasF32(
-        audio_velocity_f32.As<float>(), final_audio_bias.As<float>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows),
-        kH3AudioLatentChannels, stream);
+    // H3-Image: step `i` projects with PDD head `i`.
+    const std::size_t head_offset =
+        image ? static_cast<std::size_t>(step) * kH3VideoPatchWidth : 0U;
     dit_ops::LaunchFinalAdaLn(
         hidden_input + video_offset, final_norm_weight.As<std::uint16_t>(),
         final_modulation.As<std::uint16_t>(), time_rows.video_rows[step],
@@ -2356,13 +2422,15 @@ struct DenoiserSession::Impl {
         kFinalModulationSlots, 0, 1, kDitNormEpsilon, stream);
     if (!CheckLaunch("H3 final video normalization", error) ||
         !projection_gemm.Run(
-            final_video_weight.As<float>(), projection_scratch_f32.As<float>(),
-            video_velocity_f32.As<float>(), layout.video_target_rows,
-            kH3VideoPatchWidth, kDitHiddenSize, stream, error)) {
+            final_video_weight.As<float>() + head_offset * kDitHiddenSize,
+            projection_scratch_f32.As<float>(), video_velocity_f32.As<float>(),
+            layout.video_target_rows, kH3VideoPatchWidth, kDitHiddenSize,
+            stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasF32(
-        video_velocity_f32.As<float>(), final_video_bias.As<float>(),
+        video_velocity_f32.As<float>(),
+        final_video_bias.As<float>() + head_offset,
         static_cast<std::uint32_t>(layout.video_target_rows),
         kH3VideoPatchWidth, stream);
     if (!CheckLaunch("H3 final velocity heads", error)) {
@@ -2498,13 +2566,35 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     reference_pictures |= reference.placement.kind != ReferenceKind::kAudio;
     reference_sound |= reference.placement.audio_latent_frames > 0;
   }
-  auto layout = BuildReferenceLayout(options.text_rows, options.geometry,
-                                     image_placements, audio_placements,
-                                     reference_placements, error);
+  // MiniMax-H3-Image: text only; no guides, references, control or audio.
+  if (options.image &&
+      (!image_placements.empty() || !audio_placements.empty() ||
+       !reference_placements.empty() || options.control != nullptr ||
+       !conditioning.audio_keep.empty() || options.reuse_interval != 1 ||
+       options.sigmas.size() !=
+           static_cast<std::size_t>(options.evaluations) + 1U ||
+       options.geometry.temporal.video_latent_frames != 1 ||
+       options.geometry.temporal.audio_latent_frames != 0)) {
+    SetError(error, "invalid MiniMax-H3-Image denoiser arguments");
+    return nullptr;
+  }
+  auto layout =
+      options.image
+          ? BuildImageTextLayout(options.text_rows,
+                                 options.geometry.latent_height,
+                                 options.geometry.latent_width, error)
+          : BuildReferenceLayout(options.text_rows, options.geometry,
+                                 image_placements, audio_placements,
+                                 reference_placements, error);
+  if (!layout) {
+    return nullptr;
+  }
   auto schedule =
-      BuildServingSchedule(options.evaluations, error,
-                           options.video_sigma_shift, options.audio_sigma_shift);
-  if (!layout || !schedule) {
+      options.image ? BuildProvidedSchedule(options.sigmas, error)
+                    : BuildServingSchedule(options.evaluations, error,
+                                           options.video_sigma_shift,
+                                           options.audio_sigma_shift);
+  if (!schedule) {
     return nullptr;
   }
   auto time_rows = BuildTimeRowSchedule(*schedule, error);
@@ -2538,6 +2628,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   }
   auto impl = std::make_unique<Impl>();
   impl->inventory = &inventory;
+  impl->image = options.image;
   impl->geometry = options.geometry;
   impl->layout = std::move(*layout);
   impl->schedule = std::move(*schedule);
@@ -2805,9 +2896,10 @@ bool DenoiserSession::Forward(int step, std::span<const float> video_latent,
                        impl_->geometry.temporal.video_latent_frames,
                        impl_->geometry.latent_height,
                        impl_->geometry.latent_width, velocity->video, error) ||
-      !UnpackAudio(impl_->audio_rows_host, kH3AudioLatentChannels,
-                   impl_->geometry.temporal.audio_latent_frames,
-                   velocity->audio, error)) {
+      (!impl_->audio_rows_host.empty() &&
+       !UnpackAudio(impl_->audio_rows_host, kH3AudioLatentChannels,
+                    impl_->geometry.temporal.audio_latent_frames,
+                    velocity->audio, error))) {
     return false;
   }
   const Faults faults_after = ReadFaults();
@@ -2932,12 +3024,13 @@ bool DenoiserSession::DenoiseWithProgress(
                         impl_->video_velocity_f32.bytes() / sizeof(float),
                         plan.video_sigma_from_timestep, plan.video_ratio,
                         plan.video_extrapolation, impl_->stream, error) ||
-        !HipEulerUpdate(impl_->audio_sample.data(),
-                        impl_->audio_sample.bytes() / sizeof(float), 0,
-                        impl_->audio_velocity_f32.data(), previous_audio,
-                        impl_->audio_velocity_f32.bytes() / sizeof(float),
-                        plan.audio_sigma_from_timestep, plan.audio_ratio,
-                        plan.audio_extrapolation, impl_->stream, error) ||
+        (impl_->audio_sample.bytes() != 0 &&
+         !HipEulerUpdate(impl_->audio_sample.data(),
+                         impl_->audio_sample.bytes() / sizeof(float), 0,
+                         impl_->audio_velocity_f32.data(), previous_audio,
+                         impl_->audio_velocity_f32.bytes() / sizeof(float),
+                         plan.audio_sigma_from_timestep, plan.audio_ratio,
+                         plan.audio_extrapolation, impl_->stream, error)) ||
         !impl_->RestoreKeptAudio(error)) {
       return false;
     }
@@ -2961,10 +3054,11 @@ bool DenoiserSession::DenoiseWithProgress(
                         impl_->video_sample.data(), impl_->video_sample.bytes(),
                         hipMemcpyDeviceToHost, "read H3 final video latent",
                         error) ||
-      !impl_->CopyAsync(impl_->audio_rows_host.data(),
-                        impl_->audio_sample.data(), impl_->audio_sample.bytes(),
-                        hipMemcpyDeviceToHost, "read H3 final audio latent",
-                        error)) {
+      (impl_->audio_sample.bytes() != 0 &&
+       !impl_->CopyAsync(impl_->audio_rows_host.data(),
+                         impl_->audio_sample.data(),
+                         impl_->audio_sample.bytes(), hipMemcpyDeviceToHost,
+                         "read H3 final audio latent", error))) {
     return false;
   }
   const hipError_t status = hipStreamSynchronize(impl_->stream);
@@ -2976,9 +3070,10 @@ bool DenoiserSession::DenoiseWithProgress(
                        impl_->geometry.temporal.video_latent_frames,
                        impl_->geometry.latent_height,
                        impl_->geometry.latent_width, video_latent, error) ||
-      !UnpackAudio(impl_->audio_rows_host, kH3AudioLatentChannels,
-                   impl_->geometry.temporal.audio_latent_frames, audio_latent,
-                   error)) {
+      (!impl_->audio_rows_host.empty() &&
+       !UnpackAudio(impl_->audio_rows_host, kH3AudioLatentChannels,
+                    impl_->geometry.temporal.audio_latent_frames, audio_latent,
+                    error))) {
     return false;
   }
   if (!IsFinite(video_latent, "video_latent",

@@ -105,6 +105,10 @@ struct ImageCapabilities {
   bool edits{false};
   /// Accepts `ImageBackground::kTransparent`.
   bool transparent_background{false};
+  /// Largest output the runner accepts; the host keeps its 4096 px / 4 MP
+  /// limits unless a runner declares more (MiniMax-H3-Image: ~16 MP).
+  int max_side{4096};
+  std::uint64_t max_pixels{4194304};
 };
 
 /// Thrown by `ImageRunner::Generate` when the request does not fit into the

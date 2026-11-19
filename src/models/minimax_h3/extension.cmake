@@ -10,6 +10,8 @@ gufo_extension_target(
     denoiser.cpp
     dit.cpp
     generation.cpp
+    image_generation.cpp
+    image_vae.cpp
     json.cpp
     lora.cpp
     media.cpp
@@ -45,6 +47,7 @@ gufo_extension_target(
   SOURCES
     runtime_hip.cpp
     provider.cpp
+    image_provider.cpp
   LINK_LIBRARIES
     gufo_minimax_h3
     hip::host
@@ -60,6 +63,7 @@ if(TARGET gufo_minimax_h3_hip)
       denoiser.hip
       dit.hip
       dense.hip
+      image_vae.hip
       prompt_encoder.hip
       sampling.hip
       video_vae.hip
