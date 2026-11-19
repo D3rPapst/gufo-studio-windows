@@ -195,6 +195,11 @@ struct FakeApi {
   std::atomic<bool> release{false};
   int video_polls{0};
   bool video_deleted{false};
+  /// 2.2.8: POST /v1/videos answers 429 video_queue_full this many times,
+  /// status polls answer 503 overloaded this many times.
+  int video_full{0};
+  int video_poll_overloaded{0};
+  int video_posts{0};
   bool objekt_deleted = false;
   int objekt_polls = 0;
   /// 3D status polls answered 503 before the real answer (a reloading
@@ -407,6 +412,15 @@ struct FakeApi {
       return result;
     }
     if (request.method == "POST" && request.path == "/v1/videos") {
+      const std::lock_guard<std::mutex> lock(mutex);
+      ++video_posts;
+      if (video_full > 0) {
+        --video_full;
+        result.status = 429;
+        result.body =
+            R"({"error":{"message":"video queue is full","code":"video_queue_full"}})";
+        return result;
+      }
       result.status = 202;
       result.body = R"({"id":"video_1","status":"queued","progress":0})";
       return result;
@@ -419,6 +433,13 @@ struct FakeApi {
     }
     if (request.method == "GET" && request.path == "/v1/videos/video_1") {
       const std::lock_guard<std::mutex> lock(mutex);
+      if (video_poll_overloaded > 0) {
+        --video_poll_overloaded;
+        result.status = 503;
+        result.body =
+            R"({"error":{"message":"connection limit reached","code":"overloaded"}})";
+        return result;
+      }
       ++video_polls;
       // `release` here means "never finish" (for the cancel test).
       result.body =
@@ -878,6 +899,38 @@ void TestCancel() {
   for (const auto& call : h.api->calls)
     image_posts += call == "POST /v1/images/generations";
   CHECK(image_posts == 2);  // "SLOW two" never ran
+}
+
+void TestVideoQueueFull() {
+  // 2.2.8: 429 video_queue_full from the worker puts the job back like
+  // memory_busy (memory_wait.code says which); a status poll answered 503
+  // overloaded (connection limit) is tried again.
+  Harness h("video-queue-full", /*start=*/false);
+  h.memory_busy_retry = std::chrono::milliseconds(200);
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    h.api->video_full = 2;
+    h.api->video_poll_overloaded = 2;
+  }
+  h.Open(true);
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")
+          .member_str("id");
+  json::Value view;
+  for (int i = 0; i < 200; ++i) {
+    view = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+    if (view.find("memory_wait") != nullptr)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const json::Value* wait = view.find("memory_wait");
+  CHECK(view.member_str("status") == "queued");
+  CHECK(wait != nullptr && wait->member_str("code") == "video_queue_full");
+  const json::Value done = h.WaitFor(id, "completed");
+  CHECK(done.member_str("video_id") == "video_1");
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->video_posts == 3);
+  CHECK(h.api->video_poll_overloaded == 0);
 }
 
 void TestVideo() {
@@ -3036,6 +3089,7 @@ int main() {
   TestSubmitRejections();
   TestCancel();
   TestVideo();
+  TestVideoQueueFull();
   TestVideoCancel();
   TestObjekt();
   TestObjektCancel();

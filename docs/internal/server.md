@@ -1749,6 +1749,28 @@ ComfyUI adapter (`/prompt`):
 Nothing of a GufoBusy prompt's failing task ran; outputs of earlier
 tasks of the same prompt are kept in the history entry as usual.
 
+**Full video queue (2.2.8).** A video worker (`gufo serve video`) runs one
+job and lets `--video-queue` more wait (default 8, 1-64; it was a fixed 1,
+which with four ComfyUI prompts of `wan2.2-i2v-a14b` from the partner
+gave 429s, Regie 19.11.). A waiting job holds its request (prompt and
+inputs, at most the worker's request size) in host memory and a small
+JSON record on disk; GPU memory only while it runs. The router passes a
+worker's `429 video_queue_full` on unchanged (it does not hold the request
+open, which would cost a connection for as long as the queue stays full).
+The callers wait instead:
+
+- ComfyUI adapter: a video task whose `POST /v1/videos` gets `429
+  video_queue_full` or `503 overloaded` (a router's connection limit)
+  sends it again every 10 s (`AdapterOptions::video_busy_retry`) for at
+  most 6 h in a row (`video_busy_limit`), as long as the prompt is not
+  interrupted; logged as `event=video_wait` / `event=video_wait_end`.
+  A status poll of a running video that fails with no answer, 429, 502,
+  503 or 504 is tried again for 10 min (`video_poll_grace`,
+  `event=video_poll_retry`) before the prompt fails.
+- Job API: `429 video_queue_full` and `503 overloaded` put the job back
+  like `memory_busy` (`memory_wait.code` names which); the video status
+  poll has the same 10 min grace (`Options::video_poll_grace`).
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
