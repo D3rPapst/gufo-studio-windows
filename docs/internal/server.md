@@ -790,6 +790,22 @@ another precision (`int8`, `fp8`, `gguf`, `convrot`, `fp16`, ...), runs with
 a `gufo_warning` that the file's weights are not loaded, so
 `qwen_image_2.1_bf16.safetensors` and `..._int8_convrot.safetensors` give
 the same image.
+ComfyUI Wan 2.2 Animate chains (2.2.9): `WanAnimateToVideo` chunks
+chained the ComfyUI way (Regie 19.11., `pipeline/mehrsprecher.py`: each next
+node takes the previous chunk's decoded frames as `continue_motion` and its
+output 5 as `video_frame_offset`, `TrimVideoLatent` / `ImageFromBatch` on
+`trim_image` / `ImageBatch` join the parts, `ImageFromBatch(0, n)` before
+`SaveImage`) run as one `wan2.2-animate-14b` job: gufo chains the chunks
+itself (`gufo.animate.length` = the chunk length, `continue_frames` = the
+later chunks' `continue_motion_max_frames`). Frames = length + (chunks - 1)
+x (length - continue_frames), cut to the output's n (rendered as the next
+4k+1, a `SaveImage` keeps exactly n), at most 481 (30 s at 16 fps). The
+chunks must agree in every other input (prompts, size, length, sampler,
+pose / face / background / mask / reference); another seed is a
+`gufo_warning` (the first chunk's seed is used). An output of one chunk
+alone fails validation. Without `wan2.2-animate-14b` in the preset the
+chain still fails (no VACE fallback). `comfy_graph.cpp` `AnimateChain`,
+`ApplyAnimateChain`, `ChainOutputCut`.
 ComfyUI live previews (2.1): each image or video task of a `POST /prompt`
 previews under an id known from the answer on: `extra_data.gufo_preview_id`
 (1..128 characters `[A-Za-z0-9._-]`, else 400) or the prompt id, with

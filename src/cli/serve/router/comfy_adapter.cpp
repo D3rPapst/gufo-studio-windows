@@ -3383,6 +3383,9 @@ json::Value Adapter::SaveVideoFrames(const OutputTarget& target,
   std::lock_guard<std::mutex> lock(OutputMutex());
   int counter = CounterIn(destination);
   for (int index = 1;; ++index) {
+    // A chain of Animate chunks cut by ImageFromBatch(0, n): the first n.
+    if (target.max_frames > 0 && index > target.max_frames)
+      break;
     char own[32];
     std::snprintf(own, sizeof(own), "f_%05d.png", index);
     const fs::path source = frames / own;

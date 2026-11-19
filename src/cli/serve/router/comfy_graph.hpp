@@ -55,7 +55,12 @@
 //   animate KSampler <- WanAnimateToVideo when ModelIds::available has
 //          `animate`: every node input (reference, pose, face, background
 //          + character_mask, continue_motion, video_frame_offset)
-//          -> /v1/videos (wan2.2-animate-14b, gufo.animate, 16 fps)
+//          -> /v1/videos (wan2.2-animate-14b, gufo.animate, 16 fps);
+//          chained chunks (each next WanAnimateToVideo takes the decoded
+//          frames of the one before as continue_motion and its
+//          video_frame_offset output) become one job with gufo's own
+//          chunking (gufo.animate.length / continue_frames), up to 481
+//          frames; ImageFromBatch(0, n) before the output cuts to n
 //   talk   KSampler <- WanInfiniteTalkToVideo (audio from LoadAudio ->
 //          AudioEncoderEncode, two speakers with mask_1 / mask_2; chained
 //          windows via previous_frames become one job; video to video:
@@ -152,6 +157,10 @@ struct OutputTarget {
   OutputKind kind{OutputKind::kImage};
   std::string prefix;  // filename_prefix
   bool temp{false};    // Preview* nodes write to the temp folder
+  /// Frames of a video job an image output keeps (0 = all): a chain of
+  /// WanAnimateToVideo chunks cut by ImageFromBatch(batch_index 0, length
+  /// n) when the job renders more (gufo renders 4k+1 frames).
+  int max_frames{0};
 };
 
 enum class SizeSource {
@@ -582,6 +591,12 @@ struct VideoTask {
   int continue_motion_max_frames{5};
   /// ImageFromBatch on trim_image drops the continue_motion frames.
   bool animate_trim_continue{false};
+  /// Chained WanAnimateToVideo chunks as one job: frames per chunk
+  /// (gufo.animate.length; 0 = `frames`, one chunk) and the continue_motion
+  /// frames each next chunk takes from the one before
+  /// (gufo.animate.continue_frames; 0 = not sent).
+  int animate_length{0};
+  int animate_continue_frames{0};
 };
 
 /// The /v1/videos body for `task` without the keyframes (the executor adds

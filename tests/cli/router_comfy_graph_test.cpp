@@ -8,7 +8,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <utility>
@@ -3101,6 +3104,157 @@ void TestAnimateNative() {
              .message.find("character_mask") != std::string::npos);
 }
 
+// Chained Wan 2.2 Animate chunks as the Regie's pipeline builds them
+// (pipeline/mehrsprecher.py, 19.11.): 81 frames in chunks of 77, chunk 2
+// with continue_motion = chunk 1's decode and video_frame_offset = chunk 1's
+// output 5, joined by ImageFromBatch / ImageBatch, cut to 81 before
+// SaveImage. Before: "output depends on more than one generating node".
+// The graph is tests/fixtures/comfy/animate_kette_regie.json.
+std::string AnimateChainGraph() {
+  const std::filesystem::path file =
+      std::filesystem::path(__FILE__).parent_path().parent_path() /
+      "fixtures" / "comfy" / "animate_kette_regie.json";
+  std::ifstream in(file, std::ios::binary);
+  assert(in && "tests/fixtures/comfy/animate_kette_regie.json");
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+void TestAnimateChain() {
+  comfy::ModelIds models;
+  models.available = {"wan2.1-vace-14b", "wan2.2-animate-14b"};
+  const auto plan_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    const bool ok = comfy::BuildPlan(json::parse(text), models, &plan, &error);
+    if (!ok)
+      std::cerr << "unexpected plan error: " << error.message << "\n";
+    assert(ok);
+    return plan;
+  };
+  const auto error_of = [&](const std::string& text) {
+    comfy::Plan plan;
+    comfy::PlanError error;
+    assert(!comfy::BuildPlan(json::parse(text), models, &plan, &error));
+    return error;
+  };
+  const auto warned = [](const comfy::Plan& p, const std::string& text) {
+    return std::any_of(p.warnings.begin(), p.warnings.end(),
+                       [&](const std::string& w) {
+                         return w.find(text) != std::string::npos;
+                       });
+  };
+  const std::string regie = AnimateChainGraph();
+
+  // One job: chunk length 77, continue 5, 77 + 72 = 149 frames cut to 81.
+  const comfy::Plan plan = plan_of(regie);
+  assert(plan.tasks.size() == 1 && plan.tasks[0].node_id == "a0_k");
+  assert(plan.tasks[0].outputs.size() == 1);
+  assert(plan.tasks[0].outputs[0].node_id == "save");
+  assert(plan.tasks[0].outputs[0].kind == comfy::OutputKind::kImage);
+  assert(plan.tasks[0].outputs[0].max_frames == 0);  // 81 is 4k+1
+  const auto& video = std::get<comfy::VideoTask>(plan.tasks[0].spec);
+  assert(video.family == comfy::VideoFamily::kAnimate);
+  assert(video.model == "wan2.2-animate-14b");
+  assert(video.frames == 81 && video.animate_length == 77 &&
+         video.animate_continue_frames == 5);
+  assert(video.animate_offset == 0 && !video.continue_motion &&
+         video.continue_runs.empty() && !video.animate_trim_continue);
+  assert((video.pose_video ==
+          comfy::FileRef{"mehrsprecher_pose.mp4", "input"}));
+  assert(video.seed == 7 && video.steps == 6);
+  assert(!warned(plan, "seed") && !warned(plan, "drops"));
+  const json::Value body = comfy::VideoRequestBody(video);
+  assert(body.find("seconds")->as_double() == 5.0);
+  assert(body.find("gufo")->find("frames")->as_double() == 81);
+  const json::Value* animate = body.find("gufo")->find("animate");
+  assert(animate->find("length")->as_double() == 77);
+  assert(animate->find("continue_frames")->as_double() == 5);
+  assert(!animate->contains("video_frame_offset"));
+
+  // A cut that is no 4k+1: 85 frames rendered, the SaveImage keeps 80.
+  const comfy::Plan cut80 = plan_of(Replace(regie, "\"length\": 81", "\"length\": 82"));
+  const auto& v82 = std::get<comfy::VideoTask>(cut80.tasks[0].spec);
+  assert(v82.frames == 85 && cut80.tasks[0].outputs[0].max_frames == 82);
+
+  // No cut: every frame of both chunks (77 + 72).
+  const comfy::Plan whole = plan_of(
+      Replace(regie, "\"images\": [\"n\", 0]", "\"images\": [\"join\", 0]"));
+  const auto& all = std::get<comfy::VideoTask>(whole.tasks[0].spec);
+  assert(all.frames == 149 && whole.tasks[0].outputs[0].max_frames == 0);
+  assert(comfy::VideoRequestBody(all).find("seconds")->as_double() == 9.25);
+
+  // Three chunks: 77 + 72 + 72.
+  std::string three = Replace(regie, " \"join\":",
+      " \"a2_anim\": {\"class_type\": \"WanAnimateToVideo\", \"inputs\": "
+      "{\"positive\": [\"pos\", 0], \"negative\": [\"neg\", 0], \"vae\": "
+      "[\"vae\", 0], \"width\": 832, \"height\": 480, \"length\": 77, "
+      "\"batch_size\": 1, \"continue_motion_max_frames\": 5, "
+      "\"video_frame_offset\": [\"a1_anim\", 5], \"continue_motion\": "
+      "[\"a1_dec\", 0], \"clip_vision_output\": [\"cve\", 0], "
+      "\"reference_image\": [\"ref\", 0], \"face_video\": [\"face\", 0], "
+      "\"pose_video\": [\"pose\", 0]}},\n"
+      " \"a2_k\": {\"class_type\": \"KSampler\", \"inputs\": {\"model\": "
+      "[\"ms\", 0], \"positive\": [\"a2_anim\", 0], \"negative\": "
+      "[\"a2_anim\", 1], \"latent_image\": [\"a2_anim\", 2], \"seed\": 9, "
+      "\"steps\": 6, \"cfg\": 1.0, \"sampler_name\": \"euler\", "
+      "\"scheduler\": \"simple\", \"denoise\": 1.0}},\n"
+      " \"a2_trim\": {\"class_type\": \"TrimVideoLatent\", \"inputs\": "
+      "{\"samples\": [\"a2_k\", 0], \"trim_amount\": [\"a2_anim\", 3]}},\n"
+      " \"a2_dec\": {\"class_type\": \"VAEDecode\", \"inputs\": {\"samples\": "
+      "[\"a2_trim\", 0], \"vae\": [\"vae\", 0]}},\n"
+      " \"join2\": {\"class_type\": \"ImageBatch\", \"inputs\": {\"image1\": "
+      "[\"join\", 0], \"image2\": [\"a2_dec\", 0]}},\n \"join\":");
+  three = Replace(three, "\"images\": [\"n\", 0]", "\"images\": [\"join2\", 0]");
+  const comfy::Plan three_plan = plan_of(three);
+  assert(three_plan.tasks.size() == 1 && three_plan.tasks[0].node_id == "a0_k");
+  assert(std::get<comfy::VideoTask>(three_plan.tasks[0].spec).frames == 221);
+  // Chunk 3 has another seed and no ImageFromBatch on its trim_image.
+  assert(warned(three_plan, "seed of node a0_k"));
+  assert(warned(three_plan, "node a2_anim: gufo drops"));
+
+  // Errors: a chunk with another prompt, a literal video_frame_offset, an
+  // output of one chunk alone, a cut that does not start at frame 0.
+  std::string other_prompt = Replace(
+      regie, "\"positive\": [\"pos\", 0], \"negative\": [\"neg\", 0], "
+             "\"vae\": [\"vae\", 0], \"width\": 832, \"height\": 480, "
+             "\"length\": 77, \"batch_size\": 1, "
+             "\"continue_motion_max_frames\": 5, \"video_frame_offset\": "
+             "[\"a0_anim\", 5]",
+      "\"positive\": [\"pos2\", 0], \"negative\": [\"neg\", 0], "
+      "\"vae\": [\"vae\", 0], \"width\": 832, \"height\": 480, "
+      "\"length\": 77, \"batch_size\": 1, "
+      "\"continue_motion_max_frames\": 5, \"video_frame_offset\": "
+      "[\"a0_anim\", 5]");
+  other_prompt = Replace(other_prompt, " \"neg\":",
+                         " \"pos2\": {\"class_type\": \"CLIPTextEncode\", "
+                         "\"inputs\": {\"clip\": [\"clip\", 0], \"text\": "
+                         "\"someone else\"}},\n \"neg\":");
+  assert(error_of(other_prompt).message.find("prompts") != std::string::npos);
+  assert(error_of(Replace(regie, "\"video_frame_offset\": [\"a0_anim\", 5]",
+                          "\"video_frame_offset\": 72"))
+             .message.find("video_frame_offset") != std::string::npos);
+  const std::string one_chunk = Replace(
+      regie, " \"join\":",
+      " \"save0\": {\"class_type\": \"SaveImage\", \"inputs\": {\"images\": "
+      "[\"a0_dec\", 0], \"filename_prefix\": \"teil0\"}},\n \"join\":");
+  assert(error_of(one_chunk).message.find("one chunk") != std::string::npos);
+  assert(error_of(Replace(regie, "\"batch_index\": 0, \"length\": 81",
+                          "\"batch_index\": 4, \"length\": 81"))
+             .message.find("batch_index 0") != std::string::npos);
+  // Chunks of different length (the first one 81, the second 77).
+  assert(error_of(Replace(regie, "\"length\": 77", "\"length\": 81"))
+             .message.find("length") != std::string::npos);
+
+  // Without wan2.2-animate-14b the chain is not run on VACE.
+  comfy::ModelIds vace_only;
+  comfy::Plan vace_plan;
+  comfy::PlanError vace_error;
+  assert(!comfy::BuildPlan(json::parse(regie), vace_only, &vace_plan,
+                           &vace_error));
+  assert(vace_error.message.find("chained generators") != std::string::npos);
+}
+
 void TestInfiniteTalk() {
   const comfy::Plan plan = PlanOf(kTalk);
   assert(plan.tasks.size() == 1);
@@ -3870,6 +4024,7 @@ int main() {
   TestFirstLastFrame();
   TestAnimate();
   TestAnimateNative();
+  TestAnimateChain();
   TestPoseAnimationScaled();
   TestInfiniteTalk();
   TestInfiniteTalkVideoToVideo();

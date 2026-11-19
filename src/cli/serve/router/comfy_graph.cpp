@@ -3245,10 +3245,13 @@ void AnimateVideo(const Graph& graph, const std::string& node,
 /// the reference latent; ImageFromBatch on trim_image stays the graph's.
 /// clip_vision_output: gufo always uses the CLIP-H states of the reference
 /// image (the model's image cross-attention needs them).
+/// `chunk`: a later chunk of a chain (AnimateChain): continue_motion and
+/// video_frame_offset come from the chunk before and are not read here.
 VideoTask BuildAnimate(const Graph& graph, const std::string& first,
                        const ModelIds& models, const Link& latent,
                        std::vector<std::string>* warnings,
-                       const std::vector<std::string>& stages = {}) {
+                       const std::vector<std::string>& stages = {},
+                       bool chunk = false) {
   const std::string node = latent.node;
   const std::string sampler = CheckSamplerStages(
       graph, stages.empty() ? std::vector<std::string>{first} : stages,
@@ -3277,7 +3280,7 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
     throw NodeFailure(node, "unsupported_value",
                       "gufo wan2.2-animate-14b renders batch_size 1");
   task.animate_offset =
-      WholeInput(graph, node, "video_frame_offset", 0, 0, 100000);
+      chunk ? 0 : WholeInput(graph, node, "video_frame_offset", 0, 0, 100000);
   task.continue_motion_max_frames =
       WholeInput(graph, node, "continue_motion_max_frames", 5, 1, 81);
   if ((task.continue_motion_max_frames - 1) % 4 != 0)
@@ -3290,9 +3293,10 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
   AnimateVideo(graph, node, "background_video", warnings,
                &task.background_video, &task.background_runs,
                &task.background_video_fits);
-  AnimateVideo(graph, node, "continue_motion", warnings,
-               &task.continue_motion, &task.continue_runs,
-               &task.continue_motion_fits);
+  if (!chunk)
+    AnimateVideo(graph, node, "continue_motion", warnings,
+                 &task.continue_motion, &task.continue_runs,
+                 &task.continue_motion_fits);
   // ImageFromBatch(batch_index = trim_image) behind the decode drops the
   // continue_motion frames; gufo does that itself.
   task.animate_trim_continue =
@@ -3394,6 +3398,189 @@ VideoTask BuildAnimate(const Graph& graph, const std::string& first,
     link = graph.RequireLink(link.node, "model");
   }
   return task;
+}
+
+/// gufo wan2.2-animate-14b renders at most 30 s at 16 fps in one job.
+constexpr int kAnimateMaxFrames = 481;
+
+/// Chained Wan 2.2 Animate chunks (Regie 19.11., pipeline mehrsprecher):
+/// KSampler <- WanAnimateToVideo per chunk, each next WanAnimateToVideo
+/// taking the decoded frames of the chunk before as continue_motion. The
+/// generators in chain order (each one's WanAnimateToVideo has exactly the
+/// ones before it upstream), nullopt when `generators` is not such a chain.
+std::optional<std::vector<std::string>> AnimateChain(
+    const Graph& graph, const std::vector<std::string>& generators) {
+  std::vector<std::pair<std::size_t, std::string>> order;
+  std::set<std::string> anims;
+  for (const std::string& generator : generators) {
+    if (!IsSampler(graph.Class(generator)))
+      return std::nullopt;
+    const auto latent = graph.LinkOf(generator, "latent_image");
+    if (!latent || graph.Class(latent->node) != "WanAnimateToVideo" ||
+        !anims.insert(latent->node).second)
+      return std::nullopt;
+    const std::set<std::string> before = graph.Ancestors(latent->node);
+    std::size_t earlier = 0;
+    for (const std::string& other : generators)
+      if (other != generator && before.contains(other))
+        ++earlier;
+    order.emplace_back(earlier, generator);
+  }
+  std::sort(order.begin(), order.end());
+  std::vector<std::string> chain;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (order[i].first != i)
+      return std::nullopt;
+    chain.push_back(order[i].second);
+  }
+  return chain;
+}
+
+/// The first input in which two chunks of an Animate chain differ (gufo
+/// renders the chain as one job with one set of inputs), empty when they
+/// agree. The seed is not compared (see ApplyAnimateChain).
+std::string AnimateChunkDiffers(const VideoTask& a, const VideoTask& b) {
+  if (a.model != b.model)
+    return "the model";
+  if (a.prompt != b.prompt || a.negative_prompt != b.negative_prompt)
+    return "the prompts";
+  if (a.width != b.width || a.height != b.height)
+    return "width / height";
+  if (a.frames != b.frames)
+    return "length";
+  if (a.steps != b.steps || a.guidance != b.guidance ||
+      a.vace_sampler != b.vace_sampler || a.vace_shift != b.vace_shift ||
+      a.vace_lora != b.vace_lora)
+    return "the sampler settings (steps, cfg, sampler, shift, LoRA)";
+  if (a.pose_video != b.pose_video || a.pose_runs != b.pose_runs ||
+      a.pose_video_fits != b.pose_video_fits)
+    return "pose_video";
+  if (a.face_video != b.face_video || a.face_runs != b.face_runs ||
+      a.face_video_fits != b.face_video_fits)
+    return "face_video";
+  if (a.background_video != b.background_video ||
+      a.background_runs != b.background_runs ||
+      a.background_video_fits != b.background_video_fits)
+    return "background_video";
+  if (a.vace_mask != b.vace_mask || a.mask_runs != b.mask_runs ||
+      a.vace_mask_channel != b.vace_mask_channel ||
+      a.vace_invert_mask != b.vace_invert_mask)
+    return "character_mask";
+  if (a.reference_images != b.reference_images ||
+      a.reference_fits != b.reference_fits)
+    return "reference_image";
+  return "";
+}
+
+/// Turns the first chunk's task into the whole chain's: gufo.animate.length
+/// = the chunk length, continue_frames = the later chunks'
+/// continue_motion_max_frames, frames = everything the chunks give
+/// (length + (chunks - 1) x (length - continue_frames), the continue_motion
+/// frames of the later chunks dropped as ImageFromBatch on trim_image
+/// does). The later chunks must take continue_motion from the chunk before
+/// and video_frame_offset from its WanAnimateToVideo, and agree with the
+/// first in every other input.
+void ApplyAnimateChain(const Graph& graph, const ModelIds& models,
+                       const std::vector<std::string>& chain, VideoTask* task,
+                       std::vector<std::string>* warnings) {
+  const auto anim_of = [&](const std::string& generator) {
+    return graph.RequireLink(generator, "latent_image").node;
+  };
+  const std::string first_anim = anim_of(chain.front());
+  if (task->animate_trim_continue)
+    throw NodeFailure(first_anim, "unsupported_link",
+                      "a chain of WanAnimateToVideo chunks whose first chunk "
+                      "continues a loaded video and drops those frames "
+                      "(ImageFromBatch on trim_image) is not supported by "
+                      "gufo; keep the continue frames or render the first "
+                      "chunk on its own");
+  int continue_frames = 0;
+  for (std::size_t i = 1; i < chain.size(); ++i) {
+    const std::string anim = anim_of(chain[i]);
+    const std::string before = anim_of(chain[i - 1]);
+    const auto motion = graph.LinkOf(anim, "continue_motion");
+    if (!motion || !graph.Ancestors(motion->node).contains(chain[i - 1]))
+      throw NodeFailure(anim, "unsupported_link",
+                        "a chained WanAnimateToVideo needs continue_motion "
+                        "from the decoded frames of the chunk before "
+                        "(sampler " +
+                            chain[i - 1] + ")");
+    const json::Value* raw = graph.Raw(anim, "video_frame_offset");
+    const auto offset = raw != nullptr ? Graph::AsLink(*raw) : std::nullopt;
+    if (!offset || offset->node != before || offset->slot != 5)
+      throw NodeFailure(anim, "unsupported_link",
+                        "video_frame_offset of a chained WanAnimateToVideo "
+                        "must come from the video_frame_offset output of the "
+                        "chunk before (node " +
+                            before + ")");
+    std::vector<std::string> ignored;  // the first chunk's warnings suffice
+    const VideoTask chunk =
+        BuildAnimate(graph, chain[i], models,
+                     graph.RequireLink(chain[i], "latent_image"), &ignored, {},
+                     true);
+    const std::string differs = AnimateChunkDiffers(*task, chunk);
+    if (!differs.empty())
+      throw NodeFailure(anim, "unsupported_value",
+                        "chained WanAnimateToVideo chunks must agree in " +
+                            differs + " (gufo renders the chain as one job); "
+                            "this one differs from node " +
+                            first_anim);
+    if (chunk.seed != task->seed)
+      warnings->push_back("node " + chain[i] +
+                          ": gufo renders every chunk of the chain with the "
+                          "seed of node " +
+                          chain.front());
+    if (i == 1)
+      continue_frames = chunk.continue_motion_max_frames;
+    else if (chunk.continue_motion_max_frames != continue_frames)
+      throw NodeFailure(anim, "unsupported_value",
+                        "chained WanAnimateToVideo chunks must agree in "
+                        "continue_motion_max_frames");
+    if (!graph.Feeds("ImageFromBatch", "batch_index", Link{anim, 4}))
+      warnings->push_back(
+          "node " + anim +
+          ": gufo drops the continue_motion frames of this chunk (as "
+          "ImageFromBatch on trim_image)");
+  }
+  const int length = task->frames;
+  if (continue_frames >= length)
+    throw NodeFailure(anim_of(chain[1]), "unsupported_value",
+                      "continue_motion_max_frames of a chained chunk must be "
+                      "below its length");
+  const int frames = length + static_cast<int>(chain.size() - 1) *
+                                  (length - continue_frames);
+  if (frames > kAnimateMaxFrames)
+    throw NodeFailure(anim_of(chain.back()), "unsupported_value",
+                      "gufo wan2.2-animate-14b renders at most " +
+                          std::to_string(kAnimateMaxFrames) +
+                          " frames (30 s at 16 fps) in one chain, not " +
+                          std::to_string(frames));
+  task->animate_length = length;
+  task->animate_continue_frames = continue_frames;
+  task->frames = frames;
+}
+
+/// The frames an output keeps of a chain: ImageFromBatch(batch_index 0,
+/// length n) right before it (SaveImage / PreviewImage images, or the
+/// images of the CreateVideo of a SaveVideo); nullopt without such a cut.
+std::optional<int> ChainOutputCut(const Graph& graph,
+                                  const std::string& output) {
+  std::optional<Link> link = graph.LinkOf(output, "images");
+  if (!link)
+    link = graph.LinkOf(output, "video");
+  if (link && graph.Class(link->node) == "CreateVideo")
+    link = graph.LinkOf(link->node, "images");
+  if (!link || graph.Class(link->node) != "ImageFromBatch")
+    return std::nullopt;
+  const json::Value* index = graph.Raw(link->node, "batch_index");
+  if (index != nullptr && Graph::AsLink(*index) &&
+      !graph.Class(Graph::AsLink(*index)->node).starts_with("Primitive"))
+    return std::nullopt;  // e.g. trim_image: not a cut of the joined frames
+  if (WholeInput(graph, link->node, "batch_index", 0, 0, 4095) != 0)
+    throw NodeFailure(link->node, "unsupported_value",
+                      "gufo keeps the frames of a chain of WanAnimateToVideo "
+                      "chunks from the first one (batch_index 0)");
+  return WholeInput(graph, link->node, "length", 4096, 1, 4096);
 }
 
 /// A DynamicCombo sub-input: ComfyUI names it "<combo>.<input>" in the API
@@ -4395,8 +4582,9 @@ json::Value VideoRequestBody(const VideoTask& task) {
       i2v["lora"] = false;
     gufo["i2v"] = std::move(i2v);
   } else if (task.family == VideoFamily::kAnimate) {
-    // 16 fps, one chunk of the node's length. The executor adds the
-    // reference image and the videos to gufo.animate.
+    // 16 fps, one chunk of the node's length, or a chain of chunks that
+    // gufo renders itself (animate_length / animate_continue_frames). The
+    // executor adds the reference image and the videos to gufo.animate.
     body["size"] =
         std::to_string(task.width) + "x" + std::to_string(task.height);
     body["seconds"] = (task.frames - 1) / 16.0;
@@ -4406,7 +4594,10 @@ json::Value VideoRequestBody(const VideoTask& task) {
     if (!task.negative_prompt.empty())
       gufo["negative_prompt"] = task.negative_prompt;
     json::Value animate = json::Value::object();
-    animate["length"] = task.frames;
+    animate["length"] =
+        task.animate_length > 0 ? task.animate_length : task.frames;
+    if (task.animate_continue_frames > 0)
+      animate["continue_frames"] = task.animate_continue_frames;
     if (task.animate_offset != 0)
       animate["video_frame_offset"] = task.animate_offset;
     if (task.continue_motion || !task.continue_runs.empty()) {
@@ -4897,6 +5088,14 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
   std::map<std::string, std::size_t> task_of;
   std::map<std::size_t, std::optional<Delivery>> delivery_of;
   std::map<std::string, std::vector<std::string>> stages_of;
+  // Chained Wan 2.2 Animate chunks by the first chunk's sampler; every
+  // sampler of a chain; per chain task the outputs (index into its
+  // outputs) and their ImageFromBatch cut; outputs of one generator.
+  std::map<std::string, std::vector<std::string>> animate_chain_of;
+  std::set<std::string> animate_chain_members;
+  std::map<std::size_t, std::vector<std::pair<std::size_t, std::optional<int>>>>
+      chain_outputs;
+  std::vector<std::pair<std::string, std::string>> single_outputs;
   bool any_output = false;
   try {
     for (const auto& [id, node] : prompt.members()) {
@@ -4925,6 +5124,9 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                           "Qwen3-TTS) upstream");
       if (process)
         generators.push_back(*process);
+      bool animate_chained = false;
+      if (generators.size() == 1)
+        single_outputs.emplace_back(id, generators.front());
       if (generators.size() > 1) {
         // Chained InfiniteTalk windows: the last sampler (the one all others
         // feed) stands for the whole chain.
@@ -4942,6 +5144,16 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
                               return other == g || before.contains(other);
                             }))
               last = g;
+          }
+        }
+        if (last.empty() && AnimateAvailable(models)) {
+          // Wan 2.2 Animate chunks chained through continue_motion (Regie
+          // 19.11.): one job, gufo chains the chunks itself.
+          if (auto chain = AnimateChain(graph, generators)) {
+            last = chain->front();
+            animate_chain_members.insert(chain->begin(), chain->end());
+            animate_chain_of[last] = std::move(*chain);
+            animate_chained = true;
           }
         }
         if (last.empty()) {
@@ -5047,9 +5259,15 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
             task.spec = BuildCamera(graph, generator, models, latent,
                                     &plan->warnings);
           else if (latent_class == "WanAnimateToVideo" &&
-                   AnimateAvailable(models))
-            task.spec = BuildAnimate(graph, generator, models, latent,
-                                     &plan->warnings, stages_of[generator]);
+                   AnimateAvailable(models)) {
+            VideoTask animate = BuildAnimate(graph, generator, models, latent,
+                                             &plan->warnings,
+                                             stages_of[generator]);
+            if (animate_chained)
+              ApplyAnimateChain(graph, models, animate_chain_of[generator],
+                                &animate, &plan->warnings);
+            task.spec = std::move(animate);
+          }
           else if (latent_class == "WanVaceToVideo" ||
                    latent_class == "WanFirstLastFrameToVideo" ||
                    latent_class == "WanAnimateToVideo")
@@ -5156,7 +5374,43 @@ bool BuildPlan(const json::Value& original, const ModelIds& models, Plan* plan,
         if (format.find("mp4") == std::string::npos)
           plan->warnings.push_back("node " + id + ": format " + format +
                                    " -> gufo writes an H.264 MP4");
-      }      task.outputs.push_back(std::move(target));
+      }
+      if (animate_chained)
+        chain_outputs[found->second].emplace_back(task.outputs.size(),
+                                                  ChainOutputCut(graph, id));
+      task.outputs.push_back(std::move(target));
+    }
+    // An output of a single chunk of an Animate chain: gufo renders the
+    // chain as one job, so there is no such chunk to save.
+    for (const auto& [output, generator] : single_outputs)
+      if (animate_chain_members.contains(generator))
+        throw NodeFailure(output, "unsupported_link",
+                          "this output saves one chunk of chained "
+                          "WanAnimateToVideo nodes; gufo renders the chain "
+                          "as one video, save the joined frames instead");
+    // Chains cut by ImageFromBatch(0, n): render the 4k+1 frames that hold
+    // the longest cut (all when an output keeps everything); image outputs
+    // keep exactly their n frames.
+    for (auto& [index, outputs] : chain_outputs) {
+      auto& video = std::get<VideoTask>(plan->tasks[index].spec);
+      int longest = 0;
+      for (const auto& [output, cut] : outputs)
+        longest = cut ? std::max(longest, *cut) : video.frames;
+      if (longest > 0 && longest < video.frames)
+        video.frames =
+            std::min(video.frames, std::max(5, ((longest + 2) / 4) * 4 + 1));
+      for (const auto& [output, cut] : outputs) {
+        OutputTarget& target = plan->tasks[index].outputs[output];
+        if (!cut || *cut >= video.frames)
+          continue;
+        if (target.kind == OutputKind::kImage)
+          target.max_frames = *cut;
+        else
+          plan->warnings.push_back(
+              "node " + target.node_id + ": gufo writes " +
+              std::to_string(video.frames) + " frames (4k+1), not " +
+              std::to_string(*cut));
+      }
     }
   } catch (const NodeFailure& failure) {
     error->type = "prompt_outputs_failed_validation";
