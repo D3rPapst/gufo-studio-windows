@@ -26,6 +26,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/einrichtung.cpp
   src/cli/serve/router/figuren.cpp
   src/cli/serve/router/figuren_ccip.cpp
+  src/cli/serve/router/job_files.cpp
   src/cli/serve/router/jobs.cpp
   src/cli/serve/router/mcp.cpp
   src/cli/serve/router/names.cpp
@@ -114,6 +115,18 @@ if (BUILD_TESTING)
   add_test(NAME router_pool_relay_test
     COMMAND router_pool_relay_test $<TARGET_FILE:gufo>)
   set_tests_properties(router_pool_relay_test PROPERTIES
+    LABELS "cpu;router" TIMEOUT 90)
+
+  # Finished video/3D jobs answered from the job folder (2.2.13): the file
+  # reader alone, then `gufo router` with users and a fake video worker.
+  add_executable(router_job_files_test tests/cli/router_job_files_test.cpp)
+  target_link_libraries(router_job_files_test PRIVATE gufo_router)
+  target_compile_options(router_job_files_test PRIVATE
+    ${gufo_router_test_undebug})
+  add_dependencies(router_job_files_test gufo)
+  add_test(NAME router_job_files_test
+    COMMAND router_job_files_test $<TARGET_FILE:gufo>)
+  set_tests_properties(router_job_files_test PROPERTIES
     LABELS "cpu;router" TIMEOUT 90)
 
   # Maintenance drain (2.1.8): two `gufo router` processes as pool partners.
