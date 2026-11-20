@@ -67,6 +67,12 @@ struct VideoJobSnapshot {
   std::string id;
   VideoJobStatus status{VideoJobStatus::kQueued};
   int progress{0};
+  /// The running phase as the provider reports it (event=progress):
+  /// inventory, prompt, denoiser, video_vae, audio_vae, media; empty before
+  /// the first report. Not persisted (2.2.15).
+  std::string phase;
+  int phase_completed{0};
+  int phase_total{0};
   std::int64_t created_at{0};
   std::int64_t completed_at{0};
   std::int64_t expires_at{0};

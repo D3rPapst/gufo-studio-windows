@@ -238,6 +238,8 @@ struct FakeApi {
   std::set<std::string> waiting;
   std::set<std::string> redirected;
   int image_posts{0};
+  /// The bodies of every POST /v1/images/edits (multipart).
+  std::vector<std::string> edit_bodies;
 
   std::string SideOf(const std::string& prompt) {
     const std::lock_guard<std::mutex> lock(mutex);
@@ -389,6 +391,28 @@ struct FakeApi {
       result.body = reply.dump();
       return result;
     }
+    if (request.path == "/v1/images/edits") {
+      // 2.2.15: multipart edits; the body is kept to check the preview
+      // field, "SLOW" in it holds the request until released.
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        edit_bodies.push_back(request.body);
+      }
+      if (request.body.find("SLOW") != std::string::npos) {
+        while (!release.load() &&
+               !(request.is_cancelled && request.is_cancelled()))
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      json::Value item = json::Value::object();
+      item["b64_json"] = gufo::router::comfy::Base64Encode(kPng);
+      json::Value data = json::Value::array();
+      data.push_back(item);
+      json::Value reply = json::Value::object();
+      reply["created"] = 1;
+      reply["data"] = std::move(data);
+      result.body = reply.dump();
+      return result;
+    }
     if (request.path.starts_with("/v1/previews/")) {
       result.body = R"({"state":"running","seq":1,"step":5,"steps":20})";
       return result;
@@ -487,7 +511,7 @@ struct FakeApi {
       // `release` here means "never finish" (for the cancel test).
       result.body =
           release.load() || video_polls < 3
-              ? R"({"id":"video_1","status":"in_progress","progress":40})"
+              ? R"({"id":"video_1","status":"in_progress","progress":40,"progress_detail":{"phase":"denoiser","completed":12,"total":30}})"
               : R"({"id":"video_1","status":"completed","progress":100})";
       return result;
     }
@@ -1193,6 +1217,16 @@ void TestVideoCancel() {
   }
   const json::Value running = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
   CHECK(running.member_str("preview_url") == "/v1/previews/video_1");
+  // 2.2.15: the worker's phase and step counts, not an estimate.
+  const json::Value* detail = running.find("progress_detail");
+  CHECK(detail != nullptr && detail->is_object());
+  if (detail != nullptr && detail->is_object()) {
+    CHECK(detail->member_str("source") == "worker");
+    CHECK(detail->member_str("phase") == "denoiser");
+    CHECK(detail->member_double("completed", -1) == 12);
+    CHECK(detail->member_double("total", -1) == 30);
+  }
+  CHECK(!running.find("progress_estimated")->as_bool());
   h.Call("DELETE", "/v1/jobs/" + id);
   h.WaitFor(id, "cancelled");
   const std::lock_guard<std::mutex> lock(h.api->mutex);
@@ -1591,6 +1625,7 @@ void TestEstimatedProgress() {
   json::Value running = h.WaitFor(first, "in_progress");
   CHECK(running.find("progress")->is_null());
   CHECK(!running.find("progress_estimated")->as_bool());
+  CHECK(running.find("progress_detail")->is_null());
   h.api->release.store(true);
   const json::Value done = h.WaitFor(first, "completed");
   CHECK(done.member_double("progress") == 100);
@@ -1607,6 +1642,8 @@ void TestEstimatedProgress() {
   CHECK(running.find("progress_estimated")->as_bool());
   CHECK(running.member_double("progress", -1) >= 0);
   CHECK(running.member_double("progress", -1) <= 95);
+  CHECK(running.find("progress_detail")->member_str("source") == "estimate");
+  CHECK(running.find("progress_detail")->find("phase")->is_null());
   h.api->release.store(true);
   const json::Value second_done = h.WaitFor(second, "completed");
   CHECK(second_done.member_double("progress") == 100);
@@ -1624,6 +1661,118 @@ void TestEstimatedProgress() {
   const std::string image = h.Submit(ImageJob("a cat")).member_str("id");
   const json::Value image_done = h.WaitFor(image, "completed");
   CHECK(!image_done.find("progress_estimated")->as_bool());
+}
+
+/// Polls the job until its progress is `value` (or gives up) and returns it.
+json::Value WaitProgress(Harness& h, const std::string& id, double value) {
+  json::Value job;
+  for (int i = 0; i < 400; ++i) {
+    job = json::parse(h.Call("GET", "/v1/jobs/" + id).body);
+    if (job.member_double("progress", -1) == value)
+      return job;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  std::cerr << "job " << id << " never reached progress " << value << ": "
+            << job.dump() << "\n";
+  ++failures;
+  return job;
+}
+
+bool Called(Harness& h, const std::string& call) {
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  return std::find(h.api->calls.begin(), h.api->calls.end(), call) !=
+         h.api->calls.end();
+}
+
+std::string EditJob(const std::string& form) {
+  return R"({"request":{"path":"/v1/images/edits","content_type":"multipart/form-data; boundary=XyZ","body_base64":")" +
+         gufo::router::comfy::Base64Encode(form) + R"("}})";
+}
+
+std::string FormField(const std::string& name, const std::string& value) {
+  return "--XyZ\r\nContent-Disposition: form-data; name=\"" + name +
+         "\"\r\n\r\n" + value + "\r\n";
+}
+
+// 2.2.15: progress from the live preview (step of steps) instead of an
+// estimate, with progress_detail; image edits (multipart) get the preview
+// as a form field; a request's own preview id is polled under that id.
+void TestPreviewProgress() {
+  Harness h("preview-progress");
+  // JSON image generation: the job id as preview, 5 of 20 steps = 25 %.
+  h.api->release.store(false);
+  const std::string image = h.Submit(ImageJob("SLOW a cat")).member_str("id");
+  json::Value running = WaitProgress(h, image, 25);
+  const json::Value* detail = running.find("progress_detail");
+  CHECK(detail != nullptr && detail->is_object());
+  if (detail != nullptr && detail->is_object()) {
+    CHECK(detail->member_str("source") == "preview");
+    CHECK(detail->member_str("phase") == "denoise");
+    CHECK(detail->member_double("completed", -1) == 5);
+    CHECK(detail->member_double("total", -1) == 20);
+  }
+  CHECK(!running.find("progress_estimated")->as_bool());
+  CHECK(Called(h, "GET /v1/previews/" + image +
+                      "?format=json&model=qwen-image"));
+  h.api->release.store(true);
+  const json::Value done = h.WaitFor(image, "completed");
+  CHECK(done.find("progress_detail")->is_null());
+
+  // A JSON body with its own preview id: polled under that id.
+  h.api->release.store(false);
+  const std::string own = h.Submit(R"({"request":{"path":"/v1/images/generations","body":{"model":"qwen-image","prompt":"SLOW own","gufo":{"preview":{"id":"meine-vorschau_1"}}}}})")
+                              .member_str("id");
+  running = WaitProgress(h, own, 25);
+  CHECK(running.member_str("preview_url") ==
+        "/v1/previews/meine-vorschau_1?model=qwen-image");
+  CHECK(Called(h, "GET /v1/previews/meine-vorschau_1?format=json&model=qwen-image"));
+  h.api->release.store(true);
+  h.WaitFor(own, "completed");
+
+  // Multipart edit: the router adds the form field gufo.preview.
+  h.api->release.store(false);
+  const std::string form = FormField("model", "qwen-image") +
+                           FormField("prompt", "SLOW edit") + "--XyZ--\r\n";
+  const std::string edit = h.Submit(EditJob(form)).member_str("id");
+  running = WaitProgress(h, edit, 25);
+  CHECK(running.find("progress_detail")->member_str("source") == "preview");
+  CHECK(Called(h, "GET /v1/previews/" + edit + "?format=json&model=qwen-image"));
+  h.api->release.store(true);
+  h.WaitFor(edit, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(!h.api->edit_bodies.empty());
+    if (!h.api->edit_bodies.empty()) {
+      const std::string& sent = h.api->edit_bodies.back();
+      CHECK(sent.find(FormField("gufo.preview", R"({"id":")" + edit + R"("})")) !=
+            std::string::npos);
+      // The other fields stay, the form still ends with its boundary.
+      CHECK(sent.find(FormField("prompt", "SLOW edit")) != std::string::npos);
+      CHECK(sent.ends_with("--XyZ--\r\n"));
+      std::vector<gufo::router::comfy::MultipartPart> parts;
+      std::string error;
+      CHECK(gufo::router::comfy::ParseMultipart(
+          "multipart/form-data; boundary=XyZ", sent, &parts, &error));
+      CHECK(parts.size() == 3);
+    }
+  }
+
+  // Multipart edit with its own gufo.preview: sent unchanged, polled under
+  // the client's id.
+  h.api->release.store(false);
+  const std::string own_form =
+      FormField("model", "qwen-image") + FormField("prompt", "SLOW own edit") +
+      FormField("gufo.preview", R"({"id":"seite-42"})") + "--XyZ--\r\n";
+  const std::string own_edit = h.Submit(EditJob(own_form)).member_str("id");
+  WaitProgress(h, own_edit, 25);
+  CHECK(Called(h, "GET /v1/previews/seite-42?format=json&model=qwen-image"));
+  h.api->release.store(true);
+  h.WaitFor(own_edit, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(h.api->mutex);
+    CHECK(!h.api->edit_bodies.empty() &&
+          h.api->edit_bodies.back() == own_form);
+  }
 }
 
 void TestMusic() {
@@ -3257,6 +3406,7 @@ int main() {
   TestBulkDelete();
   TestListFilters();
   TestEstimatedProgress();
+  TestPreviewProgress();
   TestMusic();
   TestConcatHelpers();
   TestConcatEndpoint();

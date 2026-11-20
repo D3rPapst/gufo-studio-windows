@@ -55,6 +55,14 @@ struct JobQueue::Job {
   long long completed_at{0};
   /// 0..100, negative = unknown.
   double progress{-1};
+  /// Where `progress` came from while the job runs (2.2.15): "preview" (the
+  /// live preview's step), "worker" (the worker's own job status), empty
+  /// while nothing real was reported. With the phase and its step counts
+  /// when the source names them (completed/total < 0 = not named).
+  std::string progress_source;
+  std::string progress_phase;
+  long long progress_completed{-1};
+  long long progress_total{-1};
   /// Live preview of the running job (/v1/previews/{id}).
   std::string preview_id;
   /// The worker's /v1/videos job id.
@@ -144,6 +152,128 @@ constexpr std::string_view kConcatPath = "/v1/videos/concat";
 constexpr std::size_t kConcatMinInputs = 2;
 constexpr std::size_t kConcatMaxInputs = 20;
 constexpr std::size_t kConcatMaxDataUrl = 64 * 1024 * 1024;
+
+/// The real step behind a worker's progress (2.2.15): the phase and, when
+/// named, its completed/total counts (-1 = not named).
+struct LiveDetail {
+  std::string phase;
+  long long completed{-1};
+  long long total{-1};
+};
+
+/// From a worker job status: "progress_detail": {"phase", "completed",
+/// "total"} (video worker, 2.2.15), else a plain "phase" string (3D, YuE).
+LiveDetail DetailOf(const json::Value& status) {
+  LiveDetail detail;
+  const json::Value* object = status.find("progress_detail");
+  if (object != nullptr && object->is_object()) {
+    detail.phase = object->member_str("phase");
+    const double completed = object->member_double("completed", -1);
+    const double total = object->member_double("total", -1);
+    if (total > 0 && completed >= 0) {
+      detail.completed = static_cast<long long>(completed);
+      detail.total = static_cast<long long>(total);
+    }
+  } else {
+    detail.phase = status.member_str("phase");
+  }
+  return detail;
+}
+
+/// The boundary parameter of a multipart content type ("" when missing).
+std::string BoundaryOf(std::string_view content_type) {
+  std::string lower(content_type);
+  for (char& c : lower)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  const std::size_t at = lower.find("boundary=");
+  if (at == std::string::npos)
+    return "";
+  std::string_view value = content_type.substr(at + 9);
+  if (const std::size_t end = value.find(';'); end != std::string_view::npos)
+    value = value.substr(0, end);
+  while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+    value.remove_suffix(1);
+  if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+    value = value.substr(1, value.size() - 2);
+  return std::string(value);
+}
+
+/// Image edits (multipart, 2.2.15): the body with a form field
+/// "gufo.preview" = {"id": <id>} added before the closing boundary, so the
+/// worker publishes the live preview the job polls for its progress. Empty
+/// when the body is not a well-formed form or already carries a preview
+/// ("gufo.preview") or a whole "gufo" field (the worker would refuse the
+/// second one as a duplicate): it then runs unchanged, without live steps.
+std::string WithPreviewPart(std::string_view content_type,
+                            const std::string& payload,
+                            const std::string& id) {
+  std::vector<comfy::MultipartPart> parts;
+  std::string error;
+  if (!comfy::ParseMultipart(content_type, payload, &parts, &error))
+    return "";
+  for (const auto& part : parts)
+    if (part.name == "gufo" || part.name == "gufo.preview")
+      return "";
+  const std::string boundary = BoundaryOf(content_type);
+  if (boundary.empty())
+    return "";
+  const std::size_t closing = payload.rfind("--" + boundary + "--");
+  if (closing == std::string::npos)
+    return "";
+  json::Value preview = json::Value::object();
+  preview["id"] = id;
+  std::string out = payload.substr(0, closing);
+  out += "--" + boundary +
+         "\r\nContent-Disposition: form-data; name=\"gufo.preview\"\r\n\r\n" +
+         preview.dump() + "\r\n";
+  out += payload.substr(closing);
+  return out;
+}
+
+/// A preview id the router may put into /v1/previews/<id> (the worker's
+/// own rule: 1..128 of [A-Za-z0-9_-]).
+bool SafePreviewId(std::string_view id) {
+  if (id.empty() || id.size() > 128)
+    return false;
+  return std::all_of(id.begin(), id.end(), [](char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-';
+  });
+}
+
+/// The preview id a request brings itself (2.2.15): a JSON body's
+/// "gufo": {"preview": {"id"}}, or the form fields "gufo.preview" /
+/// "gufo" of a multipart body. Empty when there is none (or it is unsafe).
+std::string ClientPreviewId(std::string_view content_type,
+                            const std::string& payload) {
+  const auto from_preview = [](const json::Value& preview) {
+    const std::string id =
+        preview.is_object() ? preview.member_str("id") : std::string();
+    return SafePreviewId(id) ? id : std::string();
+  };
+  const auto from_gufo = [&](const json::Value& gufo) {
+    const json::Value* preview = gufo.is_object() ? gufo.find("preview")
+                                                  : nullptr;
+    return preview != nullptr ? from_preview(*preview) : std::string();
+  };
+  try {
+    std::vector<comfy::MultipartPart> parts;
+    std::string error;
+    if (comfy::ParseMultipart(content_type, payload, &parts, &error)) {
+      for (const auto& part : parts) {
+        if (part.name == "gufo.preview")
+          return from_preview(json::parse(part.data));
+        if (part.name == "gufo")
+          return from_gufo(json::parse(part.data));
+      }
+      return "";
+    }
+    const json::Value body = json::parse(payload);
+    const json::Value* gufo = body.find("gufo");
+    return gufo != nullptr ? from_gufo(*gufo) : std::string();
+  } catch (const std::exception&) {
+    return "";
+  }
+}
 
 long long NowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
@@ -2696,6 +2826,25 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   }
   view["progress"] = progress >= 0 ? json::Value(progress) : json::Value();
   view["progress_estimated"] = estimated;
+  // 2.2.15: what the number rests on while the job runs: "preview" (the
+  // live preview's step of steps), "worker" (the worker's job status, with
+  // its phase and step counts when it names them) or "estimate" (learned
+  // duration); null when nothing is known or the job does not run.
+  if (job.status == "in_progress" && (estimated || !job.progress_source.empty())) {
+    json::Value detail = json::Value::object();
+    detail["source"] = estimated ? std::string("estimate") : job.progress_source;
+    detail["phase"] = estimated || job.progress_phase.empty()
+                          ? json::Value()
+                          : json::Value(job.progress_phase);
+    const bool counts = !estimated && job.progress_total > 0 &&
+                        job.progress_completed >= 0;
+    detail["completed"] =
+        counts ? json::Value(job.progress_completed) : json::Value();
+    detail["total"] = counts ? json::Value(job.progress_total) : json::Value();
+    view["progress_detail"] = std::move(detail);
+  } else {
+    view["progress_detail"] = nullptr;
+  }
   view["keep"] = job.keep;
   view["expired_at"] =
       job.expired_at > 0 ? json::Value(job.expired_at) : json::Value();
@@ -3548,8 +3697,13 @@ void JobQueue::PollPreview(const std::shared_ptr<Job>& job,
       // 100 only once the result is stored.
       const double progress = std::min(99.0, std::floor(100.0 * step / steps));
       const std::lock_guard<std::mutex> lock(mutex_);
-      if (job->status == "in_progress")
+      if (job->status == "in_progress") {
         job->progress = progress;
+        job->progress_source = "preview";
+        job->progress_phase = "denoise";
+        job->progress_completed = static_cast<long long>(step);
+        job->progress_total = static_cast<long long>(steps);
+      }
     } catch (const std::exception&) {
       // A malformed preview is skipped; the next poll tries again.
     }
@@ -3604,9 +3758,12 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
       RunConcat(job, payload);
       return;
     }
-    // Image progress: the live preview's step, polled under the job id. A
-    // request that brings its own preview id keeps it (and no progress).
+    // Image progress: the live preview's step, polled under the job id.
+    // 2.2.15: image edits (multipart) get the preview as the form field
+    // "gufo.preview", and a request that brings its own preview id keeps it
+    // and is polled under that id (before: no progress, or an estimate).
     std::string with_preview;
+    std::string poll_preview;
     if (job->path == "/v1/images/generations" &&
         IsJsonType(job->content_type)) {
       try {
@@ -3618,10 +3775,17 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           preview["id"] = job->id;
           body["gufo"]["preview"] = std::move(preview);
           with_preview = body.dump();
+        } else {
+          poll_preview = ClientPreviewId(job->content_type, payload);
         }
       } catch (const std::exception&) {
         // The worker answers the malformed body itself.
       }
+    } else if (job->path == "/v1/images/edits" &&
+               MediaType(job->content_type) == "multipart/form-data") {
+      with_preview = WithPreviewPart(job->content_type, payload, job->id);
+      if (with_preview.empty())
+        poll_preview = ClientPreviewId(job->content_type, payload);
     }
     // Music progress: the worker's async music job (202 + id), polled like
     // a video job. A worker that answers the audio at once is fine too.
@@ -3662,6 +3826,19 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
         }
         result = Post(job, payload);
       }
+    } else if (!poll_preview.empty()) {
+      // The client's own preview id: polled for the progress, the body
+      // goes unchanged.
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        job->preview_id = poll_preview;
+      }
+      std::jthread progress([&](std::stop_token stop) {
+        PollPreview(job, job->model, stop);
+      });
+      result = Post(job, payload);
+      progress.request_stop();
+      progress.join();
     } else {
       result = Post(job, payload);
     }
@@ -3724,6 +3901,9 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->status = "queued";
           job->started_at = 0;
           job->progress = -1;
+          job->progress_source.clear();
+          job->progress_phase.clear();
+          job->progress_completed = job->progress_total = -1;
           job->preview_id.clear();
           job->pulled_by.clear();
           job->side = job->pin_local ? "local" : "";
@@ -3763,6 +3943,9 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
           job->status = "queued";
           job->started_at = 0;
           job->progress = -1;
+          job->progress_source.clear();
+          job->progress_phase.clear();
+          job->progress_completed = job->progress_total = -1;
           job->preview_id.clear();
           job->pulled_by.clear();
           job->side = job->pin_local ? "local" : "";
@@ -3870,9 +4053,14 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
     json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     {
+      const LiveDetail detail = DetailOf(parsed);
       const std::lock_guard<std::mutex> lock(mutex_);
       job->progress =
           std::min(99.0, std::max(0.0, parsed.member_double("progress", 0)));
+      job->progress_source = "worker";
+      job->progress_phase = detail.phase;
+      job->progress_completed = detail.completed;
+      job->progress_total = detail.total;
     }
     if (status == "completed") {
       final_status = std::move(parsed);
@@ -4039,9 +4227,14 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     transient = 0;
     const std::string status = parsed.member_str("status");
     {
+      const LiveDetail detail = DetailOf(parsed);
       const std::lock_guard<std::mutex> lock(mutex_);
       job->progress =
           std::min(99.0, std::max(0.0, parsed.member_double("progress", 0)));
+      job->progress_source = "worker";
+      job->progress_phase = detail.phase;
+      job->progress_completed = detail.completed;
+      job->progress_total = detail.total;
     }
     if (status == "completed") {
       final_status = std::move(parsed);
@@ -4129,9 +4322,14 @@ void JobQueue::RunMusic(const std::shared_ptr<Job>& job,
     json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
     {
+      const LiveDetail detail = DetailOf(parsed);
       const std::lock_guard<std::mutex> lock(mutex_);
       job->progress =
           std::min(99.0, std::max(0.0, parsed.member_double("progress", 0)));
+      job->progress_source = "worker";
+      job->progress_phase = detail.phase;
+      job->progress_completed = detail.completed;
+      job->progress_total = detail.total;
     }
     if (status == "completed") {
       final_status = std::move(parsed);

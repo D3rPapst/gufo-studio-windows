@@ -664,6 +664,9 @@ struct VideoJobService::Impl {
     job->snapshot.progress =
         std::max(job->snapshot.progress,
                  std::clamp(ProgressPercent(phase, completed, total), 1, 99));
+    job->snapshot.phase = std::string(phase);
+    job->snapshot.phase_completed = std::max(0, completed);
+    job->snapshot.phase_total = std::max(0, total);
     const int bucket =
         total > 0 ? static_cast<int>(10LL * completed / total) : 0;
     if (job->logged_phase != phase || bucket > job->logged_bucket) {

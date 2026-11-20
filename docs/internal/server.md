@@ -1588,6 +1588,28 @@ inputs. Errors: `400 invalid_input` (bad list, unknown job, unreadable
 clip), `500 concat_failed` with ffmpeg's last stderr lines. Temporary files
 live under `<jobs-dir>/temp/` and are removed after every call.
 
+### Job progress (`progress`, `progress_detail`, 2.2.15)
+
+A running job's `"progress"` (0..99, 100 once the result is stored) comes
+from a live source where there is one: image generations and image edits
+poll the worker's live preview (`/v1/previews/<id>?format=json`, step of
+steps; the router adds `gufo.preview.id` = the job id to a JSON body, or the
+form field `gufo.preview` to a multipart edit, and polls the client's own
+preview id when the request brings one), video, music and 3D jobs copy the
+worker's job status. Only paths without such a source (speech,
+transcription, chat, upscale, ...) are estimated from the learned duration
+(`"progress_estimated": true`, at most 95). `"progress_detail"` says what
+the number rests on while the job runs: `{"source": "preview" | "worker" |
+"estimate", "phase", "completed", "total"}`; `phase` is `"denoise"` for a
+preview, the worker's phase for a worker status (the video worker reports
+`progress_detail` `{phase, completed, total}` of its `event=progress` in
+`GET /v1/videos/{id}`: `inventory`, `prompt`, `denoiser`, `video_vae`,
+`audio_vae`, `media`), `null` for an estimate; `completed`/`total` are the
+step counts when the source names them, else `null`. Outside `in_progress`
+and while nothing is known `"progress_detail"` is `null`. A worker without
+live previews answers the added preview with `400`; the job then runs once
+more without it, as before.
+
 ### Job thumbnails (`GET /v1/jobs/{id}/thumb`)
 
 A small preview of a job's result so a gallery page does not download the

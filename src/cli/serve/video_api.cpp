@@ -85,6 +85,17 @@ json::Value SnapshotValue(const VideoJobSnapshot& snapshot) {
   root["created_at"] = static_cast<long long>(snapshot.created_at);
   root["status"] = std::string(ToString(snapshot.status));
   root["progress"] = snapshot.progress;
+  // 2.2.15: the real step behind the percentage (the router's job view
+  // shows it as progress_detail); null before the first report.
+  if (snapshot.phase.empty()) {
+    root["progress_detail"] = json::Value();
+  } else {
+    json::Value detail = json::Value::object();
+    detail["phase"] = snapshot.phase;
+    detail["completed"] = snapshot.phase_completed;
+    detail["total"] = snapshot.phase_total;
+    root["progress_detail"] = std::move(detail);
+  }
   root["model"] = snapshot.model;
   root["size"] = snapshot.size;
   root["seconds"] = snapshot.seconds;
