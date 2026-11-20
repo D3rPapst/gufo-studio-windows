@@ -70,3 +70,29 @@ conditioning and `denoise` have no effect on H3 (the weights are
 CFG-distilled); the adapter warns when they differ from 1. `sampler_name`
 and `scheduler` are not used: gufo samples with its own Euler steps on the
 shifted linear schedule.
+
+## MiniMax-H3-Image edits
+
+`serve image` with the MiniMax-H3-Image release (provider `minimax-h3-image`)
+answers `/v1/images/edits` when `--h3-vision-projector` (or
+`GUFO_H3_VISION_PROJECTOR`) names the Qwen3-VL mmproj GGUF of the H3 text
+encoder, the same file as the video's `--vision-projector`. The recipe follows
+the diffusers `MiniMaxH3ImageBlocks` "image_conditioned" path (checked against
+commit `c215605a`):
+
+| Step | Reference | gufo |
+| --- | --- | --- |
+| Sizes | `bound_short_edge`: VAE copy keeps a short edge in [1024, 2048], vision copy 1024; PIL Lanczos, no crop; Qwen's `smart_resize` on the vision copy | `PlanImageEditReferences` (`image_edit.cpp`) with `ResizeRgb8Lanczos` |
+| Text encoder | per reference `Picture i: ` (no angle brackets) + `<\|vision_start\|>`, (h/32)(w/32) `<\|image_pad\|>`, `<\|vision_end\|>`, then the prompt; vision rows tagged image | `BuildImageEditPresentation`; vision tower and layer 50 in the isolated prompt child |
+| VAE | top-left crop to 16 px, ImageNet normalization, tiled CNN encoder (same weights layout as the H3 VisualVAE encoder), posterior sample, float16, crop to whole 2x2 patches, `latents_mean/std` | `EncodeKeyframeMoments` on the image inventory (now 16-px sides), `BuildImageEditConditioning` |
+| Layout | `[text \| refs \| image]`, reference j on rotary time text + j with its own aspect grid, the image on text + n | `BuildImageEditLayout` (video condition segment) |
+| Steps | references held at t = 0.999 (AdaLN time row), only the image rows step | the denoiser's condition rows, now allowed in image mode |
+
+Deviation: gufo's `NormalRng` replaces the torch generator (posterior and
+anchor noise per reference under seeds derived from the request seed, the
+image noise under the seed itself), so seeds are reproducible in gufo only.
+
+Status 20.11.2026: CPU unit tests (`minimax_h3_image_test`) compare the sizes,
+the layout, the presentation and the conditioning with the reference; the GPU
+path is not yet run. Memory: each 1024 × 1024 reference adds 1,024 DiT rows
+plus 1,031 text rows, a 2048 × 2048 one 4,096 + 1,031.

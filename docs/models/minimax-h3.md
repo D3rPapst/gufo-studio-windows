@@ -115,6 +115,44 @@ interpolation, [Real-ESRGAN](realesrgan/README.md) upscaling and
 `gufo.keyframes` guide frames. Every option, request field and the production
 preset are in the [fork notes](../internal/models/minimax-h3/FORK.md).
 
+## MiniMax-H3-Image
+
+The fork's `gufo serve image` also runs
+[MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+(provider `minimax-h3-image`, own community license): one checkpoint for text
+to image and image edits on the H3 DiT without audio, six distilled steps, no
+CFG and no negative prompt. It reuses the FL2VA text encoder above, so start it
+with the image release as `--model` and the H3 root for the text encoder:
+
+```sh
+gufo serve --port 8080 image --model /models/MiniMax-H3-Image \
+  --h3-root /models/MiniMax-H3 \
+  --h3-vision-projector /models/MiniMax-H3-vision/mmproj-BF16.gguf
+```
+
+- `POST /v1/images/generations`: `prompt` (used verbatim, at most 4,096
+  tokens; the model expects a long English description), `size`, `seed`.
+  `steps` is 0 or 6. Sizes up to 8192 px per side and 20 MP; a canvas below
+  `gufo.min_generation_area` (default 2048 × 2048) is generated larger and
+  resized back with Lanczos.
+- `POST /v1/images/edits` (multipart, needs `--h3-vision-projector` or
+  `GUFO_H3_VISION_PROJECTOR`): 1 to 16 `image` parts, in upload order
+  `<Picture 1>`, `<Picture 2>`, … in the prompt, within the host's 20 MiB /
+  32 MP upload limit. No `mask` or `init_image`. Each reference is used twice,
+  as in the release: as a `Picture i: ` label with a Qwen3-VL vision block in
+  front of the prompt (short edge resized to 1024), and as a VAE latent in the
+  packed sequence (short edge kept between 1024 and 2048, otherwise resized to
+  the nearer bound; cropped at the top left to whole 32-pixel cells) that stays
+  at t = 0.999 through all steps. References are never resized to the output
+  size; an alpha channel is dropped.
+- Noise comes from gufo's own generator, so a seed gives the same image in
+  gufo every time but not the image of diffusers or SGLang for that seed.
+
+Every reference adds rows to the DiT sequence (a 1024 × 1024 reference about
+2,100 including its vision block, a 2048 × 2048 one about 5,100), which costs
+attention time and a little memory; see the
+[edit notes](../internal/models/minimax-h3/FORK.md#minimax-h3-image-edits) for the recipe and its status.
+
 ## Performance
 
 As of November 2026, complete-video timings are still being measured. See the
