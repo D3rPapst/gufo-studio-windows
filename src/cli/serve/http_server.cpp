@@ -147,6 +147,25 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   return true;
 }
 
+// 2.2.13: reads and drops n body bytes, so a 413 reaches a client that is
+// still sending instead of a connection reset (WSAECONNRESET 10054).
+constexpr std::size_t kDrainTooLargeMax = static_cast<std::size_t>(1) << 30;
+
+bool DiscardN(int fd, std::size_t n) {
+  std::size_t got = 0;
+  char buf[65536];
+  while (got < n) {
+    const std::size_t want = std::min(sizeof(buf), n - got);
+    const std::intptr_t r = net::Receive(fd, buf, want, 0);
+    if (r < 0 && net::IsSocketInterrupted())
+      continue;
+    if (r <= 0)
+      return false;
+    got += static_cast<std::size_t>(r);
+  }
+  return true;
+}
+
 bool SendAll(int fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
@@ -2509,6 +2528,8 @@ void HttpServer::handle_connection(int client_fd,
   try {
     bool ok = false;
     bool payload_too_large = false;
+    std::size_t too_large_bytes = 0;
+    std::size_t too_large_limit = 0;
     bool too_many_fields = false;
     {
       std::string buffer;
@@ -2536,10 +2557,22 @@ void HttpServer::handle_connection(int client_fd,
             framing_valid ? static_cast<std::size_t>(head.content_length) : 0;
         const std::size_t remaining =
             content_length > body.size() ? content_length - body.size() : 0;
+        // 2.2.13: the front may give some requests (the router's own
+        // calls) another limit than max_request_body_bytes.
+        const std::size_t body_limit =
+            options_.body_limit ? options_.body_limit(req)
+                                : options_.max_request_body_bytes;
         if (!framing_valid) {
           ok = false;
-        } else if (content_length > options_.max_request_body_bytes) {
+        } else if (content_length > body_limit) {
           payload_too_large = true;
+          too_large_bytes = content_length;
+          too_large_limit = body_limit;
+          // Read the rest away (up to kDrainTooLargeMax), so the client
+          // that is still sending gets the 413 and not a reset.
+          if (remaining > 0 && remaining <= kDrainTooLargeMax &&
+              (!http11 || head.expect_continue == 0))
+            (void)DiscardN(client_fd, remaining);
         } else if (content_length > 0) {
           if (remaining > 0) {
             // A HTTP/1.0 request's expectation is ignored (RFC 9110 10.1.1).
@@ -2588,7 +2621,10 @@ void HttpServer::handle_connection(int client_fd,
 
     HttpResponse resp;
     if (payload_too_large) {
-      resp = Err(413, "Payload Too Large", "request body is too large",
+      const std::string message =
+          "request body is too large (" + std::to_string(too_large_bytes) +
+          " bytes, limit " + std::to_string(too_large_limit) + ")";
+      resp = Err(413, "Payload Too Large", message.c_str(),
                  "invalid_request_error", "payload_too_large");
     } else if (too_many_fields) {
       resp = Err(431, "Request Header Fields Too Large",

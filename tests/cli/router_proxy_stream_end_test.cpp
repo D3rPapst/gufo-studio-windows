@@ -446,6 +446,64 @@ void TestStress(int tokens, int streams) {
 
 }  // namespace
 
+// 2.2.13 (Regie #56-1287): a worker whose --max-request-bytes the body
+// exceeds answers 413 with size and limit after reading the body away; the
+// relay hands that 413 on instead of "502 receive failed (10054)". With
+// body_limit the router's own calls get a larger limit.
+void TestWorkerRefusesLargeBody() {
+  HttpServerOptions worker_options;
+  worker_options.max_request_body_bytes = 8192;
+  worker_options.body_limit = [](const HttpRequest& head) {
+    return head.header("X-Big") == "1" ? std::size_t{8} << 20
+                                       : std::size_t{8192};
+  };
+  worker_options.dispatcher = [](const HttpRequest& request) {
+    HttpResponse response;
+    response.body = std::to_string(request.body.size());
+    return response;
+  };
+  auto worker = std::make_unique<HttpServer>("127.0.0.1", 0, nullptr, nullptr,
+                                             nullptr, nullptr, worker_options);
+  std::string error;
+  if (!worker->start(&error)) {
+    std::cerr << "worker: " << error << std::endl;
+    std::exit(2);
+  }
+  std::thread run([&] { worker->run(false); });
+  const std::string body(3 << 20, 'x');  // 3 MiB, as a base64 video
+  UpstreamTarget target;
+  target.port = worker->port();
+  HttpRequest request;
+  request.method = "POST";
+  request.path = "/v1/videos";
+  request.body = body;
+  request.headers.emplace_back("Content-Type", "application/json");
+  HttpResponse refused = ProxyToWorker(target, request);
+  std::string refused_body = refused.body;
+  if (refused.streaming_body)
+    refused.streaming_body([&](std::string_view chunk) {
+      refused_body.append(chunk);
+      return true;
+    });
+  Check(refused.status == 413, "worker 413 reaches the client as 413",
+        std::to_string(refused.status) + " " + refused_body);
+  Check(refused_body.find("3145728 bytes, limit 8192") != std::string::npos,
+        "413 names size and limit", refused_body);
+  request.headers.emplace_back("X-Big", "1");
+  HttpResponse accepted = ProxyToWorker(target, request);
+  std::string accepted_body = accepted.body;
+  if (accepted.streaming_body)
+    accepted.streaming_body([&](std::string_view chunk) {
+      accepted_body.append(chunk);
+      return true;
+    });
+  Check(accepted.status == 200 && accepted_body == std::to_string(body.size()),
+        "body_limit lets the larger call through",
+        std::to_string(accepted.status) + " " + accepted_body);
+  worker->stop();
+  run.join();
+}
+
 int main(int argc, char** argv) {
   net::EnsureSocketRuntimeStarted();
   int stress_tokens = 60;
@@ -458,6 +516,7 @@ int main(int argc, char** argv) {
   TestCorruptFraming();
   TestContentLengthShort();
   TestClientCancelled();
+  TestWorkerRefusesLargeBody();
   TestStress(stress_tokens, 6);
   std::cout << (failures == 0 ? "All router relay end tests passed."
                               : "FAILED: " + std::to_string(failures))

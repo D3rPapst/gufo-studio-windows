@@ -94,6 +94,10 @@ using Handler =
 
 struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
+  /// 2.2.13: optional per-request body limit, asked with the parsed head
+  /// (method, path, headers; no body) instead of max_request_body_bytes.
+  /// The router front gives its own calls (X-Gufo-Internal) a larger one.
+  std::function<std::size_t(const HttpRequest& head)> body_limit{};
   std::size_t max_connections{16};
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
   /// Called once, on the listener or a request thread, when the text backend or

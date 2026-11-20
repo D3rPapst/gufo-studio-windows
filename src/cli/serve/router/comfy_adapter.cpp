@@ -3486,6 +3486,48 @@ std::string Adapter::RenderFrameRuns(const std::vector<FrameRun>& runs,
   return bytes;
 }
 
+void Adapter::FitVideoToBudget(const fs::path& mp4, std::string_view what) {
+  const std::size_t budget = options_.video_input_budget;
+  std::error_code ec;
+  const auto before = fs::file_size(mp4, ec);
+  if (budget == 0 || ec || before <= budget)
+    return;
+  // Visually lossless first, then a little stronger, until it fits. The
+  // workers decode with ffmpeg to rgb24, any pixel format reads.
+  for (const char* crf : {"12", "16", "20", "24"}) {
+    const fs::path out = WorkFile("mp4");
+    std::string error;
+    const bool ok = RunFfmpeg({"-i", mp4, "-map", "0", "-c:v", "libx264",
+                               "-preset", "medium", "-crf", crf, "-pix_fmt",
+                               "yuv444p", "-c:a", "copy", out},
+                              &error);
+    const auto after = ok ? fs::file_size(out, ec) : 0;
+    if (!ok || ec) {
+      fs::remove(out, ec);
+      Logger::Warn("comfy", "event=video_cut_reencode_failed what=" +
+                                std::string(what) + " crf=" + crf +
+                                " error=\"" + error + "\"");
+      return;  // keep the lossless file; the request says if it is too big
+    }
+    const bool fits = after <= budget;
+    Logger::Info("comfy", "event=video_cut_reencode what=" +
+                              std::string(what) + " crf=" + crf +
+                              " bytes_before=" + std::to_string(before) +
+                              " bytes_after=" + std::to_string(after) +
+                              " budget=" + std::to_string(budget) +
+                              (fits ? "" : " still_too_big"));
+    if (fits || std::string_view(crf) == "24") {
+      fs::rename(out, mp4, ec);
+      if (ec) {
+        fs::copy_file(out, mp4, fs::copy_options::overwrite_existing, ec);
+        fs::remove(out, ec);
+      }
+      return;
+    }
+    fs::remove(out, ec);
+  }
+}
+
 fs::path Adapter::ScaleToWorkFile(const FileRef& file,
                                   const std::vector<FrameFit>& fits,
                                   bool video, std::string_view what) {
@@ -3510,6 +3552,8 @@ fs::path Adapter::ScaleToWorkFile(const FileRef& file,
                              std::string(what) + " (ImageScale): " +
                              (error.empty() ? "no output" : error));
   }
+  if (video)
+    FitVideoToBudget(out, what);
   return out;
 }
 
@@ -3587,6 +3631,7 @@ FileRef Adapter::CutVideo(const FileRef& file,
                              ".." + std::to_string(first + count - 1) +
                              " of " + file.name + " (ImageFromBatch): " +
                              (error.empty() ? "no output" : error));
+  FitVideoToBudget(out, "cut of " + file.name);
   FileRef cut{std::string(kWorkDir) + "/" + PathU8(out.filename()), "temp"};
   done->emplace_back(file, cut);
   return cut;

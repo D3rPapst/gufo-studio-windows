@@ -1068,6 +1068,20 @@ failing:
   `pool_busy` like on `memory_busy` (after its one immediate requeue),
   and the ComfyUI adapter's `MemoryWaitOf` counts `pool_busy` as a wait
   (Retry-After 30 s).
+- *Large cut videos (2.2.13, Regie #56-1287):* a cut (ImageFromBatch) or
+  scaled video input is first written lossless (libx264rgb); above
+  `video_input_budget` (40 MiB) the adapter encodes it again visually
+  lossless (libx264 yuv444p, crf 12, then 16/20/24 until it fits;
+  `event=video_cut_reencode` with the sizes). The workers decode to rgb24
+  with ffmpeg, any pixel format reads. The router's own calls
+  (`X-Gufo-Internal` with this process's key) are held to 1 GiB
+  (`kInternalBodyMax`, `HttpServerOptions::body_limit`) instead of the
+  front's `--max-request-bytes`: a 285-frame cut went past 64 MiB as
+  base64 and the front refused the adapter's own `/v1/videos`. A front
+  or worker that refuses a body now reads it away (up to 1 GiB) and
+  answers 413 `payload_too_large` "request body is too large (N bytes,
+  limit M)"; before, it closed at once and the sender got "502 receive
+  failed (socket error 10054)".
 `/v1/jobs` needs no such change: with the shared queue (1.4.20) a free
 runner of the partner pulls this router's queued and pool-waiting jobs,
 so `--jobs-parallel 2` on both machines already runs up to four jobs.

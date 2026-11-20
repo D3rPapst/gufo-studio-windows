@@ -394,6 +394,28 @@ void TestFramingAndMetrics() {
 
 // curl sends "Expect: 100-continue" before a body over 1 MiB and waits for
 // the interim response; without it, every large upload stalls for a second.
+// 2.2.13 (Regie #56-1287): an oversized body is read away, so the client
+// that sends all of it gets the 413 (with size and limit) instead of a
+// reset; body_limit gives single requests (the router's own) another limit.
+void TestBodyLimitPerRequest() {
+  gufo::server::HttpServerOptions options;
+  options.max_request_body_bytes = 8192;
+  options.body_limit = [](const gufo::server::HttpRequest& head) {
+    return head.header("X-Big") == "1" ? std::size_t{1} << 20
+                                       : std::size_t{8192};
+  };
+  RunningServer server(std::move(options));
+  const std::string payload(200000, 'x');
+  const std::string head = "POST /echo HTTP/1.1\r\nContent-Length: " +
+                           std::to_string(payload.size()) + "\r\n";
+  const auto refused = server.Send(head + "\r\n" + payload);
+  ExpectStatus(refused, 413);
+  assert(refused.find("200000 bytes, limit 8192") != std::string::npos);
+  const auto echo = server.Send(head + "X-Big: 1\r\n\r\n" + payload);
+  ExpectStatus(echo, 200);
+  assert(echo.substr(echo.find("\r\n\r\n") + 4) == payload);
+}
+
 void TestExpectContinue() {
   RunningServer server({.max_request_body_bytes = 8192});
   for (const std::string expect :
@@ -3660,6 +3682,7 @@ int main() {
   TestQueryParameters();
   TestFramingAndMetrics();
   TestExpectContinue();
+  TestBodyLimitPerRequest();
   TestFallbackBackendMetrics();
   TestLlamaProps();
   TestApplyTemplate();

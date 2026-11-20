@@ -5819,6 +5819,19 @@ int RunRouter(std::span<const char* const> args) {
 
   HttpServerOptions options;
   options.max_request_body_bytes = max_request_body_bytes;
+  // 2.2.13 (Regie #56-1287): the router's own calls (ComfyUI adapter, job
+  // runner; X-Gufo-Internal with this process's key) are not held to the
+  // front's --max-request-bytes: their bodies were built here (a cut video
+  // as base64 went past 64 MiB and ended as 502 10054). The model's own
+  // limit (remote max-request-bytes, the worker's) still applies.
+  options.body_limit = [state, max_request_body_bytes](const HttpRequest& head) {
+    const std::string internal = head.header(router::auth::kInternalHeader);
+    const std::string& key = state->gate->internal_key();
+    if (!internal.empty() && !key.empty() &&
+        router::auth::ConstantTimeEquals(internal, key))
+      return std::max(max_request_body_bytes, router::kInternalBodyMax);
+    return max_request_body_bytes;
+  };
   options.max_connections = max_connections;
   // SIGTERM only stops the listener here; the drain below keeps established
   // connections (and their relays) alive until they finish or the drain

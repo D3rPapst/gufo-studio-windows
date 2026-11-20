@@ -380,6 +380,11 @@ inline constexpr std::chrono::hours kComfyWaitCap{24 * 30};
 /// hours.
 inline constexpr std::chrono::seconds kForwardedGpuBusyCap{60};
 
+/// 2.2.13 (Regie #56-1287): body limit for the router's own calls
+/// (X-Gufo-Internal) instead of the front's --max-request-bytes.
+inline constexpr std::size_t kInternalBodyMax =
+    static_cast<std::size_t>(1) << 30;
+
 /// 2.2.13 (Regie #56-1277): after the partner answered a request "nothing
 /// started" (503 memory_busy or pool_busy) the request decides without the
 /// partner; this long after that answer it may go to the partner again.

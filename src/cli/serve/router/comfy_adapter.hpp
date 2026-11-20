@@ -105,6 +105,12 @@ struct AdapterOptions {
   /// (no answer, 429, 502, 503, 504) is tried again for this long before
   /// the prompt fails; the video job on the worker goes on meanwhile.
   std::chrono::milliseconds video_poll_grace{std::chrono::minutes(10)};
+  /// 2.2.13 (Regie #56-1287): a cut or scaled video input (lossless work
+  /// file) larger than this is encoded again visually lossless (libx264
+  /// yuv444p, crf 12 and up) until it fits: it goes into the request as
+  /// base64 (x4/3) beside the other inputs, and the workers' and fronts'
+  /// max-request-bytes are 64-128 MiB. 0 = no limit.
+  std::size_t video_input_budget{static_cast<std::size_t>(40) << 20};
   /// Preview poll interval while a /ws client watches.
   std::chrono::milliseconds preview_poll{std::chrono::milliseconds(400)};
   std::size_t history_limit{2000};
@@ -349,6 +355,10 @@ private:
   json::Value SaveAudioTrack(const OutputTarget& target,
                              const std::filesystem::path& media);
   std::filesystem::path WorkFile(std::string_view extension);
+  /// 2.2.13: `mp4` (a lossless work file) encoded again in place, visually
+  /// lossless, when it is above video_input_budget (event=video_cut_reencode).
+  void FitVideoToBudget(const std::filesystem::path& mp4,
+                        std::string_view what);
   bool RunFfmpeg(const std::vector<std::filesystem::path>& args,
                  std::string* error);
   /// Frames built in the graph (VideoTask::control_runs / mask_runs) as a
