@@ -1703,6 +1703,14 @@ public:
   /// ComfyUI adapter requests (X-Gufo-Origin: comfy) that wait in the pool
   /// for a machine now (state mutex; /router/status comfy_parallel, 2.2.6).
   int comfy_pool_waiting_{0};
+  /// 2.2.13: this machine's own adapter requests (not forwarded ones) that
+  /// wait in the pool or are relayed to the partner right now: their
+  /// prompts are parked (pool.hpp ComfyQueueGpuBusy). Atomic: the relay
+  /// runs with the state mutex released.
+  std::atomic<int> comfy_own_parked_{0};
+  /// Last ComfyQueueGpuBusy verdict that ignored parked prompts (log once
+  /// per change).
+  mutable bool comfy_parked_logged_{false};
 
   /// Whether this request for `preset` is decided by the pool: a POST (new
   /// work) to a model placed in the pool. Everything else is served like
@@ -1744,18 +1752,43 @@ public:
     return residency->LoadWaitingFor(model_id);
   }
 
+  /// 2.2.13: the adapter's queue as GPU work here (pool.hpp
+  /// ComfyQueueGpuBusy): prompts whose request waits in the pool, runs on
+  /// the partner or sleeps in a memory wait do not count.
+  bool ComfyQueueBusyLocked() const {
+    if (comfy == nullptr || comfy->QueueRemaining() <= 0)
+      return false;
+    router::ComfyQueueLoad load;
+    load.running = comfy->RunningPrompts();
+    load.pending = std::max(0, comfy->QueueRemaining() - load.running);
+    load.parked_adapter = comfy->ParkedRunning();
+    load.parked_router = comfy_own_parked_.load();
+    load.limit = static_cast<int>(comfy->ParallelLimit());
+    const bool busy = router::ComfyQueueGpuBusy(load);
+    if (!busy && !comfy_parked_logged_) {
+      Logger::Info("router",
+                   "event=comfy_queue_parked running=" +
+                       std::to_string(load.running) + " pending=" +
+                       std::to_string(load.pending) + " parked_adapter=" +
+                       std::to_string(load.parked_adapter) +
+                       " parked_router=" +
+                       std::to_string(load.parked_router) +
+                       " (queue not counted as gpu busy)");
+    }
+    comfy_parked_logged_ = !busy;
+    return busy;
+  }
+
   /// The pool's busy rule (state mutex held): GPU work runs on this
   /// machine, i.e. the ComfyUI adapter queue is not empty (ignored for the
   /// adapter's own calls, `from_comfy`) or an image/video/music model other
   /// than `model_id` has work in flight. Read in process, never over HTTP.
   bool GpuBusyLocked(const std::string& model_id, bool from_comfy,
                      std::string* reason) const {
-    if (!from_comfy && comfy != nullptr) {
-      if (const int queued = comfy->QueueRemaining(); queued > 0) {
-        if (reason != nullptr)
-          *reason = "comfy queue " + std::to_string(queued);
-        return true;
-      }
+    if (!from_comfy && ComfyQueueBusyLocked()) {
+      if (reason != nullptr)
+        *reason = "comfy queue " + std::to_string(comfy->QueueRemaining());
+      return true;
     }
     for (const auto& [preset, status] : registry.Statuses()) {
       (void)status;
@@ -1775,7 +1808,7 @@ public:
   /// request that waits for a machine.
   bool OthersBusyLocked(const std::string& model_id, bool from_comfy,
                         bool count_waiting = true) const {
-    if (!from_comfy && comfy != nullptr && comfy->QueueRemaining() > 0)
+    if (!from_comfy && ComfyQueueBusyLocked())
       return true;
     for (const auto& [preset, status] : registry.Statuses()) {
       (void)status;
@@ -2127,6 +2160,8 @@ public:
         --pool_[model_id].waiting_by_priority[priority];
         if (comfy_wait)
           --comfy_pool_waiting_;
+        if (from_comfy)
+          --comfy_own_parked_;
         waiting = false;
       }
     };
@@ -2332,8 +2367,12 @@ public:
                               router::comfy::RestrictedUser(req));
         ++pool_[model_id].remote_picks;
         pool_[model_id].remote_warm_at = std::chrono::steady_clock::now();
+        std::optional<router::comfy::Adapter::ParkGuard> relay_parked;
+        if (from_comfy)
+          relay_parked.emplace(comfy_own_parked_);
         HttpResponse response =
             DispatchRemoteLocked(req, model_id, *preset.remote, lock);
+        relay_parked.reset();
         if (!lock.owns_lock())
           lock.lock();
         // 2.2.12: a video, music or 3D create is not tried again after a
@@ -2350,10 +2389,14 @@ public:
           lock.unlock();
           std::string body = ReadSmallBody(response);
           lock.lock();
+          // 2.2.13: 503 pool_busy (the partner turned a forwarded request
+          // back: GPU busy, a load waits, or no machine) also means nothing
+          // started there.
           partner_memory_busy =
               router::comfy::MemoryBusyOf(
-                  {.status = response.status, .body = std::move(body)})
-                  .has_value();
+                  {.status = response.status, .body = body})
+                  .has_value() ||
+              router::comfy::ErrorCodeOf(body) == "pool_busy";
         }
         // 507 from the partner: it could not load the model (memory held
         // outside its router). This machine may still fit it after evicting
@@ -2433,12 +2476,37 @@ public:
           pool_jobs_.erase(job_id);
         return std::move(*local_failure);
       }
+      // 2.2.13: a request the partner relayed here does not wait long for
+      // this machine's GPU work: that work may itself wait on the partner
+      // (both ComfyUI queues held by prompts whose requests wait on the
+      // other machine, 20.11.). Turned back with 503 pool_busy, the
+      // partner decides again and runs it itself.
+      if (router::ForwardedGpuBusyGiveUp(forwarded, pool_input.local.gpu_busy,
+                                         waited)) {
+        stop_waiting();
+        std::string busy_reason;
+        (void)GpuBusyLocked(model_id, from_comfy, &busy_reason);
+        Logger::Warn("router", "event=pool_forwarded_gpu_busy model=" +
+                                   model_id + " busy=\"" + busy_reason +
+                                   "\" waited_ms=" +
+                                   std::to_string(waited.count()));
+        HttpResponse refused =
+            Err(503, "Service Unavailable",
+                "pool model '" + model_id +
+                    "': the GPU of this router is busy (" + busy_reason +
+                    "); run the request on your own machine",
+                "server_error", "pool_busy");
+        refused.headers.emplace_back("Retry-After", "30");
+        return refused;
+      }
       if (!waiting) {
         waiting = true;
         ++pool_[model_id].waiting;
         ++pool_[model_id].waiting_by_priority[priority];
         if (comfy_wait)
           ++comfy_pool_waiting_;
+        if (from_comfy)
+          ++comfy_own_parked_;
         NotePoolLocked(model_id, decision, waited);
         NotePoolJobLocked(job_id, "wait");
       }
@@ -3995,6 +4063,13 @@ public:
   /// pool decision would pick (pool.hpp PoolCanStartSoon, the partner as
   /// its last probe saw it) and no other request of it waiting there;
   /// anything else (local, remote, unknown) needs no free machine here.
+  /// 2.2.13: whether the video job runs through the pool partner (the
+  /// adapter parks its prompt while it polls it).
+  bool ComfyVideoRemote(const std::string& video_id) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return registry.JobRemote(video_id);
+  }
+
   bool ComfyModelFree(const std::string& model) {
     const std::lock_guard<std::mutex> lock(mutex);
     const std::string id = registry.CanonicalId(model);
@@ -5480,6 +5555,9 @@ int RunRouter(std::span<const char* const> args) {
     // An extra prompt starts only when its first model finds a machine.
     comfy_options.model_free = [raw](const std::string& model) {
       return raw->ComfyModelFree(model);
+    };
+    comfy_options.video_remote = [raw](const std::string& video_id) {
+      return raw->ComfyVideoRemote(video_id);
     };
     try {
       state->comfy =

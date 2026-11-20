@@ -610,6 +610,9 @@ void TestMemoryBusyInterrupted(const std::filesystem::path& root) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   CHECK(posts.load() >= 4);  // still waiting, not failed
   CHECK(adapter.QueueRemaining() == 1);
+  // 2.2.13: the waiting prompt is parked (no GPU busy for the pool).
+  CHECK(adapter.RunningPrompts() == 1);
+  CHECK(adapter.ParkedRunning() == 1);
   HttpRequest interrupt;
   interrupt.method = "POST";
   interrupt.path = "/interrupt";
@@ -626,10 +629,17 @@ void TestMemoryBusyInterrupted(const std::filesystem::path& root) {
                     message.items()[0].str() == "execution_interrupted";
     CHECK(interrupted);
   }
+  for (int i = 0; i < 300 && adapter.RunningPrompts() != 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  CHECK(adapter.RunningPrompts() == 0);
+  CHECK(adapter.ParkedRunning() == 0);  // the guard ended with the wait
   adapter.Stop();
 }
 
 void TestMemoryWaitOf() {
+  CHECK(comfy::ErrorCodeOf(kBusyBody) == "memory_busy");
+  CHECK(comfy::ErrorCodeOf(R"({"error":{"code":"pool_busy"}})") == "pool_busy");
+  CHECK(comfy::ErrorCodeOf("not json").empty());
   const auto busy = comfy::MemoryWaitOf({.status = 503, .body = kBusyBody});
   CHECK(busy && busy->code == "memory_busy" && busy->retry_after_s == 30);
   const auto not_free =

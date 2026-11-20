@@ -1035,6 +1035,26 @@ failing:
   stop), the router stopping or a client that left end the wait. Film
   clips of 7-27 min on both machines no longer end a waiting prompt with
   503 `pool_busy` / `remote_busy`.
+- *Parked prompts and forwarded requests (2.2.13):* a running prompt whose
+  current request waits in this router's pool, is relayed to the partner,
+  sleeps in the adapter's memory wait (`memory_free_wait`,
+  `video_poll_memory_wait`) or polls a video that runs on the partner is
+  *parked*: it does not make this machine "GPU busy" for the pool
+  (pool.hpp `ComfyQueueLoad` / `ComfyQueueGpuBusy`; counters
+  `Adapter::RunningPrompts` / `ParkedRunning` and the router's
+  `comfy_own_parked_`, all RAII). A waiting prompt counts only when a slot
+  is free for it. The first time the rule ignores a non-empty queue it
+  logs `event=comfy_queue_parked`. In addition a request the partner
+  relayed here waits at most `kForwardedGpuBusyCap` (60 s) for this
+  machine's GPU work, also with origin `comfy`; then it gets 503
+  `pool_busy` (`event=pool_forwarded_gpu_busy`) and the partner decides
+  again: a 503 `pool_busy` of the partner, like `memory_busy`, means
+  nothing started there, so also a video/music/3D create runs on the
+  partner's own machine or waits there. 20.11. 03:10-05:30: the .198
+  adapter's H3 request waited on the .56 behind the .56's ComfyUI queue
+  while the .56 adapter's MMAudio request waited on the .198 behind the
+  .198's queue; each queue was held by the prompt whose request waited on
+  the other machine, and both stood for over two hours.
 `/v1/jobs` needs no such change: with the shared queue (1.4.20) a free
 runner of the partner pulls this router's queued and pool-waiting jobs,
 so `--jobs-parallel 2` on both machines already runs up to four jobs.

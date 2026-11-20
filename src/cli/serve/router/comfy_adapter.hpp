@@ -128,6 +128,11 @@ struct AdapterOptions {
   /// adapter's mutex, about every `model_free_poll` while the next prompt
   /// is held. Optional (unset = extra prompts start at once).
   std::function<bool(const std::string& model)> model_free;
+  /// 2.2.13: whether a video job runs through the pool partner (the
+  /// router's Registry::JobRemote). While a prompt only polls such a video
+  /// it is parked (ParkedRunning): it keeps no GPU here busy. Lock-free
+  /// enough to be asked from the poll loop; optional (unset = local).
+  std::function<bool(const std::string& video_id)> video_remote;
   std::chrono::milliseconds model_free_poll{std::chrono::seconds(1)};
 };
 
@@ -182,6 +187,9 @@ struct MemoryWait {
   int retry_after_s{0};
 };
 
+/// 2.2.13: error.code of a JSON error body ("" when there is none).
+[[nodiscard]] std::string ErrorCodeOf(std::string_view body);
+
 /// MemoryBusyOf or MemoryNotFreeOf of an answer, nullopt for anything else.
 [[nodiscard]] std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result);
 
@@ -223,6 +231,12 @@ public:
   /// the router may read it with its state mutex held (placement = pool:
   /// a non-empty queue keeps pool LLM requests off this machine).
   [[nodiscard]] int QueueRemaining() const { return queue_remaining_.load(); }
+
+  /// 2.2.13 (pool busy rule, ComfyQueueGpuBusy): running prompts and the
+  /// ones of them parked by the adapter (memory wait, polling a video that
+  /// runs on the partner). Lock-free.
+  [[nodiscard]] int RunningPrompts() const { return running_count_.load(); }
+  [[nodiscard]] int ParkedRunning() const { return parked_count_.load(); }
 
   /// Prompts that may run at the same time now (own parallel + the
   /// partner's free share, 2.2.6) and the partner's share in it; lock-free.
@@ -411,6 +425,27 @@ private:
   void LimitMain();
   /// QueueRemainingLocked() as of the last EmitStatusLocked().
   std::atomic<int> queue_remaining_{0};
+  /// running_.size(), kept with it (2.2.13).
+  std::atomic<int> running_count_{0};
+  /// Running prompts parked right now (ParkGuard, 2.2.13).
+  std::atomic<int> parked_count_{0};
+
+ public:
+  /// Counts a prompt as parked for its lifetime (RAII, cannot leak).
+  class ParkGuard {
+   public:
+    explicit ParkGuard(std::atomic<int>& count) : count_(&count) {
+      count_->fetch_add(1);
+    }
+    ~ParkGuard() { count_->fetch_sub(1); }
+    ParkGuard(const ParkGuard&) = delete;
+    ParkGuard& operator=(const ParkGuard&) = delete;
+
+   private:
+    std::atomic<int>* count_;
+  };
+
+ private:
   std::map<std::string, json::Value> history_;
   std::vector<std::string> history_order_;
   /// The signed-in user (X-Gufo-User) of each history entry that has one;

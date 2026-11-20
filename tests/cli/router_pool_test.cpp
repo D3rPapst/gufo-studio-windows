@@ -881,6 +881,56 @@ void TestYieldClock() {
   CHECK(clock.total == std::chrono::milliseconds(6000));
 }
 
+using gufo::router::ComfyQueueGpuBusy;
+using gufo::router::ComfyQueueLoad;
+using gufo::router::ForwardedGpuBusyGiveUp;
+
+// 2.2.13 (20.11. pool deadlock): a forwarded request gives up waiting for
+// this machine's GPU after kForwardedGpuBusyCap; own requests never do.
+void TestForwardedGpuBusyCap() {
+  using std::chrono::milliseconds;
+  CHECK(!ForwardedGpuBusyGiveUp(true, true, milliseconds(59000)));
+  CHECK(ForwardedGpuBusyGiveUp(true, true, milliseconds(60000)));
+  CHECK(!ForwardedGpuBusyGiveUp(false, true, milliseconds(3600000)));
+  CHECK(!ForwardedGpuBusyGiveUp(true, false, milliseconds(3600000)));
+  CHECK(ForwardedGpuBusyGiveUp(true, true, milliseconds(10), milliseconds(5)));
+}
+
+// 2.2.13: parked ComfyUI prompts (request in the pool, on the partner or in
+// a memory wait) do not make this machine GPU busy.
+void TestComfyQueueParked() {
+  ComfyQueueLoad load;
+  CHECK(!ComfyQueueGpuBusy(load));  // empty queue
+  load.running = 1;
+  CHECK(ComfyQueueGpuBusy(load));  // a prompt works here
+  load.parked_router = 1;
+  CHECK(!ComfyQueueGpuBusy(load));  // its request is with the partner
+  load.parked_router = 0;
+  load.parked_adapter = 1;
+  CHECK(!ComfyQueueGpuBusy(load));  // memory wait / remote video
+  // Two running, one parked: the other still works here.
+  load.running = 2;
+  CHECK(ComfyQueueGpuBusy(load));
+  load.parked_router = 1;
+  CHECK(!ComfyQueueGpuBusy(load));
+  // Waiting prompts behind a full set of parked ones: no GPU work.
+  load.pending = 4;
+  load.limit = 2;
+  CHECK(!ComfyQueueGpuBusy(load));
+  // A free slot: the waiting prompt starts at once.
+  load.limit = 3;
+  CHECK(ComfyQueueGpuBusy(load));
+  // Limit unknown: waiting prompts count as before.
+  load.limit = 0;
+  CHECK(ComfyQueueGpuBusy(load));
+  // Over-counted parks never make it negative work.
+  ComfyQueueLoad odd;
+  odd.running = 1;
+  odd.parked_adapter = 1;
+  odd.parked_router = 2;
+  CHECK(!ComfyQueueGpuBusy(odd));
+}
+
 int main() {
   TestTopLevelMember();
   TestYieldClock();
@@ -903,6 +953,8 @@ int main() {
   TestRegistryCounts();
   TestFallback();
   TestPriority();
+  TestForwardedGpuBusyCap();
+  TestComfyQueueParked();
   if (failures != 0) {
     std::cerr << failures << " router pool checks failed\n";
     return 1;

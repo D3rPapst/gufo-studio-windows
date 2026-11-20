@@ -369,6 +369,53 @@ inline constexpr std::chrono::hours kComfyWaitCap{24 * 30};
   return origin == "comfy";
 }
 
+/// 2.2.13: a request the partner relayed here ("forwarded") that waits only
+/// because this machine's GPU is busy is turned back after this long with
+/// 503 pool_busy, also for the ComfyUI adapter's requests (kComfyWaitCap
+/// does not apply). The partner then decides again and runs it itself.
+/// 20.11. 03:10-05:30: the .198 adapter's H3 request waited on the .56
+/// behind the .56's ComfyUI queue while the .56 adapter's MMAudio request
+/// waited on the .198 behind the .198's queue (each queue held by the
+/// prompt whose request waited on the other machine): both stood for
+/// hours.
+inline constexpr std::chrono::seconds kForwardedGpuBusyCap{60};
+
+/// Whether a forwarded request that waits now gives up (see
+/// kForwardedGpuBusyCap). Only GPU busy counts: other waits of a forwarded
+/// request keep their own limits.
+[[nodiscard]] inline bool ForwardedGpuBusyGiveUp(
+    bool forwarded, bool local_gpu_busy, std::chrono::milliseconds waited,
+    std::chrono::milliseconds cap = kForwardedGpuBusyCap) {
+  return forwarded && local_gpu_busy && waited >= cap;
+}
+
+/// 2.2.13: what makes the ComfyUI adapter's queue keep pool requests off
+/// this machine. Running prompts count only while not parked: a prompt is
+/// parked while its current request waits in the pool, runs on the partner
+/// or sleeps in a memory wait. A waiting prompt counts only when a slot is
+/// free for it (it starts at once). Before 2.2.13 any non-empty queue
+/// counted, so a prompt whose request waited on the partner made this
+/// machine "GPU busy" for the partner's forwarded requests.
+struct ComfyQueueLoad {
+  int running{0};
+  int pending{0};
+  /// Prompts the adapter knows are parked (memory wait, remote video).
+  int parked_adapter{0};
+  /// Adapter requests the router holds in the pool wait or relays to the
+  /// partner right now.
+  int parked_router{0};
+  /// The adapter's parallel limit now (0 = unknown: pending counts).
+  int limit{0};
+};
+
+[[nodiscard]] inline bool ComfyQueueGpuBusy(const ComfyQueueLoad& load) {
+  const int parked =
+      std::max(0, load.parked_adapter) + std::max(0, load.parked_router);
+  if (load.running - parked > 0)
+    return true;
+  return load.pending > 0 && (load.limit <= 0 || load.running < load.limit);
+}
+
 /// How long a pool or remote-GPU wait may last: queue-timeout-seconds, or
 /// kComfyWaitCap for a ComfyUI adapter request.
 [[nodiscard]] inline std::chrono::seconds PoolQueueTimeout(

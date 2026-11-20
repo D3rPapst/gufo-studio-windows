@@ -817,6 +817,17 @@ std::optional<std::string> MemoryNotFreeOf(const FetchResult& result) {
   return std::nullopt;
 }
 
+std::string ErrorCodeOf(std::string_view body) {
+  try {
+    const json::Value parsed = json::parse(std::string(body));
+    const json::Value* error = parsed.find("error");
+    if (error != nullptr && error->is_object())
+      return error->member_str("code");
+  } catch (const std::exception&) {
+  }
+  return {};
+}
+
 std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result) {
   if (auto busy = MemoryBusyOf(result))
     return MemoryWait{"memory_busy", busy->what(), busy->retry_after_s};
@@ -1799,6 +1810,7 @@ void Adapter::WorkerMain() {
       job = pending_.front();
       pending_.pop_front();
       running_.push_back(job);
+      running_count_.store(static_cast<int>(running_.size()));
       live_[job->id].prompt_id = job->id;
       EmitStatusLocked();
     }
@@ -1806,6 +1818,7 @@ void Adapter::WorkerMain() {
     {
       const std::lock_guard<std::mutex> lock(mutex_);
       std::erase(running_, job);
+      running_count_.store(static_cast<int>(running_.size()));
       live_.erase(job->id);
       prompt_previews_.erase(job->id);
       EmitStatusLocked();
@@ -2166,6 +2179,9 @@ FetchResult Adapter::Call(const std::shared_ptr<Job>& job, std::string method,
   if (auto wait = MemoryWaitOf(result)) {
     const auto began = std::chrono::steady_clock::now();
     int tries = 1;
+    // 2.2.13: nothing runs for this prompt while it waits: the partner's
+    // forwarded requests may use this machine (ComfyQueueGpuBusy).
+    const ParkGuard parked(parked_count_);
     Logger::Warn("comfy", "event=memory_free_wait prompt_id=" + job->id +
                               " path=" + request.path + " code=" + wait->code +
                               " retry_ms=" +
@@ -3219,6 +3235,16 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
   std::optional<std::chrono::steady_clock::time_point> poll_trouble;
   // First poll of the current run of memory waits (2.2.12).
   std::optional<std::chrono::steady_clock::time_point> poll_memory;
+  // 2.2.13: a video that runs on the pool partner (or a read that waits for
+  // memory) keeps no GPU here busy: the prompt is parked meanwhile.
+  std::optional<ParkGuard> parked;
+  const bool remote_video =
+      options_.video_remote && options_.video_remote(video_id);
+  if (remote_video) {
+    parked.emplace(parked_count_);
+    Logger::Info("comfy", "event=comfy_parked prompt_id=" + job->id +
+                              " video=" + video_id + " reason=remote_video");
+  }
   for (;;) {
     if (job->cancel.load()) {
       HttpRequest cancel;
@@ -3240,6 +3266,8 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
       if (const auto wait = MemoryWaitOf(state)) {
         if (!poll_memory) {
           poll_memory = now;
+          if (!parked)
+            parked.emplace(parked_count_);
           Logger::Warn("comfy", "event=video_poll_memory_wait prompt_id=" +
                                     job->id + " video=" + video_id +
                                     " code=" + wait->code);
@@ -3266,6 +3294,8 @@ std::string Adapter::RenderVideo(const std::shared_ptr<Job>& job,
                                "): " + ErrorMessage(state));
     }
     poll_trouble.reset();
+    if (poll_memory && !remote_video)
+      parked.reset();
     poll_memory.reset();
     const json::Value parsed = json::parse(state.body);
     const std::string status = parsed.member_str("status");
