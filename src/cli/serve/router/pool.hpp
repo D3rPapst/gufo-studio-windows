@@ -487,6 +487,15 @@ struct PoolFallbackInput {
   return in;
 }
 
+/// After the B5 fallback: whether the partner may still take the request
+/// because this machine cannot (`without` = the input without the partner
+/// waits) while the full input picks the partner right now (2.2.14).
+[[nodiscard]] inline bool PoolPartnerFreedFirst(const PoolInput& without,
+                                                const PoolInput& with) {
+  return ChoosePool(without).choice == PoolChoice::kWait &&
+         ChoosePool(with).choice == PoolChoice::kRemote;
+}
+
 /// "local" | "remote" from an X-Gufo-Pool header value; "" for anything
 /// else (any side).
 [[nodiscard]] inline std::string PoolSideOf(std::string_view header) {

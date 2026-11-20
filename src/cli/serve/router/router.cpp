@@ -2242,8 +2242,19 @@ public:
                                      std::to_string(waited.count()));
         }
       }
-      if (fallback != nullptr)
-        pool_input = router::WithoutPartner(pool_input);
+      // 2.2.14 (Regie #56-1295, pool block 20.11.): the fallback only keeps
+      // the request from waiting for the partner; it must not keep it off a
+      // partner that frees up first. Four Wan 2.2 I2V clips fell back after
+      // 60 s (the .198 ran a relayed Wan Animate clip) and then queued one
+      // after another on the .56 while the .198 stood idle (1362 s instead
+      // of ~760 s). When this machine cannot take it yet but the partner
+      // can right now, it goes there.
+      if (fallback != nullptr) {
+        router::PoolInput without = router::WithoutPartner(pool_input);
+        if (!(router::PoolPartnerFreedFirst(without, pool_input) &&
+              forced != "local"))
+          pool_input = without;
+      }
       // One side only (capabilities): the other is out, even when free.
       // A remote pin ends once the partner failed this request or the
       // fallback dropped it (local_capable: this side has the LoRAs).

@@ -698,6 +698,24 @@ void TestFallback() {
   busy.local = Warm(false);
   CHECK(ChoosePool(busy).choice == PoolChoice::kWait);
 
+  // 2.2.14 (Regie #56-1295): after the fallback the request waits here
+  // behind its own model; the partner, busy at the fallback, frees up
+  // first and takes it (cold load on an idle machine).
+  using gufo::router::PoolPartnerFreedFirst;
+  PoolInput later;
+  later.local = Warm(false);
+  later.remote = Cold();
+  later.waited = seconds(300);
+  CHECK(PoolPartnerFreedFirst(WithoutPartner(later), later));
+  // Partner still on GPU work: no.
+  PoolInput still = later;
+  still.remote.gpu_busy = true;
+  CHECK(!PoolPartnerFreedFirst(WithoutPartner(still), still));
+  // This machine can run it: stays here.
+  PoolInput here_free = later;
+  here_free.local = Warm(true);
+  CHECK(!PoolPartnerFreedFirst(WithoutPartner(here_free), here_free));
+
   // An unreachable partner is held off like a failed one.
   CHECK(PoolRemoteHold(PoolRemoteAnswer::kRetryUnreachable));
   CHECK(PoolRemoteHold(PoolRemoteAnswer::kRetryFailed));
