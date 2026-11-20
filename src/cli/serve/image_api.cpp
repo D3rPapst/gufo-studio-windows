@@ -236,9 +236,10 @@ void ValidateRequest(const ext::ImageRequest& request,
         std::to_string(capabilities.max_pixels) + " pixels");
   if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
     throw std::invalid_argument("image steps must be between 2 and 100");
-  if (request.images.size() > 10)
-    throw std::invalid_argument(
-        "image edits accept at most 10 reference images");
+  if (request.images.size() > capabilities.max_images)
+    throw std::invalid_argument("image edits accept at most " +
+                                std::to_string(capabilities.max_images) +
+                                " reference images");
   std::size_t pixels = 0;
   for (const auto& image : request.images) {
     CheckImage(image);
@@ -275,7 +276,8 @@ bool NamedImagePart(std::string_view name) {
          name == "region_image[]";
 }
 
-Parsed Multipart(const HttpRequest& request) {
+// `max_images`: the runner's ImageCapabilities::max_images (default 10).
+Parsed Multipart(const HttpRequest& request, std::size_t max_images = 10) {
   const auto content_type = request.header("content-type");
   if (!content_type.starts_with("multipart/form-data"))
     throw std::invalid_argument("image edits require multipart/form-data");
@@ -360,11 +362,12 @@ Parsed Multipart(const HttpRequest& request) {
         (void)image;
         references += part == "region_image[]";
       }
-      if ((reference && parsed.images.size() == 10) ||
+      if ((reference && parsed.images.size() >= max_images) ||
           (name == "region_image[]" && references >= 20) ||
           data.size() > core::kMaxEncodedImageBytes - image_bytes)
         throw std::invalid_argument(
-            "image inputs exceed 10 images (20 with regions) or 20 MiB");
+            "image inputs exceed " + std::to_string(max_images) +
+            " images (20 with regions) or 20 MiB");
       image_bytes += data.size();
       auto decoded = DecodeImage(std::span(
           reinterpret_cast<const std::uint8_t*>(data.data()), data.size()));
@@ -557,7 +560,7 @@ HttpResponse HandleImageApiRequest(const HttpRequest& request,
       throw std::invalid_argument("model " + service.model_id() +
                                   " does not support image edits");
     if (edit)
-      parsed = Multipart(request);
+      parsed = Multipart(request, service.capabilities().max_images);
     else {
       if (!request.header("content-type").starts_with("application/json"))
         throw std::invalid_argument(

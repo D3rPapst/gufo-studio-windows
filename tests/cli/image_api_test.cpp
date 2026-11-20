@@ -331,7 +331,7 @@ server::HttpRequest Generation(std::string_view body) {
   return http;
 }
 
-server::HttpRequest Edit(std::string_view background) {
+server::HttpRequest Edit(std::string_view background, int images = 1) {
   server::HttpRequest http;
   http.method = "POST";
   http.path = "/v1/images/edits";
@@ -344,10 +344,13 @@ server::HttpRequest Edit(std::string_view background) {
       0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x38, 0x91, 0xc2, 0xd0,
       0x00, 0x00, 0x04, 0xd1, 0x01, 0xad, 0x85, 0x3c, 0x2f, 0x4d, 0x00, 0x00,
       0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
-  http.body =
-      "--b\r\nContent-Disposition: form-data; name=\"image\"\r\n"
-      "Content-Type: image/png\r\n\r\n";
-  http.body.append(reinterpret_cast<const char*>(png.data()), png.size());
+  for (int image = 0; image < images; ++image) {
+    http.body += image == 0 ? "--b" : "\r\n--b";
+    http.body +=
+        "\r\nContent-Disposition: form-data; name=\"image\"\r\n"
+        "Content-Type: image/png\r\n\r\n";
+    http.body.append(reinterpret_cast<const char*>(png.data()), png.size());
+  }
   for (const auto& [name, value] :
        {std::pair<std::string_view, std::string_view>{"prompt", "cube"},
         {"size", "256x256"},
@@ -476,6 +479,26 @@ void TestRequestValidation() {
   Require(seen.back().images.size() == 1 &&
               seen.back().background == ext::ImageBackground::kTransparent,
           "edit forwarded");
+
+  // Reference count: 10 unless the runner declares more (H3-Image: 16).
+  response = server::HandleImageApiRequest(Edit("auto", 10), full);
+  Require(response.status == 200, response.body);
+  Require(seen.back().images.size() == 10, "ten references forwarded");
+  response = server::HandleImageApiRequest(Edit("auto", 11), full);
+  Require(response.status == 400 &&
+              Message(response).find("exceed 10 images") != std::string::npos,
+          "eleventh reference rejected by default");
+  server::ImageService many(
+      std::make_shared<server::CallbackImageRunner>(
+          record, ext::ImageCapabilities{.edits = true, .max_images = 16}),
+      "many");
+  response = server::HandleImageApiRequest(Edit("auto", 16), many);
+  Require(response.status == 200, response.body);
+  Require(seen.back().images.size() == 16, "sixteen references forwarded");
+  response = server::HandleImageApiRequest(Edit("auto", 17), many);
+  Require(response.status == 400 &&
+              Message(response).find("exceed 16 images") != std::string::npos,
+          "seventeenth reference rejected");
 }
 
 }  // namespace

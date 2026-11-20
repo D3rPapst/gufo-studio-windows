@@ -109,6 +109,10 @@ struct ImageCapabilities {
   /// limits unless a runner declares more (MiniMax-H3-Image: ~16 MP).
   int max_side{4096};
   std::uint64_t max_pixels{4194304};
+  /// Most reference images one edit accepts; the host keeps 10 unless a
+  /// runner declares more (MiniMax-H3-Image: 16). Their combined size stays
+  /// within the host's 20 MiB / 32 MP upload limits.
+  std::size_t max_images{10};
 };
 
 /// Thrown by `ImageRunner::Generate` when the request does not fit into the
