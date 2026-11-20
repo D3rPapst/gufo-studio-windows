@@ -382,6 +382,53 @@ void TestCommitLimit() {
   CHECK(plan.action == Action::kSpawn);
 }
 
+void TestIdleWorkerEvictedForCommit() {
+  // 20.11.: Fun-VACE (exclusive, experts resident) idle after three jobs; its
+  // private bytes showed a few GB while the system commit was nearly used up
+  // by its GPU memory. Crediting only the private bytes left the 27B load
+  // short of commit: it waited "outside" and gave up with 507 although
+  // stopping the idle worker gave back 43 GB. GPU and RAM fit after the
+  // eviction, only commit does not: evict it, the next plan sees the truth.
+  using Wait = AdmissionPlan::Wait;
+  const MemoryPolicy policy;
+  ResidentView vace = Resident("vace", 46, 30, 1);
+  vace.exclusive = true;
+  vace.current.commit = Gb(2);
+  auto plan = PlanAdmission(WithCommit(Machine(30, 10, 8), 1.5), {vace},
+                            "27b", Need(20, 4.4), false, policy);
+  CHECK(plan.action == Action::kEvict);
+  CHECK(plan.evict.size() == 1 && plan.evict[0] == "vace");
+  CHECK(plan.reason.find("commit short") != std::string::npos);
+  // The same for a non-exclusive idle resident.
+  vace.exclusive = false;
+  plan = PlanAdmission(WithCommit(Machine(30, 10, 8), 1.5), {vace}, "27b",
+                       Need(20, 4.4), false, policy);
+  CHECK(plan.action == Action::kEvict && plan.evict.size() == 1 &&
+        plan.evict[0] == "vace");
+  // And for an exclusive candidate.
+  plan = PlanAdmission(WithCommit(Machine(30, 10, 8), 1.5), {vace}, "h3",
+                       Need(20, 4.4), true, policy);
+  CHECK(plan.action == Action::kEvict && plan.evict.size() == 1 &&
+        plan.evict[0] == "vace");
+  // Busy, it is never stopped: wait for it.
+  vace.busy = true;
+  plan = PlanAdmission(WithCommit(Machine(30, 10, 8), 1.5), {vace}, "27b",
+                       Need(20, 4.4), false, policy);
+  CHECK(plan.action == Action::kWait && plan.wait == Wait::kBusy);
+  // When the GPU would be short as well, evicting does not help: the memory
+  // is held outside the router, the idle resident stays.
+  ResidentView small = Resident("small", 5, 5, 1);
+  small.current.commit = Gb(1);
+  plan = PlanAdmission(WithCommit(Machine(30, 10, 8), 1.5), {small}, "27b",
+                       Need(20, 4.4), false, policy);
+  CHECK(plan.action == Action::kWait && plan.wait == Wait::kOutside &&
+        plan.evict.empty());
+  // Nothing of ours resident: commit short stays an outside wait.
+  plan = PlanAdmission(WithCommit(Machine(2, 0.2, 20), 5), {}, "27b",
+                       Need(20, 4.4), false, policy);
+  CHECK(plan.action == Action::kWait && plan.wait == Wait::kOutside);
+}
+
 void TestCommitWatchdog() {
   const MemoryPolicy policy;
   const std::vector<ResidentView> residents = {
@@ -891,6 +938,7 @@ int main() {
   TestReload27bAfterIdleUnload();
   TestWatchdog();
   TestCommitLimit();
+  TestIdleWorkerEvictedForCommit();
   TestCommitWatchdog();
   TestFactors();
   TestMemoryBook();

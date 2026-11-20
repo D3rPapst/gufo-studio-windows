@@ -100,8 +100,8 @@ Room Project(const SystemMemory& system,
   return room;
 }
 
-bool Fits(const Room& room, const MemoryNeed& need,
-          const MemoryPolicy& policy) {
+bool Fits(const Room& room, const MemoryNeed& need, const MemoryPolicy& policy,
+          bool check_commit = true) {
   // The GPU reserve guards dedicated + shared together: a full dedicated
   // segment is no failure (the driver places the rest in shared), but every
   // byte that spills into shared comes out of host RAM.
@@ -130,7 +130,8 @@ bool Fits(const Room& room, const MemoryNeed& need,
   // charged: 03.11. on 48/16 the 27B (37 GB gpu need) took ~6 GB of commit,
   // while counting gpu + host kept qwen-image-2.1 (48 GB gpu need) waiting
   // for 10 minutes at 49 GB free commit.
-  return room.commit - policy.reserve_commit >= need.host + spill;
+  return !check_commit ||
+         room.commit - policy.reserve_commit >= need.host + spill;
 }
 
 /// True when even an empty machine could not give `need` (estimate larger
@@ -229,6 +230,35 @@ bool EvictUnmeasured(const std::vector<const ResidentView*>& evict,
   plan->evict = std::move(ids);
   plan->reason = "evicting idle " + names +
                  " (no memory sample, what it frees is unknown); " +
+                 RoomText(room);
+  return true;
+}
+
+/// Turns `plan` into the eviction of the idle residents in `evict` when only
+/// the commit check fails. A worker's private bytes miss most of what it
+/// holds in commit: GPU memory on this UMA machine is charged to the system
+/// commit but not to the process. 20.11.: Fun-VACE with resident experts
+/// showed a few GB of private bytes, the 27B load then saw 4.5 GB of commit
+/// after crediting its eviction (48 GB once it was gone) and gave up with
+/// 507 while the idle worker kept running. Evicted, the next plan sees the
+/// real numbers. False when nothing idle is left or more than commit is
+/// missing.
+bool EvictForCommit(const std::vector<const ResidentView*>& evict,
+                    const Room& room, const MemoryNeed& need,
+                    const MemoryPolicy& policy, AdmissionPlan* plan) {
+  if (evict.empty() || !Fits(room, need, policy, /*check_commit=*/false)) {
+    return false;
+  }
+  plan->action = AdmissionPlan::Action::kEvict;
+  std::string names;
+  for (const ResidentView* view : evict) {
+    plan->evict.push_back(view->id);
+    names += (names.empty() ? "" : ", ") + view->id;
+  }
+  plan->reason = "evicting idle " + names +
+                 " (commit short; its GPU memory is charged to commit, not "
+                 "to its private bytes); need " +
+                 Gb(need.gpu) + " GB gpu + " + Gb(need.host) + " GB host; " +
                  RoomText(room);
   return true;
 }
@@ -383,7 +413,8 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     const Room room = Project(system, {}, evict);
     const bool fits = Fits(room, need, policy);
     if (!fits && !NeverFits(system, need, policy)) {
-      if (EvictUnmeasured(evict, room, &plan)) {
+      if (EvictUnmeasured(evict, room, &plan) ||
+          EvictForCommit(evict, room, need, policy, &plan)) {
         return plan;
       }
       plan.action = AdmissionPlan::Action::kWait;
@@ -461,7 +492,8 @@ AdmissionPlan PlanAdmission(const SystemMemory& system,
     // An idle resident without a sample was credited nothing: its memory
     // may be what is missing, so it goes first and the next plan sees the
     // real numbers.
-    if (EvictUnmeasured(evict, room, &plan)) {
+    if (EvictUnmeasured(evict, room, &plan) ||
+        EvictForCommit(evict, room, need, policy, &plan)) {
       return plan;
     }
     // Even with every worker of ours gone it would not fit: the memory is
