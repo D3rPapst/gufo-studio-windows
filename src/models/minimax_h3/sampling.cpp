@@ -827,6 +827,81 @@ std::optional<PackedLayout> BuildImageTextLayout(std::size_t text_rows,
   return layout;
 }
 
+std::optional<PackedLayout> BuildImageEditLayout(
+    std::size_t text_rows, std::span<const ReferencePlacement> references,
+    int latent_height, int latent_width, std::string* error) {
+  if (references.empty()) {
+    return BuildImageTextLayout(text_rows, latent_height, latent_width, error);
+  }
+  if (references.size() > kH3ImageMaximumReferences) {
+    SetError(error, "MiniMax-H3-Image takes at most " +
+                        std::to_string(kH3ImageMaximumReferences) +
+                        " reference images");
+    return std::nullopt;
+  }
+  auto layout =
+      BuildImageTextLayout(text_rows, latent_height, latent_width, error);
+  if (!layout) {
+    return std::nullopt;
+  }
+  std::size_t condition_rows = 0;
+  for (const ReferencePlacement& reference : references) {
+    if (reference.kind != ReferenceKind::kImage ||
+        reference.latent_frames != 1 || reference.audio_latent_frames != 0 ||
+        reference.latent_height < 2 || reference.latent_width < 2 ||
+        reference.latent_height % 2 != 0 || reference.latent_width % 2 != 0 ||
+        static_cast<std::int64_t>(reference.latent_height) *
+                reference.latent_width * kH3VaeSpatialRatio *
+                kH3VaeSpatialRatio >
+            kH3ImageMaximumPixels) {
+      SetError(error, "invalid MiniMax-H3-Image reference geometry");
+      return std::nullopt;
+    }
+    condition_rows += static_cast<std::size_t>(reference.latent_height / 2) *
+                      static_cast<std::size_t>(reference.latent_width / 2);
+  }
+  const std::size_t image_rows = layout->video_target_rows;
+  if (condition_rows >
+      std::numeric_limits<std::uint32_t>::max() - text_rows - image_rows) {
+    SetError(error, "MiniMax-H3-Image packed row count overflows");
+    return std::nullopt;
+  }
+  try {
+    std::vector<Position3D> positions;
+    positions.reserve(text_rows + condition_rows + image_rows);
+    positions.insert(positions.end(), layout->positions.begin(),
+                     layout->positions.begin() +
+                         static_cast<std::ptrdiff_t>(text_rows));
+    // Every image is one frame on the rotary clock that starts where the
+    // text ends: one integer slot per reference, then the generated image.
+    double time = static_cast<double>(text_rows);
+    for (const ReferencePlacement& reference : references) {
+      for (const Position3D& position :
+           FrameGrid(reference.latent_height, reference.latent_width)) {
+        positions.push_back({time, position.height, position.width});
+      }
+      time += 1.0;
+    }
+    for (std::size_t row = text_rows; row < layout->positions.size(); ++row) {
+      const Position3D& position = layout->positions[row];
+      positions.push_back({time, position.height, position.width});
+    }
+    const std::size_t target = text_rows + condition_rows;
+    layout->positions = std::move(positions);
+    layout->condition_rows = condition_rows;
+    layout->segments = {
+        {0, text_rows, SegmentKind::kText},
+        {text_rows, target, SegmentKind::kVideoCondition},
+        {target, target, SegmentKind::kAudioTarget},
+        {target, target + image_rows, SegmentKind::kVideoTarget},
+    };
+  } catch (const std::exception&) {
+    SetError(error, "MiniMax-H3-Image layout cannot be allocated");
+    return std::nullopt;
+  }
+  return layout;
+}
+
 std::optional<SigmaSchedule> BuildProvidedSchedule(
     std::span<const float> sigmas, std::string* error) {
   if (sigmas.size() < 3 || sigmas.size() > kH3MaximumEvaluations + 1U ||

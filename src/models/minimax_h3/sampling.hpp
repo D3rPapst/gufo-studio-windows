@@ -305,6 +305,26 @@ struct ImageCanvas {
     std::size_t text_rows, int latent_height, int latent_width,
     std::string* error = nullptr);
 
+// --- MiniMax-H3-Image edits (reference images) ------------------------------
+
+/// Reference images one edit accepts (the model card: up to 16).
+inline constexpr std::size_t kH3ImageMaximumReferences = 16;
+/// The rotary time / AdaLN level the reference rows are held at.
+inline constexpr float kH3ImageReferenceNoiseAugmentation = 0.999F;
+
+/// `[text | reference 1 | ... | reference n | generated image]`
+/// (build_image_packed_sequence with references): text row i at (i, 0, 0);
+/// reference j (0-based) on rotary time `text_rows + j` with the
+/// aspect-normalized (h, w) grid of its own latent size; the generated image
+/// on time `text_rows + n`. The reference rows form the video condition
+/// segment (timestep 0.999, image tag), followed by an empty audio-target
+/// segment and the generated rows. Every reference must be a one-frame image
+/// with even latent sides; without references this equals
+/// BuildImageTextLayout.
+[[nodiscard]] std::optional<PackedLayout> BuildImageEditLayout(
+    std::size_t text_rows, std::span<const ReferencePlacement> references,
+    int latent_height, int latent_width, std::string* error = nullptr);
+
 /// A provided (unshifted) sigma grid as an H3 schedule: video and audio
 /// streams share it; it must start at 1, decrease strictly and end at 0.
 [[nodiscard]] std::optional<SigmaSchedule> BuildProvidedSchedule(

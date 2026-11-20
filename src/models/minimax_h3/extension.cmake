@@ -10,6 +10,7 @@ gufo_extension_target(
     denoiser.cpp
     dit.cpp
     generation.cpp
+    image_edit.cpp
     image_generation.cpp
     image_vae.cpp
     json.cpp
