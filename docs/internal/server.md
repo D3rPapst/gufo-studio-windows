@@ -1055,6 +1055,19 @@ failing:
   while the .56 adapter's MMAudio request waited on the .198 behind the
   .198's queue; each queue was held by the prompt whose request waited on
   the other machine, and both stood for over two hours.
+- *A partner's "nothing started" never reaches the client (2.2.13, Regie
+  #56-1277):* a 503 `memory_busy` or `pool_busy` of the partner (load
+  yield "makes way for loading", forwarded GPU busy, no machine there) is
+  read for every relayed request, also after an earlier partner failure
+  and for requests that may retry anyway; the request decides again
+  without the partner and may go there again `kPartnerBusyRetry` (30 s)
+  later (`event=pool_partner_retry`). Before, the second such answer, or
+  the first one for a request pinned to the partner, went to the client
+  (a Wan 2.1 uni3c chain got "makes way for loading
+  'wan2.2-fun-vace-a14b'"). The job store waits on a repeated
+  `pool_busy` like on `memory_busy` (after its one immediate requeue),
+  and the ComfyUI adapter's `MemoryWaitOf` counts `pool_busy` as a wait
+  (Retry-After 30 s).
 `/v1/jobs` needs no such change: with the shared queue (1.4.20) a free
 runner of the partner pulls this router's queued and pool-waiting jobs,
 so `--jobs-parallel 2` on both machines already runs up to four jobs.

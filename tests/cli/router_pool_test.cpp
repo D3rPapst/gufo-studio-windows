@@ -896,6 +896,14 @@ void TestForwardedGpuBusyCap() {
   CHECK(ForwardedGpuBusyGiveUp(true, true, milliseconds(10), milliseconds(5)));
 }
 
+// 2.2.13 (Regie #56-1277): a partner that answered "nothing started" is
+// asked again kPartnerBusyRetry later.
+void TestPartnerBusyRetry() {
+  const auto t0 = std::chrono::steady_clock::time_point{};
+  CHECK(!gufo::router::PartnerBusyRetryDue(t0, t0 + std::chrono::seconds(29)));
+  CHECK(gufo::router::PartnerBusyRetryDue(t0, t0 + std::chrono::seconds(30)));
+}
+
 // 2.2.13: parked ComfyUI prompts (request in the pool, on the partner or in
 // a memory wait) do not make this machine GPU busy.
 void TestComfyQueueParked() {
@@ -955,6 +963,7 @@ int main() {
   TestPriority();
   TestForwardedGpuBusyCap();
   TestComfyQueueParked();
+  TestPartnerBusyRetry();
   if (failures != 0) {
     std::cerr << failures << " router pool checks failed\n";
     return 1;

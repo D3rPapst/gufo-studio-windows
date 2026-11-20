@@ -217,6 +217,8 @@ struct FakeApi {
   int objekt_flaky = 0;
   std::vector<std::string> objekt_job_headers;
   int unreachable_calls{0};
+  /// "POOLBUSY<n>": the router's 503 pool_busy for the first n calls.
+  int poolbusy_calls{0};
   /// "MEMBUSY<n>" prompts: the router's 503 memory_busy for the first n
   /// calls ("MEMBUSY" alone: every call), counted per prompt.
   std::map<std::string, int> membusy_calls;
@@ -338,6 +340,18 @@ struct FakeApi {
           result.body =
               R"({"error":{"message":"remote model 'qwen-image' is )"
               R"(unreachable: connect","code":"remote_unavailable"}})";
+          return result;
+        }
+      }
+      if (const auto at = prompt.find("POOLBUSY"); at != std::string::npos) {
+        // 2.2.13: no machine now / the partner turned it back.
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (++poolbusy_calls <= prompt[at + 8] - '0') {
+          result.status = 503;
+          result.body =
+              R"x({"error":{"message":"pool model 'qwen-image' makes way )x"
+              R"x(for loading 'wan' on this router; run the request on )x"
+              R"x(your own machine","code":"pool_busy"}})x";
           return result;
         }
       }
@@ -813,6 +827,19 @@ void TestRequeueOnceWhenRemoteGone() {
     const std::lock_guard<std::mutex> lock(h.api->mutex);
     CHECK(h.api->unreachable_calls == 2);  // the first run and one requeue
   }
+}
+
+// 2.2.13 (Regie #56-1277): 503 pool_busy more than once waits in the
+// queue like memory_busy instead of failing the job at the second answer.
+void TestPoolBusyStaysQueued() {
+  Harness h("poolbusy-retry", /*start=*/false);
+  h.memory_busy_retry = std::chrono::milliseconds(20);
+  h.Open(true);
+  const json::Value job = h.Submit(ImageJob("POOLBUSY3 a fox"));
+  const json::Value done = h.WaitFor(job.member_str("id"), "completed");
+  CHECK(done.find("error") == nullptr || done.find("error")->is_null());
+  const std::lock_guard<std::mutex> lock(h.api->mutex);
+  CHECK(h.api->poolbusy_calls == 4);
 }
 
 void TestMemoryBusyStaysQueued() {
@@ -3205,6 +3232,7 @@ int main() {
   TestFailedJob();
   TestRequeueOnceWhenRemoteGone();
   TestMemoryBusyStaysQueued();
+  TestPoolBusyStaysQueued();
   TestBinaryResult();
   TestSubmitRejections();
   TestCancel();

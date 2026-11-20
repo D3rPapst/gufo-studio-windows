@@ -2143,6 +2143,9 @@ public:
         began + router::PoolQueueTimeout(preset.remote->queue_timeout_seconds,
                                          comfy_wait);
     bool remote_failed = false;
+    // 2.2.13: when the partner last answered "nothing started" (503
+    // memory_busy / pool_busy); remote_failed ends kPartnerBusyRetry later.
+    std::optional<std::chrono::steady_clock::time_point> partner_busy_at;
     bool waiting = false;
     // How long this request has let a higher priority go first (2.0.3):
     // only real yield stretches count, not busy waits in between.
@@ -2207,6 +2210,15 @@ public:
                 "server_error", "pool_busy");
         refused.headers.emplace_back("Retry-After", "30");
         return refused;
+      }
+      if (remote_failed && partner_busy_at &&
+          router::PartnerBusyRetryDue(*partner_busy_at,
+                                      std::chrono::steady_clock::now())) {
+        remote_failed = false;
+        partner_busy_at.reset();
+        Logger::Info("router", "event=pool_partner_retry model=" + model_id +
+                                   " waited_ms=" +
+                                   std::to_string(waited.count()));
       }
       router::PoolInput pool_input =
           PoolInputLocked(preset, forwarded, from_comfy, remote_failed, waited,
@@ -2383,9 +2395,11 @@ public:
         // the small error body to tell (with the lock released: the relay's
         // closure holds a RemoteHold) and decide again like for other
         // requests: this machine, or wait in the pool for one.
+        // 2.2.13 (Regie #56-1277): read for every 503, also for requests
+        // that may retry anyway and after an earlier partner failure: a
+        // "nothing started" answer is never handed to the client.
         bool partner_memory_busy = false;
-        if (response.status == 503 && !forwarded && !may_retry &&
-            !remote_failed && (forced != "remote" || local_capable)) {
+        if (response.status == 503 && !forwarded) {
           lock.unlock();
           std::string body = ReadSmallBody(response);
           lock.lock();
@@ -2429,12 +2443,17 @@ public:
                                      std::to_string(
                                          router::kPoolRemoteFailHold.count()));
         }
-        if (((may_retry && answer != router::PoolRemoteAnswer::kPass) ||
+        if (((may_retry && answer != router::PoolRemoteAnswer::kPass &&
+              !remote_failed) ||
              partner_memory_busy) &&
-            !remote_failed && !forwarded) {
+            !forwarded) {
           // Nothing reached the client yet: decide again without the
           // remote (this machine, or wait for it).
           remote_failed = true;
+          // 2.2.13: a busy partner is asked again after a while (a request
+          // pinned to it would otherwise wait for nothing).
+          if (partner_memory_busy)
+            partner_busy_at = std::chrono::steady_clock::now();
           ++pool_[model_id].retried_local;
           ++pool_[model_id].fallbacks;
           Logger::Warn("router", "event=pool_retry_local model=" + model_id +

@@ -380,6 +380,17 @@ inline constexpr std::chrono::hours kComfyWaitCap{24 * 30};
 /// hours.
 inline constexpr std::chrono::seconds kForwardedGpuBusyCap{60};
 
+/// 2.2.13 (Regie #56-1277): after the partner answered a request "nothing
+/// started" (503 memory_busy or pool_busy) the request decides without the
+/// partner; this long after that answer it may go to the partner again.
+inline constexpr std::chrono::seconds kPartnerBusyRetry{30};
+
+[[nodiscard]] inline bool PartnerBusyRetryDue(
+    std::chrono::steady_clock::time_point busy_at,
+    std::chrono::steady_clock::time_point now) {
+  return now - busy_at >= kPartnerBusyRetry;
+}
+
 /// Whether a forwarded request that waits now gives up (see
 /// kForwardedGpuBusyCap). Only GPU busy counts: other waits of a forwarded
 /// request keep their own limits.

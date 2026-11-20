@@ -828,11 +828,26 @@ std::string ErrorCodeOf(std::string_view body) {
   return {};
 }
 
+std::string ErrorMessageOf(std::string_view body) {
+  try {
+    const json::Value parsed = json::parse(std::string(body));
+    const json::Value* error = parsed.find("error");
+    if (error != nullptr && error->is_object())
+      return error->member_str("message");
+  } catch (const std::exception&) {
+  }
+  return {};
+}
+
 std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result) {
   if (auto busy = MemoryBusyOf(result))
     return MemoryWait{"memory_busy", busy->what(), busy->retry_after_s};
   if (auto not_free = MemoryNotFreeOf(result))
     return MemoryWait{"insufficient_memory", std::move(*not_free), 0};
+  // 2.2.13 (Regie #56-1277): no machine for it now (the pool's own wait
+  // ended, or the partner turned it back): nothing started, ask again.
+  if (result.status == 503 && ErrorCodeOf(result.body) == "pool_busy")
+    return MemoryWait{"pool_busy", ErrorMessageOf(result.body), 30};
   return std::nullopt;
 }
 

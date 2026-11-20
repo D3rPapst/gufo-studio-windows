@@ -3694,7 +3694,16 @@ void JobQueue::Execute(const std::shared_ptr<Job>& job) {
     // overloaded (a router's connection limit) wait the same way, and so
     // does the router's passing 507 (memory held outside it or still being
     // released, comfy::IsMemoryNotFreeYet; Regie 19.11.).
+    // 2.2.13 (Regie #56-1277): 503 pool_busy after the one immediate
+    // requeue below (no machine now, or the partner turned it back) waits
+    // the same way instead of failing the job.
+    bool pool_busy_again = false;
+    if (failure.status == 503 && failure.code == "pool_busy") {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      pool_busy_again = job->requeued;
+    }
     if (((failure.status == 503 && failure.code == "memory_busy") ||
+         pool_busy_again ||
          (failure.status == 429 && failure.code == "video_queue_full") ||
          (failure.status == 503 && failure.code == "overloaded") ||
          comfy::IsMemoryNotFreeYet(failure.status, failure.code,

@@ -180,7 +180,8 @@ struct MemoryBusyError : std::runtime_error {
 /// An answer after which the same request may simply be sent again later
 /// (2.2.12): nothing was started, the memory may be free then.
 struct MemoryWait {
-  /// "memory_busy" (503) or "insufficient_memory" (the passing 507).
+  /// "memory_busy" (503), "insufficient_memory" (the passing 507) or, since
+  /// 2.2.13, "pool_busy" (503: no machine now, nothing started).
   std::string code;
   std::string message;
   /// The answer's retry_after_s (memory_busy), 0 when it gives none.
@@ -189,6 +190,8 @@ struct MemoryWait {
 
 /// 2.2.13: error.code of a JSON error body ("" when there is none).
 [[nodiscard]] std::string ErrorCodeOf(std::string_view body);
+/// error.message of a JSON error body ("" when there is none).
+[[nodiscard]] std::string ErrorMessageOf(std::string_view body);
 
 /// MemoryBusyOf or MemoryNotFreeOf of an answer, nullopt for anything else.
 [[nodiscard]] std::optional<MemoryWait> MemoryWaitOf(const FetchResult& result);

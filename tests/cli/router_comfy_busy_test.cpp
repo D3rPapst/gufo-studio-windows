@@ -640,6 +640,14 @@ void TestMemoryWaitOf() {
   CHECK(comfy::ErrorCodeOf(kBusyBody) == "memory_busy");
   CHECK(comfy::ErrorCodeOf(R"({"error":{"code":"pool_busy"}})") == "pool_busy");
   CHECK(comfy::ErrorCodeOf("not json").empty());
+  // 2.2.13: pool_busy (nothing started) is waited for, too.
+  const auto pool = comfy::MemoryWaitOf(
+      {.status = 503,
+       .body = R"({"error":{"message":"makes way","code":"pool_busy"}})"});
+  CHECK(pool && pool->code == "pool_busy" && pool->retry_after_s == 30 &&
+        pool->message == "makes way");
+  CHECK(!comfy::MemoryWaitOf(
+      {.status = 500, .body = R"({"error":{"code":"pool_busy"}})"}));
   const auto busy = comfy::MemoryWaitOf({.status = 503, .body = kBusyBody});
   CHECK(busy && busy->code == "memory_busy" && busy->retry_after_s == 30);
   const auto not_free =
