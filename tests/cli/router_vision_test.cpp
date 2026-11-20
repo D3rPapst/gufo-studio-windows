@@ -477,8 +477,8 @@ void TestHandFingers() {
   assert(r.tasks.size() == 1 && r.tasks[0].task == "hand");
   assert(r.hand_fingers.enabled && r.hand_fingers.model == "qwen3.8-27b");
   assert(r.hand_fingers.max_hands == 6 && r.hand_fingers.thinking);
-  assert(r.hand_fingers.timeout_seconds == 300 && r.hand_fingers.margin == 0.25);
-  assert(r.hand_fingers.wait_seconds == 600 && r.hand_fingers.max_tokens == 4096);
+  assert(r.hand_fingers.timeout_seconds == 600 && r.hand_fingers.margin == 0.25);
+  assert(r.hand_fingers.wait_seconds == 600 && r.hand_fingers.max_tokens == 8192);
   assert(!vision::ParseRequest(Body("AAAA", {"hand"})).hand_fingers.enabled);
   // With hand listed too, and options.
   json::Value body = Body("AAAA", {"face", "hand", "hand_fingers"});
@@ -529,7 +529,7 @@ void TestHandFingers() {
   assert(chat.find("stream")->as_bool());
   assert(chat.find("response_format")->member_str("type") == "json_schema");
   assert(chat.find("chat_template_kwargs")->find("enable_thinking")->as_bool());
-  assert(chat.member_double("max_tokens") == 4096);
+  assert(chat.member_double("max_tokens") == 8192);
   const json::Value& schema = *chat.find("response_format")->find("json_schema")->find("schema");
   const json::Value& props = *schema.find("properties");
   assert(props.find("fingers_sichtbar")->member_double("maximum") == 10);
@@ -844,8 +844,8 @@ void TestPersonCount() {
   assert(r.tasks.size() == 1 && r.tasks[0].task == "person");
   assert(r.person_count.enabled && r.person_count.model == "qwen3.8-27b");
   assert(r.person_count.thinking && r.person_count.expected == -1);
-  assert(r.person_count.timeout_seconds == 300 && r.person_count.wait_seconds == 600);
-  assert(r.person_count.max_tokens == 4096 && r.person_count.references.empty());
+  assert(r.person_count.timeout_seconds == 600 && r.person_count.wait_seconds == 600);
+  assert(r.person_count.max_tokens == 8192 && r.person_count.references.empty());
   assert(!vision::ParseRequest(Body("AAAA", {"person"})).person_count.enabled);
   // Both model checks in one request: hand and person detectors.
   r = vision::ParseRequest(Body("AAAA", {"hand_fingers", "person_count"}));
@@ -968,7 +968,7 @@ void TestPersonCount() {
   assert(parts.items()[6].member_str("text") == vision::PersonPrompt(with));
   assert(chat.find("stream")->as_bool());
   assert(chat.find("chat_template_kwargs")->find("enable_thinking")->as_bool());
-  assert(chat.member_double("max_tokens") == 4096 && chat.member_double("temperature") == 0);
+  assert(chat.member_double("max_tokens") == 8192 && chat.member_double("temperature") == 0);
   const json::Value& format = *chat.find("response_format");
   assert(format.member_str("type") == "json_schema");
   assert(format.find("json_schema")->member_str("name") == "person_count");

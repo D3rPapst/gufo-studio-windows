@@ -90,10 +90,12 @@ struct HandFingersRequest {
   std::string model{"qwen3.8-27b"};
   int max_hands{6};
   bool thinking{true};
-  int timeout_seconds{300};
+  // 2.2.13: 600 s / 8192 tokens (Regie 20.11.: thinking ran out at
+  // 300 s / 4096 for 4 of 22 hands).
+  int timeout_seconds{600};
   int wait_seconds{600};
   double margin{0.25};
-  int max_tokens{4096};
+  int max_tokens{8192};
 };
 
 /// The "hand_fingers_options" member; throws std::invalid_argument for the

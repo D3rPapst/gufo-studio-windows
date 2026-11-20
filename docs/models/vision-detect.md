@@ -100,13 +100,13 @@ one hand after the other:
 ```json
 {"image": "...", "tasks": ["hand_fingers"],
  "hand_fingers_options": {"model": "qwen3.8-27b", "max_hands": 6, "thinking": true,
-                          "timeout_seconds": 300, "wait_seconds": 600, "margin": 0.25,
-                          "max_tokens": 4096}}
+                          "timeout_seconds": 600, "wait_seconds": 600, "margin": 0.25,
+                          "max_tokens": 8192}}
 ```
 
 All options are optional (the values above are the defaults; `max_hands` 1 to 16,
 `timeout_seconds` 5 to 600, `wait_seconds` 0 to 3600, `margin` 0 to 1, `max_tokens` 32 to
-8192, thinking included). The answer has one
+8192, thinking included; up to 2.2.12 the defaults were 300 s and 4096). The answer has one
 entry per hand box, in score order:
 
 ```json
@@ -175,8 +175,8 @@ is given as `detektor_personen` for comparison, the model does not see it.
 {"image": "...", "tasks": ["person_count"],
  "person_count_options": {"expected": 1,
                           "references": [{"name": "Bernd", "image": "/v1/jobs/j1/files/bernd.png"}],
-                          "model": "qwen3.8-27b", "thinking": true, "timeout_seconds": 300,
-                          "wait_seconds": 600, "max_tokens": 4096}}
+                          "model": "qwen3.8-27b", "thinking": true, "timeout_seconds": 600,
+                          "wait_seconds": 600, "max_tokens": 8192}}
 ```
 
 All options are optional (`model`, `thinking`, the times and `max_tokens` as for

@@ -1256,7 +1256,7 @@ the caller needs the `text` area and the chat counts like any other. Body:
 `model` (default `qwen3.8-27b`), the image and the prompt `kFingerPrompt`
 (hidden or cut-off fingers are no error; only clearly impossible things are
 findings; in doubt none; `sicher` false for hidden fingers, a fist, blur, a
-small hand), `temperature` 0, `max_tokens` (4096, thinking included), `stream` true,
+small hand), `temperature` 0, `max_tokens` (8192 since 2.2.13, before 4096; thinking included), `stream` true,
 `chat_template_kwargs.enable_thinking` = `thinking` (default true) and
 `response_format` `json_schema` (strict) `{fingers_sichtbar: integer 0-10,
 verdeckt: [daumen|zeigefinger|mittelfinger|ringfinger|kleiner_finger],
@@ -1273,7 +1273,7 @@ hands themselves were already asked one after the other): until the first
 generated token (queue, load, prefill) the hand may wait
 `wait_seconds` (600); a 503 `memory_busy` is asked again after its
 `Retry-After` (1-30 s) while that clock allows. From the first token on the
-generation has `timeout_seconds` (300). `GenerationStarted` decides on whole
+generation has `timeout_seconds` (600 since 2.2.13, before 300). `GenerationStarted` decides on whole
 `data:` lines: a non-empty `content` / `reasoning_content` / `tool_calls`
 delta, a `finish_reason`, an error or `[DONE]`. The role chunk
 (`{"delta": {"role": "assistant"}}`) and `prompt_progress` do not count: the

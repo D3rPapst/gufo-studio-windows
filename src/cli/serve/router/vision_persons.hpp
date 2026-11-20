@@ -89,9 +89,10 @@ struct PersonCountRequest {
   bool enabled{false};
   std::string model{"qwen3.8-27b"};
   bool thinking{true};
-  int timeout_seconds{300};
+  // 2.2.13: 600 s / 8192 tokens, as hand_fingers.
+  int timeout_seconds{600};
   int wait_seconds{600};
-  int max_tokens{4096};
+  int max_tokens{8192};
   int expected{-1};  // -1: not given
   std::vector<PersonReference> references;
 };
