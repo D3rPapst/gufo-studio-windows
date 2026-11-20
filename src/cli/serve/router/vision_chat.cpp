@@ -360,8 +360,12 @@ std::string AskVisionChat(const std::string& body, const ChatLimits& limits,
   inner.is_cancelled = [outer_cancelled, over] {
     return (outer_cancelled && outer_cancelled()) || over();
   };
+  // X-Gufo-Pool too: a detect pinned to this machine (local) or the partner
+  // asks its chat there as well. 20.11.: with "local" the inner 27B call
+  // still went through the pool decision and ran on the partner.
   for (const auto& [name, value] : outer.headers) {
-    if (EqualsIgnoreCase(name, "Authorization") || EqualsIgnoreCase(name, "Cookie"))
+    if (EqualsIgnoreCase(name, "Authorization") || EqualsIgnoreCase(name, "Cookie") ||
+        EqualsIgnoreCase(name, "X-Gufo-Pool"))
       inner.headers.emplace_back(name, value);
   }
   inner.headers.emplace_back("Content-Type", "application/json");

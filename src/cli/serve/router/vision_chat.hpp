@@ -83,7 +83,7 @@ struct ChatLimits {
 };
 
 /// Asks one chat with `body` through `serve`, the caller's Authorization /
-/// Cookie copied from `outer`, and returns the answer body (2xx). Throws
+/// Cookie / X-Gufo-Pool copied from `outer`, and returns the answer body (2xx). Throws
 /// std::runtime_error: refused ("chat <status>: <message>"), cancelled,
 /// timed out. When the model did not start (or stayed busy) within
 /// wait_seconds, *model_gone is set as well (the caller asks no further

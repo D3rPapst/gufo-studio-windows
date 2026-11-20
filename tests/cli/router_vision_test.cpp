@@ -42,6 +42,7 @@
 #include "src/cli/serve/router/cpu_pool.hpp"
 #include "src/cli/serve/router/figuren.hpp"
 #include "src/cli/serve/router/vision.hpp"
+#include "src/cli/serve/router/vision_chat.hpp"
 #include "src/core/base64.hpp"
 #include "src/core/json.hpp"
 
@@ -1332,6 +1333,42 @@ std::string UniformPng(int width, int height) {
 /// All pictures of one request share kMaxRequestBytes (encoded): four
 /// Ablage pictures of 20 MB each are refused before anything is decoded.
 /// A page user (session cookie) reads an Ablage path with its own session.
+void TestChatCarriesPoolSide() {
+  // 20.11.: /v1/vision/detect with X-Gufo-Pool: local sent its inner 27B
+  // chat through the pool decision (choice=remote). The side, Authorization
+  // and Cookie go along; other headers do not.
+  HttpRequest outer;
+  outer.headers = {{"Authorization", "Bearer t"},
+                   {"x-gufo-pool", "local"},
+                   {"X-Gufo-Priority", "high"}};
+  std::vector<std::pair<std::string, std::string>> seen;
+  const auto serve = [&seen](const HttpRequest& inner) {
+    seen = inner.headers;
+    HttpResponse response;
+    response.status = 200;
+    response.body = "{}";
+    return response;
+  };
+  vision::ChatLimits limits;
+  limits.model = "qwen3.8-27b";
+  std::string gone;
+  double waited = 0;
+  assert(vision::AskVisionChat("{}", limits, serve, outer, &gone, &waited) == "{}");
+  const auto count = [&seen](const char* name, const char* value) {
+    return std::count_if(seen.begin(), seen.end(), [&](const auto& header) {
+      return header.first == name && header.second == value;
+    });
+  };
+  assert(count("x-gufo-pool", "local") == 1);
+  assert(count("Authorization", "Bearer t") == 1);
+  assert(count("X-Gufo-Priority", "high") == 0);
+  // Without the header the chat is free to use the pool.
+  outer.headers = {{"Authorization", "Bearer t"}};
+  assert(vision::AskVisionChat("{}", limits, serve, outer, &gone, &waited) == "{}");
+  assert(std::none_of(seen.begin(), seen.end(),
+                      [](const auto& header) { return header.first == "x-gufo-pool"; }));
+}
+
 void TestAblageCookie() {
   vision::Options options;
   std::string cookie;
@@ -1665,6 +1702,7 @@ int main() {
   TestPool();
   TestRequestBytes();
   TestAblageCookie();
+  TestChatCarriesPoolSide();
   TestHandFingers();
   TestPersonCount();
   const char* dir = std::getenv("GUFO_VISION_DIR");
