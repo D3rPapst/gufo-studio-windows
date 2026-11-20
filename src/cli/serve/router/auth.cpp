@@ -1141,7 +1141,13 @@ std::string PageArea(std::string_view path) {
       {"ergebnisse", "ablage"},  {"chat", "text"},
       {"speicher", "status"},    {"memory", "status"},
       {"pool", "status"},        {"status", "status"},
-      {"nacht", "status"},       {"night", "status"}};
+      {"nacht", "status"},       {"night", "status"},
+      // 2.2.15: the pages of 2.2.12 and later, as gemeinsam/anmeldung.js
+      // BEREICH names them (the API they call: /v1/vision/* bild,
+      // /v1/audio/foley musik, /v1/chat/completions text).
+      {"freistellen", "bild"},   {"pruefen", "bild"},
+      {"geraeusche", "musik"},   {"audio-beschreiben", "text"},
+      {"describe-audio", "text"}};
   const auto it = kPages.find(page);
   return it == kPages.end() ? std::string() : it->second;
 }

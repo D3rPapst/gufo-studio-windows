@@ -558,6 +558,11 @@ void TestClassify() {
   CHECK_EQ(page.area, std::string("bild"));
   CHECK_EQ(auth::Classify(Req("GET", "/lipsync/", "x")).area, std::string("video"));
   CHECK_EQ(auth::Classify(Req("GET", "/pool/", "x")).area, std::string("status"));
+  // 2.2.15: the newer pages (as anmeldung.js BEREICH).
+  CHECK_EQ(auth::Classify(Req("GET", "/freistellen/", "x")).area, std::string("bild"));
+  CHECK_EQ(auth::Classify(Req("GET", "/pruefen/", "x")).area, std::string("bild"));
+  CHECK_EQ(auth::Classify(Req("GET", "/geraeusche/", "x")).area, std::string("musik"));
+  CHECK_EQ(auth::Classify(Req("GET", "/audio-beschreiben/", "x")).area, std::string("text"));
   CHECK_EQ(auth::Classify(Req("GET", "/start/", "x")).area, std::string(""));
   CHECK(auth::Classify(Req("GET", "/", "x")).kind == Kind::kPage);
   CHECK(auth::Classify(Req("POST", "/v1/irgendwas", "x")).kind == Kind::kOther);
