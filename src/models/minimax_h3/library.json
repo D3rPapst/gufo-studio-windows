@@ -10,6 +10,7 @@
     "minimax_h3_denoiser_hip_test",
     "minimax_h3_dit_hip_test",
     "minimax_h3_generation_test",
+    "minimax_h3_image_edit_hip_test",
     "minimax_h3_image_test",
     "minimax_h3_image_vae_hip_test",
     "minimax_h3_image_vae_test",

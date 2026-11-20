@@ -1,5 +1,7 @@
 // `gufo serve image` provider "minimax-h3-image": MiniMax-H3-Image text to
-// image on the H3 DiT, the shared H3 text encoder and the 2D ViT VAE.
+// image and image edits (up to 16 reference images, "<Picture i>" in upload
+// order) on the H3 DiT, the shared H3 text encoder with its Qwen3-VL vision
+// tower and the image VAE.
 // AI-assisted (Claude Code).
 
 #include <gufo/ext/generated/minimax_h3_constants.hpp>
@@ -100,28 +102,47 @@ class MinimaxH3ImageRunner : public ext::ImageRunner {
 public:
   MinimaxH3ImageRunner(std::filesystem::path model_root,
                        std::filesystem::path text_encoder_root,
-                       std::filesystem::path manifest)
+                       std::filesystem::path manifest,
+                       std::filesystem::path vision_projector)
       : model_root_(std::move(model_root)),
         text_encoder_root_(std::move(text_encoder_root)),
-        manifest_(std::move(manifest)) {
+        manifest_(std::move(manifest)),
+        vision_projector_(std::move(vision_projector)) {
     Log("event=provider_ready model=" + std::string(h3::kH3ImageModelName) +
-        " text_encoder_root=" + text_encoder_root_.string());
+        " text_encoder_root=" + text_encoder_root_.string() + " edits=" +
+        (vision_projector_.empty() ? "off" : "on"));
   }
 
   std::optional<ext::ImageCapabilities> Capabilities() const override {
-    // Text to image only for now; edits (reference images) come later.
+    // Edits need the Qwen3-VL vision tower for the "Picture i" blocks.
     return ext::ImageCapabilities{
-        .edits = false,
+        .edits = !vision_projector_.empty(),
         .transparent_background = false,
         .max_side = h3::kH3ImageMaximumSide,
-        .max_pixels = static_cast<std::uint64_t>(h3::kH3ImageMaximumPixels)};
+        .max_pixels = static_cast<std::uint64_t>(h3::kH3ImageMaximumPixels),
+        .max_images = h3::kH3ImageMaximumReferences};
   }
 
   void ValidateRequest(const ext::ImageRequest& request) const override {
-    if (!request.images.empty() || !request.named_images.empty()) {
+    if (!request.named_images.empty()) {
       throw std::invalid_argument(
-          "MiniMax-H3-Image in gufo generates from text only (no reference "
-          "or init images yet)");
+          "MiniMax-H3-Image takes reference images (\"image\") only, no "
+          "init image, mask or control image");
+    }
+    if (!request.images.empty() && vision_projector_.empty()) {
+      throw std::invalid_argument(
+          "MiniMax-H3-Image edits need --h3-vision-projector");
+    }
+    if (request.images.size() > h3::kH3ImageMaximumReferences) {
+      throw std::invalid_argument(
+          "MiniMax-H3-Image takes at most 16 reference images");
+    }
+    for (const auto& image : request.images) {
+      if (image.width < 32 || image.height < 32) {
+        throw std::invalid_argument(
+            "MiniMax-H3-Image reference images need at least 32 pixels on "
+            "each side");
+      }
     }
     if (request.steps != 0 && request.steps != h3::kH3ImagePddSteps) {
       throw std::invalid_argument(
@@ -146,7 +167,23 @@ public:
         .width = request.width,
         .height = request.height,
         .min_generation_area = MinimumArea(request.extension_json),
+        .references = {},
+        .vision_projector = vision_projector_,
     };
+    // Reference images in upload order; an alpha channel is dropped, as
+    // PIL's convert("RGB") does.
+    for (const auto& image : request.images) {
+      h3::ImageEditInput input{.width = image.width, .height = image.height};
+      const std::size_t pixels =
+          static_cast<std::size_t>(image.width) * image.height;
+      input.rgb.resize(pixels * 3U);
+      for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
+        input.rgb[pixel * 3U + 0U] = image.rgba[pixel * 4U + 0U];
+        input.rgb[pixel * 3U + 1U] = image.rgba[pixel * 4U + 1U];
+        input.rgb[pixel * 3U + 2U] = image.rgba[pixel * 4U + 2U];
+      }
+      internal.references.push_back(std::move(input));
+    }
     h3::CancellationToken token;
     std::jthread watcher;
     if (is_cancelled) {
@@ -178,6 +215,7 @@ public:
     line << "event=generated model=" << h3::kH3ImageModelName
          << " size=" << result.width << 'x' << result.height
          << " canvas=" << result.canvas_width << 'x' << result.canvas_height
+         << " references=" << request.images.size()
          << " steps=" << h3::kH3ImagePddSteps
          << " telemetry=" << h3::ImageGenerationTelemetryJson(telemetry);
     Log(line.str());
@@ -218,6 +256,7 @@ private:
   std::filesystem::path model_root_;
   std::filesystem::path text_encoder_root_;
   std::filesystem::path manifest_;
+  std::filesystem::path vision_projector_;
 };
 
 std::unique_ptr<ext::ImageRunner> CreateWithOptions(
@@ -253,13 +292,27 @@ std::unique_ptr<ext::ImageRunner> CreateWithOptions(
           "MiniMax-H3-Image needs the pinned H3 source manifest "
           "(GUFO_H3_SOURCE_MANIFEST)");
     }
+    // Optional: the Qwen3-VL vision tower (mmproj GGUF converted from the
+    // H3 text encoder) that edits need; without it edits stay off.
+    std::filesystem::path projector;
+    if (const auto* value = ext::FindOption<std::string>(
+            options.options, "--h3-vision-projector")) {
+      projector = *value;
+    }
+    if (projector.empty()) {
+      projector = EnvironmentPath("GUFO_H3_VISION_PROJECTOR");
+    }
+    if (!projector.empty() && !std::filesystem::is_regular_file(projector)) {
+      throw std::invalid_argument("--h3-vision-projector file not found: " +
+                                  projector.string());
+    }
     std::string inspect_error;
     if (!h3::ModelInventory::InspectImage(options.model_root, {},
                                           &inspect_error)) {
       throw std::invalid_argument(inspect_error);
     }
-    return std::make_unique<MinimaxH3ImageRunner>(options.model_root,
-                                                  text_root, manifest);
+    return std::make_unique<MinimaxH3ImageRunner>(
+        options.model_root, text_root, manifest, projector);
   } catch (const std::exception& exception) {
     if (error != nullptr) {
       *error = exception.what();

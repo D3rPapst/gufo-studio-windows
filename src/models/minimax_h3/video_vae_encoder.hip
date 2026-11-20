@@ -1028,14 +1028,18 @@ bool EncodeKeyframeMoments(const ModelInventory& inventory,
     SetError(error, "invalid MiniMax H3 keyframe encoder arguments");
     return false;
   }
+  // Whole VAE cells: every downsample level halves an even side. The H3
+  // keyframes are on the 32 grid; MiniMax-H3-Image references are cropped
+  // to multiples of 16 only (MiniMaxH3ImageEditVaeEncoderStep).
   for (const KeyframeImage& image : images) {
-    if (image.width < 32 || image.height < 32 || image.width % 32 != 0 ||
-        image.height % 32 != 0 ||
+    if (image.width < 32 || image.height < 32 ||
+        image.width % kSpatialRatio != 0 ||
+        image.height % kSpatialRatio != 0 ||
         image.rgb.size() !=
             static_cast<std::size_t>(image.width) * image.height * 3U) {
       SetError(error,
                "MiniMax H3 keyframes must be RGB8 canvases with sides that "
-               "are multiples of 32");
+               "are multiples of 16 (at least 32)");
       return false;
     }
   }

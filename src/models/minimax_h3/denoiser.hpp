@@ -70,7 +70,9 @@ struct DenoiserOptions {
   // (BuildImageTextLayout), the provided unshifted `sigmas` grid (evaluations
   // = sigmas.size() - 1, no velocity reuse) and per step `i` the PDD output
   // head `pdd.video_out.{weight,bias}[i]` of an InspectImage inventory in
-  // place of `final_layer.video_out`. No guides, no audio mask.
+  // place of `final_layer.video_out`. No guides, no audio mask. An edit
+  // passes its reference images as one-frame `references` (normalized and
+  // held at t = 0.999); they pack as BuildImageEditLayout.
   bool image{false};
   std::span<const float> sigmas;
 };

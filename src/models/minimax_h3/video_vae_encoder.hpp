@@ -46,7 +46,9 @@ struct KeyframeMoments {
 /// Runs the causal 3D CNN encoder of the H3 VisualVAE on single frames. A
 /// single frame reduces every causal 3x3x3 convolution to its last temporal
 /// slice, so the encoder is a 2D CNN here. Tiles follow the reference
-/// 256-pixel/64-pixel-overlap layout and are blended in latent space.
+/// 256-pixel/64-pixel-overlap layout and are blended in latent space. Sides
+/// must be multiples of 16 (at least 32). The MiniMax-H3-Image VAE encoder
+/// has the same weights layout, so an InspectImage inventory works too.
 [[nodiscard]] bool EncodeKeyframeMoments(const ModelInventory& inventory,
                                          std::span<const KeyframeImage> images,
                                          const CancellationToken* cancellation,

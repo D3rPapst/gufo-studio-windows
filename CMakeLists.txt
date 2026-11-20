@@ -1789,6 +1789,15 @@ endfunction()
     set_tests_properties(minimax_h3_image_vae_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;minimax-h3-image;vae;quality;external-model;slow"
       SKIP_RETURN_CODE 77)
+    add_executable(minimax_h3_image_edit_hip_test
+      tests/models/minimax_h3_image_edit_hip_test.hip)
+    target_link_libraries(minimax_h3_image_edit_hip_test PRIVATE
+      gufo_core gufo_minimax_h3 gufo_minimax_h3_hip hip::host)
+    add_test(NAME minimax_h3_image_edit_real
+      COMMAND minimax_h3_image_edit_hip_test)
+    set_tests_properties(minimax_h3_image_edit_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;minimax-h3-image;edit;vae;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
     add_executable(minimax_h3_audio_vae_hip_test
       tests/models/minimax_h3_audio_vae_hip_test.hip)
     target_compile_definitions(minimax_h3_audio_vae_hip_test PRIVATE

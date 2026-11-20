@@ -189,11 +189,33 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
   }
   local.inventory_ms = Milliseconds(begin, Clock::now());
 
+  // Edit: size the references for the VAE and for the vision tower.
+  const bool edit = !request.references.empty();
+  std::vector<ImageEditReference> references;
+  if (edit) {
+    if (request.vision_projector.empty()) {
+      SetError(error,
+               "MiniMax-H3-Image edits need the Qwen3-VL vision projector "
+               "(--h3-vision-projector)");
+      return false;
+    }
+    begin = Clock::now();
+    if (!PlanImageEditReferences(request.references, &references, error)) {
+      return false;
+    }
+    local.references = references.size();
+    local.reference_plan_ms = Milliseconds(begin, Clock::now());
+  }
+
   // The prompt verbatim, without a chat template, truncated to 4096 tokens;
-  // every row is a text row (tag 1).
+  // every row is a text row (tag 1). An edit puts a "Picture i: " label and
+  // a vision block (tag 0) per reference in front of it.
   begin = Clock::now();
   Tokenizer tokenizer;
   std::vector<std::uint32_t> tokens;
+  std::vector<std::uint8_t> tags;
+  std::vector<PromptVisionBlock> vision_blocks;
+  std::vector<KeyframeImage> vision_images;
   if (!Tokenizer::Load(request.model_root / "tokenizer" / "tokenizer.json",
                        &tokenizer, error) ||
       !tokenizer.EncodePrompt(request.prompt, &tokens, error)) {
@@ -203,41 +225,101 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
     SetError(error, "MiniMax-H3-Image prompt has no tokens");
     return false;
   }
-  if (tokens.size() > kH3ImageMaximumPromptTokens) {
-    tokens.resize(kH3ImageMaximumPromptTokens);
-    local.prompt_truncated = true;
+  if (!edit) {
+    if (tokens.size() > kH3ImageMaximumPromptTokens) {
+      tokens.resize(kH3ImageMaximumPromptTokens);
+      local.prompt_truncated = true;
+    }
+    tags.assign(tokens.size(), 1);
+  } else {
+    std::vector<std::vector<std::uint32_t>> labels(references.size());
+    std::vector<std::pair<int, int>> sizes;
+    for (std::size_t index = 0; index < references.size(); ++index) {
+      if (!tokenizer.Encode(ImageEditLabel(index), false, &labels[index],
+                            error)) {
+        return false;
+      }
+      sizes.emplace_back(references[index].vision_width,
+                         references[index].vision_height);
+      vision_images.push_back({.width = references[index].vision_width,
+                               .height = references[index].vision_height,
+                               .rgb = references[index].vision_rgb});
+    }
+    ImageEditPresentation presentation;
+    if (!BuildImageEditPresentation(labels, sizes, tokens, &presentation,
+                                    error)) {
+      return false;
+    }
+    tokens = std::move(presentation.tokens);
+    tags = std::move(presentation.tags);
+    local.prompt_truncated = presentation.prompt_truncated;
+    local.vision_tokens = presentation.vision_tokens;
+    for (const ImageEditVisionSlot& slot : presentation.slots) {
+      PromptVisionBlock block;
+      block.begin = slot.begin;
+      block.grid_height = slot.grid_height;
+      block.grid_width = slot.grid_width;
+      vision_blocks.push_back(std::move(block));
+    }
   }
   local.prompt_tokens = tokens.size();
   local.tokenizer_ms = Milliseconds(begin, Clock::now());
-  const std::vector<std::uint8_t> tags(tokens.size(), 1);
 
   Report(progress, progress_opaque, "prompt", 0, 1);
   begin = Clock::now();
   PromptEmbedding embedding;
   TraceStage("h3-image prompt phase start");
   if (PromptIsolationEnabled()) {
-    double vision_ms = 0.0;
+    // The vision tower and the text encoder run in a short-lived child, so
+    // their device memory is gone before the DiT loads.
     const PromptIsolationInput isolated{
         .model_root = request.text_encoder_root,
         .manifest = request.text_encoder_manifest,
-        .projector = {},
-        .images = {},
+        .projector = edit ? request.vision_projector : std::filesystem::path(),
+        .images = vision_images,
         .tokens = tokens,
-        .blocks = {}};
+        .blocks = vision_blocks};
     if (!EncodePromptIsolated(isolated, cancellation, &embedding,
-                              &local.prompt_encoder, &vision_ms, error)) {
+                              &local.prompt_encoder, &local.vision_ms,
+                              error)) {
       return false;
     }
   } else {
+    if (edit) {
+      const auto vision_begin = Clock::now();
+      std::vector<PromptVisionBlock> encoded;
+      if (!EncodeKeyframeVision(request.vision_projector, vision_images,
+                                cancellation, &encoded, error)) {
+        return false;
+      }
+      if (encoded.size() != vision_blocks.size()) {
+        SetError(error, "MiniMax-H3-Image vision block count differs");
+        return false;
+      }
+      for (std::size_t index = 0; index < encoded.size(); ++index) {
+        if (encoded[index].grid_height != vision_blocks[index].grid_height ||
+            encoded[index].grid_width != vision_blocks[index].grid_width) {
+          SetError(error, "MiniMax-H3-Image vision grid differs");
+          return false;
+        }
+        encoded[index].begin = vision_blocks[index].begin;
+      }
+      vision_blocks = std::move(encoded);
+      local.vision_ms = Milliseconds(vision_begin, Clock::now());
+    }
     auto text_inventory = ModelInventory::Inspect(
         request.text_encoder_root, request.text_encoder_manifest, error);
+    PromptEncoderOptions prompt_options;
+    prompt_options.vision_blocks = vision_blocks;
     if (!text_inventory ||
-        !EncodePromptLayer50(*text_inventory, tokens, PromptEncoderOptions{},
+        !EncodePromptLayer50(*text_inventory, tokens, prompt_options,
                              cancellation, &embedding, &local.prompt_encoder,
                              error)) {
       return false;
     }
   }
+  vision_blocks.clear();
+  vision_images.clear();
   if (embedding.tokens != tokens.size() ||
       embedding.width != kH3TextConditionWidth) {
     SetError(error, "MiniMax-H3-Image prompt embedding has an unexpected shape");
@@ -247,7 +329,64 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
   local.prompt_ms = Milliseconds(begin, Clock::now());
   Report(progress, progress_opaque, "prompt", 1, 1);
 
-  // Noise of the single latent frame, [24][h][w].
+  // Edit: the references through the image VAE encoder (same CNN as the H3
+  // VisualVAE encoder, one frame, tiled), each posterior sampled, rounded to
+  // float16, cropped to whole patches, normalized and held at t = 0.999.
+  std::vector<ReferenceLatent> reference_latents;
+  if (edit) {
+    Report(progress, progress_opaque, "references", 0,
+           static_cast<int>(references.size()));
+    begin = Clock::now();
+    ImageVaeStatistics statistics;
+    if (!LoadImageVaeStatistics(request.model_root, &statistics, error)) {
+      return false;
+    }
+    for (std::size_t index = 0; index < references.size(); ++index) {
+      const ImageEditReference& reference = references[index];
+      const KeyframeImage image{.width = reference.vae_width,
+                                .height = reference.vae_height,
+                                .rgb = reference.vae_rgb};
+      std::vector<KeyframeMoments> moments;
+      VideoVaeEncoderTelemetry encoder_telemetry;
+      ReferenceLatent latent;
+      latent.placement = ImageEditPlacement(reference);
+      if (!EncodeKeyframeMoments(*inventory, std::span(&image, 1),
+                                 cancellation, &moments, &encoder_telemetry,
+                                 error) ||
+          moments.size() != 1U ||
+          !BuildImageEditConditioning(
+              moments.front().moments, moments.front().latent_height,
+              moments.front().latent_width, reference.latent_height,
+              reference.latent_width, statistics,
+              ImageEditPosteriorSeed(request.seed, index),
+              ImageEditAnchorSeed(request.seed, index), &latent.video,
+              error)) {
+        if (error != nullptr && error->empty()) {
+          *error = "MiniMax-H3-Image reference encoding failed";
+        }
+        return false;
+      }
+      local.reference_encoder.load_ms += encoder_telemetry.load_ms;
+      local.reference_encoder.encode_ms += encoder_telemetry.encode_ms;
+      local.reference_encoder.tiles += encoder_telemetry.tiles;
+      local.reference_encoder.weight_bytes = encoder_telemetry.weight_bytes;
+      local.reference_encoder.scratch_bytes =
+          std::max(local.reference_encoder.scratch_bytes,
+                   encoder_telemetry.scratch_bytes);
+      local.reference_rows +=
+          static_cast<std::size_t>(reference.latent_height / 2) *
+          static_cast<std::size_t>(reference.latent_width / 2);
+      reference_latents.push_back(std::move(latent));
+      Report(progress, progress_opaque, "references",
+             static_cast<int>(index + 1), static_cast<int>(references.size()));
+    }
+    references.clear();
+    local.reference_encode_ms = Milliseconds(begin, Clock::now());
+    TraceStage("h3-image references encoded");
+  }
+
+  // Noise of the single latent frame, [24][h][w] (the plain request seed,
+  // as text to image; the references use their own derived streams).
   std::vector<float> latent(kH3VideoLatentChannels *
                             static_cast<std::size_t>(geometry->latent_height) *
                             static_cast<std::size_t>(geometry->latent_width));
@@ -264,11 +403,14 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
        .reuse_interval = 1,
        .image = true,
        .sigmas = kH3ImagePddSigmas},
-      {.layer50 = embedding.values, .tags = tags}, cancellation,
-      &local.denoiser, error);
+      {.layer50 = embedding.values,
+       .tags = tags,
+       .references = reference_latents},
+      cancellation, &local.denoiser, error);
   if (denoiser == nullptr) {
     return false;
   }
+  reference_latents.clear();
   ProgressBridge denoiser_progress{progress, progress_opaque, "denoiser"};
   if (!denoiser->DenoiseWithProgress(latent, {}, cancellation, ForwardProgress,
                                      &denoiser_progress, &local.denoiser,
@@ -329,6 +471,13 @@ std::string ImageGenerationTelemetryJson(
        << ",\"vae_ms\":" << telemetry.vae_ms
        << ",\"resize_ms\":" << telemetry.resize_ms
        << ",\"total_ms\":" << telemetry.total_ms
+       << ",\"references\":" << telemetry.references
+       << ",\"reference_plan_ms\":" << telemetry.reference_plan_ms
+       << ",\"vision_ms\":" << telemetry.vision_ms
+       << ",\"vision_tokens\":" << telemetry.vision_tokens
+       << ",\"reference_encode_ms\":" << telemetry.reference_encode_ms
+       << ",\"reference_tiles\":" << telemetry.reference_encoder.tiles
+       << ",\"reference_rows\":" << telemetry.reference_rows
        << ",\"prompt_tokens\":" << telemetry.prompt_tokens
        << ",\"prompt_truncated\":"
        << (telemetry.prompt_truncated ? "true" : "false")

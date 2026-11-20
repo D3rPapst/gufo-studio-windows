@@ -2566,10 +2566,11 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     reference_pictures |= reference.placement.kind != ReferenceKind::kAudio;
     reference_sound |= reference.placement.audio_latent_frames > 0;
   }
-  // MiniMax-H3-Image: text only; no guides, references, control or audio.
+  // MiniMax-H3-Image: text and, for an edit, one-frame reference images
+  // (BuildImageEditLayout checks them); no guides, control or audio.
   if (options.image &&
       (!image_placements.empty() || !audio_placements.empty() ||
-       !reference_placements.empty() || options.control != nullptr ||
+       reference_sound || options.control != nullptr ||
        !conditioning.audio_keep.empty() || options.reuse_interval != 1 ||
        options.sigmas.size() !=
            static_cast<std::size_t>(options.evaluations) + 1U ||
@@ -2580,7 +2581,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   }
   auto layout =
       options.image
-          ? BuildImageTextLayout(options.text_rows,
+          ? BuildImageEditLayout(options.text_rows, reference_placements,
                                  options.geometry.latent_height,
                                  options.geometry.latent_width, error)
           : BuildReferenceLayout(options.text_rows, options.geometry,
