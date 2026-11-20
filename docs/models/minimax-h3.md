@@ -5,7 +5,7 @@ text-to-video-and-audio path, FL2VA, from BF16 weights and writes an MP4.
 
 It can also start from a first frame, end on a last frame, or both; see
 [gufo-studio-windows additions](#gufo-studio-windows-additions) for the rest.
-Image references, reference videos (Ref2VA) and 2K regeneration aren't supported.
+Since 2.2.12 Ref2VA references (images, videos, audio; `gufo.references`) and the Fun-ControlNet-Union (`gufo.control`) are built in (unit-tested; see [gufo-studio-windows additions](#gufo-studio-windows-additions)). 2K regeneration isn't supported.
 
 ## Files
 

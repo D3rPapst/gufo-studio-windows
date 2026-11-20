@@ -766,7 +766,7 @@ relay waits for upstream bytes with poll(), not with SO_RCVTIMEO, which
 Winsock leaves "in an indeterminate state" after a timeout.
 Video job ids returned by `POST /v1/videos` are recorded with their
 model: while a tracked job is non-terminal its worker is exempt from
-eviction and idle unload. Since 2.2.13 a status or content read of a
+eviction and idle unload. Since 2.2.12 a status or content read of a
 recorded local job that is finished on disk (`<root>/<id>/job.json`
 `completed`, `failed` or `cancelled`) is answered by the router from that
 folder without loading the worker (see "Finished jobs are read from the
@@ -2043,11 +2043,11 @@ residency planner (`PlanAdmission`) does not know whether a load serves a
 relayed request, and a waiting `/content` read is not a pool waiter; it
 would need the forwarded flag through `AdmitLocked` into the plan and a
 "wanted soon" mark per model (pool waiters, adapter tasks, recent job
-reads). The cheaper fix for the case above is built in 2.2.13 (next
+reads). The cheaper fix for the case above is built in 2.2.12 (next
 section): the `/content` of a finished video job no longer needs its
 worker, so an evicted video model is not reloaded for it at all.
 
-#### Finished jobs are read from the job folder (2.2.13)
+#### Finished jobs are read from the job folder (2.2.12)
 
 `gufo serve video` and `gufo serve objekt` keep each job in
 `<root>/<id>/` (`root` of the preset section, the worker's `--root`):
