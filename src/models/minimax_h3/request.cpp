@@ -1061,11 +1061,14 @@ bool PrepareRequest(const ext::VideoRequestInput& input,
 namespace {
 // A control input video decoded with FFmpeg into `frames` (at most `limit`
 // frames); `gray` keeps the red channel (ComfyUI's ImageToMask) as the
-// mask.
+// mask. `to_24_fps` resamples the frames onto 24 fps first
+// (ReferenceSourceFrame), as the reference pipelines do with reference
+// videos.
 bool DecodeControlFrames(const std::vector<std::uint8_t>& bytes,
                          const std::filesystem::path& work_directory,
                          const std::string& name, int limit, bool gray,
-                         ControlFrames* frames, std::string* error) {
+                         ControlFrames* frames, std::string* error,
+                         bool to_24_fps = false) {
   std::error_code ignored;
   std::filesystem::create_directories(work_directory, ignored);
   const std::filesystem::path path = work_directory / (name + ".mp4");
@@ -1095,14 +1098,27 @@ bool DecodeControlFrames(const std::vector<std::uint8_t>& bytes,
   const std::size_t pixels = static_cast<std::size_t>(info.width) *
                              static_cast<std::size_t>(info.height);
   std::vector<std::uint8_t> frame(pixels * 3U);
+  int read = 0;  // source frames read so far; `frame` holds read - 1
+  bool ended = false;
   while (frames->frames < limit) {
-    bool end = false;
-    if (!reader.Read(frame.data(), &end, error)) {
-      if (!end) {
-        reader.Close();
-        return false;
+    const int wanted =
+        to_24_fps ? ReferenceSourceFrame(frames->frames, info.fps_num,
+                                         info.fps_den)
+                  : frames->frames;
+    while (read <= wanted) {
+      bool end = false;
+      if (!reader.Read(frame.data(), &end, error)) {
+        if (!end) {
+          reader.Close();
+          return false;
+        }
+        error->clear();
+        ended = true;
+        break;
       }
-      error->clear();
+      ++read;
+    }
+    if (ended || read == 0) {
       break;
     }
     if (gray) {
@@ -1319,7 +1335,8 @@ bool DecodePreparedRequest(const ext::VideoRequest& request,
           if (!DecodeControlFrames(*bytes, work_directory,
                                    "reference_video_" + std::to_string(index),
                                    request.parameters.frames, false,
-                                   &reference.frames, error))
+                                   &reference.frames, error,
+                                   /*to_24_fps=*/true))
             return false;
           if (const json::Value* audio = item.find("audio")) {
             const auto* sound = attachment(audio->str());
