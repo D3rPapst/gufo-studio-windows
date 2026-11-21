@@ -107,17 +107,79 @@ with HTTP 500.
 ### Token budget (2.2.16)
 
 The release has no limit on the whole presentation; gufo's encoder
-(`EncodePromptLayer50`, `kPromptEncoderMaximumTokens`) takes 4,096. The vision
+(`EncodePromptLayer50`, `kPromptEncoderMaximumTokens`) took 4,096. The vision
 copies are not shrunk (the release always brings their short edge to 1024, so
 shrinking them would change the conditioning). Instead
 `CountImageEditTokens` / `CheckImageEditTokenBudget` (`image_edit.cpp`) count
 labels, markers, vision rows and the cut prompt from the upload sizes; the
 provider's `ValidateRequest` runs them with the release tokenizer before the
 request is queued (HTTP 400), `GenerateTextImage` repeats the check before the
-prompt child. `kH3ImageEditMaximumImages` = 3 is what the capabilities
-report: four references need at least 4,124 tokens. Raising the limit itself
-would need the encoder's 4,096 cap lifted (activations and RoPE tables scale
-linearly, attention quadratically) and a check that the DiT rows still fit.
+prompt child. Four references need at least 4,124 tokens.
+
+### Token limit from free memory (2.2.17)
+
+The encoder never needed the 4,096 cap for its buffers: activations (180,740
+bytes per token), rotary tables and the grouped attention's score scratch
+(at most 256 MiB) are allocated for the actual prompt length. Only the check
+was fixed. Now `PromptEncoderOptions::maximum_tokens` sets it (default 4,096,
+at most `kPromptEncoderTokenCeiling` = 32,768); video prompts keep 4,096.
+
+For edits `ImageEditTokenLimit` (`image_edit.cpp`) picks the largest token
+count T in [4,096, cap] for which both phases fit in the device memory that
+is free when the request is checked, minus a reserve:
+
+| Phase | Estimate |
+| --- | --- |
+| Prompt child | `PromptEncoderPhaseBytes(T)`: 6 GiB fixed (embedding table, two decoder layers in flight, GEMM workspace, vision tower, runtime) + activations + score scratch. Never the binding one. |
+| Image DiT | `ImageDitPhaseBytes`: 37 GiB fixed (resident 50-block core, 36,751 MiB of weights, heads, runtime) + 182,988 bytes per row of [text \| references \| image] (shared block workspace, rotary tables, hidden state, row maps, the first block's GEMM check buffer) + 21,504 bytes per row of the larger patch segment. |
+
+Calibration (GPU test 21.11.2026, 2.2.15, 2048 × 2048, `GUFO_H3_TRACE`):
+free device memory dropped by 38.06 GiB at 6,877 DiT rows (one 1024²
+reference) and by 38.66 GiB at 10,370 rows (three), a slope of 180 KiB per
+row; the estimate is 0.19 GiB above both. From 32,768 rows the DiT switches
+to its native projection path, which needs less per row; that path was never
+measured for images, so the estimate keeps the larger cost. The limit is
+never below 4,096: with too little or unknown free memory (no HIP, or
+`hipMemGetInfo` fails) everything stays as in 2.2.16.
+
+| Variable | Effect |
+| --- | --- |
+| `GUFO_H3_IMAGE_TOKEN_RESERVE_MIB=<m>` | Memory kept free besides the estimate; default 10,240 MiB. hipMalloc failed on this machine with 7.4 to 8.5 GiB still reported free, and other processes (dwm.exe, a model in another worker) can take memory between the check and the allocation. |
+| `GUFO_H3_IMAGE_MAX_TOKENS=<n>` | Hard cap, clamped to [4,096, 32,768]; default 32,768. `4096` switches the extension off (and `max_images` back to 3). |
+
+Malformed values keep the defaults. Who decides: the provider's
+`ValidateRequest` computes the limit before queueing (HTTP 400 with the
+numbers and the limit); `GenerateTextImage` measures again right before the
+prompt phase (the queue may have changed the free memory) and passes its
+limit to the prompt child in the request file (`maximum_tokens`, magic
+`H3P2`), so the child obeys the parent's number instead of measuring itself.
+The job telemetry has `prompt_token_limit` and `prompt_limit_free_bytes`.
+
+`max_images` in the capabilities is what the token cap allows with unlimited
+memory (16 by default, 9 with a cap of 10,000, 3 with 4,096). It cannot
+follow the free memory: `ImageService` reads the capabilities once at
+startup and rejects requests above `max_images` itself. Whether the memory
+allows a request's references is decided per request.
+
+What this gives on the 64 GB Strix Halo (53.87 GiB device memory, 53.57 GiB
+free in a production pause, default reserve, 2048 × 2048 canvas, short
+prompt):
+
+| Free at the check | Token limit (example) | Square references |
+| --- | --- | --- |
+| up to 49 GiB (e.g. 20, 30, 40 GiB; any time another model is loaded) | 4,096 | 3 (as before) |
+| 50 GiB | 8,930 with four 1024² references | six 1024², three 2048² |
+| 52 GiB | 20,665 with four 1024² references | eleven 1024², four 2048² |
+| 53.57 GiB | 6,990 with six 2048² references | fifteen 1024², six 2048² |
+| 56 GiB and more | up to 32,768 | 16 (1024²), eight or more (2048²) |
+
+Not measured yet (GPU recipe in the working notes): the prompt and DiT time
+and the real peak with 4 and 6 references at 2048², the native DiT path from
+32,768 rows, and bit-identity of 1- and 3-reference results with 2.2.16.
+Attention grows with the square of the length in both the encoder and the
+DiT, so long presentations are slow: a 3,202-token prompt took 63 s in
+2.2.16, six 2048² references (6,286 tokens, 34,958 DiT rows) will take
+several times longer.
 
 ### Slow prompt phase with long presentations
 
