@@ -40,7 +40,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr float kRmsEpsilon = 1.0e-6F;
 constexpr float kRopeTheta = 5'000'000.0F;
-constexpr std::size_t kMaximumPromptTokens = 4096;
+constexpr std::size_t kMaximumPromptTokens = kPromptEncoderMaximumTokens;
 constexpr std::size_t kGemmWorkspaceBytes = 64ULL << 20U;
 constexpr std::size_t kMaximumGemmAlgorithms = 16;
 
@@ -746,12 +746,14 @@ struct Activations {
   DeviceBuffer gate;
   DeviceBuffer up;
   DeviceBuffer mlp;
+  // Attention scores of long prompts (ops::CausalGqaScratchBytes), else empty.
+  DeviceBuffer scores;
 
   [[nodiscard]] std::uint64_t Bytes() const noexcept {
     return ids.bytes() + hidden.bytes() + norm.bytes() + query.bytes() +
            key.bytes() + rope_cosine.bytes() + rope_sine.bytes() +
            value.bytes() + attention.bytes() + projection.bytes() +
-           gate.bytes() + up.bytes() + mlp.bytes();
+           gate.bytes() + up.bytes() + mlp.bytes() + scores.bytes();
   }
 };
 
@@ -796,7 +798,12 @@ bool AllocateActivations(std::size_t tokens, Activations* activations,
                        tokens * kPromptEncoderIntermediateSize) &&
          allocate_bf16(&activations->up,
                        tokens * kPromptEncoderIntermediateSize) &&
-         allocate_bf16(&activations->mlp, tokens * kPromptEncoderHiddenSize);
+         allocate_bf16(&activations->mlp, tokens * kPromptEncoderHiddenSize) &&
+         activations->scores.Allocate(
+             ops::CausalGqaScratchBytes(
+                 static_cast<std::uint32_t>(tokens), kPromptEncoderQueryHeads,
+                 kPromptEncoderKeyValueHeads, kPromptEncoderHeadDimension),
+             error);
 }
 
 bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
@@ -879,7 +886,7 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
       kPromptEncoderQueryHeads, kPromptEncoderKeyValueHeads,
       kPromptEncoderHeadDimension,
       1.0F / std::sqrt(static_cast<float>(kPromptEncoderHeadDimension)),
-      stream);
+      stream, activations->scores.As<float>());
   if (!gemm->Run(output_weight, activations->attention.As<std::uint16_t>(),
                  activations->projection.As<std::uint16_t>(), tokens,
                  kPromptEncoderHiddenSize,
@@ -978,7 +985,9 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     *telemetry = {};
   }
   if (token_ids.size() > kMaximumPromptTokens) {
-    SetError(error, "MiniMax H3 prompt exceeds 4096 tokens");
+    SetError(error, "MiniMax H3 prompt has " +
+                        std::to_string(token_ids.size()) +
+                        " tokens, more than the 4096 the encoder takes");
     return false;
   }
   if (output == nullptr || telemetry == nullptr || token_ids.empty() ||

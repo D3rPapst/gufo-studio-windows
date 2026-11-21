@@ -303,14 +303,21 @@ static __global__ void CausalGqaKernel(
   }
 }
 
+// One block per (query row, key/value head) for all query heads of the group.
+// The scores of a row live in shared memory (`global_scores` null; the row
+// is blockIdx.x) or, for prompts too long for that, in a global scratch of
+// gridDim.x rows starting at `row_offset` (row = row_offset + blockIdx.x,
+// scratch [blockIdx.x][key_value_head][grouped][sequence]). Both run the
+// same arithmetic in the same order, so their results are bit-identical.
 static __global__ void GroupedCausalGqaKernel(
     const std::uint16_t* query, const std::uint16_t* key,
     const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
     std::uint32_t query_heads, std::uint32_t key_value_heads,
-    std::uint32_t head_dimension, float scale) {
+    std::uint32_t head_dimension, float scale, std::uint32_t row_offset,
+    float* global_scores) {
   constexpr std::uint32_t kMaximumGroupedHeads = 8;
   constexpr std::uint32_t kLogicalLanes = 128;
-  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t query_row = row_offset + blockIdx.x;
   const std::uint32_t key_value_head = blockIdx.y;
   const std::uint32_t lane = threadIdx.x;
   const std::uint32_t grouped_heads = query_heads / key_value_heads;
@@ -322,6 +329,13 @@ static __global__ void GroupedCausalGqaKernel(
   float* scores = shared;
   float* shared_queries =
       scores + static_cast<std::size_t>(grouped_heads) * sequence;
+  if (global_scores != nullptr) {
+    scores = global_scores +
+             (static_cast<std::size_t>(blockIdx.x) * key_value_heads +
+              key_value_head) *
+                 grouped_heads * sequence;
+    shared_queries = shared;
+  }
   float* reductions =
       shared_queries + static_cast<std::size_t>(grouped_heads) * head_dimension;
   for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
@@ -450,28 +464,115 @@ static __global__ void GroupedCausalGqaKernel(
   }
 }
 
+/// Score scratch of the long-prompt grouped attention: at most this many
+/// bytes, as whole query rows of key_value_heads x grouped x sequence floats.
+inline constexpr std::size_t kGroupedScoreScratchBytes = 256ULL << 20U;
+
+/// Query rows per launch of the long-prompt grouped attention (0 when the
+/// head layout is not grouped).
+inline std::uint32_t GroupedScoreScratchRows(std::uint32_t sequence,
+                                             std::uint32_t query_heads) {
+  const std::size_t row_bytes =
+      static_cast<std::size_t>(sequence) * query_heads * sizeof(float);
+  if (row_bytes == 0) {
+    return 0;
+  }
+  const std::size_t rows = kGroupedScoreScratchBytes / row_bytes;
+  return static_cast<std::uint32_t>(
+      rows == 0 ? 1 : (rows < sequence ? rows : sequence));
+}
+
+/// Grouped causal attention with the scores in `scratch` (at least
+/// GroupedScoreScratchRows(sequence, query_heads) rows), launched in row
+/// chunks; same results as the shared-memory kernel, any sequence length.
+inline void LaunchGroupedCausalGqaScratch(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t query_heads, std::uint32_t key_value_heads,
+    std::uint32_t head_dimension, float scale, float* scratch,
+    hipStream_t stream) {
+  const std::uint32_t grouped_heads = query_heads / key_value_heads;
+  const std::size_t shared_bytes =
+      (static_cast<std::size_t>(head_dimension) * grouped_heads + 128U) *
+      sizeof(float);
+  const std::uint32_t chunk = GroupedScoreScratchRows(sequence, query_heads);
+  for (std::uint32_t row = 0; row < sequence; row += chunk) {
+    const std::uint32_t rows = sequence - row < chunk ? sequence - row : chunk;
+    hipLaunchKernelGGL(GroupedCausalGqaKernel, dim3(rows, key_value_heads),
+                       dim3(64), shared_bytes, stream, query, key, value,
+                       output, sequence, query_heads, key_value_heads,
+                       head_dimension, scale, row, scratch);
+  }
+}
+
+namespace detail {
+inline constexpr std::size_t kMaximumGroupedSharedBytes = 48U << 10U;
+
+inline bool GroupedLayout(std::uint32_t query_heads,
+                          std::uint32_t key_value_heads) {
+  return key_value_heads != 0 && query_heads % key_value_heads == 0 &&
+         query_heads / key_value_heads <= 8;
+}
+
+inline std::size_t GroupedSharedBytes(std::uint32_t sequence,
+                                      std::uint32_t query_heads,
+                                      std::uint32_t key_value_heads,
+                                      std::uint32_t head_dimension) {
+  const std::uint32_t grouped_heads = query_heads / key_value_heads;
+  return (static_cast<std::size_t>(sequence) * grouped_heads +
+          static_cast<std::size_t>(head_dimension) * grouped_heads + 128U) *
+         sizeof(float);
+}
+}  // namespace detail
+
+/// Bytes of score scratch LaunchCausalGqa needs for `sequence` (0 when the
+/// scores fit in shared memory or the layout is not grouped).
+inline std::size_t CausalGqaScratchBytes(std::uint32_t sequence,
+                                         std::uint32_t query_heads,
+                                         std::uint32_t key_value_heads,
+                                         std::uint32_t head_dimension) {
+  if (!detail::GroupedLayout(query_heads, key_value_heads) ||
+      detail::GroupedSharedBytes(sequence, query_heads, key_value_heads,
+                                 head_dimension) <=
+          detail::kMaximumGroupedSharedBytes) {
+    return 0;
+  }
+  return static_cast<std::size_t>(
+             GroupedScoreScratchRows(sequence, query_heads)) *
+         sequence * query_heads * sizeof(float);
+}
+
+/// Causal grouped-query attention. Short prompts keep the scores in shared
+/// memory; longer ones (over ~1390 tokens with 8 query heads per key/value
+/// head) need `scratch` of CausalGqaScratchBytes bytes. Without it they fall
+/// back to the per-head kernel, which reads every key and value once per
+/// query head and is several times slower (a 3200-token edit prompt took
+/// minutes; docs/models/minimax-h3-image.md).
 inline void LaunchCausalGqa(const std::uint16_t* query,
                             const std::uint16_t* key,
                             const std::uint16_t* value, std::uint16_t* output,
                             std::uint32_t sequence, std::uint32_t query_heads,
                             std::uint32_t key_value_heads,
                             std::uint32_t head_dimension, float scale,
-                            hipStream_t stream) {
-  const std::uint32_t grouped_heads =
-      key_value_heads == 0 ? 0 : query_heads / key_value_heads;
-  const std::size_t grouped_shared_bytes =
-      (static_cast<std::size_t>(sequence) * grouped_heads +
-       static_cast<std::size_t>(head_dimension) * grouped_heads + 128U) *
-      sizeof(float);
-  constexpr std::size_t kMaximumGroupedSharedBytes = 48U << 10U;
-  if (key_value_heads != 0 && query_heads % key_value_heads == 0 &&
-      grouped_heads <= 8 &&
-      grouped_shared_bytes <= kMaximumGroupedSharedBytes) {
-    hipLaunchKernelGGL(GroupedCausalGqaKernel, dim3(sequence, key_value_heads),
-                       dim3(64), grouped_shared_bytes, stream, query, key,
-                       value, output, sequence, query_heads, key_value_heads,
-                       head_dimension, scale);
-    return;
+                            hipStream_t stream, float* scratch = nullptr) {
+  if (detail::GroupedLayout(query_heads, key_value_heads)) {
+    const std::size_t grouped_shared_bytes = detail::GroupedSharedBytes(
+        sequence, query_heads, key_value_heads, head_dimension);
+    if (grouped_shared_bytes <= detail::kMaximumGroupedSharedBytes) {
+      hipLaunchKernelGGL(GroupedCausalGqaKernel,
+                         dim3(sequence, key_value_heads), dim3(64),
+                         grouped_shared_bytes, stream, query, key, value,
+                         output, sequence, query_heads, key_value_heads,
+                         head_dimension, scale, 0U,
+                         static_cast<float*>(nullptr));
+      return;
+    }
+    if (scratch != nullptr) {
+      LaunchGroupedCausalGqaScratch(query, key, value, output, sequence,
+                                    query_heads, key_value_heads,
+                                    head_dimension, scale, scratch, stream);
+      return;
+    }
   }
   const std::size_t shared_bytes =
       (static_cast<std::size_t>(sequence) + head_dimension + 128U) *

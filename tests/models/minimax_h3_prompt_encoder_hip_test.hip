@@ -265,6 +265,91 @@ void CheckAttentionKernel() {
   }
 }
 
+// Long prompts: the grouped kernel with its scores in a global scratch (row
+// chunks) must match the shared-memory grouped kernel bit for bit, and past
+// the shared-memory limit it must agree with the per-head fallback.
+void CheckLongAttentionKernel() {
+  constexpr std::uint32_t kQueryHeads = 16;
+  constexpr std::uint32_t kKeyValueHeads = 2;
+  constexpr std::uint32_t kHeadDimension = 128;
+  const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDimension));
+  const auto fill = [](std::vector<std::uint16_t>* values, std::uint32_t salt) {
+    std::uint32_t state = 0x9E3779B9U ^ salt;
+    for (std::uint16_t& value : *values) {
+      state = state * 1664525U + 1013904223U;
+      value = ToBf16(static_cast<float>(static_cast<int>(state >> 9U) %
+                                        2001 - 1000) /
+                     500.0F);
+    }
+  };
+  const auto run = [&](std::uint32_t sequence, int mode,
+                       std::vector<std::uint16_t>* output) {
+    std::vector<std::uint16_t> query(static_cast<std::size_t>(sequence) *
+                                     kQueryHeads * kHeadDimension);
+    std::vector<std::uint16_t> key(static_cast<std::size_t>(sequence) *
+                                   kKeyValueHeads * kHeadDimension);
+    std::vector<std::uint16_t> value(key.size());
+    fill(&query, 1);
+    fill(&key, 2);
+    fill(&value, 3);
+    DeviceArray<std::uint16_t> d_query(query.size());
+    DeviceArray<std::uint16_t> d_key(key.size());
+    DeviceArray<std::uint16_t> d_value(value.size());
+    DeviceArray<std::uint16_t> d_output(query.size());
+    const std::size_t scratch_floats =
+        static_cast<std::size_t>(
+            h3ops::GroupedScoreScratchRows(sequence, kQueryHeads)) *
+        sequence * kQueryHeads;
+    DeviceArray<float> d_scratch(scratch_floats);
+    CHECK(d_query && d_key && d_value && d_output && d_scratch);
+    CHECK(d_query.CopyFrom(query));
+    CHECK(d_key.CopyFrom(key));
+    CHECK(d_value.CopyFrom(value));
+    if (mode == 0) {  // shared memory or fallback, as LaunchCausalGqa picks
+      h3ops::LaunchCausalGqa(d_query.get(), d_key.get(), d_value.get(),
+                             d_output.get(), sequence, kQueryHeads,
+                             kKeyValueHeads, kHeadDimension, scale, nullptr);
+    } else {  // grouped with the global score scratch
+      h3ops::LaunchGroupedCausalGqaScratch(
+          d_query.get(), d_key.get(), d_value.get(), d_output.get(), sequence,
+          kQueryHeads, kKeyValueHeads, kHeadDimension, scale, d_scratch.get(),
+          nullptr);
+    }
+    CHECK(hipDeviceSynchronize() == hipSuccess);
+    output->assign(query.size(), 0);
+    CHECK(d_output.CopyTo(*output));
+  };
+  // 1000 tokens fit in shared memory: both grouped paths, identical bits.
+  CHECK(h3ops::CausalGqaScratchBytes(1000, kQueryHeads, kKeyValueHeads,
+                                     kHeadDimension) == 0);
+  std::vector<std::uint16_t> shared;
+  std::vector<std::uint16_t> scratch;
+  run(1000, 0, &shared);
+  run(1000, 1, &scratch);
+  CHECK(shared == scratch);
+  // 3000 tokens do not: scratch path against the per-head fallback.
+  CHECK(h3ops::CausalGqaScratchBytes(3000, kQueryHeads, kKeyValueHeads,
+                                     kHeadDimension) > 0);
+  CHECK(h3ops::CausalGqaScratchBytes(4096, 64, 8, 128) <=
+        h3ops::kGroupedScoreScratchBytes);
+  std::vector<std::uint16_t> fallback;
+  run(3000, 0, &fallback);
+  run(3000, 1, &scratch);
+  CHECK(fallback.size() == scratch.size());
+  float worst = 0.0F;
+  for (std::size_t index = 0; index < std::min(fallback.size(), scratch.size());
+       ++index) {
+    const float a = ToFloat(fallback[index]);
+    const float b = ToFloat(scratch[index]);
+    CHECK(std::isfinite(b));
+    worst = std::max(worst, std::abs(a - b) / std::max(1.0F, std::abs(a)));
+  }
+  CHECK(worst <= 0.02F);
+  std::cout << "long attention: shared==scratch bitwise, scratch vs fallback "
+               "max relative "
+            << worst << '\n';
+}
+
 bool CheckAnalytic() {
   int device = 0;
   hipDeviceProp_t properties{};
@@ -278,6 +363,7 @@ bool CheckAnalytic() {
   CheckRmsNormKernel();
   CheckHeadNormRopeKernels();
   CheckAttentionKernel();
+  CheckLongAttentionKernel();
   CHECK(PromptEncoderLiveRegisteredHostBytes() == 0);
   return true;
 }
