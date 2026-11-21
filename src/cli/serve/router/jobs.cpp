@@ -31,6 +31,7 @@
 #include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/proxy.hpp"
 #include "src/cli/serve/router/strings.hpp"
+#include "src/cli/serve/router/video_seam.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 namespace gufo::router::jobs {
@@ -4409,6 +4410,14 @@ void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
       throw invalid("'reencode' must be true or false");
     reencode = flag->as_bool();
   }
+  // 2.2.16: smoothing at the seams (video_seam.hpp); off by default.
+  seam::Options seam_options;
+  {
+    std::string seam_error;
+    if (!seam::ParseOptions(body.find("seam"), "'seam'", &seam_options,
+                            &seam_error))
+      throw invalid(seam_error);
+  }
 
   // Inputs: a result file of a finished job here, or a data URL. Each is
   // resolved first so a bad list fails before any ffmpeg call.
@@ -4523,7 +4532,87 @@ void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
                     "): " + error);
     infos.push_back(std::move(info));
   }
-  const std::string mode = ConcatMode(infos, reencode);
+
+  // Seam smoothing: each clip after the first is decoded to RGB, corrected
+  // towards the (corrected) last frame of the clip before (the frame the
+  // page started it from) and stored again losslessly with its own sound;
+  // the join then re-encodes.
+  json::Value seam_report = json::Value::array();
+  if (seam_options.Enabled()) {
+    for (std::size_t i = 1; i < infos.size(); ++i)
+      if (infos[i].width != infos[0].width ||
+          infos[i].height != infos[0].height)
+        throw invalid("'seam' needs clips of one size: videos[" +
+                      std::to_string(i) + "] is " +
+                      std::to_string(infos[i].width) + "x" +
+                      std::to_string(infos[i].height) + ", videos[0] " +
+                      std::to_string(infos[0].width) + "x" +
+                      std::to_string(infos[0].height));
+    const int width = infos[0].width;
+    const int height = infos[0].height;
+    const auto run_ffmpeg = [&](std::vector<fs::path> run_args,
+                                const std::string& what) {
+      std::vector<fs::path> full = {"-hide_banner", "-loglevel", "error",
+                                    "-nostdin", "-y"};
+      full.insert(full.end(), run_args.begin(), run_args.end());
+      const fs::path run_out = work.path / "seam.out";
+      const fs::path run_err = work.path / "seam.err";
+      std::string run_error;
+      const int run_code =
+          RunCaptured(options_.ffmpeg, full, std::chrono::minutes(30), run_out,
+                      run_err, cancel, &run_error);
+      if (run_error == "cancelled")
+        throw Cancelled();
+      if (run_code != 0)
+        throw failed("ffmpeg (seam, " + what + ") failed: " +
+                     (run_error.empty() ? TailOf(ReadIfThere(run_err), 800)
+                                        : run_error));
+    };
+    std::vector<std::uint8_t> previous_last;
+    for (std::size_t i = 0; i < clips.size(); ++i) {
+      check_cancel();
+      const std::string n = std::to_string(i + 1);
+      const fs::path raw = work.path / ("raw-" + n + ".rgb");
+      run_ffmpeg({"-i", clips[i], "-map", "0:v:0", "-f", "rawvideo",
+                  "-pix_fmt", "rgb24", raw},
+                 "decode videos[" + std::to_string(i) + "]");
+      std::string seam_error;
+      if (i == 0) {
+        const bool ok =
+            seam::LastRawFrame(raw, width, height, &previous_last, &seam_error);
+        fs::remove(raw, ec);
+        if (!ok)
+          throw failed("videos[0]: " + seam_error);
+        continue;
+      }
+      seam::Stats stats;
+      std::vector<std::uint8_t> last;
+      if (!seam::CorrectRawFile(raw, width, height, previous_last,
+                                seam_options, &stats, &last, &seam_error)) {
+        fs::remove(raw, ec);
+        throw failed("videos[" + std::to_string(i) + "]: " + seam_error);
+      }
+      previous_last = std::move(last);
+      const fs::path smooth = work.path / ("seam-" + n + ".mp4");
+      std::vector<fs::path> encode = {
+          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s",
+          std::to_string(width) + "x" + std::to_string(height), "-framerate",
+          infos[i].frame_rate.empty() ? std::string("16") : infos[i].frame_rate,
+          "-i", raw, "-i", clips[i], "-map", "0:v:0", "-map", "1:a:0?",
+          "-c:v", "libx264rgb", "-qp", "0", "-pix_fmt", "rgb24", "-c:a",
+          "copy", smooth};
+      run_ffmpeg(std::move(encode), "encode videos[" + std::to_string(i) + "]");
+      fs::remove(raw, ec);
+      clips[i] = smooth;
+      json::Value entry = seam::StatsJson(stats);
+      entry["video"] = static_cast<int>(i);
+      Logger::Info("jobs", "event=concat_seam video=" + std::to_string(i) +
+                               " " + seam::FormatStats(stats));
+      seam_report.push_back(std::move(entry));
+    }
+  }
+  const std::string mode =
+      ConcatMode(infos, reencode || seam_options.Enabled());
   check_cancel();
 
   std::vector<fs::path> args = {"-hide_banner", "-loglevel", "error",
@@ -4632,6 +4721,11 @@ void JobQueue::ConcatVideos(const json::Value& body, const fs::path& output,
     json::Value result = json::Value::object();
     result["mode"] = mode;
     result["reencode"] = mode == "reencode";
+    if (seam_options.Enabled()) {
+      json::Value seam_summary = seam::OptionsJson(seam_options);
+      seam_summary["seams"] = std::move(seam_report);
+      result["seam"] = std::move(seam_summary);
+    }
     json::Value list = json::Value::array();
     double total = 0;
     for (std::size_t i = 0; i < inputs.size(); ++i) {

@@ -39,6 +39,7 @@ add_library(gufo_router STATIC
   src/cli/serve/router/rgba_image.cpp
   src/cli/serve/router/router.cpp
   src/cli/serve/router/selbsttest.cpp
+  src/cli/serve/router/video_seam.cpp
   src/cli/serve/router/vision.cpp
   src/cli/serve/router/vision_chat.cpp
   src/cli/serve/router/vision_fingers.cpp
@@ -154,6 +155,16 @@ if (BUILD_TESTING)
     set_tests_properties(${router_test} PROPERTIES LABELS "cpu;router"
       TIMEOUT 30)
   endforeach()
+
+  # Seam smoothing of chained videos (2.2.16): CPU only, no ffmpeg.
+  add_executable(router_video_seam_test tests/cli/router_video_seam_test.cpp
+    src/cli/serve/router/video_seam.cpp)
+  target_include_directories(router_video_seam_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_features(router_video_seam_test PRIVATE cxx_std_20)
+  target_compile_options(router_video_seam_test PRIVATE ${gufo_router_test_undebug})
+  add_test(NAME router_video_seam_test COMMAND router_video_seam_test)
+  set_tests_properties(router_video_seam_test PROPERTIES LABELS "cpu;router"
+    TIMEOUT 30)
 
   # The ComfyUI prompt limit (own + partner) and the adapter's pool wait
   # rules (2.2.6): header only.

@@ -326,6 +326,15 @@ private:
   /// the outputs' chain_frames joined from the chunks' videos.
   json::Value RunI2VChain(const std::shared_ptr<Job>& job, const Task& task,
                           const VideoTask& spec);
+  /// 2.2.16 extra_data.gufo_seam (video_seam.hpp): chunk `part` (rendered
+  /// from the start frame `start_png`) corrected towards that frame and
+  /// written again as a lossless MP4; answers the new file (the caller
+  /// removes both), or `part` with a gufo_warning when it cannot.
+  std::filesystem::path SmoothSeam(const std::shared_ptr<Job>& job,
+                                   const Task& task, const VideoTask& chunk,
+                                   int index,
+                                   const std::filesystem::path& start_png,
+                                   const std::filesystem::path& part);
   /// The /v1/videos body of `spec` with its media as data URLs.
   json::Value VideoBody(const std::shared_ptr<Job>& job, const Task& task,
                         const VideoTask& spec);
