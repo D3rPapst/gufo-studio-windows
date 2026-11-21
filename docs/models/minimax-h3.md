@@ -136,7 +136,9 @@ gufo serve --port 8080 image --model /models/MiniMax-H3-Image \
   `gufo.min_generation_area` (default 2048 × 2048) is generated larger and
   resized back with Lanczos.
 - `POST /v1/images/edits` (multipart, needs `--h3-vision-projector` or
-  `GUFO_H3_VISION_PROJECTOR`): 1 to 3 `image` parts, in upload order
+  `GUFO_H3_VISION_PROJECTOR`): 1 to 16 `image` parts (3 always fit, more
+  only with enough free device memory; see the reference limit below), in
+  upload order
   `<Picture 1>`, `<Picture 2>`, … in the prompt, within the host's 20 MiB /
   32 MP upload limit. No `mask` or `init_image`. Form fields `gufo.<name>`
   (for example `gufo.min_generation_area`) work as in the JSON body. Each reference is used twice,
@@ -150,15 +152,33 @@ gufo serve --port 8080 image --model /models/MiniMax-H3-Image \
   gufo every time but not the image of diffusers or SGLang for that seed.
 
 **Reference limit.** The release accepts up to 16 references and cuts only the
-prompt and each label to 4,096 tokens. gufo's text encoder takes 4,096 tokens
-for everything together: per reference its label (5 tokens, 6 from
+prompt and each label to 4,096 tokens. In gufo everything together goes
+through the text encoder: per reference its label (5 tokens, 6 from
 `Picture 10`), two vision markers and (short side scaled to 1024 px / 32) ×
 (long side / 32) vision tokens, then the prompt. A square image costs 1,031
-tokens whatever its size (small images are scaled up), a 16:9 one 1,831. So
-at most 3 references fit (`max_images` is 3); three squares leave 1,003 tokens
-for the prompt. A request over the budget is rejected before any GPU work
-with HTTP 400 `invalid_request` and the numbers, for example 1024² + 1500×1100
-+ 1000×557 with a 109-token prompt needs 4,386 tokens.
+tokens whatever its size (small images are scaled up), a 16:9 one 1,831.
+
+4,096 tokens always fit: three squares, leaving 1,003 tokens for the prompt.
+More are accepted only when the device memory that is free when the request
+arrives holds the longer prompt phase and the image transformer with the
+extra rows (about 37 GiB plus about 180 KiB per row of text, references and
+image), plus a reserve of 10 GiB. On a 64 GB Strix Halo that is the case only
+while no other model is loaded: with 53.6 GiB free, fifteen 1024² or six
+2048² references fit; with 49 GiB or less it stays at three. Two environment
+variables of the server tune it:
+
+| Variable | Effect |
+| --- | --- |
+| `GUFO_H3_IMAGE_TOKEN_RESERVE_MIB` | Memory kept free (default 10240). |
+| `GUFO_H3_IMAGE_MAX_TOKENS` | Hard cap between 4096 and 32768 (default 32768); 4096 restores the fixed limit of three references. |
+
+`max_images` in the capabilities reports what the cap allows (16 by default),
+because the server reads it once at startup; the memory is checked per
+request. A request over its limit is rejected before any GPU work with HTTP
+400 `invalid_request`, the numbers and the current limit, for example 1024²
++ 1500×1100 + 1000×557 with a 109-token prompt needs 4,386 tokens. Long
+presentations are slow (attention grows with the square of the length);
+timings for more than three references are not measured yet.
 
 **Time** on a Strix Halo (gfx1151, 128 GB), 2048 × 2048 output, measured
 21.11.2026 with 2.2.15 builds: one 1024² reference 160 s (prompt phase 58 s),
