@@ -883,6 +883,16 @@ std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
 void TraceStage(const char*) {}
 
 void ClearDeviceError() {}
+
+bool DeviceMemoryInfo(std::uint64_t* free_bytes, std::uint64_t* total_bytes) {
+  if (free_bytes != nullptr) {
+    *free_bytes = 0;
+  }
+  if (total_bytes != nullptr) {
+    *total_bytes = 0;
+  }
+  return false;
+}
 #endif
 
 PhaseSession::~PhaseSession() {

@@ -40,7 +40,6 @@ using Clock = std::chrono::steady_clock;
 
 constexpr float kRmsEpsilon = 1.0e-6F;
 constexpr float kRopeTheta = 5'000'000.0F;
-constexpr std::size_t kMaximumPromptTokens = kPromptEncoderMaximumTokens;
 constexpr std::size_t kGemmWorkspaceBytes = 64ULL << 20U;
 constexpr std::size_t kMaximumGemmAlgorithms = 16;
 
@@ -984,10 +983,16 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
   if (telemetry != nullptr) {
     *telemetry = {};
   }
-  if (token_ids.size() > kMaximumPromptTokens) {
+  // Buffers follow the actual length; the limit is the caller's (4096
+  // unless an image edit raised it from free device memory).
+  const std::size_t maximum_tokens =
+      std::min(options.maximum_tokens, kPromptEncoderTokenCeiling);
+  if (token_ids.size() > maximum_tokens) {
     SetError(error, "MiniMax H3 prompt has " +
                         std::to_string(token_ids.size()) +
-                        " tokens, more than the 4096 the encoder takes");
+                        " tokens, more than the " +
+                        std::to_string(maximum_tokens) +
+                        " the encoder takes for this request");
     return false;
   }
   if (output == nullptr || telemetry == nullptr || token_ids.empty() ||

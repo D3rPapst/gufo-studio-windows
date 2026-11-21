@@ -32,6 +32,10 @@ struct PromptIsolationInput {
   std::span<const KeyframeImage> images;
   std::span<const std::uint32_t> tokens;
   std::span<const PromptVisionBlock> blocks;
+  // PromptEncoderOptions::maximum_tokens of the child's encoder call: the
+  // parent decides it (image edits from free memory) and the child obeys,
+  // so both sides agree whatever the child measures.
+  std::size_t maximum_tokens{kPromptEncoderMaximumTokens};
 };
 
 /// True on Windows HIP builds unless GUFO_H3_PROMPT_INPROCESS=1.
