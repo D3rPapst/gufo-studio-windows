@@ -153,7 +153,9 @@ public:
     const hipError_t status = hipMalloc(&data_, bytes);
     if (status != hipSuccess) {
       (void)hipGetLastError();  // no stale error for a later peek
-      SetError(error, HipError("hipMalloc MiniMax H3 denoiser", status));
+      SetError(error, HipError("hipMalloc MiniMax H3 denoiser (" +
+                                   std::to_string(bytes >> 20U) + " MiB)",
+                               status));
       return false;
     }
     bytes_ = bytes;
@@ -839,9 +841,12 @@ struct DenoiserSession::Impl {
 
   // How many control blocks stay on the device; the rest take turns in one
   // reloaded slot (RunControl). GUFO_H3_CONTROL_RESIDENT=<n> forces n;
-  // otherwise as many as fit while GUFO_H3_CONTROL_RESERVE_MIB (default
-  // 8704) stays free for the heads, the I/O buffers and the driver (on the
-  // 64 GB Strix Halo, hipMalloc failed with ~7.4 GiB still reported free).
+  // GUFO_H3_CONTROL_RESERVE_MIB=<m> keeps as many as fit while m MiB stay
+  // free for the heads, the I/O buffers and the driver. Without either, all
+  // blocks stay resident as before 2.2.16: on the 64 GB Strix Halo the
+  // automatic split with an 8704 MiB reserve ran out of memory even for a
+  // 256 x 256 control job (hipMalloc failed with 8.5 GiB still reported
+  // free), so streaming stays opt-in until its budget is measured.
   std::size_t ControlResidentBlocks(std::size_t count,
                                     std::uint64_t block_bytes) {
     if (const char* forced = std::getenv("GUFO_H3_CONTROL_RESIDENT")) {
@@ -849,12 +854,14 @@ struct DenoiserSession::Impl {
       return static_cast<std::size_t>(
           std::clamp<long>(value, 0L, static_cast<long>(count)));
     }
-    std::uint64_t reserve = 8704ULL << 20U;
-    if (const char* value = std::getenv("GUFO_H3_CONTROL_RESERVE_MIB")) {
-      reserve = static_cast<std::uint64_t>(
-                    std::max(0LL, std::strtoll(value, nullptr, 10)))
-                << 20U;
+    const char* value = std::getenv("GUFO_H3_CONTROL_RESERVE_MIB");
+    if (value == nullptr || *value == '\0') {
+      return count;
     }
+    const std::uint64_t reserve =
+        static_cast<std::uint64_t>(
+            std::max(0LL, std::strtoll(value, nullptr, 10)))
+        << 20U;
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {

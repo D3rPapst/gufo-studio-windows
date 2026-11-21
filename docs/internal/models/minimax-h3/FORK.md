@@ -144,20 +144,22 @@ keys, so attention is still the largest part at 3,000+ tokens. A tiled
 that. Measure: `GUFO_H3_PROMPT_INPROCESS=1` + the layer telemetry
 (`gpu_ms` per layer) for prompts of 300, 1,750 and 3,200 tokens, before and
 after; compare `prompt_ms - vision_ms` in the `event=generated` telemetry.
-||||||| d9870b008
 
 ## Fun-ControlNet memory and reference videos (2.2.16)
 
 The Fun-ControlNet-Union 2.0 adds 10 control blocks (about 7.2 GiB) to the
-resident DiT core. When they do not all fit (a 512 × 512, 5 s control job on
-a 64 GB Strix Halo), the denoiser keeps as many as fit on the device and
-loads the others, one at a time, into one shared block slot while the base
-blocks before them run. The math is unchanged. Environment variables:
+resident DiT core. By default all of them stay on the device, as before.
+Optionally the denoiser keeps only some of them resident and loads the
+others, one at a time, into one shared block slot while the base blocks
+before them run. The math is unchanged. This streaming is opt-in: with an
+automatic 8704 MiB reserve it ran out of memory on the 64 GB Strix Halo even
+for a 256 × 256 control job (hipMalloc failed with 8.5 GiB still reported
+free), so its memory budget still has to be measured. Environment variables:
 
 | Variable | Effect |
 | --- | --- |
 | `GUFO_H3_CONTROL_RESIDENT=<n>` | Keep exactly n control blocks resident (0 to all); the rest stream through the slot. |
-| `GUFO_H3_CONTROL_RESERVE_MIB=<m>` | Without the variable above: memory left free after the control blocks (default 8704). On the 64 GB machine hipMalloc failed with about 7.4 GiB still reported free. |
+| `GUFO_H3_CONTROL_RESERVE_MIB=<m>` | Without the variable above: keep as many blocks resident as fit while m MiB stay free; the rest stream. Unset: all blocks resident. |
 | `GUFO_H3_VAE_COLUMN_CACHE=0` | The VisualVAE clip encoder (control, guide and reference videos) im2cols every input frame once per convolution and keeps the columns (about 5.1 GB for a 17-frame 256 tile); `0` turns that off. |
 
 With `GUFO_H3_TRACE=1` the log shows `control blocks resident=R of 10`; the
