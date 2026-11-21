@@ -93,6 +93,54 @@ anchor noise per reference under seeds derived from the request seed, the
 image noise under the seed itself), so seeds are reproducible in gufo only.
 
 Status 20.11.2026: CPU unit tests (`minimax_h3_image_test`) compare the sizes,
-the layout, the presentation and the conditioning with the reference; the GPU
-path is not yet run. Memory: each 1024 × 1024 reference adds 1,024 DiT rows
-plus 1,031 text rows, a 2048 × 2048 one 4,096 + 1,031.
+the layout, the presentation and the conditioning with the reference. Memory:
+each 1024 × 1024 reference adds 1,024 DiT rows plus 1,031 text rows, a
+2048 × 2048 one 4,096 + 1,031.
+
+GPU test 21.11.2026 (2.2.15 test build, 2048 × 2048, seed 42): the release
+example with one reference 160 s (prompt 58 s for 1,757 tokens, vision tower
+3.8 s, DiT 84 s); three 1024² references 433 s (prompt 287 s for 3,202
+tokens, vision 5.6 s, DiT 122 s, peak 40.1 GB). Three references with wide
+images (1024², 1500×1100, 1000×557: 4,386 tokens) failed in the prompt child
+with HTTP 500.
+
+### Token budget (2.2.16)
+
+The release has no limit on the whole presentation; gufo's encoder
+(`EncodePromptLayer50`, `kPromptEncoderMaximumTokens`) takes 4,096. The vision
+copies are not shrunk (the release always brings their short edge to 1024, so
+shrinking them would change the conditioning). Instead
+`CountImageEditTokens` / `CheckImageEditTokenBudget` (`image_edit.cpp`) count
+labels, markers, vision rows and the cut prompt from the upload sizes; the
+provider's `ValidateRequest` runs them with the release tokenizer before the
+request is queued (HTTP 400), `GenerateTextImage` repeats the check before the
+prompt child. `kH3ImageEditMaximumImages` = 3 is what the capabilities
+report: four references need at least 4,124 tokens. Raising the limit itself
+would need the encoder's 4,096 cap lifted (activations and RoPE tables scale
+linearly, attention quadratically) and a check that the DiT rows still fit.
+
+### Slow prompt phase with long presentations
+
+Cause: `LaunchCausalGqa` (`prompt_encoder_ops.hip.hpp`) keeps a row's scores
+for all 8 query heads of a key/value group in 48 KiB of shared memory, which
+holds about 1,390 tokens. Longer prompts fell back to `CausalGqaKernel`, one
+block per query head that reads every key and value row once per head (8×
+the traffic) with uncoalesced key loads. The cost grows with the square of
+the length on top of that: about 10 s of weight streaming plus attention, 44 s
+at 1,757 tokens and 271 s at 3,202 (326-token text-to-image prompts take
+11.5 s in all).
+
+Fix (2.2.16): the grouped kernel can keep its scores in a global scratch of at
+most 256 MiB (`kGroupedScoreScratchBytes`, row chunks of up to 256 rows at
+4,096 tokens), allocated with the activations when the prompt is too long for
+shared memory. Same arithmetic in the same order, so its results equal the
+shared-memory kernel bit for bit (`minimax_h3_prompt_encoder_hip_test`
+`CheckLongAttentionKernel`); it removes the 8× head traffic. Video prompts
+with long reference blocks profit too.
+
+Still open: the key loads stay uncoalesced and every row reads all earlier
+keys, so attention is still the largest part at 3,000+ tokens. A tiled
+(flash-style) kernel or hipBLASLt batched GEMMs for QK^T and PV would remove
+that. Measure: `GUFO_H3_PROMPT_INPROCESS=1` + the layer telemetry
+(`gpu_ms` per layer) for prompts of 300, 1,750 and 3,200 tokens, before and
+after; compare `prompt_ms - vision_ms` in the `event=generated` telemetry.

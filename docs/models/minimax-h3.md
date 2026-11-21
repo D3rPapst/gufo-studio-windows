@@ -136,9 +136,10 @@ gufo serve --port 8080 image --model /models/MiniMax-H3-Image \
   `gufo.min_generation_area` (default 2048 × 2048) is generated larger and
   resized back with Lanczos.
 - `POST /v1/images/edits` (multipart, needs `--h3-vision-projector` or
-  `GUFO_H3_VISION_PROJECTOR`): 1 to 16 `image` parts, in upload order
+  `GUFO_H3_VISION_PROJECTOR`): 1 to 3 `image` parts, in upload order
   `<Picture 1>`, `<Picture 2>`, … in the prompt, within the host's 20 MiB /
-  32 MP upload limit. No `mask` or `init_image`. Each reference is used twice,
+  32 MP upload limit. No `mask` or `init_image`. Form fields `gufo.<name>`
+  (for example `gufo.min_generation_area`) work as in the JSON body. Each reference is used twice,
   as in the release: as a `Picture i: ` label with a Qwen3-VL vision block in
   front of the prompt (short edge resized to 1024), and as a VAE latent in the
   packed sequence (short edge kept between 1024 and 2048, otherwise resized to
@@ -147,6 +148,25 @@ gufo serve --port 8080 image --model /models/MiniMax-H3-Image \
   size; an alpha channel is dropped.
 - Noise comes from gufo's own generator, so a seed gives the same image in
   gufo every time but not the image of diffusers or SGLang for that seed.
+
+**Reference limit.** The release accepts up to 16 references and cuts only the
+prompt and each label to 4,096 tokens. gufo's text encoder takes 4,096 tokens
+for everything together: per reference its label (5 tokens, 6 from
+`Picture 10`), two vision markers and (short side scaled to 1024 px / 32) ×
+(long side / 32) vision tokens, then the prompt. A square image costs 1,031
+tokens whatever its size (small images are scaled up), a 16:9 one 1,831. So
+at most 3 references fit (`max_images` is 3); three squares leave 1,003 tokens
+for the prompt. A request over the budget is rejected before any GPU work
+with HTTP 400 `invalid_request` and the numbers, for example 1024² + 1500×1100
++ 1000×557 with a 109-token prompt needs 4,386 tokens.
+
+**Time** on a Strix Halo (gfx1151, 128 GB), 2048 × 2048 output, measured
+21.11.2026 with 2.2.15 builds: one 1024² reference 160 s (prompt phase 58 s),
+three 1024² references 433 s (prompt phase 287 s). The prompt phase of long
+presentations was dominated by the text encoder's attention fallback; 2.2.16
+keeps them on the grouped kernel (see the
+[edit notes](../internal/models/minimax-h3/FORK.md#minimax-h3-image-edits)),
+new timings follow.
 
 Every reference adds rows to the DiT sequence (a 1024 × 1024 reference about
 2,100 including its vision block, a 2048 × 2048 one about 5,100), which costs
