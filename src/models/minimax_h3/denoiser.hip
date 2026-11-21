@@ -152,6 +152,7 @@ public:
     }
     const hipError_t status = hipMalloc(&data_, bytes);
     if (status != hipSuccess) {
+      (void)hipGetLastError();  // no stale error for a later peek
       SetError(error, HipError("hipMalloc MiniMax H3 denoiser", status));
       return false;
     }
@@ -794,6 +795,15 @@ struct DenoiserSession::Impl {
   DeviceBuffer control_pristine;
   DeviceBuffer control_stream;
   DeviceBuffer control_skip;
+  // Control blocks [0, control_resident) are in control_blocks; the others
+  // take turns in control_slot (PrepareControlSlot), with their host
+  // modulations in control_modulations.
+  std::size_t control_resident{0};
+  std::unique_ptr<DitBlockSession> control_slot;
+  int control_slot_index{-1};
+  std::vector<std::vector<std::uint16_t>> control_modulations;
+  hipEvent_t control_slot_done{nullptr};
+  bool control_slot_pending{false};
 
   bool LoadFrom(const ModelInventory& source, const TensorDescriptor& descriptor,
                 DeviceBuffer* output, const CancellationToken* cancellation,
@@ -805,6 +815,65 @@ struct DenoiserSession::Impl {
     base_telemetry.cumulative_allocation_bytes += descriptor.payload_bytes;
     base_telemetry.control_weight_bytes += descriptor.payload_bytes;
     return true;
+  }
+
+  // Device bytes of one control block's DiT weights (plus its modulation).
+  static std::uint64_t ControlBlockBytes(const ModelInventory& patch,
+                                         std::size_t modulation_rows) {
+    static constexpr const char* kNames[] = {
+        "norm1.weight",        "norm2.weight",        "attn.to_q.weight",
+        "attn.to_k.weight",    "attn.to_v.weight",    "attn.norm_q.weight",
+        "attn.norm_k.weight",  "attn.to_out.0.weight", "ff.net.0.proj.weight",
+        "ff.net.2.weight"};
+    std::uint64_t bytes = static_cast<std::uint64_t>(modulation_rows) *
+                          kDitModulationSlots * kDitHiddenSize *
+                          sizeof(std::uint16_t);
+    for (const char* name : kNames) {
+      if (const TensorDescriptor* descriptor =
+              patch.FindTensor(std::string("control_blocks.0.") + name)) {
+        bytes += descriptor->payload_bytes;
+      }
+    }
+    return bytes;
+  }
+
+  // How many control blocks stay on the device; the rest take turns in one
+  // reloaded slot (RunControl). GUFO_H3_CONTROL_RESIDENT=<n> forces n;
+  // otherwise as many as fit while GUFO_H3_CONTROL_RESERVE_MIB (default
+  // 8704) stays free for the heads, the I/O buffers and the driver (on the
+  // 64 GB Strix Halo, hipMalloc failed with ~7.4 GiB still reported free).
+  std::size_t ControlResidentBlocks(std::size_t count,
+                                    std::uint64_t block_bytes) {
+    if (const char* forced = std::getenv("GUFO_H3_CONTROL_RESIDENT")) {
+      const long value = std::strtol(forced, nullptr, 10);
+      return static_cast<std::size_t>(
+          std::clamp<long>(value, 0L, static_cast<long>(count)));
+    }
+    std::uint64_t reserve = 8704ULL << 20U;
+    if (const char* value = std::getenv("GUFO_H3_CONTROL_RESERVE_MIB")) {
+      reserve = static_cast<std::uint64_t>(
+                    std::max(0LL, std::strtoll(value, nullptr, 10)))
+                << 20U;
+    }
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+      (void)hipGetLastError();
+      return count;  // unknown: keep the previous behaviour
+    }
+    const std::uint64_t budget =
+        free_bytes > reserve ? free_bytes - reserve : 0U;
+    // Per block: its weights plus allocation and per-session overhead.
+    const std::uint64_t per_block = block_bytes + (32ULL << 20U);
+    const std::uint64_t fit = budget / per_block;
+    if (fit >= count) {
+      return count;
+    }
+    // One block's room goes to the shared slot; streaming a single block
+    // through a slot would save nothing.
+    const std::size_t resident =
+        fit >= 1U ? static_cast<std::size_t>(fit) - 1U : 0U;
+    return resident + 1U >= count ? count : resident;
   }
 
   bool LoadControl(DeviceBuffer& time_embedding,
@@ -861,8 +930,6 @@ struct DenoiserSession::Impl {
     }
     control_after_weight.resize(count);
     control_after_bias.resize(count);
-    const std::size_t modulation_rows =
-        static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
     for (std::size_t index = 0; index < count; ++index) {
       const std::string prefix =
           "control_blocks." + std::to_string(index) + ".";
@@ -879,12 +946,70 @@ struct DenoiserSession::Impl {
                     cancellation, error)) {
         return false;
       }
+    }
+    // The row-sized buffers and the before/after GEMM plan come first, so
+    // the residency budget below sees what is left for the blocks.
+    const std::size_t hidden_bytes =
+        layout.rows() * kDitHiddenSize * sizeof(std::uint16_t);
+    if (!control_rows_device.Allocate(control->rows.size_bytes(), error) ||
+        !control_pristine.Allocate(hidden_bytes, error) ||
+        !control_stream.Allocate(hidden_bytes, error) ||
+        !control_skip.Allocate(hidden_bytes, error) ||
+        !CopyAsync(control_rows_device.data(), control->rows.data(),
+                   control->rows.size_bytes(), hipMemcpyHostToDevice,
+                   "copy H3 control rows", error)) {
+      return false;
+    }
+    base_telemetry.persistent_bytes += control_rows_device.bytes();
+    base_telemetry.scratch_bytes += 3U * hidden_bytes;
+    // Fill the trunk-sized buffers before the deterministic GEMM check.
+    dit_ops::LaunchFillBf16Pattern(control_stream.As<std::uint16_t>(),
+                                   layout.rows() * kDitHiddenSize, 0x3C0001U,
+                                   stream);
+    {
+      DeviceBuffer reference;
+      DeviceBuffer mismatch;
+      if (!CheckLaunch("fill H3 control stream", error) ||
+          !(control_gemm = std::make_unique<Bf16Gemm>())->Select(
+                               control_before_weight.As<std::uint16_t>(),
+                               control_stream.As<std::uint16_t>(),
+                               control_skip.As<std::uint16_t>(), &reference,
+                               &mismatch, layout.rows(), kDitHiddenSize,
+                               kDitHiddenSize, stream, error)) {
+        return false;
+      }
+      const hipError_t status = hipStreamSynchronize(stream);
+      if (status != hipSuccess) {
+        SetError(error, HipError("select H3 control GEMM", status));
+        return false;
+      }
+    }
+    const std::size_t modulation_rows =
+        static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
+    control_resident =
+        ControlResidentBlocks(count, ControlBlockBytes(patch, modulation_rows));
+    if (std::getenv("GUFO_H3_TRACE") != nullptr) {
+      std::fprintf(stderr, "h3 trace: control blocks resident=%zu of %zu%s\n",
+                   control_resident, count,
+                   control_resident < count ? " (others through one slot)"
+                                            : "");
+    }
+    control_modulations.assign(count, {});
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::string prefix =
+          "control_blocks." + std::to_string(index) + ".";
       std::vector<std::uint16_t> modulation;
       // On an AdaLN cache hit the base blocks never selected this GEMM plan.
       if (!ComputeModulation(prefix + "adaln_proj", kBlockModulationWidth,
                              time_embedding, adaln_cache_hit && index == 0,
                              cancellation, &modulation, error, &patch)) {
         return false;
+      }
+      const bool resident = index < control_resident;
+      // The first streamed block creates the slot; later ones reuse it.
+      if (!resident && control_slot != nullptr) {
+        control_modulations[index] = std::move(modulation);
+        continue;
       }
       auto session = DitBlockSession::Create(
           patch,
@@ -905,35 +1030,20 @@ struct DenoiserSession::Impl {
       base_telemetry.scratch_bytes += session->activation_bytes();
       base_telemetry.cumulative_allocation_bytes +=
           session->weight_bytes() + session->activation_bytes();
-      control_blocks.push_back(std::move(session));
-    }
-    const std::size_t hidden_bytes =
-        layout.rows() * kDitHiddenSize * sizeof(std::uint16_t);
-    if (!control_rows_device.Allocate(control->rows.size_bytes(), error) ||
-        !control_pristine.Allocate(hidden_bytes, error) ||
-        !control_stream.Allocate(hidden_bytes, error) ||
-        !control_skip.Allocate(hidden_bytes, error) ||
-        !CopyAsync(control_rows_device.data(), control->rows.data(),
-                   control->rows.size_bytes(), hipMemcpyHostToDevice,
-                   "copy H3 control rows", error)) {
-      return false;
-    }
-    base_telemetry.persistent_bytes += control_rows_device.bytes();
-    base_telemetry.scratch_bytes += 3U * hidden_bytes;
-    // Fill the trunk-sized buffers before the deterministic GEMM check.
-    dit_ops::LaunchFillBf16Pattern(control_stream.As<std::uint16_t>(),
-                                   layout.rows() * kDitHiddenSize, 0x3C0001U,
-                                   stream);
-    DeviceBuffer reference;
-    DeviceBuffer mismatch;
-    if (!CheckLaunch("fill H3 control stream", error) ||
-        !(control_gemm = std::make_unique<Bf16Gemm>())->Select(
-                             control_before_weight.As<std::uint16_t>(),
-                             control_stream.As<std::uint16_t>(),
-                             control_skip.As<std::uint16_t>(), &reference,
-                             &mismatch, layout.rows(), kDitHiddenSize,
-                             kDitHiddenSize, stream, error)) {
-      return false;
+      if (resident) {
+        control_blocks.push_back(std::move(session));
+        continue;
+      }
+      control_modulations[index] = std::move(modulation);
+      control_slot = std::move(session);
+      control_slot_index = static_cast<int>(index);
+      if (hipEventCreateWithFlags(&control_slot_done, hipEventDisableTiming) !=
+          hipSuccess) {
+        (void)hipGetLastError();
+        control_slot_done = nullptr;
+        SetError(error, "cannot create the H3 control slot event");
+        return false;
+      }
     }
     control_active.assign(static_cast<std::size_t>(schedule.evaluations()), 0U);
     for (int step = 0; step < schedule.evaluations(); ++step) {
@@ -948,7 +1058,43 @@ struct DenoiserSession::Impl {
       return false;
     }
     base_telemetry.control_blocks = count;
+    base_telemetry.control_resident_blocks = control_resident;
     base_telemetry.control_load_ms = Milliseconds(begin, Clock::now());
+    return true;
+  }
+
+  // Loads control block `index` into the slot unless it is already there,
+  // once the queued run of the slot's previous block has finished. The load
+  // overlaps the base blocks already queued on the stream.
+  bool PrepareControlSlot(std::size_t index,
+                          const CancellationToken* cancellation,
+                          std::string* error) {
+    if (control_slot == nullptr || index >= control_modulations.size()) {
+      SetError(error, "MiniMax H3 control slot is missing");
+      return false;
+    }
+    if (control_slot_index == static_cast<int>(index)) {
+      return true;
+    }
+    const auto begin = Clock::now();
+    if (control_slot_pending) {
+      const hipError_t status = hipEventSynchronize(control_slot_done);
+      if (status != hipSuccess) {
+        SetError(error, HipError("wait for the H3 control slot", status));
+        return false;
+      }
+      control_slot_pending = false;
+    }
+    control_slot_index = -1;
+    if (!control_slot->ReloadControl(*control->inventory,
+                                     static_cast<int>(index),
+                                     control_modulations[index], cancellation,
+                                     error)) {
+      return false;
+    }
+    control_slot_index = static_cast<int>(index);
+    base_telemetry.control_stream_loads += 1U;
+    base_telemetry.control_stream_ms += Milliseconds(begin, Clock::now());
     return true;
   }
 
@@ -1056,14 +1202,34 @@ struct DenoiserSession::Impl {
         return false;
       }
     }
+    DitBlockSession* session = nullptr;
+    if (index < control_resident) {
+      session = control_blocks[index].get();
+    } else {
+      if (!PrepareControlSlot(index, cancellation, error)) {
+        return false;
+      }
+      session = control_slot.get();
+    }
     DitBlockTelemetry block_telemetry;
-    if (!control_blocks[index]->RunPreparedDevice(
+    if (!session->RunPreparedDevice(
             stream_rows, block_row_map.As<std::uint32_t>(), stream_rows,
             static_cast<void*>(stream), false, false, cancellation,
-            &block_telemetry, error) ||
-        !control_gemm->Run(control_after_weight[index].As<std::uint16_t>(),
-                          stream_rows, skip, rows, kDitHiddenSize,
-                          kDitHiddenSize, stream, error)) {
+            &block_telemetry, error)) {
+      return false;
+    }
+    if (session == control_slot.get()) {
+      // The next reload waits for this block's queued run.
+      if (hipEventRecord(control_slot_done, stream) != hipSuccess) {
+        (void)hipGetLastError();
+        SetError(error, "cannot record the H3 control slot event");
+        return false;
+      }
+      control_slot_pending = true;
+    }
+    if (!control_gemm->Run(control_after_weight[index].As<std::uint16_t>(),
+                           stream_rows, skip, rows, kDitHiddenSize,
+                           kDitHiddenSize, stream, error)) {
       return false;
     }
     dit_ops::LaunchAddBiasBf16(skip,
@@ -1088,6 +1254,10 @@ struct DenoiserSession::Impl {
   }
 
   ~Impl() {
+    if (control_slot_done != nullptr) {
+      (void)hipEventSynchronize(control_slot_done);
+      (void)hipEventDestroy(control_slot_done);
+    }
     if (staging != nullptr) {
       (void)hipHostFree(staging);
     }

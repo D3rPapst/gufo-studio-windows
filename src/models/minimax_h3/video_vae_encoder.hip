@@ -7,8 +7,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -79,6 +82,7 @@ public:
     }
     const hipError_t status = hipMalloc(&data_, bytes);
     if (status != hipSuccess) {
+      (void)hipGetLastError();  // no stale error for a later peek
       data_ = nullptr;
       SetError(error, HipError("hipMalloc H3 VisualVAE encoder", status));
       return false;
@@ -139,37 +143,37 @@ __device__ __forceinline__ int Reflect(int index, int length) {
   return index;
 }
 
-// col[(c * 9 + ky * 3 + kx) * outputs + oy * out_w + ox]
-__global__ void Im2Col3x3Kernel(const float* input, int channels, int height,
-                                int width, int out_height, int out_width,
-                                int stride, int pad, float* col) {
-  const std::size_t outputs = static_cast<std::size_t>(out_height) * out_width;
-  const std::size_t total = outputs * channels * 9U;
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= total) {
+// col[(c * 9 + ky * 3 + kx) * outputs + oy * out_w + ox]; grid.x covers the
+// output positions, grid.y the (channel, tap) rows. 32-bit position math
+// (a 64-bit division per element made this kernel a large share of the clip
+// encode); the values are the same as before.
+__global__ void Im2Col3x3Kernel(const float* input, int height, int width,
+                                int out_height, int out_width, int stride,
+                                int pad, float* col) {
+  const int outputs = out_height * out_width;
+  const int position = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (position >= outputs) {
     return;
   }
-  const std::size_t position = index % outputs;
-  const std::size_t row = index / outputs;
-  const int tap = static_cast<int>(row % 9U);
-  const int channel = static_cast<int>(row / 9U);
-  const int oy = static_cast<int>(position / out_width);
-  const int ox = static_cast<int>(position % out_width);
+  const int row = static_cast<int>(blockIdx.y);
+  const int channel = row / 9;
+  const int tap = row - channel * 9;
+  const int oy = position / out_width;
+  const int ox = position - oy * out_width;
   const int y = Reflect(oy * stride + tap / 3 - pad, height);
   const int x = Reflect(ox * stride + tap % 3 - pad, width);
-  col[index] =
+  col[static_cast<std::size_t>(row) * outputs + position] =
       input[(static_cast<std::size_t>(channel) * height + y) * width + x];
 }
 
-__global__ void AddBiasKernel(float* output, const float* bias, int channels,
-                              int plane) {
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= static_cast<std::size_t>(channels) * plane) {
+// grid.y = channel.
+__global__ void AddBiasKernel(float* output, const float* bias, int plane) {
+  const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index >= plane) {
     return;
   }
-  output[index] += bias[index / plane];
+  output[static_cast<std::size_t>(blockIdx.y) * plane + index] +=
+      bias[blockIdx.y];
 }
 
 __global__ void AddKernel(float* output, const float* addend,
@@ -224,16 +228,18 @@ __global__ void GroupStatsKernel(const float* input, int channels_per_group,
   }
 }
 
+// grid.y = channel.
 __global__ void GroupApplySiluKernel(const float* input, const float* stats,
                                      const float* gamma, const float* beta,
-                                     int channels, int channels_per_group,
-                                     int plane, float* output) {
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= static_cast<std::size_t>(channels) * plane) {
+                                     int channels_per_group, int plane,
+                                     float* output) {
+  const int position = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (position >= plane) {
     return;
   }
-  const int channel = static_cast<int>(index / plane);
+  const int channel = static_cast<int>(blockIdx.y);
+  const std::size_t index =
+      static_cast<std::size_t>(channel) * plane + position;
   const int group = channel / channels_per_group;
   const float normalized = (input[index] - stats[2 * group]) *
                                stats[2 * group + 1] * gamma[channel] +
@@ -421,6 +427,26 @@ public:
     }
     activation_elements_ = activation;
     column_elements_ = columns;
+    // Clips: the per-frame column cache of ConvolveFrames (level 0 is the
+    // largest: 17 frames of a 256 tile take ~5.1 GB). Optional: without room
+    // (or with GUFO_H3_VAE_COLUMN_CACHE=0) every tap runs its own im2col.
+    frame_columns_.Reset();
+    frame_column_elements_ = 0;
+    const char* cache = std::getenv("GUFO_H3_VAE_COLUMN_CACHE");
+    if (frames > 1 && (cache == nullptr || std::string_view(cache) != "0")) {
+      std::string ignored;
+      if (frame_columns_.Allocate(
+              columns * static_cast<std::size_t>(frames) * sizeof(float),
+              &ignored)) {
+        frame_column_elements_ = columns * static_cast<std::size_t>(frames);
+      }
+      if (std::getenv("GUFO_H3_TRACE") != nullptr) {
+        std::fprintf(stderr, "h3 trace: VisualVAE column cache %s (%.2f GiB)\n",
+                     frame_column_elements_ != 0 ? "on" : "off",
+                     static_cast<double>(columns) * frames * sizeof(float) /
+                         (1U << 30U));
+      }
+    }
     return true;
   }
 
@@ -428,7 +454,8 @@ public:
     return weight_bytes_;
   }
   [[nodiscard]] std::uint64_t scratch_bytes() const noexcept {
-    std::uint64_t bytes = columns_.bytes() + stats_.bytes();
+    std::uint64_t bytes =
+        columns_.bytes() + frame_columns_.bytes() + stats_.bytes();
     for (const DeviceBuffer& buffer : activations_) {
       bytes += buffer.bytes();
     }
@@ -714,11 +741,11 @@ private:
     const int per_group = norm.channels / kGroups;
     GroupStatsKernel<<<kGroups, kNormThreads, 0, stream_>>>(
         input, per_group, plane, kGroupNormEpsilon, stats_.As<float>());
-    GroupApplySiluKernel<<<Blocks(static_cast<std::size_t>(norm.channels) *
-                                  plane),
+    GroupApplySiluKernel<<<dim3(Blocks(static_cast<std::size_t>(plane)),
+                                static_cast<unsigned>(norm.channels)),
                            256, 0, stream_>>>(
         input, stats_.As<float>(), norm.gamma.As<float>(),
-        norm.beta.As<float>(), norm.channels, per_group, plane, output);
+        norm.beta.As<float>(), per_group, plane, output);
     const hipError_t status = hipPeekAtLastError();
     if (status != hipSuccess) {
       SetError(error, HipError("H3 VisualVAE encoder group norm", status));
@@ -774,6 +801,28 @@ private:
     }
     const int produced = (frames - 1) / time_stride + 1;
     const int taps = conv.kernel == 3 ? 3 : 1;
+    // A 3x3x3 kernel reads each input frame for up to three output frames.
+    // With room for every frame's columns, each input frame is im2col'ed
+    // once and the same GEMMs run on the cached columns (same results).
+    const std::size_t frame_columns =
+        static_cast<std::size_t>(out_height) * out_width *
+        static_cast<std::size_t>(conv.input_channels) * 9U;
+    const bool cached =
+        conv.kernel == 3 && frames > 1 &&
+        frame_columns * static_cast<std::size_t>(frames) <=
+            frame_column_elements_;
+    if (cached) {
+      for (int source = 0; source < frames; ++source) {
+        if (!Im2Col(conv,
+                    input + static_cast<std::size_t>(source) * in_elements,
+                    height, width, stride, pad,
+                    frame_columns_.As<float>() +
+                        static_cast<std::size_t>(source) * frame_columns,
+                    frame_columns, error)) {
+          return false;
+        }
+      }
+    }
     for (int frame = 0; frame < produced; ++frame) {
       float* target = output + static_cast<std::size_t>(frame) * out_elements;
       bool first = true;
@@ -793,10 +842,18 @@ private:
                    "H3 VisualVAE encoder was loaded without temporal taps");
           return false;
         }
-        if (!ConvolveTap(conv, weight,
-                         input + static_cast<std::size_t>(source) * in_elements,
-                         height, width, stride, pad, first ? 0.0F : 1.0F,
-                         target, error)) {
+        const float beta = first ? 0.0F : 1.0F;
+        const bool ok =
+            cached
+                ? Gemm(conv, weight,
+                       frame_columns_.As<float>() +
+                           static_cast<std::size_t>(source) * frame_columns,
+                       height, width, stride, beta, target, error)
+                : ConvolveTap(
+                      conv, weight,
+                      input + static_cast<std::size_t>(source) * in_elements,
+                      height, width, stride, pad, beta, target, error);
+        if (!ok) {
           return false;
         }
         first = false;
@@ -817,9 +874,10 @@ private:
     const int out_width = conv.kernel == 1 ? width : width / stride;
     const std::size_t outputs =
         static_cast<std::size_t>(out_height) * out_width;
-    AddBiasKernel<<<Blocks(outputs * conv.output_channels), 256, 0, stream_>>>(
-        output, conv.bias.As<float>(), conv.output_channels,
-        static_cast<int>(outputs));
+    AddBiasKernel<<<dim3(Blocks(outputs),
+                         static_cast<unsigned>(conv.output_channels)),
+                    256, 0, stream_>>>(output, conv.bias.As<float>(),
+                                       static_cast<int>(outputs));
     const hipError_t launch = hipPeekAtLastError();
     if (launch != hipSuccess) {
       SetError(error, HipError("H3 VisualVAE encoder convolution", launch));
@@ -828,29 +886,57 @@ private:
     return true;
   }
 
+  // im2col of one input frame of a 3x3 kernel into `columns`
+  // ((channels * 9) x outputs, outputs fastest).
+  bool Im2Col(const Conv& conv, const float* input, int height, int width,
+              int stride, int pad, float* columns, std::size_t capacity,
+              std::string* error) {
+    const int out_height = height / stride;
+    const int out_width = width / stride;
+    const std::size_t outputs =
+        static_cast<std::size_t>(out_height) * out_width;
+    const std::size_t elements = outputs * conv.input_channels * 9U;
+    if (elements > capacity ||
+        outputs > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        conv.input_channels * 9 > 65535) {
+      SetError(error, "H3 VisualVAE encoder column scratch is too small");
+      return false;
+    }
+    Im2Col3x3Kernel<<<dim3(Blocks(outputs),
+                           static_cast<unsigned>(conv.input_channels * 9)),
+                      256, 0, stream_>>>(input, height, width, out_height,
+                                         out_width, stride, pad, columns);
+    return true;
+  }
+
   // One temporal tap: output = im2col(input) x weight + beta * output,
   // without the bias.
   bool ConvolveTap(const Conv& conv, const float* weight, const float* input,
                    int height, int width, int stride, int pad, float beta,
                    float* output, std::string* error) {
+    const float* columns = input;
+    if (conv.kernel == 3) {
+      if (!Im2Col(conv, input, height, width, stride, pad,
+                  columns_.As<float>(), column_elements_, error)) {
+        return false;
+      }
+      columns = columns_.As<float>();
+    }
+    return Gemm(conv, weight, columns, height, width, stride, beta, output,
+                error);
+  }
+
+  // output = columns x weight + beta * output; `columns` is the im2col of a
+  // 3x3 kernel's input frame, or the input itself for a pointwise kernel.
+  bool Gemm(const Conv& conv, const float* weight, const float* columns,
+            int height, int width, int stride, float beta, float* output,
+            std::string* error) {
     const int out_height = conv.kernel == 1 ? height : height / stride;
     const int out_width = conv.kernel == 1 ? width : width / stride;
     const std::size_t outputs =
         static_cast<std::size_t>(out_height) * out_width;
-    const float* columns = input;
-    int depth = conv.input_channels;
-    if (conv.kernel == 3) {
-      const std::size_t elements = outputs * conv.input_channels * 9U;
-      if (elements > column_elements_) {
-        SetError(error, "H3 VisualVAE encoder column scratch is too small");
-        return false;
-      }
-      Im2Col3x3Kernel<<<Blocks(elements), 256, 0, stream_>>>(
-          input, conv.input_channels, height, width, out_height, out_width,
-          stride, pad, columns_.As<float>());
-      columns = columns_.As<float>();
-      depth *= 9;
-    }
+    const int depth =
+        conv.kernel == 3 ? conv.input_channels * 9 : conv.input_channels;
     const float alpha = 1.0F;
     const rocblas_status status =
         rocblas_sgemm(handle_, rocblas_operation_none, rocblas_operation_none,
@@ -884,6 +970,8 @@ private:
   Conv quant_conv_;
   std::array<DeviceBuffer, 4> activations_;
   DeviceBuffer columns_;
+  DeviceBuffer frame_columns_;
+  std::size_t frame_column_elements_{0};
   DeviceBuffer stats_;
   std::size_t activation_elements_{0};
   std::size_t column_elements_{0};

@@ -17,6 +17,7 @@ constexpr int kBaseShortEdge = 768;
 constexpr double kMaximumPixels = 768.0 * 1344.0;
 constexpr double kReferenceImageShortEdge = 2048.0;
 constexpr int kQwenStride = 12;  // 24 fps sampled at 2 fps
+constexpr std::int64_t kH3ReferenceFramesPerSecond = 24;
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -61,6 +62,30 @@ std::span<const std::uint8_t> Frame(const ControlFrames& frames, int index) {
 }
 
 }  // namespace
+
+std::string ReferenceSecondsLabel(double seconds) {
+  // A pair's mid time is a multiple of 0.25 s, so "%.1f" always meets an
+  // exact tie; Python rounds those half to even (0.25 -> "0.2", 0.75 ->
+  // "0.8"), which nearbyint does in the default rounding mode. printf's tie
+  // rounding differs between C runtimes.
+  const auto tenths =
+      static_cast<long long>(std::nearbyint(std::max(seconds, 0.0) * 10.0));
+  return "<" + std::to_string(tenths / 10) + "." +
+         std::to_string(tenths % 10) + " seconds>";
+}
+
+int ReferenceSourceFrame(int output, int fps_num, int fps_den) {
+  if (fps_num <= 0 || fps_den <= 0 || output < 0) {
+    return output;
+  }
+  // Source frame i lands on output frame round(i * 24 * den / num) (half
+  // away from zero); the largest i with i * 24 * den / num < output + 0.5.
+  const std::int64_t numerator =
+      (2LL * output + 1LL) * static_cast<std::int64_t>(fps_num) - 1LL;
+  const std::int64_t denominator =
+      2LL * kH3ReferenceFramesPerSecond * static_cast<std::int64_t>(fps_den);
+  return static_cast<int>(numerator / denominator);
+}
 
 bool PlanReferences(const std::vector<GenerationReference>& references,
                     const GenerationGeometry& geometry, bool image_size_max,
@@ -206,11 +231,10 @@ bool PlanReferences(const std::vector<GenerationReference>& references,
           stamps.push_back(stamps.back());
         }
         for (std::size_t index = 0; index < samples.size(); index += 2U) {
-          char label[32];
-          std::snprintf(label, sizeof(label), "<%.1f seconds>",
-                        (stamps[index] + stamps[index + 1U]) / 2.0);
           plan->presentation.push_back(
-              {label, static_cast<int>(pending.size())});
+              {ReferenceSecondsLabel((stamps[index] + stamps[index + 1U]) /
+                                     2.0),
+               static_cast<int>(pending.size())});
           const auto first = std::span<const std::uint8_t>(item.rgb).subspan(
               frame_bytes * static_cast<std::size_t>(samples[index]),
               frame_bytes);

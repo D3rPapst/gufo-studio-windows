@@ -58,6 +58,19 @@ struct ReferencePlan {
   std::vector<PresentationEntry> presentation;
 };
 
+/// The source frame a reference video shows at 24 fps output frame `output`
+/// when it is resampled from `fps_num / fps_den` like FFmpeg's fps filter
+/// (the reference pipelines resample every reference video onto H3's own
+/// 24 fps): the last source frame whose time, rounded to the nearest output
+/// frame, is not after `output` (frames are dropped or repeated, never
+/// blended). An unknown rate (fps_num or fps_den <= 0) keeps the frames.
+[[nodiscard]] int ReferenceSourceFrame(int output, int fps_num, int fps_den);
+
+/// The text-encoder label of a two-frame video block, ComfyUI's
+/// "<%.1f seconds>" % mid_time with Python's rounding ("<0.2 seconds>" for
+/// 0.25 s).
+[[nodiscard]] std::string ReferenceSecondsLabel(double seconds);
+
 /// Sizes the references like ComfyUI: images scaled down (never up) to the
 /// generation's pixel area ("match") or to a 2048 short edge ("max") on the
 /// 32 grid; videos on the 768-short-edge canvas (at most 768 x 1344 and not

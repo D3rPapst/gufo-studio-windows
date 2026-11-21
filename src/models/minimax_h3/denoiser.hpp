@@ -149,6 +149,11 @@ struct DenoiserTelemetry {
   std::size_t control_blocks{0};
   std::uint64_t control_weight_bytes{0};
   double control_load_ms{0.0};
+  // Control blocks kept on the device; the others were reloaded into one
+  // slot when needed (count and host time of those reloads).
+  std::size_t control_resident_blocks{0};
+  std::uint64_t control_stream_loads{0};
+  double control_stream_ms{0.0};
   std::uint64_t persistent_bytes{0};
   std::uint64_t scratch_bytes{0};
   std::uint64_t peak_live_bytes{0};

@@ -231,6 +231,10 @@ private:
 
 // GUFO_H3_TRACE=1: prints the stage and the device's free memory to stderr.
 void TraceStage(const char* stage);
+// Clears the calling thread's HIP error state (hipGetLastError), so an
+// error of an earlier job on this thread (e.g. a failed hipMalloc) is not
+// reported again by a later hipPeekAtLastError. No-op without HIP.
+void ClearDeviceError();
 [[nodiscard]] constexpr ResidencyMode DefaultResidencyMode() noexcept {
   return ResidencyMode::kDeviceCopy;
 }
