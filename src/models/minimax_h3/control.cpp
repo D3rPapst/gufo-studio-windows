@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <exception>
+#include <thread>
 #include <utility>
 
 #include "src/models/minimax_h3/json.hpp"
@@ -193,7 +195,8 @@ std::vector<float> FitFramesBilinearCenter(const ControlFrames& input,
                                    static_cast<std::size_t>(input.height) *
                                    static_cast<std::size_t>(channels);
   output.resize(static_cast<std::size_t>(frames) * height * width * channels);
-  for (int frame = 0; frame < frames; ++frame) {
+  // Frames are independent: split them over a few threads (same values).
+  const auto fit_frame = [&](int frame) {
     const std::uint8_t* source =
         input.pixels.data() +
         frame_values * static_cast<std::size_t>(std::min(frame, input.frames - 1));
@@ -225,6 +228,24 @@ std::vector<float> FitFramesBilinearCenter(const ControlFrames& input,
         }
       }
     }
+  };
+  const int workers = std::clamp(
+      static_cast<int>(std::thread::hardware_concurrency()), 1,
+      std::min(8, frames));
+  std::atomic<int> next{0};
+  const auto work = [&] {
+    for (int frame = next.fetch_add(1); frame < frames;
+         frame = next.fetch_add(1)) {
+      fit_frame(frame);
+    }
+  };
+  std::vector<std::thread> threads;
+  for (int index = 1; index < workers; ++index) {
+    threads.emplace_back(work);
+  }
+  work();
+  for (std::thread& thread : threads) {
+    thread.join();
   }
   return output;
 }
