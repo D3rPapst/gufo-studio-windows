@@ -261,9 +261,11 @@ struct Parsed {
 constexpr std::size_t kMaxGufoFieldBytes = 8U << 20U;
 
 // Form fields "gufo.<name>" whose value is JSON (numbers, booleans, objects);
-// the others are strings. Keys are the Qwen-Image-2.1 extension's.
+// the others are strings. Keys are the Qwen-Image-2.1 extension's, plus
+// MiniMax-H3-Image's "min_generation_area" (an integer pixel count).
 bool JsonFormField(std::string_view key) {
   return key == "guidance" || key == "guidance_steps" ||
+         key == "min_generation_area" ||
          key == "strength" || key == "preview" ||
          key == "mask_composite" || key == "mask_feather" ||
          key == "mask_blur" || key == "regions" || key == "base_strength" ||

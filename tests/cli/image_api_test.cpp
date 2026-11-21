@@ -331,7 +331,9 @@ server::HttpRequest Generation(std::string_view body) {
   return http;
 }
 
-server::HttpRequest Edit(std::string_view background, int images = 1) {
+server::HttpRequest Edit(std::string_view background, int images = 1,
+                         std::string_view extra_name = {},
+                         std::string_view extra_value = {}) {
   server::HttpRequest http;
   http.method = "POST";
   http.path = "/v1/images/edits";
@@ -357,6 +359,10 @@ server::HttpRequest Edit(std::string_view background, int images = 1) {
         {"background", background}})
     http.body += "\r\n--b\r\nContent-Disposition: form-data; name=\"" +
                  std::string(name) + "\"\r\n\r\n" + std::string(value);
+  if (!extra_name.empty())
+    http.body += "\r\n--b\r\nContent-Disposition: form-data; name=\"" +
+                 std::string(extra_name) + "\"\r\n\r\n" +
+                 std::string(extra_value);
   http.body += "\r\n--b--\r\n";
   return http;
 }
@@ -499,6 +505,15 @@ void TestRequestValidation() {
   Require(response.status == 400 &&
               Message(response).find("exceed 16 images") != std::string::npos,
           "seventeenth reference rejected");
+
+  // "gufo.min_generation_area" (MiniMax-H3-Image) arrives as a JSON number,
+  // as in the JSON body's "gufo" object.
+  response = server::HandleImageApiRequest(
+      Edit("auto", 1, "gufo.min_generation_area", "1048576"), many);
+  Require(response.status == 200, response.body);
+  Require(seen.back().extension_json.find("\"min_generation_area\":1048576") !=
+              std::string::npos,
+          seen.back().extension_json);
 }
 
 }  // namespace

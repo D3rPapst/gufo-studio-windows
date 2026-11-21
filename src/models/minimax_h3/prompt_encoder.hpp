@@ -19,6 +19,9 @@ inline constexpr std::size_t kPromptEncoderQueryHeads = 64;
 inline constexpr std::size_t kPromptEncoderKeyValueHeads = 8;
 inline constexpr std::size_t kPromptEncoderHeadDimension = 128;
 inline constexpr std::size_t kPromptEncoderVocabularySize = 151936;
+/// The most tokens (text, vision blocks and their markers together) one
+/// EncodePromptLayer50 call takes.
+inline constexpr std::size_t kPromptEncoderMaximumTokens = 4096;
 
 inline constexpr std::uint32_t kVisionStartToken = 151652;
 inline constexpr std::uint32_t kVisionEndToken = 151653;

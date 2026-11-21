@@ -245,6 +245,22 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
                                .height = references[index].vision_height,
                                .rgb = references[index].vision_rgb});
     }
+    // The whole presentation must fit the text encoder; checked before any
+    // GPU work (the provider already rejects such requests with HTTP 400).
+    {
+      std::vector<std::pair<int, int>> uploads;
+      std::vector<std::size_t> label_counts;
+      for (std::size_t index = 0; index < references.size(); ++index) {
+        uploads.emplace_back(request.references[index].width,
+                             request.references[index].height);
+        label_counts.push_back(labels[index].size());
+      }
+      if (!CheckImageEditTokenBudget(
+              CountImageEditTokens(uploads, label_counts, tokens.size()),
+              kPromptEncoderMaximumTokens, error)) {
+        return false;
+      }
+    }
     ImageEditPresentation presentation;
     if (!BuildImageEditPresentation(labels, sizes, tokens, &presentation,
                                     error)) {

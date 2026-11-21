@@ -106,6 +106,54 @@ std::pair<int, int> BoundShortEdge(int width, int height, int minimum,
           RoundToMultiple(height * scale, multiple)};
 }
 
+std::pair<int, int> ImageEditVisionSize(int width, int height) {
+  const auto [vision_width, vision_height] =
+      BoundShortEdge(width, height, kH3ImageVisionShortEdge,
+                     kH3ImageVisionShortEdge, kVisionFactor);
+  return SmartResize(vision_width, vision_height);
+}
+
+ImageEditTokenBudget CountImageEditTokens(
+    std::span<const std::pair<int, int>> image_sizes,
+    std::span<const std::size_t> label_tokens, std::size_t prompt_tokens) {
+  ImageEditTokenBudget budget;
+  budget.references = image_sizes.size();
+  for (std::size_t index = 0; index < image_sizes.size(); ++index) {
+    const auto [width, height] =
+        ImageEditVisionSize(image_sizes[index].first, image_sizes[index].second);
+    budget.vision_tokens += static_cast<std::size_t>(width / kVisionFactor) *
+                            static_cast<std::size_t>(height / kVisionFactor);
+    const std::size_t label =
+        index < label_tokens.size() ? label_tokens[index] : 0;
+    budget.label_tokens += std::min(label, kH3ImageEditMaximumTokens) + 2U;
+  }
+  budget.prompt_tokens = std::min(prompt_tokens, kH3ImageEditMaximumTokens);
+  budget.total =
+      budget.vision_tokens + budget.label_tokens + budget.prompt_tokens;
+  return budget;
+}
+
+bool CheckImageEditTokenBudget(const ImageEditTokenBudget& budget,
+                               std::size_t limit, std::string* error) {
+  if (budget.total <= limit) {
+    return true;
+  }
+  SetError(
+      error,
+      "MiniMax-H3-Image edit needs " + std::to_string(budget.total) +
+          " text-encoder tokens, more than the " + std::to_string(limit) +
+          " it takes: " + std::to_string(budget.references) +
+          " reference image(s) use " + std::to_string(budget.vision_tokens) +
+          " vision tokens plus " + std::to_string(budget.label_tokens) +
+          " label/marker tokens, the prompt " +
+          std::to_string(budget.prompt_tokens) +
+          ". Every image costs (short side scaled to 1024 px / 32) x (long "
+          "side / 32) tokens, at least 1024 for a square one; smaller images "
+          "cost the same. Use fewer or squarer reference images (at most 3 "
+          "squares) or a shorter prompt.");
+  return false;
+}
+
 bool PlanImageEditReferences(std::span<const ImageEditInput> inputs,
                              std::vector<ImageEditReference>* references,
                              std::string* error) {
@@ -174,15 +222,8 @@ bool PlanImageEditReferences(std::span<const ImageEditInput> inputs,
       }
     }
     // The vision copy: short edge 1024, then Qwen's own grid rounding.
-    auto [vision_width, vision_height] = BoundShortEdge(
-        input.width, input.height, kH3ImageVisionShortEdge,
-        kH3ImageVisionShortEdge, kVisionFactor);
-    const auto [grid_width, grid_height] =
-        SmartResize(vision_width, vision_height);
-    if (grid_width != vision_width || grid_height != vision_height) {
-      vision_width = grid_width;
-      vision_height = grid_height;
-    }
+    const auto [vision_width, vision_height] =
+        ImageEditVisionSize(input.width, input.height);
     if (!Resize(input, vision_width, vision_height, &reference.vision_rgb,
                 error)) {
       return false;

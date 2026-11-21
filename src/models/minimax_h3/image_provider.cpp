@@ -1,7 +1,9 @@
 // `gufo serve image` provider "minimax-h3-image": MiniMax-H3-Image text to
-// image and image edits (up to 16 reference images, "<Picture i>" in upload
-// order) on the H3 DiT, the shared H3 text encoder with its Qwen3-VL vision
-// tower and the image VAE.
+// image and image edits ("<Picture i>" in upload order) on the H3 DiT, the
+// shared H3 text encoder with its Qwen3-VL vision tower and the image VAE.
+// The release takes up to 16 references, but every one costs at least 1024
+// text-encoder tokens and gufo's encoder takes 4096 in all: at most 3 images
+// (squares; wide ones cost more), checked with the prompt before queueing.
 // AI-assisted (Claude Code).
 
 #include <gufo/ext/generated/minimax_h3_constants.hpp>
@@ -10,6 +12,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <filesystem>
 #include <memory>
 #include <sstream>
@@ -23,6 +26,7 @@
 #include "src/models/minimax_h3/image_generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
+#include "src/models/minimax_h3/tokenizer.hpp"
 
 namespace gufo::models::minimax_h3 {
 namespace {
@@ -120,7 +124,7 @@ public:
         .transparent_background = false,
         .max_side = h3::kH3ImageMaximumSide,
         .max_pixels = static_cast<std::uint64_t>(h3::kH3ImageMaximumPixels),
-        .max_images = h3::kH3ImageMaximumReferences};
+        .max_images = h3::kH3ImageEditMaximumImages};
   }
 
   void ValidateRequest(const ext::ImageRequest& request) const override {
@@ -133,9 +137,13 @@ public:
       throw std::invalid_argument(
           "MiniMax-H3-Image edits need --h3-vision-projector");
     }
-    if (request.images.size() > h3::kH3ImageMaximumReferences) {
+    if (request.images.size() > h3::kH3ImageEditMaximumImages) {
       throw std::invalid_argument(
-          "MiniMax-H3-Image takes at most 16 reference images");
+          "MiniMax-H3-Image takes at most " +
+          std::to_string(h3::kH3ImageEditMaximumImages) +
+          " reference images in gufo (each costs at least 1024 of the 4096 "
+          "text-encoder tokens); got " +
+          std::to_string(request.images.size()));
     }
     for (const auto& image : request.images) {
       if (image.width < 32 || image.height < 32) {
@@ -143,6 +151,9 @@ public:
             "MiniMax-H3-Image reference images need at least 32 pixels on "
             "each side");
       }
+    }
+    if (!request.images.empty()) {
+      CheckEditTokens(request);
     }
     if (request.steps != 0 && request.steps != h3::kH3ImagePddSteps) {
       throw std::invalid_argument(
@@ -245,6 +256,45 @@ public:
     };
   }
 
+  // The edit presentation (labels, vision blocks, prompt) against the text
+  // encoder's 4096 tokens, with the release tokenizer, before any GPU work.
+  void CheckEditTokens(const ext::ImageRequest& request) const {
+    std::string error;
+    std::vector<std::uint32_t> prompt;
+    std::vector<std::size_t> labels;
+    {
+      std::lock_guard lock(tokenizer_mutex_);
+      if (!tokenizer_) {
+        auto tokenizer = std::make_unique<h3::Tokenizer>();
+        if (!h3::Tokenizer::Load(model_root_ / "tokenizer" / "tokenizer.json",
+                                 tokenizer.get(), &error)) {
+          throw std::runtime_error("MiniMax-H3-Image tokenizer: " + error);
+        }
+        tokenizer_ = std::move(tokenizer);
+      }
+      if (!tokenizer_->EncodePrompt(request.prompt, &prompt, &error)) {
+        throw std::invalid_argument("MiniMax-H3-Image prompt: " + error);
+      }
+      for (std::size_t index = 0; index < request.images.size(); ++index) {
+        std::vector<std::uint32_t> ids;
+        if (!tokenizer_->Encode(h3::ImageEditLabel(index), false, &ids,
+                                &error)) {
+          throw std::runtime_error("MiniMax-H3-Image label: " + error);
+        }
+        labels.push_back(ids.size());
+      }
+    }
+    std::vector<std::pair<int, int>> sizes;
+    for (const auto& image : request.images) {
+      sizes.emplace_back(image.width, image.height);
+    }
+    if (!h3::CheckImageEditTokenBudget(
+            h3::CountImageEditTokens(sizes, labels, prompt.size()),
+            h3::kPromptEncoderMaximumTokens, &error)) {
+      throw std::invalid_argument(error);
+    }
+  }
+
   std::string Query(std::string_view topic) const override {
     if (topic == "model") {
       return "{\"name\":\"" + std::string(h3::kH3ImageModelName) + "\"}";
@@ -257,6 +307,9 @@ private:
   std::filesystem::path text_encoder_root_;
   std::filesystem::path manifest_;
   std::filesystem::path vision_projector_;
+  // Loaded on the first edit request (about 7 MB of JSON).
+  mutable std::mutex tokenizer_mutex_;
+  mutable std::unique_ptr<h3::Tokenizer> tokenizer_;
 };
 
 std::unique_ptr<ext::ImageRunner> CreateWithOptions(

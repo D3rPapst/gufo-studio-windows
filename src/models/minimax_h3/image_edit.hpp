@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/sampling.hpp"
 
 namespace gufo::minimax_h3 {
@@ -38,6 +39,46 @@ inline constexpr std::int64_t kH3ImageVisionMinimumPixels = 65536;
 [[nodiscard]] std::pair<int, int> BoundShortEdge(int width, int height,
                                                  int minimum, int maximum,
                                                  int multiple);
+
+/// The vision-tower copy of a width x height reference: short edge 1024,
+/// long side scaled with it and rounded to 32 (Qwen's smart_resize). The
+/// presentation spends (width / 32) * (height / 32) image-pad tokens on it.
+[[nodiscard]] std::pair<int, int> ImageEditVisionSize(int width, int height);
+
+/// The release puts no limit on the whole presentation (only the prompt and
+/// every label are cut to 4096 tokens), but gufo's text encoder takes at most
+/// kPromptEncoderMaximumTokens (4096) tokens in all. Every reference costs at
+/// least 1024 vision tokens (a square; its short edge is always brought to
+/// 1024 px, so smaller images cost the same) plus its "Picture i: " label (5
+/// tokens, 6 from Picture 10) and the two vision markers: four references
+/// never fit, three squares leave about 1000 tokens for the prompt.
+inline constexpr std::size_t kH3ImageEditMinimumReferenceTokens = 1024 + 5 + 2;
+inline constexpr std::size_t kH3ImageEditMaximumImages = 3;
+static_assert(kH3ImageEditMaximumImages * kH3ImageEditMinimumReferenceTokens <
+                  kPromptEncoderMaximumTokens &&
+              (kH3ImageEditMaximumImages + 1) *
+                      kH3ImageEditMinimumReferenceTokens >
+                  kPromptEncoderMaximumTokens);
+
+/// What an edit presentation costs in text-encoder tokens.
+struct ImageEditTokenBudget {
+  std::size_t references{0};
+  std::size_t vision_tokens{0};  // image-pad rows of all vision blocks
+  std::size_t label_tokens{0};   // "Picture i: " labels plus 2 markers each
+  std::size_t prompt_tokens{0};  // after the 4096 cut
+  std::size_t total{0};
+};
+
+/// The budget of references of the given (width, height) upload sizes, the
+/// token counts of their labels (in the same order) and of the prompt.
+[[nodiscard]] ImageEditTokenBudget CountImageEditTokens(
+    std::span<const std::pair<int, int>> image_sizes,
+    std::span<const std::size_t> label_tokens, std::size_t prompt_tokens);
+
+/// True when the budget fits `limit` tokens; otherwise an English message
+/// with the numbers and what to change.
+[[nodiscard]] bool CheckImageEditTokenBudget(
+    const ImageEditTokenBudget& budget, std::size_t limit, std::string* error);
 
 /// One uploaded reference, already upright (the host applies EXIF).
 struct ImageEditInput {

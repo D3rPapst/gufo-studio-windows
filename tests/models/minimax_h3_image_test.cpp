@@ -581,6 +581,59 @@ void TestEditPlan() {
   CHECK(!h3::PlanImageEditReferences(many, &references, &error));
 }
 
+void TestEditTokenBudget() {
+  // Vision copies: short edge 1024, long side rounded to 32.
+  CHECK(h3::ImageEditVisionSize(1024, 1024) == std::make_pair(1024, 1024));
+  CHECK(h3::ImageEditVisionSize(80, 60) == std::make_pair(1376, 1024));
+  CHECK(h3::ImageEditVisionSize(1500, 1100) == std::make_pair(1408, 1024));
+  CHECK(h3::ImageEditVisionSize(1000, 557) == std::make_pair(1824, 1024));
+  CHECK(h3::ImageEditVisionSize(1100, 1500) == std::make_pair(1024, 1408));
+  const std::vector<std::size_t> labels = {5, 5, 5, 5};
+  std::string error;
+  // GPU test 21.11.: one 1024^2 reference with the release prompt.
+  const std::vector<std::pair<int, int>> one = {{1024, 1024}};
+  auto budget = h3::CountImageEditTokens(
+      one, std::span(labels).first(1), 726);
+  CHECK(budget.references == 1 && budget.vision_tokens == 1024 &&
+        budget.label_tokens == 7 && budget.total == 1757);
+  CHECK(h3::CheckImageEditTokenBudget(budget, 4096, &error));
+  // Three squares and a short prompt (3202 tokens, ran on the GPU).
+  const std::vector<std::pair<int, int>> squares = {
+      {1024, 1024}, {1024, 1024}, {1024, 1024}};
+  budget = h3::CountImageEditTokens(squares, std::span(labels).first(3), 109);
+  CHECK(budget.vision_tokens == 3072 && budget.total == 3202);
+  CHECK(h3::CheckImageEditTokenBudget(budget, 4096, &error));
+  // Three squares leave 1003 prompt tokens; one more is too many.
+  budget = h3::CountImageEditTokens(squares, std::span(labels).first(3), 1003);
+  CHECK(budget.total == 4096 && h3::CheckImageEditTokenBudget(budget, 4096,
+                                                              &error));
+  budget = h3::CountImageEditTokens(squares, std::span(labels).first(3), 1004);
+  CHECK(!h3::CheckImageEditTokenBudget(budget, 4096, &error));
+  // GPU test 21.11.: 1024^2 + 1500x1100 + 1000x557 failed in the prompt child
+  // (500); now a clear message before any GPU work.
+  const std::vector<std::pair<int, int>> wide = {
+      {1024, 1024}, {1500, 1100}, {1000, 557}};
+  budget = h3::CountImageEditTokens(wide, std::span(labels).first(3), 109);
+  CHECK(budget.vision_tokens == 1024 + 1408 + 1824);
+  CHECK(budget.total == 4256 + 21 + 109);
+  error.clear();
+  CHECK(!h3::CheckImageEditTokenBudget(budget, 4096, &error));
+  CHECK(error.find("4386") != std::string::npos &&
+        error.find("4096") != std::string::npos &&
+        error.find("4256 vision tokens") != std::string::npos &&
+        error.find("fewer or squarer") != std::string::npos);
+  // Four images never fit, even tiny ones (each scaled to a 1024 edge).
+  const std::vector<std::pair<int, int>> four = {
+      {64, 64}, {64, 64}, {64, 64}, {64, 64}};
+  budget = h3::CountImageEditTokens(four, labels, 1);
+  CHECK(budget.total > 4096 &&
+        !h3::CheckImageEditTokenBudget(budget, 4096, &error));
+  CHECK(h3::kH3ImageEditMaximumImages == 3);
+  // The prompt counts after the release's 4096 cut.
+  budget = h3::CountImageEditTokens(one, std::span(labels).first(1), 9000);
+  CHECK(budget.prompt_tokens == 4096);
+}
+
 void TestReleaseTokenizer(const std::filesystem::path& root) {
   h3::Tokenizer tokenizer;
   std::string error;
@@ -653,6 +706,7 @@ int main() {
   TestEditConditioning();
   TestEditPresentation();
   TestEditPlan();
+  TestEditTokenBudget();
   if (const char* root = std::getenv("GUFO_H3_IMAGE_ROOT")) {
     TestReleaseConfig(root);
     TestReleaseTokenizer(root);
