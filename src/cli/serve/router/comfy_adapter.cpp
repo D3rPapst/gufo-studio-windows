@@ -46,6 +46,7 @@
 #include "src/cli/serve/router/jobs.hpp"
 #include "src/cli/serve/router/pool.hpp"
 #include "src/cli/serve/router/remote.hpp"
+#include "src/cli/serve/router/video_seam.hpp"
 #include "src/cli/serve/websocket.hpp"
 
 namespace gufo::router::comfy {
@@ -75,6 +76,9 @@ struct Adapter::Job {
   /// the prompt id; several = more than one image or video task.
   std::string preview_base;
   bool several_previews{false};
+  /// 2.2.16 extra_data.gufo_seam: smoothing at the seams of an I2V chain
+  /// (off = ComfyUI's plain ImageBatch).
+  seam::Options seam;
 };
 
 namespace {
@@ -893,6 +897,12 @@ HttpResponse Adapter::Submit(const HttpRequest& request) {
     job->preview_base = wanted->str();
   } else {
     job->preview_base = job->id;
+  }
+  {
+    std::string seam_error;
+    if (!seam::ParseOptions(job->extra_data.find("gufo_seam"),
+                            "extra_data.gufo_seam", &job->seam, &seam_error))
+      return ErrorResponse(400, "invalid_prompt", seam_error);
   }
   if (!job->client_id.empty())
     job->extra_data["client_id"] = job->client_id;
@@ -2731,11 +2741,13 @@ json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
     };
     json::Value body = body_of();
     std::string first_frame;
+    fs::path start_png;
     if (c > 0) {
       // ComfyUI: ImageFromBatch(VAEDecode of the chunk before) ->
       // start_image. gufo: that frame of the chunk's video as first_frame.
       const ChainFrame& start = spec.i2v_starts[c - 1];
       const fs::path png = WorkFile("png");
+      start_png = png;
       made.push_back(png);
       std::string error;
       if (!RunFfmpeg({"-i", parts[start.chunk], "-vf",
@@ -2780,6 +2792,17 @@ json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
     parts.push_back(WorkFile("mp4"));
     made.push_back(parts.back());
     WriteAll(parts.back(), content);
+    // 2.2.16 extra_data.gufo_seam: the chunk corrected towards its start
+    // frame before anything else reads it, so the next start frame and the
+    // joined outputs see the corrected pixels (no drift adds up).
+    if (c > 0 && job->seam.Enabled()) {
+      const fs::path smooth =
+          SmoothSeam(job, task, chunk, c, start_png, parts.back());
+      if (smooth != parts.back()) {
+        made.push_back(smooth);
+        parts.back() = smooth;
+      }
+    }
   }
   json::Value ui = json::Value::object();
   for (const OutputTarget& target : task.outputs) {
@@ -2832,6 +2855,74 @@ json::Value Adapter::RunI2VChain(const std::shared_ptr<Job>& job,
         SaveVideoOutput(target, spec, ReadAll(joined), joined);
   }
   return ui;
+}
+
+fs::path Adapter::SmoothSeam(const std::shared_ptr<Job>& job, const Task& task,
+                             const VideoTask& chunk, int index,
+                             const fs::path& start_png, const fs::path& part) {
+  std::vector<fs::path> scratch;
+  struct RemoveFiles {
+    std::vector<fs::path>* files;
+    ~RemoveFiles() {
+      std::error_code ignored;
+      for (const fs::path& file : *files)
+        fs::remove(file, ignored);
+    }
+  } cleanup{&scratch};
+  const std::string where = "node " + task.node_id + " chunk " +
+                            std::to_string(index + 1);
+  const auto give_up = [&](const std::string& reason) {
+    Logger::Warn("comfy", "event=i2v_seam_skipped prompt_id=" + job->id +
+                              " node=" + task.node_id + " chunk=" +
+                              std::to_string(index + 1) + " reason=\"" +
+                              reason + "\"");
+    job->warnings.push_back(where + ": gufo_seam not applied (" + reason +
+                            ")");
+    return part;
+  };
+  const auto dims = ImageDimensions(ReadAll(start_png));
+  if (!dims)
+    return give_up("the start frame is no image");
+  const int width = dims->first;
+  const int height = dims->second;
+  const fs::path reference_raw = WorkFile("rgb");
+  scratch.push_back(reference_raw);
+  const fs::path frames_raw = WorkFile("rgb");
+  scratch.push_back(frames_raw);
+  std::string error;
+  if (!RunFfmpeg({"-i", start_png, "-frames:v", "1", "-f", "rawvideo",
+                  "-pix_fmt", "rgb24", reference_raw},
+                 &error))
+    return give_up("cannot decode the start frame: " + error);
+  if (!RunFfmpeg({"-i", part, "-f", "rawvideo", "-pix_fmt", "rgb24",
+                  frames_raw},
+                 &error))
+    return give_up("cannot decode the chunk: " + error);
+  std::vector<std::uint8_t> reference;
+  seam::Stats stats;
+  if (!seam::ReadRawImage(reference_raw, width, height, &reference, &error) ||
+      !seam::CorrectRawFile(frames_raw, width, height, reference, job->seam,
+                            &stats, nullptr, &error))
+    return give_up(error);
+  const fs::path smooth = WorkFile("mp4");
+  if (!RunFfmpeg({"-f", "rawvideo", "-pix_fmt", "rgb24", "-s",
+                  std::to_string(width) + "x" + std::to_string(height),
+                  "-framerate", std::to_string(chunk.fps), "-i", frames_raw,
+                  "-an", "-c:v", "libx264rgb", "-qp", "0", "-pix_fmt", "rgb24",
+                  smooth},
+                 &error)) {
+    std::error_code ignored;
+    fs::remove(smooth, ignored);
+    return give_up("cannot encode the corrected chunk: " + error);
+  }
+  Logger::Info("comfy", "event=i2v_seam prompt_id=" + job->id + " node=" +
+                            task.node_id + " chunk=" +
+                            std::to_string(index + 1) + " color_match=" +
+                            (job->seam.color_match ? "1" : "0") +
+                            " blend_frames=" +
+                            std::to_string(job->seam.blend_frames) + " " +
+                            seam::FormatStats(stats));
+  return smooth;
 }
 
 json::Value Adapter::VideoBody(const std::shared_ptr<Job>& job,

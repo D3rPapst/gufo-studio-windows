@@ -1938,6 +1938,17 @@ void TestConcatEndpoint() {
                   R"("/v1/jobs/job_def/files/video.mp4"],"output_format":"webm"})");
   CHECK(answer.status == 400 &&
         answer.body.find("output_format") != std::string::npos);
+  // 2.2.16 seam smoothing: a bad "seam" fails before the inputs resolve.
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":["/v1/jobs/job_abc/files/video.mp4",)"
+                  R"("/v1/jobs/job_def/files/video.mp4"],"seam":{"blend_frames":99}})");
+  CHECK(answer.status == 400 &&
+        answer.body.find("'seam'.blend_frames") != std::string::npos);
+  answer = h.Call("POST", "/v1/videos/concat",
+                  R"({"videos":["/v1/jobs/job_abc/files/video.mp4",)"
+                  R"("/v1/jobs/job_def/files/video.mp4"],"seam":"on"})");
+  CHECK(answer.status == 400 &&
+        answer.body.find("'seam' must be") != std::string::npos);
   // A finished video job of this router resolves; then ffmpeg is missing.
   const std::string video =
       h.Submit(R"({"request":{"path":"/v1/videos","body":{"model":"minimax-h3","prompt":"x"}}})")

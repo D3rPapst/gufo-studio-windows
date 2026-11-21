@@ -110,7 +110,8 @@
 //                                      the same with scheme and host, or
 //                                      data: URLs of at most 64 MiB],
 //                                      "output_format": "mp4",
-//                                      "reencode": false} -> the stitched
+//                                      "reencode": false, "seam": false
+//                                      (2.2.16, video_seam.hpp)} -> the stitched
 //                                      mp4 (Content-Disposition video.mp4).
 //                                      Needs ffmpeg + ffprobe (Options).
 //                                      Wrapped in a job the result file is

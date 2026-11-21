@@ -881,6 +881,27 @@ Branches (two chunks continuing one) and independent videos joined in one
 output fail validation, as do RIFE / upscale nodes behind a chain and sound
 outputs. Needs `--comfy-ffmpeg`. `comfy_graph.cpp` `I2VChain`,
 `ApplyI2VChain`, `ChainFramesOf`; `comfy_adapter.cpp` `RunI2VChain`.
+Seam smoothing (2.2.16, off by default = ComfyUI's plain `ImageBatch`):
+`extra_data.gufo_seam` on `/prompt` = `true` (both tools, 8 blend frames)
+or `{"color_match": bool, "blend_frames": 0..32}` (400 `invalid_prompt`
+otherwise). Each chunk after the first is decoded to RGB right after it is
+rendered and corrected towards the start frame it was given, then stored
+again losslessly (libx264rgb `-qp 0`), so the next start frame and every
+output see the corrected pixels. `color_match`: one per-channel gain /
+offset for the whole chunk that gives its frame 0 the mean and standard
+deviation of the start frame (gain 0.75..1.333). `blend_frames` N: the
+per-pixel rest `start - frame 0` (after the colour match) is added with
+weight (N-k)/N to frame k < N, so frame 0 equals the start frame and the
+difference fades out over N frames instead of jumping. The frame count is
+unchanged. Each chunk logs `event=i2v_seam ... drift=A->B seam1=C->D
+typical=E gain=.. offset=..` (`video_seam.hpp`: D(a,b) = mean |a-b| over
+all pixels and channels, 0..255; drift = D(start, frame 0), seam1 =
+D(start, frame 1), the visible seam when `ImageFromBatch(batch_index 1)`
+drops the repeated start frame; typical = median D of neighbour frames 1..17
+of the uncorrected chunk). A chunk that cannot be corrected (other size,
+ffmpeg error) stays as rendered with a `gufo_warning`
+(`event=i2v_seam_skipped`). `comfy_adapter.cpp` `SmoothSeam`,
+`video_seam.cpp`; tests `router_video_seam_test`.
 ComfyUI Wan 2.2 I2V A14B and Fun VACE A14B LoRA per expert (2.2.9): the
 step-distill LoRA (lightx2v / Lightning) is taken per expert from the
 `KSamplerAdvanced` stages: the high-noise expert has it when a stage
@@ -1587,6 +1608,21 @@ result file is `video.mp4` and `response.json` lists the mode and the probed
 inputs. Errors: `400 invalid_input` (bad list, unknown job, unreadable
 clip), `500 concat_failed` with ffmpeg's last stderr lines. Temporary files
 live under `<jobs-dir>/temp/` and are removed after every call.
+
+Seam smoothing (2.2.16, for chains of the /video/ page whose next part
+started from the last frame of the one before): `"seam": true` (colour
+match + 8 blend frames) or `{"color_match": bool, "blend_frames": 0..32}`;
+absent / false = off, as before. Every clip after the first is decoded to
+RGB24, corrected towards the (corrected) last frame of the clip before as
+described for the ComfyUI I2V chain above (same code, `video_seam.cpp`),
+stored losslessly with its own sound copied, and the join re-encodes
+(`mode` `reencode`). All clips must have one size (else 400
+`invalid_input`). Frame and sample counts are unchanged; the repeated
+start frame stays (now identical to the frame before it with
+`blend_frames`). `response.json` gains `"seam": {"color_match",
+"blend_frames", "seams": [{"video": i, "frames", "drift_before",
+"drift_after", "seam1_before", "seam1_after", "typical", "gain",
+"offset"}]}` and the log `event=concat_seam`.
 
 ### Job progress (`progress`, `progress_detail`, 2.2.15)
 
