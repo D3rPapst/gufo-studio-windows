@@ -135,6 +135,10 @@ public:
 
 }  // namespace
 
+void ClearDeviceError() {
+  (void)hipGetLastError();
+}
+
 void TraceStage(const char* stage) {
   static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
   if (!enabled) {

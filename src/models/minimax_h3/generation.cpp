@@ -907,6 +907,7 @@ bool GenerateTextVideo(const GenerationRequest& request,
   const bool use_vision =
       !vision_images.empty() && !request.vision_projector.empty();
   const bool isolate_prompt = PromptIsolationEnabled();
+  ClearDeviceError();
   TraceStage("prompt phase start");
   if (use_vision && isolate_prompt) {
     for (const KeyframeImage& image : vision_images) {
@@ -1546,6 +1547,12 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << "  \"control_weight_bytes\": "
          << telemetry.denoiser.control_weight_bytes << ",\n"
          << "  \"control_load_ms\": " << telemetry.denoiser.control_load_ms
+         << ",\n"
+         << "  \"control_resident_blocks\": "
+         << telemetry.denoiser.control_resident_blocks << ",\n"
+         << "  \"control_stream_loads\": "
+         << telemetry.denoiser.control_stream_loads << ",\n"
+         << "  \"control_stream_ms\": " << telemetry.denoiser.control_stream_ms
          << ",\n"
          << "  \"vision_ms\": " << telemetry.vision_ms << ",\n"
          << "  \"vision_tokens\": " << telemetry.vision_tokens << ",\n"

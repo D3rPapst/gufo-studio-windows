@@ -881,6 +881,8 @@ std::unique_ptr<ResidencyBackend> CreateHipResidencyBackend(
 }
 
 void TraceStage(const char*) {}
+
+void ClearDeviceError() {}
 #endif
 
 PhaseSession::~PhaseSession() {

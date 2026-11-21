@@ -150,6 +150,19 @@ public:
                          DitBlockTelemetry* telemetry,
                          std::string* error = nullptr);
 
+  // Control block sessions only (control_index >= 0): loads the weights of
+  // control block `control_index` of `inventory` into this session's own
+  // device buffers (no new device allocation) and takes `modulation` as its
+  // modulation, so one session can serve several control blocks in turn
+  // when they do not all fit in device memory. Synchronous; the caller makes
+  // sure no queued work still reads the previous weights.
+  [[nodiscard]] bool ReloadControl(const ModelInventory& inventory,
+                                   int control_index,
+                                   std::span<const std::uint16_t> modulation,
+                                   const CancellationToken* cancellation,
+                                   std::string* error = nullptr);
+  [[nodiscard]] int control_index() const noexcept;
+
   [[nodiscard]] std::size_t rows() const noexcept;
   [[nodiscard]] std::size_t block_index() const noexcept;
   [[nodiscard]] std::uintptr_t scratch_address() const noexcept;
@@ -161,6 +174,16 @@ public:
 private:
   struct Impl;
   explicit DitBlockSession(std::unique_ptr<Impl> impl);
+  // The VideoX-Fun control block tensors, arranged into the native layout
+  // while they load (fused per-head QKV, [gate; value] fc1). `allocate`
+  // creates the device buffers; otherwise the existing ones are rewritten.
+  [[nodiscard]] static bool LoadControlWeights(
+      Impl* impl, const ModelInventory& inventory, int control_index,
+      bool allocate, const CancellationToken* cancellation,
+      std::string* error);
+  // Rows >= 32768: repacks the projection weights for the native kernels.
+  [[nodiscard]] static bool PackNativeProjections(Impl* impl,
+                                                  std::string* error);
   [[nodiscard]] bool RunInternal(
       const DitPreparedInput& input, const CancellationToken* cancellation,
       std::span<std::uint16_t> modulation_attention,

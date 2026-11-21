@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <limits>
 #include <memory>
@@ -224,6 +225,10 @@ public:
     }
     const hipError_t status = hipMalloc(&data_, bytes);
     if (status != hipSuccess) {
+      // Clear the thread's sticky error: a later hipPeekAtLastError (in
+      // this job or the next one on this thread) must not report it again.
+      (void)hipGetLastError();
+      data_ = nullptr;
       SetError(error, HipError("hipMalloc", status));
       return false;
     }
@@ -420,6 +425,82 @@ bool LoadWeight(const ModelInventory& inventory,
   }
   output->descriptor = &descriptor;
   return true;
+}
+
+// Reads `descriptor` into device memory that already exists: byte b of the
+// tensor lands at target(b / segment_bytes) + b % segment_bytes. Lets a
+// tensor be rearranged (per-head QKV fusion, fc1 half swap) while it loads,
+// without a second full-size device copy.
+bool LoadWeightSegments(const ModelInventory& inventory,
+                        const TensorDescriptor& descriptor, int device,
+                        hipStream_t stream, void* staging,
+                        std::size_t staging_bytes,
+                        const CancellationToken* cancellation,
+                        std::size_t segment_bytes,
+                        const std::function<std::byte*(std::size_t)>& target,
+                        std::string* error) {
+  if (descriptor.payload_bytes > std::numeric_limits<std::size_t>::max() ||
+      segment_bytes == 0 || descriptor.payload_bytes % segment_bytes != 0 ||
+      staging == nullptr) {
+    SetError(error, "invalid MiniMax H3 DiT segmented load of " +
+                        descriptor.name);
+    return false;
+  }
+  const auto bytes = static_cast<std::size_t>(descriptor.payload_bytes);
+  const std::filesystem::path path = inventory.model_root() / descriptor.shard;
+  std::string open_error;
+  const platform::PlatformFile file = platform::OpenReadFile(path, &open_error);
+  if (!platform::FileValid(file)) {
+    SetError(error, "cannot open MiniMax H3 DiT shard " + path.string() + ": " +
+                        open_error);
+    return false;
+  }
+  std::size_t copied = 0;
+  bool success = true;
+  while (copied < bytes) {
+    if (IsCancelled(cancellation)) {
+      SetError(error, "MiniMax H3 DiT weight load cancelled");
+      success = false;
+      break;
+    }
+    const std::size_t chunk = std::min(staging_bytes, bytes - copied);
+    const std::uint64_t position = descriptor.file_offset + copied;
+    const std::uint64_t aligned = position / kSector * kSector;
+    const auto lead = static_cast<std::size_t>(position - aligned);
+    const std::size_t span = (lead + chunk + kSector - 1U) / kSector * kSector;
+    const std::size_t read_bytes = platform::ReadFileParallel(
+        file, staging, span, aligned, WeightReaders());
+    if (read_bytes < lead + chunk) {
+      SetError(error,
+               "short read loading MiniMax H3 DiT tensor " + descriptor.name);
+      success = false;
+      break;
+    }
+    hipError_t status = hipSetDevice(device);
+    std::size_t offset = 0;
+    while (status == hipSuccess && offset < chunk) {
+      const std::size_t absolute = copied + offset;
+      const std::size_t segment = absolute / segment_bytes;
+      const std::size_t within = absolute % segment_bytes;
+      const std::size_t piece = std::min(chunk - offset, segment_bytes - within);
+      status = hipMemcpyAsync(
+          target(segment) + within,
+          static_cast<const std::byte*>(staging) + lead + offset, piece,
+          hipMemcpyHostToDevice, stream);
+      offset += piece;
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(stream);
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("copy MiniMax H3 DiT weight", status));
+      success = false;
+      break;
+    }
+    copied += chunk;
+  }
+  platform::CloseFile(file);
+  return success;
 }
 
 class Bf16Gemm {
@@ -894,6 +975,8 @@ struct DitBlockSession::Impl {
   std::uint64_t gemm_plan_validations{0};
   double load_ms{0.0};
   bool constants_prepared{false};
+  // >= 0: the control block whose weights the buffers hold.
+  int control_index{-1};
 
   ~Impl() {
     if (staging != nullptr) {
@@ -1052,80 +1135,33 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   }
 
   const auto load_begin = Clock::now();
-  std::vector<std::pair<const TensorDescriptor*, LoadedWeight*>> weights = {
-      {norm1, &impl->norm1},
-      {norm2, &impl->norm2},
-      {query_norm, &impl->query_norm},
-      {key_norm, &impl->key_norm},
-      {output_weight, &impl->output_weight},
-      {fc1_weight, &impl->fc1_weight},
-      {fc2_weight, &impl->fc2_weight},
-  };
-  std::array<LoadedWeight, 3> qkv_loaded;
+  impl->control_index = options.control_index;
   if (control) {
-    for (std::size_t part = 0; part < 3; ++part) {
-      weights.emplace_back(qkv_parts[part], &qkv_loaded[part]);
+    // Arranged into the native layout while loading (no second device copy).
+    if (!LoadControlWeights(impl.get(), inventory, options.control_index,
+                            true, cancellation, error)) {
+      return nullptr;
     }
   } else {
-    weights.emplace_back(qkv_weight, &impl->qkv_weight);
-  }
-  for (const auto& [descriptor, weight] : weights) {
-    if (!LoadWeight(inventory, *descriptor, impl->device, impl->stream,
-                    impl->staging, WeightStagingBytes(), cancellation, weight,
-                    error)) {
-      return nullptr;
-    }
-    impl->weight_bytes += descriptor->payload_bytes;
-  }
-  if (control) {
-    // Native layout: the fused QKV rows interleave per head
-    // ([head0: q k v, head1: q k v, ...]) and fc1 is [gate; value], where
-    // the VideoX-Fun checkpoint stores to_q/to_k/to_v and [value; gate].
-    const std::size_t head_bytes =
-        kDitHeadDimension * kDitHiddenSize * sizeof(std::uint16_t);
-    if (!impl->qkv_weight.storage.Allocate(
-            head_bytes * kDitAttentionHeads * 3U, error)) {
-      return nullptr;
-    }
-    status = hipSuccess;
-    for (std::size_t head = 0;
-         head < kDitAttentionHeads && status == hipSuccess; ++head) {
-      for (std::size_t part = 0; part < 3 && status == hipSuccess; ++part) {
-        status = hipMemcpyAsync(
-            static_cast<std::byte*>(impl->qkv_weight.storage.data()) +
-                (head * 3U + part) * head_bytes,
-            static_cast<const std::byte*>(qkv_loaded[part].storage.data()) +
-                head * head_bytes,
-            head_bytes, hipMemcpyDeviceToDevice, impl->stream);
+    const std::array<std::pair<const TensorDescriptor*, LoadedWeight*>, 8>
+        weights = {{
+            {norm1, &impl->norm1},
+            {norm2, &impl->norm2},
+            {query_norm, &impl->query_norm},
+            {key_norm, &impl->key_norm},
+            {output_weight, &impl->output_weight},
+            {fc1_weight, &impl->fc1_weight},
+            {fc2_weight, &impl->fc2_weight},
+            {qkv_weight, &impl->qkv_weight},
+        }};
+    for (const auto& [descriptor, weight] : weights) {
+      if (!LoadWeight(inventory, *descriptor, impl->device, impl->stream,
+                      impl->staging, WeightStagingBytes(), cancellation,
+                      weight, error)) {
+        return nullptr;
       }
+      impl->weight_bytes += descriptor->payload_bytes;
     }
-    DeviceBuffer swapped;
-    const std::size_t half_bytes =
-        kDitFeedForwardSize * kDitHiddenSize * sizeof(std::uint16_t);
-    if (status == hipSuccess && !swapped.Allocate(half_bytes * 2U, error)) {
-      return nullptr;
-    }
-    if (status == hipSuccess) {
-      status = hipMemcpyAsync(
-          swapped.data(),
-          static_cast<const std::byte*>(impl->fc1_weight.storage.data()) +
-              half_bytes,
-          half_bytes, hipMemcpyDeviceToDevice, impl->stream);
-    }
-    if (status == hipSuccess) {
-      status = hipMemcpyAsync(
-          static_cast<std::byte*>(swapped.data()) + half_bytes,
-          impl->fc1_weight.storage.data(), half_bytes,
-          hipMemcpyDeviceToDevice, impl->stream);
-    }
-    if (status == hipSuccess) {
-      status = hipStreamSynchronize(impl->stream);
-    }
-    if (status != hipSuccess) {
-      SetError(error, HipError("arrange H3 control block weights", status));
-      return nullptr;
-    }
-    impl->fc1_weight.storage = std::move(swapped);
   }
   (void)hipHostFree(impl->staging);
   impl->staging = nullptr;
@@ -1148,36 +1184,8 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       }
     }
   }
-  if (impl->native_projections) {
-    for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
-                                 &impl->fc1_weight, &impl->fc2_weight}) {
-      DeviceBuffer packed;
-      if (!packed.Allocate(weight->storage.bytes(), error))
-        return nullptr;
-      if (weight == &impl->fc1_weight)
-        dit_ops::LaunchPackFfnUpWeights(weight->storage.As<std::uint16_t>(),
-                                        packed.As<std::uint16_t>(),
-                                        impl->stream);
-      else if (weight == &impl->qkv_weight)
-        dit_ops::LaunchPackDense(
-            weight->storage.As<std::uint16_t>(), packed.As<std::uint16_t>(),
-            kDitAttentionWidth * 3U, kDitHiddenSize, impl->stream);
-      else
-        dit_ops::LaunchPackDense(weight->storage.As<std::uint16_t>(),
-                                 packed.As<std::uint16_t>(), kDitHiddenSize,
-                                 weight == &impl->output_weight
-                                     ? kDitAttentionWidth
-                                     : kDitFeedForwardSize,
-                                 impl->stream);
-      status = hipGetLastError();
-      if (status == hipSuccess)
-        status = hipStreamSynchronize(impl->stream);
-      if (status != hipSuccess) {
-        SetError(error, HipError("pack H3 projection weights", status));
-        return nullptr;
-      }
-      weight->storage = std::move(packed);
-    }
+  if (impl->native_projections && !PackNativeProjections(impl.get(), error)) {
+    return nullptr;
   }
   impl->load_ms = Milliseconds(load_begin, Clock::now());
 
@@ -1364,6 +1372,221 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     return nullptr;
   }
   return std::unique_ptr<DitBlockSession>(new DitBlockSession(std::move(impl)));
+}
+
+bool DitBlockSession::LoadControlWeights(Impl* impl,
+                                         const ModelInventory& inventory,
+                                         int control_index, bool allocate,
+                                         const CancellationToken* cancellation,
+                                         std::string* error) {
+  if (impl == nullptr || control_index < 0 || impl->staging == nullptr) {
+    SetError(error, "invalid MiniMax H3 control block load");
+    return false;
+  }
+  const std::string prefix =
+      "control_blocks." + std::to_string(control_index) + ".";
+  const auto require = [&](const char* name,
+                           std::initializer_list<std::uint64_t> shape) {
+    return RequireTensor(inventory, prefix + name, shape, error);
+  };
+  const TensorDescriptor* norm1 = require("norm1.weight", {kDitHiddenSize});
+  const TensorDescriptor* norm2 = require("norm2.weight", {kDitHiddenSize});
+  const TensorDescriptor* query_norm =
+      require("attn.norm_q.weight", {kDitHeadDimension});
+  const TensorDescriptor* key_norm =
+      require("attn.norm_k.weight", {kDitHeadDimension});
+  const TensorDescriptor* output_weight =
+      require("attn.to_out.0.weight", {kDitHiddenSize, kDitAttentionWidth});
+  const TensorDescriptor* fc1_weight = require(
+      "ff.net.0.proj.weight", {kDitFeedForwardSize * 2U, kDitHiddenSize});
+  const TensorDescriptor* fc2_weight =
+      require("ff.net.2.weight", {kDitHiddenSize, kDitFeedForwardSize});
+  const std::array<const TensorDescriptor*, 3> qkv_parts = {
+      require("attn.to_q.weight", {kDitAttentionWidth, kDitHiddenSize}),
+      require("attn.to_k.weight", {kDitAttentionWidth, kDitHiddenSize}),
+      require("attn.to_v.weight", {kDitAttentionWidth, kDitHiddenSize})};
+  if (norm1 == nullptr || norm2 == nullptr || query_norm == nullptr ||
+      key_norm == nullptr || output_weight == nullptr ||
+      fc1_weight == nullptr || fc2_weight == nullptr ||
+      qkv_parts[0] == nullptr || qkv_parts[1] == nullptr ||
+      qkv_parts[2] == nullptr) {
+    return false;
+  }
+  // Loads into `weight`, allocating it first unless it already has the
+  // tensor's size (reload).
+  const auto load_into = [&](const TensorDescriptor& descriptor,
+                             LoadedWeight* weight, std::size_t total_bytes,
+                             std::size_t segment_bytes,
+                             const std::function<std::byte*(std::size_t)>&
+                                 target) {
+    if (allocate) {
+      if (!weight->storage.Allocate(total_bytes, error)) {
+        return false;
+      }
+    } else if (weight->storage.bytes() != total_bytes) {
+      SetError(error, "MiniMax H3 control block buffer differs in size: " +
+                          descriptor.name);
+      return false;
+    }
+    return LoadWeightSegments(inventory, descriptor, impl->device,
+                              impl->stream, impl->staging,
+                              WeightStagingBytes(), cancellation,
+                              segment_bytes, target, error);
+  };
+  const auto direct = [&](const TensorDescriptor* descriptor,
+                          LoadedWeight* weight) {
+    const auto bytes = static_cast<std::size_t>(descriptor->payload_bytes);
+    if (!load_into(*descriptor, weight, bytes, bytes,
+                   [weight](std::size_t) {
+                     return static_cast<std::byte*>(weight->storage.data());
+                   })) {
+      return false;
+    }
+    weight->descriptor = descriptor;
+    return true;
+  };
+  if (!direct(norm1, &impl->norm1) || !direct(norm2, &impl->norm2) ||
+      !direct(query_norm, &impl->query_norm) ||
+      !direct(key_norm, &impl->key_norm) ||
+      !direct(output_weight, &impl->output_weight) ||
+      !direct(fc2_weight, &impl->fc2_weight)) {
+    return false;
+  }
+  // Native layout: the fused QKV rows interleave per head
+  // ([head0: q k v, head1: q k v, ...]) and fc1 is [gate; value], where the
+  // VideoX-Fun checkpoint stores to_q/to_k/to_v and [value; gate].
+  const std::size_t head_bytes =
+      kDitHeadDimension * kDitHiddenSize * sizeof(std::uint16_t);
+  const std::size_t qkv_bytes = head_bytes * kDitAttentionHeads * 3U;
+  if (allocate && !impl->qkv_weight.storage.Allocate(qkv_bytes, error)) {
+    return false;
+  }
+  if (impl->qkv_weight.storage.bytes() != qkv_bytes) {
+    SetError(error, "MiniMax H3 control QKV buffer differs in size");
+    return false;
+  }
+  auto* fused = static_cast<std::byte*>(impl->qkv_weight.storage.data());
+  for (std::size_t part = 0; part < 3; ++part) {
+    if (!LoadWeightSegments(inventory, *qkv_parts[part], impl->device,
+                            impl->stream, impl->staging, WeightStagingBytes(),
+                            cancellation, head_bytes,
+                            [fused, part](std::size_t head) {
+                              return fused + (head * 3U + part) * head_bytes;
+                            },
+                            error)) {
+      return false;
+    }
+  }
+  const std::size_t half_bytes =
+      kDitFeedForwardSize * kDitHiddenSize * sizeof(std::uint16_t);
+  if (!load_into(*fc1_weight, &impl->fc1_weight, half_bytes * 2U, half_bytes,
+                 [impl](std::size_t half) {
+                   return static_cast<std::byte*>(
+                              impl->fc1_weight.storage.data()) +
+                          (half == 0 ? half_bytes : 0U);
+                 })) {
+    return false;
+  }
+  impl->fc1_weight.descriptor = fc1_weight;
+  if (allocate) {
+    for (const TensorDescriptor* descriptor :
+         {norm1, norm2, query_norm, key_norm, output_weight, fc1_weight,
+          fc2_weight, qkv_parts[0], qkv_parts[1], qkv_parts[2]}) {
+      impl->weight_bytes += descriptor->payload_bytes;
+    }
+  }
+  impl->control_index = control_index;
+  return true;
+}
+
+bool DitBlockSession::PackNativeProjections(Impl* impl, std::string* error) {
+  for (LoadedWeight* weight : {&impl->qkv_weight, &impl->output_weight,
+                               &impl->fc1_weight, &impl->fc2_weight}) {
+    DeviceBuffer packed;
+    if (!packed.Allocate(weight->storage.bytes(), error))
+      return false;
+    if (weight == &impl->fc1_weight)
+      dit_ops::LaunchPackFfnUpWeights(weight->storage.As<std::uint16_t>(),
+                                      packed.As<std::uint16_t>(),
+                                      impl->stream);
+    else if (weight == &impl->qkv_weight)
+      dit_ops::LaunchPackDense(
+          weight->storage.As<std::uint16_t>(), packed.As<std::uint16_t>(),
+          kDitAttentionWidth * 3U, kDitHiddenSize, impl->stream);
+    else
+      dit_ops::LaunchPackDense(weight->storage.As<std::uint16_t>(),
+                               packed.As<std::uint16_t>(), kDitHiddenSize,
+                               weight == &impl->output_weight
+                                   ? kDitAttentionWidth
+                                   : kDitFeedForwardSize,
+                               impl->stream);
+    hipError_t status = hipGetLastError();
+    if (status == hipSuccess)
+      status = hipStreamSynchronize(impl->stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("pack H3 projection weights", status));
+      return false;
+    }
+    weight->storage = std::move(packed);
+  }
+  return true;
+}
+
+bool DitBlockSession::ReloadControl(const ModelInventory& inventory,
+                                    int control_index,
+                                    std::span<const std::uint16_t> modulation,
+                                    const CancellationToken* cancellation,
+                                    std::string* error) {
+  if (impl_ == nullptr || impl_->control_index < 0 || control_index < 0) {
+    SetError(error, "MiniMax H3 ReloadControl needs a control block session");
+    return false;
+  }
+  const std::size_t modulation_elements =
+      impl_->modulation_rows * kDitModulationSlots * kDitHiddenSize;
+  if (modulation.size() != modulation_elements ||
+      impl_->modulation.bytes() != modulation.size_bytes()) {
+    SetError(error, "MiniMax H3 control modulation size differs from session");
+    return false;
+  }
+  if (impl_->staging == nullptr) {
+    // Kept for the next reload; released with the session.
+    const hipError_t status =
+        hipHostMalloc(&impl_->staging,
+                      WeightStagingBytes() + kWeightStagingSlack,
+                      hipHostMallocDefault);
+    if (status != hipSuccess) {
+      (void)hipGetLastError();
+      impl_->staging = nullptr;
+      SetError(error, HipError("allocate H3 control reload staging", status));
+      return false;
+    }
+  }
+  const auto begin = Clock::now();
+  impl_->control_index = -1;  // stale until the reload completes
+  if (!LoadControlWeights(impl_.get(), inventory, control_index, false,
+                          cancellation, error) ||
+      (impl_->native_projections &&
+       !PackNativeProjections(impl_.get(), error))) {
+    impl_->constants_prepared = false;
+    return false;
+  }
+  hipError_t status = hipMemcpyAsync(impl_->modulation.data(),
+                                     modulation.data(), modulation.size_bytes(),
+                                     hipMemcpyHostToDevice, impl_->stream);
+  if (status == hipSuccess) {
+    status = hipStreamSynchronize(impl_->stream);
+  }
+  if (status != hipSuccess) {
+    impl_->constants_prepared = false;
+    SetError(error, HipError("copy H3 control modulation", status));
+    return false;
+  }
+  impl_->load_ms = Milliseconds(begin, Clock::now());
+  return true;
+}
+
+int DitBlockSession::control_index() const noexcept {
+  return impl_ == nullptr ? -1 : impl_->control_index;
 }
 
 bool DitBlockSession::PrepareConstants(
