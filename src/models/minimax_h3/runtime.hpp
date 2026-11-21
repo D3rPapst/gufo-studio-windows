@@ -235,6 +235,10 @@ void TraceStage(const char* stage);
 // error of an earlier job on this thread (e.g. a failed hipMalloc) is not
 // reported again by a later hipPeekAtLastError. No-op without HIP.
 void ClearDeviceError();
+// hipMemGetInfo of the current device. False without HIP or on failure
+// (both values are then 0).
+[[nodiscard]] bool DeviceMemoryInfo(std::uint64_t* free_bytes,
+                                    std::uint64_t* total_bytes);
 [[nodiscard]] constexpr ResidencyMode DefaultResidencyMode() noexcept {
   return ResidencyMode::kDeviceCopy;
 }

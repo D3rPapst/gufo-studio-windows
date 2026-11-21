@@ -350,7 +350,29 @@ void CheckLongAttentionKernel() {
             << worst << '\n';
 }
 
+// Host-only: the byte model the image edit budget uses
+// (PromptEncoderScoreScratchBytes, prompt_encoder.cpp) equals the scratch
+// the encoder allocates (ops::CausalGqaScratchBytes) at every length the
+// memory-based limit can reach.
+void CheckScratchModel() {
+  using gufo::minimax_h3::kPromptEncoderHeadDimension;
+  using gufo::minimax_h3::kPromptEncoderKeyValueHeads;
+  using gufo::minimax_h3::kPromptEncoderQueryHeads;
+  using gufo::minimax_h3::kPromptEncoderTokenCeiling;
+  using gufo::minimax_h3::PromptEncoderScoreScratchBytes;
+  for (std::uint32_t tokens :
+       {1U, 1392U, 1393U, 1757U, 3202U, 4096U, 4097U, 8192U, 16504U,
+        20000U, 32768U}) {
+    CHECK(tokens <= kPromptEncoderTokenCeiling);
+    CHECK(PromptEncoderScoreScratchBytes(tokens) ==
+          h3ops::CausalGqaScratchBytes(tokens, kPromptEncoderQueryHeads,
+                                       kPromptEncoderKeyValueHeads,
+                                       kPromptEncoderHeadDimension));
+  }
+}
+
 bool CheckAnalytic() {
+  CheckScratchModel();
   int device = 0;
   hipDeviceProp_t properties{};
   if (hipGetDevice(&device) != hipSuccess ||
