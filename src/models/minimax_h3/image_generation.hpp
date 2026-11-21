@@ -81,6 +81,11 @@ struct ImageGenerationTelemetry {
   std::size_t reference_rows{0};
   std::size_t prompt_tokens{0};
   bool prompt_truncated{false};
+  // Edits: the text-encoder token limit of this request (4096, more with
+  // enough free device memory; ImageEditTokenLimit) and the free bytes it
+  // was computed from.
+  std::size_t prompt_token_limit{0};
+  std::uint64_t prompt_limit_free_bytes{0};
   PromptEncoderTelemetry prompt_encoder;
   DenoiserTelemetry denoiser;
   ImageVaeTelemetry vae;
