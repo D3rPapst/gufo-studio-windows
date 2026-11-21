@@ -4,13 +4,17 @@
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 
+#include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/image_generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/prompt_encoder.hpp"
+#include "src/models/minimax_h3/runtime.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -149,9 +153,147 @@ bool CheckImageEditTokenBudget(const ImageEditTokenBudget& budget,
           std::to_string(budget.prompt_tokens) +
           ". Every image costs (short side scaled to 1024 px / 32) x (long "
           "side / 32) tokens, at least 1024 for a square one; smaller images "
-          "cost the same. Use fewer or squarer reference images (at most 3 "
-          "squares) or a shorter prompt.");
+          "cost the same. Use fewer or squarer reference images or a shorter "
+          "prompt. The limit is 4096 tokens (3 squares) and grows with the "
+          "free device memory when the request is checked (" +
+          std::to_string(limit) + " now).");
   return false;
+}
+
+namespace {
+
+// Strict whole-number parse; false on anything else.
+bool ParseUnsigned(const char* text, std::uint64_t* value) {
+  if (text == nullptr || *text == '\0' || *text == '-' || *text == '+') {
+    return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0') {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+}  // namespace
+
+std::uint64_t ImageDitRowBytes(const ImageDitRows& rows) noexcept {
+  constexpr std::uint64_t kBf16 = sizeof(std::uint16_t);
+  constexpr std::uint64_t kAttention = kDitAttentionWidth;
+  constexpr std::uint64_t kFeedForward = kDitFeedForwardSize;
+  constexpr std::uint64_t kHidden = kDitHiddenSize;
+  // Shared block workspace (MakeSharedWorkspaceLayout): row map, QKV/FC1,
+  // activated MLP, two attention-wide regions and the norm factors.
+  constexpr std::uint64_t kCommon =
+      sizeof(std::uint32_t) + kFeedForward * kBf16 + 2U * kAttention * kBf16 +
+      sizeof(float) +
+      2U * kDitRopeHalf * kBf16 +    // rotary cos/sin
+      kHidden * kBf16 +              // the denoiser's hidden state
+      sizeof(std::uint32_t);         // the denoiser's block row map
+  // QKV/FC1 holds max(3 attention, 2 feed-forward) and the first block
+  // validates its GEMM plans against a buffer of the same size. From 32,768
+  // rows the native projection path needs less (attention + hidden, no check
+  // buffer) plus a 256 KiB SiLU lookup, but its fixed part was never
+  // measured for images, so the larger per-row cost stays (conservative,
+  // and the bytes stay monotone in the row count).
+  constexpr std::uint64_t kQkvFc1 =
+      std::max(3U * kAttention, 2U * kFeedForward) * kBf16;
+  constexpr std::uint64_t kPerRow = kCommon + 2U * kQkvFc1;
+  const std::uint64_t total = rows.total();
+  const std::uint64_t lookup = total < 32'768U ? 0U : (1ULL << 16U) * 4U;
+  // AllocateIo's float projection scratch over the largest patch segment.
+  const std::uint64_t projection =
+      static_cast<std::uint64_t>(std::max(rows.image, rows.condition)) *
+      kHidden * sizeof(float);
+  return total * kPerRow + lookup + projection;
+}
+
+std::uint64_t ImageDitPhaseBytes(const ImageDitRows& rows) noexcept {
+  return kH3ImageDitFixedBytes + ImageDitRowBytes(rows);
+}
+
+std::size_t ImageEditReferenceDitRows(int width, int height) {
+  if (width < 1 || height < 1) {
+    return 0;
+  }
+  // PlanImageEditReferences: bounded VAE copy, crop to whole cells, then to
+  // whole 2x2 patches.
+  const auto [vae_width, vae_height] = BoundShortEdge(
+      width, height, kH3ImageReferenceMinimumShortEdge,
+      kH3ImageReferenceMaximumShortEdge, kVisionFactor);
+  const std::size_t latent_width =
+      static_cast<std::size_t>(vae_width / kVaeCell / 2 * 2);
+  const std::size_t latent_height =
+      static_cast<std::size_t>(vae_height / kVaeCell / 2 * 2);
+  return (latent_width / 2U) * (latent_height / 2U);
+}
+
+ImageEditMemory ImageEditMemoryFromSettings(std::uint64_t free_bytes,
+                                            const char* reserve_mib,
+                                            const char* max_tokens) {
+  ImageEditMemory memory;
+  memory.free_bytes = free_bytes;
+  std::uint64_t value = 0;
+  if (ParseUnsigned(reserve_mib, &value) &&
+      value <= (std::numeric_limits<std::uint64_t>::max() >> 20U)) {
+    memory.reserve_bytes = value << 20U;
+  }
+  if (ParseUnsigned(max_tokens, &value)) {
+    memory.token_cap = static_cast<std::size_t>(
+        std::clamp<std::uint64_t>(value, kPromptEncoderMaximumTokens,
+                                  kPromptEncoderTokenCeiling));
+  }
+  return memory;
+}
+
+ImageEditMemory CurrentImageEditMemory() {
+  std::uint64_t free_bytes = 0;
+  std::uint64_t total_bytes = 0;
+  if (!DeviceMemoryInfo(&free_bytes, &total_bytes)) {
+    free_bytes = 0;
+  }
+  return ImageEditMemoryFromSettings(
+      free_bytes, std::getenv("GUFO_H3_IMAGE_TOKEN_RESERVE_MIB"),
+      std::getenv("GUFO_H3_IMAGE_MAX_TOKENS"));
+}
+
+std::size_t ImageEditTokenLimit(const ImageEditMemory& memory,
+                                std::size_t condition_rows,
+                                std::size_t image_rows) {
+  const std::size_t cap = std::clamp(
+      memory.token_cap, kPromptEncoderMaximumTokens, kPromptEncoderTokenCeiling);
+  if (memory.free_bytes <= memory.reserve_bytes) {
+    return kPromptEncoderMaximumTokens;
+  }
+  const std::uint64_t budget = memory.free_bytes - memory.reserve_bytes;
+  // Top down (at most 28,672 cheap steps): the score scratch is rounded to
+  // whole rows, so the prompt-phase bytes are not strictly monotone.
+  for (std::size_t tokens = cap; tokens > kPromptEncoderMaximumTokens;
+       --tokens) {
+    if (PromptEncoderPhaseBytes(tokens) <= budget &&
+        ImageDitPhaseBytes({.text = tokens,
+                            .condition = condition_rows,
+                            .image = image_rows}) <= budget) {
+      return tokens;
+    }
+  }
+  return kPromptEncoderMaximumTokens;
+}
+
+std::size_t ImageEditMaximumSquareReferences(const ImageEditMemory& memory,
+                                             std::size_t image_rows) {
+  std::size_t best = kH3ImageEditMaximumImages;
+  std::size_t tokens = 1;  // the prompt
+  for (std::size_t count = 1; count <= kH3ImageMaximumReferences; ++count) {
+    tokens += kH3ImageEditMinimumReferenceTokens + (count >= 10 ? 1U : 0U);
+    if (count > best &&
+        tokens <= ImageEditTokenLimit(memory, count * 1024U, image_rows)) {
+      best = count;
+    }
+  }
+  return best;
 }
 
 bool PlanImageEditReferences(std::span<const ImageEditInput> inputs,

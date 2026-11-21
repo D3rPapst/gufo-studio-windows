@@ -1,9 +1,10 @@
 // `gufo serve image` provider "minimax-h3-image": MiniMax-H3-Image text to
 // image and image edits ("<Picture i>" in upload order) on the H3 DiT, the
 // shared H3 text encoder with its Qwen3-VL vision tower and the image VAE.
-// The release takes up to 16 references, but every one costs at least 1024
-// text-encoder tokens and gufo's encoder takes 4096 in all: at most 3 images
-// (squares; wide ones cost more), checked with the prompt before queueing.
+// The release takes up to 16 references; every one costs at least 1031
+// text-encoder tokens. gufo's encoder takes 4096 in all (3 squares) and more
+// when the device has the memory for it (ImageEditTokenLimit, 2.2.17),
+// checked with the prompt before queueing.
 // AI-assisted (Claude Code).
 
 #include <gufo/ext/generated/minimax_h3_constants.hpp>
@@ -14,7 +15,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <filesystem>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +26,7 @@
 #include <utility>
 
 #include <gufo/ext/host.hpp>
+#include "src/models/minimax_h3/image_edit.hpp"
 #include "src/models/minimax_h3/image_generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/runtime.hpp"
@@ -119,12 +123,23 @@ public:
 
   std::optional<ext::ImageCapabilities> Capabilities() const override {
     // Edits need the Qwen3-VL vision tower for the "Picture i" blocks.
+    // max_images: the square references (1024 x 1024 or smaller, default
+    // 2048 x 2048 canvas) that GUFO_H3_IMAGE_MAX_TOKENS would allow with
+    // unlimited memory: 16 by default, 3 with the extension switched off
+    // (4096). It cannot follow the free memory: the image service reads the
+    // capabilities once at startup and gates every request with them.
+    // Whether the memory allows a request's references is decided per
+    // request (ValidateRequest -> HTTP 400 with the numbers).
+    const h3::ImageEditMemory unlimited = h3::ImageEditMemoryFromSettings(
+        std::numeric_limits<std::uint64_t>::max(), nullptr,
+        std::getenv("GUFO_H3_IMAGE_MAX_TOKENS"));
     return ext::ImageCapabilities{
         .edits = !vision_projector_.empty(),
         .transparent_background = false,
         .max_side = h3::kH3ImageMaximumSide,
         .max_pixels = static_cast<std::uint64_t>(h3::kH3ImageMaximumPixels),
-        .max_images = h3::kH3ImageEditMaximumImages};
+        .max_images =
+            h3::ImageEditMaximumSquareReferences(unlimited, DefaultImageRows())};
   }
 
   void ValidateRequest(const ext::ImageRequest& request) const override {
@@ -137,13 +152,11 @@ public:
       throw std::invalid_argument(
           "MiniMax-H3-Image edits need --h3-vision-projector");
     }
-    if (request.images.size() > h3::kH3ImageEditMaximumImages) {
+    if (request.images.size() > h3::kH3ImageMaximumReferences) {
       throw std::invalid_argument(
           "MiniMax-H3-Image takes at most " +
-          std::to_string(h3::kH3ImageEditMaximumImages) +
-          " reference images in gufo (each costs at least 1024 of the 4096 "
-          "text-encoder tokens); got " +
-          std::to_string(request.images.size()));
+          std::to_string(h3::kH3ImageMaximumReferences) +
+          " reference images; got " + std::to_string(request.images.size()));
     }
     for (const auto& image : request.images) {
       if (image.width < 32 || image.height < 32) {
@@ -152,17 +165,19 @@ public:
             "each side");
       }
     }
-    if (!request.images.empty()) {
-      CheckEditTokens(request);
-    }
     if (request.steps != 0 && request.steps != h3::kH3ImagePddSteps) {
       throw std::invalid_argument(
           "MiniMax-H3-Image runs its fixed 6 distilled steps (steps 0 or 6)");
     }
     std::string error;
-    if (!h3::ResolveImageCanvas(request.width, request.height,
-                                MinimumArea(request.extension_json), &error)) {
+    const auto canvas = h3::ResolveImageCanvas(
+        request.width, request.height, MinimumArea(request.extension_json),
+        &error);
+    if (!canvas) {
       throw std::invalid_argument(error);
+    }
+    if (!request.images.empty()) {
+      CheckEditTokens(request, *canvas);
     }
   }
 
@@ -256,9 +271,23 @@ public:
     };
   }
 
+  // DiT rows of the default 2048 x 2048 canvas (4096).
+  static std::size_t DefaultImageRows() {
+    const auto canvas = h3::ResolveImageCanvas(2048, 2048);
+    const auto geometry =
+        canvas ? h3::ImageGenerationGeometry(*canvas) : std::nullopt;
+    return geometry ? static_cast<std::size_t>(geometry->latent_height / 2) *
+                          static_cast<std::size_t>(geometry->latent_width / 2)
+                    : 4096U;
+  }
+
   // The edit presentation (labels, vision blocks, prompt) against the text
-  // encoder's 4096 tokens, with the release tokenizer, before any GPU work.
-  void CheckEditTokens(const ext::ImageRequest& request) const {
+  // encoder's limit for this request (ImageEditTokenLimit: 4096, more with
+  // enough free device memory; the same function GenerateTextImage runs
+  // again before the prompt phase), with the release tokenizer, before any
+  // GPU work.
+  void CheckEditTokens(const ext::ImageRequest& request,
+                       const h3::ImageCanvas& canvas) const {
     std::string error;
     std::vector<std::uint32_t> prompt;
     std::vector<std::size_t> labels;
@@ -285,12 +314,23 @@ public:
       }
     }
     std::vector<std::pair<int, int>> sizes;
+    std::size_t condition_rows = 0;
     for (const auto& image : request.images) {
       sizes.emplace_back(image.width, image.height);
+      condition_rows += h3::ImageEditReferenceDitRows(image.width, image.height);
     }
+    const auto geometry = h3::ImageGenerationGeometry(canvas, &error);
+    if (!geometry) {
+      throw std::invalid_argument(error);
+    }
+    const std::size_t image_rows =
+        static_cast<std::size_t>(geometry->latent_height / 2) *
+        static_cast<std::size_t>(geometry->latent_width / 2);
+    const std::size_t limit = h3::ImageEditTokenLimit(
+        h3::CurrentImageEditMemory(), condition_rows, image_rows);
     if (!h3::CheckImageEditTokenBudget(
-            h3::CountImageEditTokens(sizes, labels, prompt.size()),
-            h3::kPromptEncoderMaximumTokens, &error)) {
+            h3::CountImageEditTokens(sizes, labels, prompt.size()), limit,
+            &error)) {
       throw std::invalid_argument(error);
     }
   }
