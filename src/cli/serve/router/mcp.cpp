@@ -534,7 +534,9 @@ std::vector<Tool> BuildTools(const Options& options) {
         "schritte": {"type": "integer", "minimum": 1, "maximum": 200},
         "guidance": {"type": "number", "minimum": 1, "maximum": 15, "description": "Nur triposg (guidance, triposg only)"},
         "seed": {"type": "integer", "minimum": 0},
-        "aufloesung": {"type": "integer", "enum": [256, 512], "description": "Gitterauflösung, nur triposg (grid resolution)"},
+        "aufloesung": {"type": "integer", "enum": [256, 512, 1024, 1536], "description": "Gitterauflösung: triposg 256|512, trellis2 512|1024|1536 (grid resolution)"},
+        "weitere_ansichten": {"type": "array", "maxItems": 3, "items": {"type": "string"}, "description": "Nur trellis2: bis zu 3 weitere Ansichten desselben Objekts, PNG mit Alpha (more views of the same object, trellis2 only)"},
+        "multi_modus": {"type": "string", "enum": ["stochastic", "multidiffusion"], "description": "Nur trellis2 mit mehreren Ansichten: stochastic (schnell) oder multidiffusion (alle Ansichten je Schritt) (multi-view mode)"},
         "max_dreiecke": {"type": "integer", "minimum": 0, "description": "Höchstzahl Dreiecke, 0 = unbegrenzt (max faces)"},
         "textur": {"type": "boolean", "description": "Nur trellis2: Farben als Textur (texture, trellis2 only)"}
       }
@@ -2364,7 +2366,8 @@ json::Value McpService::RunMusik(const json::Value& args,
 json::Value McpService::RunObjekt3d(const json::Value& args,
                                     const HttpRequest& outer) const {
   // pages/objekt/index.html: POST /v1/3d/generations {model, image (data
-  // URL), steps, seed, resolution, max_faces, preview, texture?/guidance?}
+  // URL) or images (TRELLIS.2 views), steps, seed, resolution, max_faces,
+  // preview, texture?/guidance?, multi_mode?}
   // (server.md "POST /v1/3d/generations").
   const std::string bild = ArgString(args, "bild", true);
   std::string model = ArgString(args, "model", false);
@@ -2375,9 +2378,27 @@ json::Value McpService::RunObjekt3d(const json::Value& args,
   if (guidance.has_value() && *guidance > 15.0)
     throw InvalidParams("arguments.guidance must be between 1 and 15");
   const auto seed = ArgInt(args, "seed", 0, 4294967295LL);
-  const auto aufloesung = ArgInt(args, "aufloesung", 256, 512);
-  if (aufloesung.has_value() && *aufloesung != 256 && *aufloesung != 512)
-    throw InvalidParams("arguments.aufloesung must be 256 or 512");
+  const auto aufloesung = ArgInt(args, "aufloesung", 256, 1536);
+  if (aufloesung.has_value() && *aufloesung != 256 && *aufloesung != 512 &&
+      *aufloesung != 1024 && *aufloesung != 1536)
+    throw InvalidParams("arguments.aufloesung must be 256, 512, 1024 or 1536");
+  // TRELLIS.2: further views of the same object (the worker checks the
+  // model's limit and answers 400 for models with one image).
+  const json::Value* weitere = Arg(args, "weitere_ansichten");
+  if (weitere != nullptr && !weitere->is_null() && !weitere->is_array())
+    throw InvalidParams("arguments.weitere_ansichten must be an array of strings");
+  if (weitere != nullptr && weitere->is_array() && weitere->size() > 3)
+    throw InvalidParams("arguments.weitere_ansichten takes at most 3 images");
+  if (weitere != nullptr && weitere->is_array())
+    for (const json::Value& ansicht : weitere->items())
+      if (!ansicht.is_string() || ansicht.str().empty())
+        throw InvalidParams(
+            "arguments.weitere_ansichten must be an array of strings");
+  const std::string multi_modus = ArgString(args, "multi_modus", false);
+  if (!multi_modus.empty() && multi_modus != "stochastic" &&
+      multi_modus != "multidiffusion")
+    throw InvalidParams(
+        "arguments.multi_modus must be stochastic or multidiffusion");
   const auto max_dreiecke = ArgInt(args, "max_dreiecke", 0, 100000000LL);
   const auto textur = ArgBool(args, "textur");
   const auto vorrang = ArgInt(args, "vorrang", 0, 9);
@@ -2386,7 +2407,26 @@ json::Value McpService::RunObjekt3d(const json::Value& args,
     return std::move(*media.failure);
   json::Value body = json::Value::object();
   body["model"] = model;
-  body["image"] = DataUrlOf(media);
+  if (weitere != nullptr && weitere->is_array() && weitere->size() > 0) {
+    json::Value images = json::Value::array();
+    images.push_back(DataUrlOf(media));
+    std::size_t index = 0;
+    for (const json::Value& ansicht : weitere->items()) {
+      const std::string where =
+          "arguments.weitere_ansichten[" + std::to_string(index++) + "]";
+      if (!ansicht.is_string())
+        throw InvalidParams(where + " must be a string");
+      Media more = ReadMedia(outer, ansicht.str(), where);
+      if (more.failure.has_value())
+        return std::move(*more.failure);
+      images.push_back(DataUrlOf(more));
+    }
+    body["images"] = std::move(images);
+  } else {
+    body["image"] = DataUrlOf(media);
+  }
+  if (!multi_modus.empty())
+    body["multi_mode"] = multi_modus;
   if (schritte.has_value())
     body["steps"] = *schritte;
   if (seed.has_value())

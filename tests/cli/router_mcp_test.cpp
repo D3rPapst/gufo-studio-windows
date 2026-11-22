@@ -2407,9 +2407,32 @@ void TestMediaJobs() {
              kLan, Fixture::Bearer(mia));
   CheckAccepted(r, "triposg");
   CHECK(WrappedBody(LastSubmit(f)).find("texture")->as_bool());
+  // TRELLIS.2: further views go out as `images` (first = bild), the mode
+  // and 1024 / 1536 pass through.
+  r = f.Call("objekt_3d",
+             "{\"bild\":\"" + png_url + "\",\"weitere_ansichten\":[\"" +
+                 png_url + "\",\"" + png_url +
+                 "\"],\"multi_modus\":\"multidiffusion\",\"aufloesung\":1536}",
+             kLan, Fixture::Bearer(mia));
+  CheckAccepted(r, "triposg");
+  {
+    const json::Value b = WrappedBody(LastSubmit(f));
+    CHECK(b.find("image") == nullptr);
+    const json::Value* images = b.find("images");
+    CHECK(images != nullptr && images->is_array() && images->size() == 3);
+    if (images != nullptr && images->is_array() && images->size() == 3)
+      CHECK_EQ(images->items()[0].str(), png_url);
+    CHECK_EQ(b.member_str("multi_mode"), std::string("multidiffusion"));
+    CHECK_EQ(b.member_double("resolution"), 1536.0);
+  }
   for (const char* bad :
        {"{}", "{\"bild\":\"x.png\"}",
         "{\"bild\":\"data:image/png;base64,QUJD\",\"aufloesung\":300}",
+        "{\"bild\":\"data:image/png;base64,QUJD\",\"aufloesung\":768}",
+        "{\"bild\":\"data:image/png;base64,QUJD\",\"multi_modus\":\"concat\"}",
+        "{\"bild\":\"data:image/png;base64,QUJD\",\"weitere_ansichten\":\"x\"}",
+        "{\"bild\":\"data:image/png;base64,QUJD\",\"weitere_ansichten\":[1]}",
+        "{\"bild\":\"data:image/png;base64,QUJD\",\"weitere_ansichten\":[\"a\",\"b\",\"c\",\"d\"]}",
         "{\"bild\":\"data:image/png;base64,QUJD\",\"guidance\":20}"}) {
     r = f.Call("objekt_3d", bad, kLan, Fixture::Bearer(mia));
     CHECK_EQ(RpcCode(r), mcp::kInvalidParams);

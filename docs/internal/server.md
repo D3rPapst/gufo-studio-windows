@@ -2936,9 +2936,11 @@ areas instead of the list hiding why a tool is missing.
   `/v1/audio/music` `{model, prompt, lyrics, task text2music, duration,
   seed?, response_format, bitrate_kbps 192 for mp3}`.
 - `objekt_3d` `{bild, model?, schritte?, guidance? (1-15), seed?,
-  aufloesung? (256|512), max_dreiecke?, textur?, titel?, vorrang?}`:
-  `/v1/3d/generations` `{model, image (data url), steps?, seed?,
-  resolution?, max_faces?, guidance?, texture?, preview true}`.
+  aufloesung? (256|512|1024|1536), weitere_ansichten? (up to 3 more views,
+  trellis2), multi_modus? (stochastic|multidiffusion), max_dreiecke?,
+  textur?, titel?, vorrang?}`: `/v1/3d/generations` `{model, image (data
+  url) or images (bild + weitere_ansichten), steps?, seed?, resolution?,
+  multi_mode?, max_faces?, guidance?, texture?, preview true}`.
 - `hochskalieren` `{datei, faktor? (2|4), variante? (allgemein|
   entrauscht|anime), ausgabe? (png|jpg), model?, titel?, vorrang?}`: an
   image (by content type) goes to `/v1/images/upscale` `{model, variant
@@ -3072,7 +3074,7 @@ the chat case answered, the child was stopped; see the C5 commit.
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `POST` | `/v1/images/upscale` | `gufo serve upscale` (Real-ESRGAN on the NPU, GPU or CPU); sync, or `"async": true` for a job read at `/v1/images/upscale/{id}[/content]` |
 | `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 (or with `"output_format": "png_zip"` a stored ZIP of lossless PNG frames) at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](../models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
-| `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header |
+| `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header. TRELLIS.2 (`feat/trellis2-hq`) also takes `images` (1-4 views of one object instead of `image`), `resolution` 512\|1024\|1536 (cascade, needs the 1024 flows) and `multi_mode` `stochastic`\|`multidiffusion`; 400 `invalid_images`, `too_many_images`, `invalid_resolution`, `invalid_multi_mode` (see [trellis2.md](../models/trellis2.md)). The snapshot adds `views` and `multi_mode`, `data[0]` adds `resolution` (grid used) and `tokens`. The router relays the body unchanged |
 | `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds}}` |
 | `GET` | `/v1/3d/generations/{id}/content` | The finished GLB (`model/gltf-binary`, `Content-Disposition: attachment`) |
 | `GET` | `/v1/3d/generations/{id}/preview` | Three-view preview PNG of the mesh |
