@@ -183,6 +183,7 @@ struct Drafter {
   int window = 1024;
   bool swa[NL] = {true, false, true};
   bool adjacent = false;
+  bool markov_on = true;  // false: base logits lm_head(row) only (sanity check of the Markov head)
   float fuse[4][4];
   std::vector<float> out_norm, dspark_norm, mask, joint_b, hout_b;
   Mat markov, joint, hout;
@@ -335,7 +336,7 @@ struct Drafter {
         latent[c] = std::tanh(gates[2 * RANK + c]);
       }
       hout.Apply(latent.data(), corr.data(), 1);
-      for (int c = 0; c < E; ++c) h2[c] = hid[i * E + c] + corr[c] + hout_b[c];
+      for (int c = 0; c < E; ++c) h2[c] = hid[i * E + c] + (markov_on ? corr[c] + hout_b[c] : 0.f);
       lm_head.Apply(h2.data(), logits.data(), 1);
       int best = 0;
       float bv = -1e30f;
@@ -361,7 +362,7 @@ std::vector<int> ParseList(const std::string& s) {
 
 int main(int argc, char** argv) {
   std::string model, drafter_path, prompt_path, klist = "3,5,7", rope = "neox";
-  int gen = 256, chat = 1, tap_shift = 0;
+  int gen = 256, chat = 1, tap_shift = 0, window_extra = 0, markov = 1;
   unsigned ctx = 8192;
   for (int i = 1; i < argc; ++i) {
     const std::string k = argv[i];
@@ -376,6 +377,8 @@ int main(int argc, char** argv) {
     else if (k == "--threads") g_threads = std::atoi(next().c_str());
     else if (k == "--tap-shift") tap_shift = std::atoi(next().c_str());
     else if (k == "--rope") rope = next();
+    else if (k == "--window-extra") window_extra = std::atoi(next().c_str());
+    else if (k == "--markov") markov = std::atoi(next().c_str());
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
   (void)tap_shift;  // reserved: the taps sit at the visit inputs 5/23/41 (sebt3, ciru-ai)
@@ -440,6 +443,9 @@ int main(int argc, char** argv) {
   // ---- 2 drafter context for every position with features
   Drafter d(*dreader);
   d.adjacent = rope == "adjacent";
+  d.window += window_extra;
+  d.markov_on = markov != 0;
+  std::printf("drafter variant: window %d, markov %d\n", d.window, markov);
   const int npos = static_cast<int>(feat.size() / (4 * E));
   const auto t1 = Clock::now();
   d.Inject(feat, npos);

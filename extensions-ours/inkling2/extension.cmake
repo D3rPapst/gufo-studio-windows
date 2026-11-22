@@ -44,7 +44,7 @@ gufo_extension_target(
     gufo_ext_hip
 )
 if(TARGET gufo_inkling2_hip)
-  gufo_extension_hip_sources(gufo_inkling2_hip SOURCES src/hip/kernels.hip src/hip/fast.hip src/vision/vision_encoder.hip)
+  gufo_extension_hip_sources(gufo_inkling2_hip SOURCES src/hip/kernels.hip src/hip/fast.hip src/vision/vision_encoder.hip src/hip/dspark.hip)
 endif()
 
 # GPU tools (test role: built only with BUILD_TESTING=ON and HIP).
@@ -132,7 +132,7 @@ install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
 # -DGUFO_INKLING2_TOOLS=ON (the pause scripts build them by name; never part of the gufo target).
 option(GUFO_INKLING2_TOOLS "Build the Inkling 2 check/bench tools" OFF)
 if(GUFO_INKLING2_TOOLS AND TARGET gufo_inkling2_hip)
-  foreach(tool IN ITEMS inkling2_force inkling2_spec inkling2_dspark inkling2_bench_win)
+  foreach(tool IN ITEMS inkling2_force inkling2_spec inkling2_dspark inkling2_dsrun inkling2_bench_win)
     if(NOT tool STREQUAL inkling2_bench_win)
       add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tools-win/${tool}.cpp")
     else()

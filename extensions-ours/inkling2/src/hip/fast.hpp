@@ -81,6 +81,8 @@ struct ConvResidArgs {
   float* blk;  // may be null
   int nsum = 0;  // > 1: x holds [nb][nsum][2304] partial rows that are added in slot order first
   int tok_base = 0;  // gufo_windows: token index offset of a per-token launch (chain mode)
+  float* log = nullptr;  // gufo_windows: chain mode, state after every token: log[tok * log_stride + visit-local offset]
+  std::size_t log_stride = 0;
   int chain = 0;  // gufo_windows: > 1 = the nb tokens are consecutive positions of ONE session (speculative
                   // verify); the launcher then runs one launch per token in order, so the conv history advances
 };
@@ -154,6 +156,8 @@ struct KvPrepArgs {
   float scale, qk_thr, eps;
   int ld = 0, ldd = 0;  // token strides of k / v and of dk / dv (decode batches); slot advances 48 entries per token
   int tok_base = 0;  // gufo_windows: token index offset of a per-token launch (chain mode)
+  float* log = nullptr;  // gufo_windows: chain mode, state after every token: log[tok * log_stride + visit-local offset]
+  std::size_t log_stride = 0;
   int chain = 0;  // gufo_windows: > 1 = consecutive positions of one session (see ConvResidArgs::chain)
 };
 void KvPrep(hipStream_t s, const KvPrepArgs& a, int nb = 1);

@@ -286,7 +286,7 @@ struct Engine::Impl {
   float *d_cur, *d_prelude, *d_bankout, *d_msgs, *d_mixed, *d_ctl, *d_in, *d_g64, *d_proj, *d_sink,
       *d_dyn, *d_ob, *d_ao, *d_h, *d_mixf, *d_hn, *d_moe, *d_rlog, *d_wts8, *d_act8, *d_ws_o, *d_ws_m,
       *d_ws_l;
-  static constexpr int kMaxB = 4;  // sessions per decode batch
+  static constexpr int kMaxB = 8;  // tokens per decode step (gufo_windows: 8 for chains; sessions stay <= 4)
   // token strides (floats) of the decode buffers
   static constexpr int kSIn = 3 * kEmbd;    // d_in, d_mixed
   static constexpr int kSCtl = 4 * kEmbd;   // d_ctl, d_msgs
@@ -617,7 +617,7 @@ struct Engine::Impl {
     head_fast = IsType(w->output, kk::kTQ8_0);
     // Capture the short-context graphs now (single-threaded, before any cache thread exists).
     if (use_graph && fast_decode && BatchCapable()) {
-      for (nb = 1; nb <= kMaxB; ++nb) (void)CaptureGraph(2048, 2048 * 8 + nb);
+      for (nb = 1; nb <= 4; ++nb) (void)CaptureGraph(2048, 2048 * 64 + nb);
       nb = 1;
     }
   }
@@ -1190,6 +1190,10 @@ struct Engine::Impl {
       ka.ld = kSProj;
       ka.ldd = 64;
       ka.chain = chain;
+      if (chain > 1) {
+        ka.log = d_convlog + static_cast<std::size_t>(slot_idx) * kConvChannels * 3;
+        ka.log_stride = static_cast<std::size_t>(48) * kConvChannels * 3;
+      }
       fs::KvPrep(ds, ka, nb);
     }
 
@@ -1243,6 +1247,10 @@ struct Engine::Impl {
       ca.cur = cur;
       ca.blk = nullptr;
       ca.chain = chain;
+      if (chain > 1) {
+        ca.log = d_convlog + static_cast<std::size_t>(slot_idx) * kConvChannels * 3;
+        ca.log_stride = static_cast<std::size_t>(48) * kConvChannels * 3;
+      }
       if (ip % static_cast<int>(cfg->attn_res_block) == 0) {
         ca.blk = NewBlock();
         d_states[d_ns++] = ca.blk;
@@ -1324,6 +1332,10 @@ struct Engine::Impl {
       ca.cur = cur;
       ca.blk = nullptr;
       ca.chain = chain;
+      if (chain > 1) {
+        ca.log = d_convlog + static_cast<std::size_t>(slot_idx) * kConvChannels * 3;
+        ca.log_stride = static_cast<std::size_t>(48) * kConvChannels * 3;
+      }
       pend.on = true;
       pend.a = ca;
     }
@@ -1487,6 +1499,7 @@ struct Engine::Impl {
   int chain = 0;
   bool no_cr_fuse = false;
   // gufo_windows: DSpark feature capture (taps at visits 5/23/41 + final normalised state), [kMaxB][4][kEmbd]
+  float* d_convlog = nullptr;  // gufo_windows: [kMaxB][48 visits][kConvChannels][3] conv state after every chain token
   bool capture_feat = false;
   float* d_feat = nullptr;               // allocated by Engine::SetFeatureCapture (never inside a graph capture)
   std::vector<float>* feat_out = nullptr;  // host copy target of the last decode step
@@ -1516,7 +1529,7 @@ struct Engine::Impl {
       Check(hipMemcpyAsync(d_tbl + b * 48, sess[b]->tbl_, 48 * sizeof(fs::SlotEntry), hipMemcpyDeviceToDevice, ds),
             "slot table");
     if (use_graph) {
-      const int key = ctx * 32 + n + (chain_mode ? 8 : 0) + (capture_feat ? 16 : 0);
+      const int key = ctx * 64 + n + (chain_mode ? 16 : 0) + (capture_feat ? 32 : 0);
       auto it = graphs.find(key);
       if (it == graphs.end() && failed_graphs.count(key) == 0) it = CaptureGraph(ctx, key);
       if (it != graphs.end()) {
@@ -1741,7 +1754,7 @@ bool Engine::batch_capable() const {
 }
 
 void Engine::DecodeBatch(std::span<Session* const> sessions, std::span<const std::int32_t> tokens) {
-  if (sessions.size() != tokens.size() || sessions.size() > static_cast<std::size_t>(Impl::kMaxB))
+  if (sessions.size() != tokens.size() || sessions.size() > kMaxDecodeBatch)
     throw std::runtime_error("inkling2: bad decode batch");
   const std::lock_guard lock(mutex_);
   for (std::size_t i = 0; i < sessions.size(); ++i) {
@@ -1783,8 +1796,28 @@ void Engine::VerifyChain(Session& s, std::span<const std::int32_t> tokens,
     sess[i] = &s;
     outs[i] = &(*logits)[i];
   }
+  if (!impl_->d_convlog)
+    impl_->d_convlog = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 48 * kConvChannels * 3 * 4, "chain conv log"));
   impl_->DecodeN(sess, tokens.data(), outs, static_cast<int>(n), /*chain_mode=*/true);
   s.logits_ = logits->back();
+  s.chain_first_ = s.pos_ - n;
+  s.chain_n_ = n;
+}
+
+void Engine::ChainKeep(Session& s, std::size_t keep, const std::vector<float>& logits) {
+  const std::lock_guard lock(mutex_);
+  if (keep == 0 || keep > s.chain_n_ || s.pos_ != s.chain_first_ + s.chain_n_)
+    throw std::runtime_error("inkling2: ChainKeep needs the last step of this session to be a chain of >= keep tokens");
+  if (keep < s.chain_n_) {
+    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+    const std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
+    for (std::size_t v = 0; v < 48; ++v)
+      Check(hipMemcpy(s.slots_[v].conv, impl_->d_convlog + ((keep - 1) * 48 + v) * per, per * 4, hipMemcpyDeviceToDevice),
+            "chain keep");
+    s.pos_ = s.chain_first_ + keep;
+    s.logits_ = logits;
+  }
+  s.chain_n_ = 0;
 }
 
 void Engine::SetFeatureCapture(bool on) {
@@ -1794,6 +1827,21 @@ void Engine::SetFeatureCapture(bool on) {
   impl_->capture_feat = on;
   impl_->feat_out = on ? &features_ : nullptr;
   if (!on) features_.clear();
+}
+
+Engine::DraftTargetView Engine::draft_target() const {
+  DraftTargetView v;
+  const auto& W = weights_;
+  v.embd = impl_->dw.Ptr(W.token_embd);
+  v.embd_type = static_cast<int>(W.token_embd.type);
+  v.embd_norm = static_cast<const float*>(impl_->dw.Ptr(W.token_embd_norm));
+  v.head = impl_->dw.Ptr(W.output);
+  v.head_type = static_cast<int>(W.output.type);
+  v.head_rows = static_cast<int>(W.output.ne[1]);
+  v.vocab = static_cast<int>(W.config.n_vocab_text);
+  v.eps = W.config.rms_eps;
+  v.features = impl_->d_feat;
+  return v;
 }
 
 void Engine::Synchronize() {

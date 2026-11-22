@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
       }
       std::printf("verify T=%d: %.2f ms per step (%s)\n", T, total / reps, T == 1 ? "decode path" : "multi-token path, all logits");
     }
-    for (int T = 2; T <= 4 && engine->batch_capable(); ++T) {
+    for (int T = 2; T <= 8 && engine->batch_capable(); ++T) {
       std::vector<std::vector<float>> rows;
       double total = 0;
       for (int r = 0; r < 6; ++r) {
@@ -170,13 +170,13 @@ int main(int argc, char** argv) {
       }
       std::printf("verify T=%d: %.2f ms per step (chain path, weights read once)\n", T, total / 5);
     }
-    // chain correctness: 4 sequential decode steps vs one chain of the same 4 tokens
+    // chain correctness: 8 sequential decode steps vs one chain of the same 8 tokens
     if (engine->batch_capable()) {
       Load(*s, base);
       std::vector<std::int32_t> seq;
       std::vector<std::vector<float>> ref;
       std::int32_t t = Argmax(base.logits.data(), V);
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < 8; ++i) {
         seq.push_back(t);
         engine->Forward(*s, std::span<const std::int32_t>(&t, 1));
         ref.push_back(s->logits());
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
       Load(*s, base);
       std::vector<std::vector<float>> rows;
       engine->VerifyChain(*s, seq, &rows);
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < 8; ++i) {
         double ab = 0, aa = 0, bb = 0, md = 0;
         for (std::size_t j = 0; j < V; ++j) {
           md = std::max(md, std::abs(double(rows[i][j]) - ref[i][j]));
@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
       std::vector<float> after_seq;
       {
         Load(*s, base);
-        for (int i = 0; i < 4; ++i) engine->Forward(*s, std::span<const std::int32_t>(&seq[i], 1));
+        for (int i = 0; i < 8; ++i) engine->Forward(*s, std::span<const std::int32_t>(&seq[i], 1));
         engine->Forward(*s, std::span<const std::int32_t>(&t, 1));
         after_seq = s->logits();
         Load(*s, base);

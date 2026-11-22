@@ -83,6 +83,7 @@ private:
   friend class SessionStateAccess;  // M2 hook: export/import of the per-visit state
   Session() = default;
   SessionHooks* hooks_ = nullptr;  // M2 hook
+  std::size_t chain_first_ = 0, chain_n_ = 0;  // gufo_windows: last VerifyChain (for ChainKeep)
   std::size_t pos_ = 0;
   std::size_t bytes_ = 0;
   std::vector<float> logits_;
@@ -141,7 +142,7 @@ public:
   [[nodiscard]] bool batch_capable() const;
   void DecodeBatch(std::span<Session* const> sessions, std::span<const std::int32_t> tokens);
 
-  /// gufo_windows addition (speculative verify): evaluates 2..kMaxDecodeBatch tokens of ONE session at
+  /// gufo_windows addition (speculative verify): evaluates 2..8 tokens of ONE session at
   /// consecutive positions through the batched decode graph (weights read once, like DecodeBatch), with the
   /// conv histories run through the tokens in order. `logits[i]` receives the logits after tokens[0..i].
   /// The session advances by tokens.size(); s.logits() holds the last row. Throws when not batch_capable().
@@ -150,7 +151,26 @@ public:
   /// gufo_windows addition (DSpark drafter features): when on, every decode step (single-token Forward,
   /// DecodeBatch, VerifyChain) also records per token the residual stream entering visits 5, 23 and 41 and
   /// the final normalised state, [tokens][4][2304] floats, readable with features() after the step.
+  /// gufo_windows: after VerifyChain of n tokens keep only the first `keep` (1..n): conv histories from the
+  /// per-token log of the chain, position first + keep, logits = `logits` (the chain row keep - 1). No recompute.
+  void ChainKeep(Session& s, std::size_t keep, const std::vector<float>& logits);
+
   void SetFeatureCapture(bool on);
+
+  /// gufo_windows (DSpark drafter): device views of the target tensors the drafter shares, and the feature
+  /// buffer of the last decode step ([tokens][4][2304] floats, valid after a step with feature capture on).
+  struct DraftTargetView {
+    const void* embd = nullptr;  // token_embd
+    int embd_type = 0;
+    const float* embd_norm = nullptr;
+    const void* head = nullptr;  // output (lm_head)
+    int head_type = 0;
+    int head_rows = 0;
+    int vocab = 0;  // n_vocab_text (argmax range)
+    float eps = 1e-6f;
+    const float* features = nullptr;
+  };
+  [[nodiscard]] DraftTargetView draft_target() const;
   [[nodiscard]] const std::vector<float>& features() const { return features_;}
 
 private:

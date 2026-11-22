@@ -564,6 +564,10 @@ __device__ __forceinline__ void conv_resid_elem(const ConvResidArgs& a, int c, i
 #pragma unroll
   for (int i = 0; i < 4; ++i) y += a.w[(size_t)c * 4 + i] * xin[i];
   st[0] = xin[1]; st[1] = xin[2]; st[2] = xin[3];
+  if (a.log) {  // gufo_windows: chain verify keeps the state after every token (rollback without recompute)
+    float* lg = a.log + (size_t)tok * a.log_stride + (size_t)a.conv_off * 3 + (size_t)c * 3;
+    lg[0] = xin[1]; lg[1] = xin[2]; lg[2] = xin[3];
+  }
   const float o = (xin[3] + y) * a.scale;
   const float cv = a.cur[to + c];
   if (a.blk) {
@@ -832,6 +836,12 @@ __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
   }
   sk[0] = kx[1]; sk[1] = kx[2]; sk[2] = kx[3];
   sv[0] = vx[1]; sv[1] = vx[2]; sv[2] = vx[3];
+  if (a.log) {  // gufo_windows: chain verify keeps the state after every token
+    float* lk = a.log + (size_t)tk * a.log_stride + (size_t)a.conv_off_k * 3 + (size_t)c * 3;
+    float* lv = a.log + (size_t)tk * a.log_stride + (size_t)a.conv_off_v * 3 + (size_t)c * 3;
+    lk[0] = kx[1]; lk[1] = kx[2]; lk[2] = kx[3];
+    lv[0] = vx[1]; lv[1] = vx[2]; lv[2] = vx[3];
+  }
   const float kc = (kx[3] + ky) * a.scale, vc = (vx[3] + vy) * a.scale;
   const float kss = block_sum(kc * kc, red);
   const float vss = block_sum(vc * vc, red);
@@ -1797,6 +1807,13 @@ void SetTune(int proj, int gu, int down) {
 
 // ---------------------------------------------------------------------------------------------
 void ProjMulti(hipStream_t s, const ProjSpec& p, const float* x, int ni, float* y, int nb, int ldx, int ldy) {
+  if (nb > 4) {  // gufo_windows: chains of up to 8 tokens run as chunks of 4 (same per-token arithmetic)
+    ProjMulti(s, p, x, ni, y, 4, ldx, ldy);
+    ProjSpec p2 = p;
+    for (int i = 0; i < p2.tn; ++i) p2.ty[i] += 4 * (size_t)p2.tys[i];
+    ProjMulti(s, p2, x + 4 * (size_t)ldx, ni, y + 4 * (size_t)ldy, nb - 4, ldx, ldy);
+    return;
+  }
   MultiP mp{};
   mp.ldx = ldx;
   mp.ldy = ldy;
@@ -1861,6 +1878,11 @@ void ProjMulti(hipStream_t s, const ProjSpec& p, const float* x, int ni, float* 
 }
 
 void GemvQ8(hipStream_t s, int k, const void* w, const float* x, float* y, int m, float softcap, int nb) {
+  if (nb > 4) {  // gufo_windows: chunks of 4 tokens (x [nb][k], y [nb][m])
+    GemvQ8(s, k, w, x, y, m, softcap, 4);
+    GemvQ8(s, k, w, x + 4 * (size_t)k, y + 4 * (size_t)m, m, softcap, nb - 4);
+    return;
+  }
   const uint8_t* W = static_cast<const uint8_t*>(w);
   if (k == 2304) {
     constexpr int LPR = 32, NIT = 1, BW = 4, RPB = BW * (WS / LPR) * NIT;
