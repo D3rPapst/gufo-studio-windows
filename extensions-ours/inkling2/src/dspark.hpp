@@ -40,6 +40,8 @@ public:
   void Stage(std::size_t pos0, std::size_t n, const float* device_rows);
   /// Injects the staged rows now (Draft does it itself).
   void Flush();
+  /// Injects device rows right away (no staging; round-6 behaviour, for A/B checks).
+  void InjectNow(std::size_t pos0, std::size_t n, const float* device_rows);
   /// Up to k (<= 7) tokens after `anchor` at position pos0; empty when the context of pos0 - 1 is missing.
   [[nodiscard]] std::vector<std::int32_t> Draft(std::int32_t anchor, std::size_t pos0, int k);
   /// Wall time of the last Draft call (synchronised), milliseconds.

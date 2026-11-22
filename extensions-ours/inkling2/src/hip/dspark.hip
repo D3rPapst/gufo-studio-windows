@@ -549,6 +549,10 @@ void DSparkDrafter::Stage(std::size_t pos0, std::size_t n, const float* device_r
   impl_->Stage(static_cast<long long>(pos0), static_cast<int>(n), device_rows);
 }
 void DSparkDrafter::Flush() { impl_->Flush(); }
+void DSparkDrafter::InjectNow(std::size_t pos0, std::size_t n, const float* device_rows) {
+  impl_->Flush();
+  impl_->InjectRows(static_cast<long long>(pos0), static_cast<int>(n), device_rows);
+}
 void DSparkDrafter::Inject(std::size_t pos0, std::size_t n) {
   impl_->tv.features = impl_->target->draft_target().features;
   impl_->Inject(static_cast<long long>(pos0), static_cast<int>(n));

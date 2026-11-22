@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include <hip/hip_runtime.h>
+
 #include <gufo/ext/gguf_reader.hpp>
 
 #include "src/dspark.hpp"
@@ -41,6 +43,25 @@ std::int32_t Argmax(const std::vector<float>& v, int n) {
   return static_cast<std::int32_t>(std::max_element(v.begin(), v.begin() + n) - v.begin());
 }
 
+// prompt: one prefill Forward, chains of 8 (decode kernels) or single decode steps
+void FeedPrompt(Engine& e, Session& s, const std::vector<std::int32_t>& ids, const std::string& path) {
+  if (path == "prefill") { e.Forward(s, ids); return; }
+  std::vector<std::int32_t> am;
+  std::size_t i = 0;
+  while (i < ids.size()) {
+    const std::size_t n = path == "chain" ? std::min<std::size_t>(8, ids.size() - i) : 1;
+    if (n >= 2) e.VerifyChainArgmax(s, std::span<const std::int32_t>(ids.data() + i, n), &am), e.ChainKeep(s, n);
+    else e.Forward(s, std::span<const std::int32_t>(ids.data() + i, 1));
+    i += n;
+  }
+}
+
+double Cos(const float* a, const float* b, int n) {
+  double ab = 0, aa = 0, bb = 0;
+  for (int i = 0; i < n; ++i) { ab += double(a[i]) * b[i]; aa += double(a[i]) * a[i]; bb += double(b[i]) * b[i]; }
+  return ab / std::sqrt(aa * bb + 1e-30);
+}
+
 std::vector<std::string> Split(const std::string& s) {
   std::vector<std::string> out;
   std::stringstream ss(s);
@@ -51,8 +72,9 @@ std::vector<std::string> Split(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, drafter_path, prompt_path, policies = "3,5,7,a";
-  int gen = 256, chat = 1, window_extra = 0;
+  std::string model, drafter_path, prompt_path, policies = "3,5,7,a", prompt_path_mode = "prefill";
+  int gen = 256, chat = 1, window_extra = 0, stage = 1, feature_diff = 0;
+  double min_accept = 0;
   unsigned ctx = 8192;
   for (int i = 1; i < argc; ++i) {
     const std::string k = argv[i];
@@ -65,6 +87,10 @@ int main(int argc, char** argv) {
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
     else if (k == "--policies") policies = next();
     else if (k == "--window-extra") window_extra = std::atoi(next().c_str());
+    else if (k == "--prompt-path") prompt_path_mode = next();
+    else if (k == "--stage") stage = std::atoi(next().c_str());
+    else if (k == "--feature-diff") feature_diff = std::atoi(next().c_str());
+    else if (k == "--min-accept") min_accept = std::atof(next().c_str());
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
   std::string err, text;
@@ -99,8 +125,11 @@ int main(int argc, char** argv) {
   if (!drafter) { std::fprintf(stderr, "drafter: %s\n", err.c_str()); return 1; }
   std::printf("prompt %zu tokens, gen %d, drafter loaded in %.1f s\n", ids.size(), gen, Ms(tl) / 1000.0);
   const Session* spec_session = nullptr;
+  int exit_code = 0;
   auto sink = [&](const Session& s, std::size_t pos0, std::size_t n, const float* rows) {
-    if (&s == spec_session) drafter->Stage(pos0, n, rows);
+    if (&s != spec_session) return;
+    if (stage) drafter->Stage(pos0, n, rows);
+    else drafter->InjectNow(pos0, n, rows);
   };
 
   // ---- warm-up: decode graphs with and without features, chains of 2..8, outside the timing
@@ -116,12 +145,41 @@ int main(int argc, char** argv) {
     engine->Forward(*w, std::span<const std::int32_t>(t.data(), 1));
   }
 
-  // ---- plain reference: prefill, then single-token greedy decode (no feature capture)
+  // ---- feature diff: the rows the drafter gets for the prompt from prefill / chains vs single decode steps
+  if (feature_diff) {
+    const int E = 2304;
+    auto collect = [&](const std::string& path) {
+      std::vector<float> host(ids.size() * 4 * E, 0.f);
+      auto s = engine->NewSession();
+      engine->SetFeatureSink([&](const Session& ss, std::size_t pos0, std::size_t n, const float* rows) {
+        if (&ss != s.get() || pos0 + n > ids.size()) return;
+        (void)hipMemcpy(host.data() + pos0 * 4 * E, rows, n * 4 * E * 4, hipMemcpyDeviceToHost);
+      });
+      FeedPrompt(*engine, *s, ids, path);
+      engine->SetFeatureSink({});
+      return host;
+    };
+    const auto dec = collect("decode"), pre = collect("prefill"), chn = collect("chain");
+    for (const auto& [name, v] : {std::pair<const char*, const std::vector<float>*>{"prefill", &pre}, {"chain", &chn}}) {
+      double mn[4] = {1, 1, 1, 1}, mean[4] = {0, 0, 0, 0};
+      int worst[4] = {0, 0, 0, 0};
+      for (std::size_t p = 0; p < ids.size(); ++p)
+        for (int j = 0; j < 4; ++j) {
+          const double c = Cos(v->data() + (p * 4 + j) * E, dec.data() + (p * 4 + j) * E, E);
+          mean[j] += c / ids.size();
+          if (c < mn[j]) { mn[j] = c; worst[j] = static_cast<int>(p); }
+        }
+      std::printf("feature diff %s vs decode (%zu positions): tap5 mean %.5f min %.5f@%d | tap23 %.5f %.5f@%d | tap41 %.5f %.5f@%d | final %.5f %.5f@%d\n",
+                  name, ids.size(), mean[0], mn[0], worst[0], mean[1], mn[1], worst[1], mean[2], mn[2], worst[2], mean[3], mn[3], worst[3]);
+    }
+  }
+
+  // ---- plain reference: prompt, then single-token greedy decode (no feature capture)
   std::vector<std::int32_t> ref;
   double decode_ms = 22.5;
   {
     auto s = engine->NewSession();
-    engine->Forward(*s, ids);
+    FeedPrompt(*engine, *s, ids, prompt_path_mode);
     std::int32_t nx = Argmax(s->logits(), V);
     const auto t0 = Clock::now();
     for (int g = 0; g < gen; ++g) {
@@ -146,7 +204,7 @@ int main(int argc, char** argv) {
     auto s = engine->NewSession();
     spec_session = s.get();
     drafter->Reset(0);
-    engine->Forward(*s, ids);  // prefill: features through the sink
+    FeedPrompt(*engine, *s, ids, prompt_path_mode);  // features through the sink
     std::vector<std::int32_t> out;
     std::int32_t nx = Argmax(s->logits(), V);
     int cycles = 0, plain_steps = 0, drafted = 0, accepted = 0, probes = 0;
@@ -221,8 +279,13 @@ int main(int argc, char** argv) {
                 cycles ? static_cast<double>(gen - plain_steps) / cycles : 0.0, cycles ? draft_total / cycles : 0.0,
                 cycles ? verify_total / cycles : 0.0, cycles ? keep_total / cycles : 0.0, policy.Hit());
     for (const auto& [k, n] : k_used) std::printf(" %d:%d", k, n);
-    std::printf("\n");
+    std::printf(" [prompt %s, stage %d]\n", prompt_path_mode.c_str(), stage);
+    if (!adaptive && min_accept > 0 && drafted > 0) {
+      const double acc = 100.0 * accepted / drafted;
+      std::printf("acceptance check K=%d: %.0f%% %s (minimum %.0f%%)\n", fixed_k, acc, acc >= min_accept ? "OK" : "FAIL", min_accept);
+      if (acc < min_accept) exit_code = 4;
+    }
   }
   engine->SetFeatureSink({});
-  return 0;
+  return exit_code;
 }
