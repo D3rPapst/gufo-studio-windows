@@ -132,6 +132,8 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
       return 256;
+    case core::GgmlType::kNVFP4:
+      return 64;
     default:
       return 0;
   }
@@ -180,6 +182,9 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
 
 // Dequantize row of Q8_0 to float
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of NVFP4 (64 E2M1 values, 4 UE4M3 scales per block) to float
+void DequantizeNVFP4(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of Q5_1 to float
 void DequantizeQ5_1(const void* src, float* dst, std::size_t k);

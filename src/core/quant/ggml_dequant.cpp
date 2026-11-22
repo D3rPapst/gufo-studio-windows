@@ -187,6 +187,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
     case core::GgmlType::kQ8_1:
       block_bytes = 36;
       break;
+    case core::GgmlType::kNVFP4:
+      block_bytes = 36;
+      break;
     case core::GgmlType::kQ2_K:
       block_bytes = 84;
       break;
@@ -671,6 +674,40 @@ __attribute__((target("avx512f"))) void DequantizeIQ4_NLAvx512(
 
 #endif
 
+namespace {
+// UE4M3 scale, halved to match the doubled E2M1 table (ggml_ue4m3_to_fp32).
+float Ue4m3ToFloatHalf(std::uint8_t x) noexcept {
+  if (x == 0 || x == 0x7F) {
+    return 0.0F;
+  }
+  const int exponent = (x >> 3) & 0xF;
+  const int mantissa = x & 0x7;
+  const float raw =
+      exponent == 0
+          ? std::ldexp(static_cast<float>(mantissa), -9)
+          : std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F, exponent - 7);
+  return raw * 0.5F;
+}
+constexpr std::int8_t kValuesFp4[16] = {0, 1,  2,  3,  4,  6,  8,  12,
+                                        0, -1, -2, -3, -4, -6, -8, -12};
+}  // namespace
+
+void DequantizeNVFP4(const void* src, float* dst, std::size_t k) {
+  const auto* bytes = static_cast<const std::uint8_t*>(src);
+  for (std::size_t block = 0; block < k / 64; ++block) {
+    const std::uint8_t* p = bytes + block * 36;
+    for (int sub = 0; sub < 4; ++sub) {
+      const float d = Ue4m3ToFloatHalf(p[sub]);
+      float* y = dst + block * 64 + sub * 16;
+      for (int j = 0; j < 8; ++j) {
+        const std::uint8_t q = p[4 + sub * 8 + j];
+        y[j] = static_cast<float>(kValuesFp4[q & 0x0F]) * d;
+        y[j + 8] = static_cast<float>(kValuesFp4[q >> 4]) * d;
+      }
+    }
+  }
+}
+
 void DequantizeIQ4_NL(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_iq4_nl*>(src);
   const std::size_t nb = k / 32;
@@ -1084,6 +1121,9 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
       return true;
     case core::GgmlType::kQ8_0:
       DequantizeQ8_0(src, dst, k);
+      return true;
+    case core::GgmlType::kNVFP4:
+      DequantizeNVFP4(src, dst, k);
       return true;
     case core::GgmlType::kQ2_K:
       DequantizeQ2_K(src, dst, k);

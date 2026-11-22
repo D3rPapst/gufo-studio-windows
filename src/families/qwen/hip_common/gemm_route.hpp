@@ -99,6 +99,7 @@ struct QwenGemmFormatCapabilities {
     case core::GgmlType::kIQ3_XXS:
     case core::GgmlType::kIQ1_S:
     case core::GgmlType::kIQ1_M:
+    case core::GgmlType::kNVFP4:
       return {.quantized = true};
   }
   return {};
