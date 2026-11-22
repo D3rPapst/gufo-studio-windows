@@ -171,6 +171,11 @@ public:
     t_thinking_ = id(d::kThinking);
     t_end_message_ = id(d::kEndMessage);
     t_invoke_ = id(d::kInvokeJson);
+    for (std::size_t t = 0; t < tok_->VocabSize(); ++t) {
+      const auto ti = static_cast<::inkling2::text::TokenId>(t);
+      if (!tok_->IsSpecial(ti) && tok_->TokenBytes(ti).starts_with('<'))
+        spelled_framing_.push_back(static_cast<g::TextRunnerToken>(t));
+    }
   }
 
   ~Inkling2Runner() {
@@ -537,6 +542,16 @@ public:
           if (t < raw.size()) masked[t] = raw[t];
       }
     }
+    // gufo_windows: a JSON grammar's reasoning opener is the literal text "<|message_model|><|content_thinking|>",
+    // which ordinary tokens can also spell. Spelled out, the framing reads as a function name (block kTool) and the
+    // reply comes out empty (round 12, case 3 at effort low: 22 tokens, no content). Between blocks and right after
+    // a header no text token starting with '<' is legitimate, so under a grammar only the control tokens remain.
+    // Without a grammar nothing changes (the DSpark path stays the plain path).
+    if (sampler.config().constraint && (st.block == Block::kIdle || st.block == Block::kAfterHeader)) {
+      if (masked.empty()) masked.assign(raw.begin(), raw.end());
+      for (const auto t : spelled_framing_)
+        if (t < masked.size()) masked[t] = -std::numeric_limits<float>::infinity();
+    }
     const auto& logits = masked.empty() ? raw : masked;
     const auto token = static_cast<g::TextRunnerToken>(sampler.Sample(logits));
     const bool stop = state.stop_at_eos() && tok_->IsStop(token);
@@ -763,6 +778,8 @@ private:
   mutable std::mutex vision_mutex_;
   mutable hipStream_t vision_stream_ = nullptr;
   g::TextRunnerToken t_header_{}, t_text_{}, t_thinking_{}, t_end_message_{}, t_invoke_{};
+  /// Ordinary (non-control) tokens whose bytes start with '<' (see SelectNext).
+  std::vector<g::TextRunnerToken> spelled_framing_;
 };
 
 /// The layout of the identity text (schema line, artifact id, tokenizer/template hash, state ABI)
