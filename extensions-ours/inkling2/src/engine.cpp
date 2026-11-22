@@ -1025,6 +1025,10 @@ struct Engine::Impl {
     float* cur = d_cur;
     const fs::SlotEntry* slot = d_tbl + slot_idx;
     const int* pos = d_step + kMaxB;
+    if (capture_feat && (visit_no == 5 || visit_no == 23 || visit_no == 41)) {
+      FlushPending();  // the stream entering this visit includes the deferred post-conv of the previous one
+      TapFeature(d_cur, visit_no == 5 ? 0 : visit_no == 23 ? 1 : 2);
+    }
 
     // A. attention inputs
     const float* inp[3] = {cur, cur, cur};
@@ -1411,6 +1415,7 @@ struct Engine::Impl {
       DLayer(ip, ip, nullptr, bucket_ctx);
     DMix(cur, DS(w->output_res_query), 1, d_mixf);
     kk::RmsNorm(ds, d_mixf, kEmbd, DS(w->output_norm), d_hn, kEmbd, kEmbd, nb, cfg->rms_eps);
+    if (capture_feat) TapFeature(d_hn, 3);
     const int V = static_cast<int>(cfg->n_vocab_text);
     if (head_fast) {
       fs::GemvQ8(ds, kEmbd, D(w->output), d_hn, logits_d, V, cfg->logit_softcap, nb);
@@ -1481,6 +1486,16 @@ struct Engine::Impl {
   /// verify of n tokens, weights read once); conv histories run through the tokens in order.
   int chain = 0;
   bool no_cr_fuse = false;
+  // gufo_windows: DSpark feature capture (taps at visits 5/23/41 + final normalised state), [kMaxB][4][kEmbd]
+  bool capture_feat = false;
+  float* d_feat = nullptr;               // allocated by Engine::SetFeatureCapture (never inside a graph capture)
+  std::vector<float>* feat_out = nullptr;  // host copy target of the last decode step
+  void TapFeature(const float* src, int j) {
+    for (int b = 0; b < nb; ++b)
+      Check(hipMemcpyAsync(d_feat + (static_cast<std::size_t>(b) * 4 + j) * kEmbd, src + static_cast<std::size_t>(b) * kEmbd,
+                           kEmbd * 4, hipMemcpyDeviceToDevice, ds),
+            "feature tap");
+  }
   void DecodeN(Session* const* sess, const std::int32_t* tokens, std::vector<float>* const* outs, int n,
                bool chain_mode = false) {
     nb = n;
@@ -1501,7 +1516,7 @@ struct Engine::Impl {
       Check(hipMemcpyAsync(d_tbl + b * 48, sess[b]->tbl_, 48 * sizeof(fs::SlotEntry), hipMemcpyDeviceToDevice, ds),
             "slot table");
     if (use_graph) {
-      const int key = ctx * 16 + n + (chain_mode ? 8 : 0);
+      const int key = ctx * 32 + n + (chain_mode ? 8 : 0) + (capture_feat ? 16 : 0);
       auto it = graphs.find(key);
       if (it == graphs.end() && failed_graphs.count(key) == 0) it = CaptureGraph(ctx, key);
       if (it != graphs.end()) {
@@ -1516,6 +1531,10 @@ struct Engine::Impl {
     for (int b = 0; b < n; ++b) {
       outs[b]->resize(V);
       Check(hipMemcpyAsync(outs[b]->data(), logits_d + b * V, V * 4, hipMemcpyDeviceToHost, ds), "logits copy");
+    }
+    if (capture_feat && feat_out) {
+      feat_out->resize(static_cast<std::size_t>(n) * 4 * kEmbd);
+      Check(hipMemcpyAsync(feat_out->data(), d_feat, feat_out->size() * 4, hipMemcpyDeviceToHost, ds), "features copy");
     }
     Check(hipStreamSynchronize(ds), "decode sync");
     ProfFlush();
@@ -1766,6 +1785,15 @@ void Engine::VerifyChain(Session& s, std::span<const std::int32_t> tokens,
   }
   impl_->DecodeN(sess, tokens.data(), outs, static_cast<int>(n), /*chain_mode=*/true);
   s.logits_ = logits->back();
+}
+
+void Engine::SetFeatureCapture(bool on) {
+  const std::lock_guard lock(mutex_);
+  if (on && !impl_->d_feat)
+    impl_->d_feat = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 4 * kEmbd * 4, "dspark features"));
+  impl_->capture_feat = on;
+  impl_->feat_out = on ? &features_ : nullptr;
+  if (!on) features_.clear();
 }
 
 void Engine::Synchronize() {

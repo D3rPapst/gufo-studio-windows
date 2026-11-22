@@ -147,6 +147,17 @@ public:
   /// The session advances by tokens.size(); s.logits() holds the last row. Throws when not batch_capable().
   void VerifyChain(Session& s, std::span<const std::int32_t> tokens, std::vector<std::vector<float>>* logits);
 
+  /// gufo_windows addition (DSpark drafter features): when on, every decode step (single-token Forward,
+  /// DecodeBatch, VerifyChain) also records per token the residual stream entering visits 5, 23 and 41 and
+  /// the final normalised state, [tokens][4][2304] floats, readable with features() after the step.
+  void SetFeatureCapture(bool on);
+  [[nodiscard]] const std::vector<float>& features() const { return features_;}
+
+private:
+  std::vector<float> features_;
+
+public:
+
   /// Optional per-visit hidden-state tap for bisecting against llama.cpp: called with the
   /// visit index (0..47), a label ("l_out" or "ffn_inp") and the first token's [2304] row.
   using Tap = std::function<void(int visit, const char* what, const std::vector<float>& row)>;
