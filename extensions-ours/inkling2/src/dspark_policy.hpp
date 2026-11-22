@@ -35,7 +35,6 @@ public:
   DSparkPolicy() : DSparkPolicy(Params{}) {}
   explicit DSparkPolicy(Params p) : p_(std::move(p)) {
     chain_ms_ = {{2, 30.5}, {3, 34.9}, {4, 39.9}, {5, 48.8}, {6, 55.1}, {7, 61.4}, {8, 67.0}};
-    for (int k = 1; k <= 7; ++k) draft_ms_[k] = 6.0 + 0.6 * k;
     speculating_ = true;
   }
 
@@ -44,15 +43,19 @@ public:
     const double plain = 1.0 / decode_ms_;
     double best = 0;
     int best_k = 0;
-    const double hit = Hit();
     for (int k : p_.depths) {
-      double e = 0, q = 1;
-      for (int i = 0; i <= k; ++i) { e += q; q *= hit; }
-      const double r = e / (draft_ms_[k] + Chain(k + 1));
+      const double r = Rate(k);
       if (r > best) { best = r; best_k = k; }
     }
+    // stay at the current depth unless another one is clearly (3 %) better
+    if (cur_k_ > 0 && std::find(p_.depths.begin(), p_.depths.end(), cur_k_) != p_.depths.end() &&
+        Rate(cur_k_) * 1.03 >= best) {
+      best_k = cur_k_;
+      best = Rate(cur_k_);
+    }
     speculating_ = speculating_ ? best > plain * p_.leave : best > plain * p_.enter;
-    return speculating_ ? best_k : 0;
+    cur_k_ = speculating_ ? best_k : 0;
+    return cur_k_;
   }
   /// In plain mode: true when a shadow draft is due now (then call Probe with its result later).
   [[nodiscard]] bool ProbeDue() {
@@ -63,14 +66,23 @@ public:
   }
   [[nodiscard]] int probe_k() const { return p_.probe_k; }
 
+  // Costs: the chain benchmark (T = 2..8) plus ONE learned overhead, and one learned draft time (+0.3 ms per
+  // token). Round 9: learning per depth kept the unused depths at their optimistic start values, so the policy
+  // drifted to K = 2 on code although K = 3 was faster.
   void Cycle(int k, int accepted, double draft_ms, double chain_ms) {
     Observe(k, accepted);
-    Ema(&draft_ms_[k], draft_ms);
-    Ema(&chain_ms_[std::min(k + 1, 8)], chain_ms);
+    Ema(&draft_base_, draft_ms - 0.3 * k);
+    Ema(&chain_over_, chain_ms - Chain(k + 1));
   }
   void Probe(int k, int accepted, double draft_ms) {
     Observe(k, accepted);
-    Ema(&draft_ms_[k], draft_ms);
+    Ema(&draft_base_, draft_ms - 0.3 * k);
+  }
+  [[nodiscard]] double Rate(int k) const {  // expected tokens per ms at depth k
+    const double hit = Hit();
+    double e = 0, q = 1;
+    for (int i = 0; i <= k; ++i) { e += q; q *= hit; }
+    return e / (draft_base_ + 0.3 * k + Chain(k + 1) + chain_over_);
   }
   void Plain(double ms) { Ema(&decode_ms_, ms); }
 
@@ -94,7 +106,9 @@ private:
 
   Params p_;
   std::deque<std::pair<int, int>> obs_;
-  std::map<int, double> chain_ms_, draft_ms_;
+  std::map<int, double> chain_ms_;
+  double draft_base_ = 6.5, chain_over_ = 2.0;
+  int cur_k_ = 0;
   double decode_ms_ = 22.5;
   bool speculating_ = true;
   int since_probe_ = 0;

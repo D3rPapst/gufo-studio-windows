@@ -86,6 +86,7 @@ public:
   std::unique_ptr<DSparkPolicy> ds_policy;
   std::vector<std::int32_t> ds_probe, ds_probe_seen;
   double ds_probe_ms = 0;
+  std::string ds_last_skip;  // last logged reason why a step does not speculate
   [[nodiscard]] g::TextRunnerMeasuredResources MeasuredResources() const noexcept override {
     return {.per_request_state_bytes = session_->allocated_bytes(), .temporary_scratch_bytes = 0};
   }
@@ -185,6 +186,9 @@ public:
     d.capabilities.final_token_advance_required = false;
     d.capabilities.incremental_text_is_exact = true;  // the streamed pieces are the text (Piece())
     d.capabilities.prefix_reuse = true;
+    // gufo_windows: with DSpark the scheduler must call DecodeStep (several tokens per step); without this
+    // capability it only ever calls SelectNext + Advance and the drafter never runs (round 9).
+    d.capabilities.multi_token_decode = drafter_ != nullptr;
     d.capabilities.in_pass_checkpoint = false;  // checkpoints are taken between prefill passes
     sampling::TextSamplingValues v;  // Unsloth/OpenAI defaults: temperature 1, no truncation
     v.temperature = 1.0F;
@@ -607,8 +611,23 @@ public:
     }
     const g::TextRunnerToken token = first.token;
     const auto& cfg = sampler.config();
-    const bool can_spec = max_tokens >= 2 && cfg.can_use_unmodified_argmax() && !cfg.logprobs &&
-                          !sampler.NeedsConstraintMask() && !st.reasoning_off && !st.call_required;
+    const char* skip = max_tokens < 2                        ? "max_tokens"
+                       : cfg.temperature != 0.0F                 ? "temperature"
+                       : cfg.penalties_enabled()                 ? "penalties"
+                       : !cfg.can_use_unmodified_argmax()        ? "sampler"
+                       : cfg.logprobs.has_value()                ? "logprobs"
+                       : sampler.NeedsConstraintMask()           ? "grammar"
+                       : st.reasoning_off                        ? "reasoning_off"
+                       : st.call_required                        ? "call_required"
+                                                                 : "";
+    const bool can_spec = *skip == '\0';
+    if (st.ds_last_skip != skip && *skip != '\0' && std::string_view(skip) != "max_tokens") {
+      std::fprintf(stderr, "inkling2 dspark: spec_skip_reason=%s (temperature %.2f) - plain decoding for this request\n",
+                   skip, static_cast<double>(cfg.temperature));
+      st.ds_last_skip = skip;
+    } else if (can_spec) {
+      st.ds_last_skip.clear();
+    }
     if (!st.ds_policy) st.ds_policy = std::make_unique<DSparkPolicy>();
     DSparkPolicy& pol = *st.ds_policy;
     const std::size_t pos = st.session().position();
@@ -882,8 +901,10 @@ std::shared_ptr<ext::TextModelRunner> CreateInkling2TextRunner(const ext::TextRu
         const std::lock_guard<std::mutex> lock(*m);
         d->InjectNow(pos0, n, rows);
       });
-      std::fprintf(stderr, "inkling2: DSpark drafter %s loaded (greedy requests only, at most %d draft tokens)\n",
-                   options.speculative.draft_model_path.c_str(), max_draft);
+      std::fprintf(stderr,
+                   "inkling2: DSpark drafter %s loaded, %.2f GB device memory (in the resource claim), greedy requests only,"
+                   " at most %d draft tokens\n",
+                   options.speculative.draft_model_path.c_str(), static_cast<double>(drafter->device_bytes()) / 1e9, max_draft);
     }
     return std::make_shared<Inkling2Runner>(shared_engine, std::move(tok), max_context, identity, durable,
                                             std::move(vision), std::move(vision_identity), drafter, drafter_mutex,
