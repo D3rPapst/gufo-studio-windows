@@ -2,7 +2,10 @@
 // speculation on the Inkling 2 engine, plus the cost of a multi-token step (verify cost), which
 // decides whether any speculation (lookup, DSpark) can pay off.
 //
-//   inkling2_spec --model GGUF --text FILE [--prompt 512] [--gen 256] [--k 0,2,4,8] [--ngram 3] [--ctx 8192]
+//   inkling2_spec --model GGUF --text FILE [--prompt 512] [--gen 256] [--k 0,1,2,3] [--ngram 3] [--ctx 8192]
+//                 [--verify chain|prefill]
+// --verify chain (default): Engine::VerifyChain, the batched decode graph with one session at consecutive
+// positions (k <= 3); prefill: the multi-token Forward path (any k).
 //
 // 1 verify cost: after the prompt, time Forward() of T = 1..9 tokens (state restored after each).
 // 2 greedy decode of --gen tokens for every k in --k (k = 0: plain single-token decode, the reference):
@@ -12,6 +15,7 @@
 //   the frontier are overwritten later; the window rings have ubatch rows of slack).
 // Prints tok/s, acceptance and how many of the generated tokens equal the k = 0 run.
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -80,7 +84,7 @@ void Load(Session& s, const Snapshot& snap) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, text, klist = "0,2,4,8";
+  std::string model, text, klist = "0,1,2,3", verify = "chain";
   int prompt_len = 512, gen = 256, ngram = 3;
   unsigned ctx = 8192;
   for (int i = 1; i < argc; ++i) {
@@ -92,6 +96,7 @@ int main(int argc, char** argv) {
     else if (k == "--gen") gen = std::atoi(next().c_str());
     else if (k == "--k") klist = next();
     else if (k == "--ngram") ngram = std::atoi(next().c_str());
+    else if (k == "--verify") verify = next();
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
@@ -153,6 +158,48 @@ int main(int argc, char** argv) {
       }
       std::printf("verify T=%d: %.2f ms per step (%s)\n", T, total / reps, T == 1 ? "decode path" : "multi-token path, all logits");
     }
+    for (int T = 2; T <= 4 && engine->batch_capable(); ++T) {
+      std::vector<std::vector<float>> rows;
+      double total = 0;
+      for (int r = 0; r < 6; ++r) {
+        Load(*s, base);
+        engine->Synchronize();
+        const auto t0 = Clock::now();
+        engine->VerifyChain(*s, std::span<const std::int32_t>(toks.data(), static_cast<std::size_t>(T)), &rows);
+        if (r > 0) total += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+      }
+      std::printf("verify T=%d: %.2f ms per step (chain path, weights read once)\n", T, total / 5);
+    }
+    // chain correctness: 4 sequential decode steps vs one chain of the same 4 tokens
+    if (engine->batch_capable()) {
+      Load(*s, base);
+      std::vector<std::int32_t> seq;
+      std::vector<std::vector<float>> ref;
+      std::int32_t t = Argmax(base.logits.data(), V);
+      for (int i = 0; i < 4; ++i) {
+        seq.push_back(t);
+        engine->Forward(*s, std::span<const std::int32_t>(&t, 1));
+        ref.push_back(s->logits());
+        t = Argmax(s->logits().data(), V);
+      }
+      Load(*s, base);
+      std::vector<std::vector<float>> rows;
+      engine->VerifyChain(*s, seq, &rows);
+      for (int i = 0; i < 4; ++i) {
+        double ab = 0, aa = 0, bb = 0;
+        for (std::size_t j = 0; j < V; ++j) {
+          ab += double(rows[i][j]) * ref[i][j];
+          aa += double(rows[i][j]) * rows[i][j];
+          bb += double(ref[i][j]) * ref[i][j];
+        }
+        std::printf("chain check row %d: argmax chain %d decode %d, cos %.6f\n", i, Argmax(rows[i].data(), V),
+                    Argmax(ref[i].data(), V), ab / std::sqrt(aa * bb + 1e-30));
+      }
+      // continuing after the chain must equal continuing after the 4 decode steps
+      const std::int32_t t5 = Argmax(rows[3].data(), V);
+      engine->Forward(*s, std::span<const std::int32_t>(&t5, 1));
+      std::printf("chain check: next token after chain %d (decode path %d)\n", Argmax(s->logits().data(), V), t);
+    }
     const auto t0 = Clock::now();
     for (int r = 0; r < 20; ++r) { Save(*s, &cyc); Load(*s, cyc); }
     std::printf("conv save+restore: %.3f ms\n", std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / 20);
@@ -168,7 +215,12 @@ int main(int argc, char** argv) {
     engine->Synchronize();
     const auto t0 = Clock::now();
     while (static_cast<int>(out.size()) < gen) {
-      std::vector<std::int32_t> d = Lookup(hist, ngram, std::min(k, gen - static_cast<int>(out.size()) - 1));
+      // the draft continues AFTER `next` (Pause 6 bug: the lookup ran on the history without `next`, so every
+      // draft guessed `next` itself and nothing was ever accepted)
+      hist.push_back(next);
+      const int kmax = verify == "chain" ? std::min(k, static_cast<int>(Engine::kMaxDecodeBatch) - 1) : k;
+      std::vector<std::int32_t> d = Lookup(hist, ngram, std::min(kmax, gen - static_cast<int>(out.size()) - 1));
+      hist.pop_back();
       ++cycles;
       if (d.empty()) {
         out.push_back(next);
@@ -181,9 +233,15 @@ int main(int argc, char** argv) {
       std::vector<std::int32_t> step{next};
       step.insert(step.end(), d.begin(), d.end());
       std::vector<std::int32_t> arg(step.size());
-      engine->Forward(*s, step, [&](std::size_t first, std::size_t count, const float* data) {
-        for (std::size_t r = 0; r < count; ++r) arg[first + r] = Argmax(data + r * V, V);
-      });
+      if (verify == "chain") {
+        std::vector<std::vector<float>> rows;
+        engine->VerifyChain(*s, step, &rows);
+        for (std::size_t r = 0; r < rows.size(); ++r) arg[r] = Argmax(rows[r].data(), V);
+      } else {
+        engine->Forward(*s, step, [&](std::size_t first, std::size_t count, const float* data) {
+          for (std::size_t r = 0; r < count; ++r) arg[first + r] = Argmax(data + r * V, V);
+        });
+      }
       std::size_t a = 0;
       while (a < d.size() && arg[a] == d[a]) ++a;
       drafted += static_cast<int>(d.size());
@@ -191,7 +249,14 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i <= a; ++i) { out.push_back(step[i]); hist.push_back(step[i]); }
       if (a < d.size()) {
         Load(*s, cyc);  // back to the frontier before `next`, then evaluate only the accepted part
-        engine->Forward(*s, std::span<const std::int32_t>(step.data(), a + 1));
+        if (a == 0) {
+          engine->Forward(*s, std::span<const std::int32_t>(step.data(), 1));
+        } else if (verify == "chain") {
+          std::vector<std::vector<float>> rows;
+          engine->VerifyChain(*s, std::span<const std::int32_t>(step.data(), a + 1), &rows);
+        } else {
+          engine->Forward(*s, std::span<const std::int32_t>(step.data(), a + 1));
+        }
       }
       next = arg[a];
     }

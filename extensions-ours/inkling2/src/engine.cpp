@@ -999,7 +999,7 @@ struct Engine::Impl {
     if (nw)
       for (int q = 0; q < nq; ++q) mj.nw[q] = nw[q];
     if (pend.on) {
-      if (nq == 1) {
+      if (nq == 1 && chain <= 1) {  // gufo_windows: chain mode runs the post-conv on its own (ordered history)
         mj.has_cr = 1;
         mj.cr = pend.a;
         pend.on = false;
@@ -1182,6 +1182,7 @@ struct Engine::Impl {
       ka.eps = cfg->rms_eps;
       ka.ld = kSProj;
       ka.ldd = 64;
+      ka.chain = chain;
       fs::KvPrep(ds, ka, nb);
     }
 
@@ -1234,6 +1235,7 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      ca.chain = chain;
       if (ip % static_cast<int>(cfg->attn_res_block) == 0) {
         ca.blk = NewBlock();
         d_states[d_ns++] = ca.blk;
@@ -1314,6 +1316,7 @@ struct Engine::Impl {
       ca.scale = 1.0f / std::sqrt(5.0f);
       ca.cur = cur;
       ca.blk = nullptr;
+      ca.chain = chain;
       pend.on = true;
       pend.a = ca;
     }
@@ -1471,12 +1474,17 @@ struct Engine::Impl {
 
   /// One decode step of `n` (<= kMaxB) distinct sessions, one token each, as one graph launch: the
   /// weights are read once for all tokens.
-  void DecodeN(Session* const* sess, const std::int32_t* tokens, std::vector<float>* const* outs, int n) {
+  /// gufo_windows: `chain_mode` = the n entries are the SAME session at consecutive positions (speculative
+  /// verify of n tokens, weights read once); conv histories run through the tokens in order.
+  int chain = 0;
+  void DecodeN(Session* const* sess, const std::int32_t* tokens, std::vector<float>* const* outs, int n,
+               bool chain_mode = false) {
     nb = n;
+    chain = chain_mode ? n : 0;
     int maxpos = 0;
     std::int32_t step[2 * kMaxB] = {};
     for (int b = 0; b < n; ++b) {
-      const int pos = static_cast<int>(sess[b]->pos_);
+      const int pos = static_cast<int>(sess[b]->pos_) + (chain_mode ? b : 0);
       maxpos = std::max(maxpos, pos);
       step[b] = tokens[b];
       step[kMaxB + b] = pos;
@@ -1489,7 +1497,7 @@ struct Engine::Impl {
       Check(hipMemcpyAsync(d_tbl + b * 48, sess[b]->tbl_, 48 * sizeof(fs::SlotEntry), hipMemcpyDeviceToDevice, ds),
             "slot table");
     if (use_graph) {
-      const int key = ctx * 8 + n;
+      const int key = ctx * 16 + n + (chain_mode ? 8 : 0);
       auto it = graphs.find(key);
       if (it == graphs.end() && failed_graphs.count(key) == 0) it = CaptureGraph(ctx, key);
       if (it != graphs.end()) {
@@ -1509,6 +1517,7 @@ struct Engine::Impl {
     ProfFlush();
     for (int b = 0; b < n; ++b) sess[b]->pos_ += 1;
     nb = 1;
+    chain = 0;
   }
 
   void Tap(int visit, const char* what) {
@@ -1731,6 +1740,28 @@ void Engine::DecodeBatch(std::span<Session* const> sessions, std::span<const std
     return;
   }
   for (std::size_t i = 0; i < sessions.size(); ++i) impl_->Decode(*sessions[i], tokens[i], &sessions[i]->logits_);
+}
+
+void Engine::VerifyChain(Session& s, std::span<const std::int32_t> tokens,
+                         std::vector<std::vector<float>>* logits) {
+  const std::size_t n = tokens.size();
+  if (n < 2 || n > static_cast<std::size_t>(Impl::kMaxB)) throw std::runtime_error("inkling2: bad verify chain");
+  if (!batch_capable()) throw std::runtime_error("inkling2: verify chain needs the batched decode kernels");
+  const std::lock_guard lock(mutex_);
+  if (s.pos_ + n > max_context_) throw std::runtime_error("inkling2: context exhausted");
+  for (auto t : tokens)
+    if (t < 0 || static_cast<std::uint32_t>(t) >= weights_.config.n_vocab_text)
+      throw std::runtime_error("inkling2: token id out of range");
+  if (s.hooks_ != nullptr) s.hooks_->BeforeWrite(s.pos_, s.pos_ + n);  // M2 hook
+  logits->resize(n);
+  Session* sess[Impl::kMaxB];
+  std::vector<float>* outs[Impl::kMaxB];
+  for (std::size_t i = 0; i < n; ++i) {
+    sess[i] = &s;
+    outs[i] = &(*logits)[i];
+  }
+  impl_->DecodeN(sess, tokens.data(), outs, static_cast<int>(n), /*chain_mode=*/true);
+  s.logits_ = logits->back();
 }
 
 void Engine::Synchronize() {

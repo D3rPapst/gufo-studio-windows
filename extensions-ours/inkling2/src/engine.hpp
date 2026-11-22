@@ -141,6 +141,12 @@ public:
   [[nodiscard]] bool batch_capable() const;
   void DecodeBatch(std::span<Session* const> sessions, std::span<const std::int32_t> tokens);
 
+  /// gufo_windows addition (speculative verify): evaluates 2..kMaxDecodeBatch tokens of ONE session at
+  /// consecutive positions through the batched decode graph (weights read once, like DecodeBatch), with the
+  /// conv histories run through the tokens in order. `logits[i]` receives the logits after tokens[0..i].
+  /// The session advances by tokens.size(); s.logits() holds the last row. Throws when not batch_capable().
+  void VerifyChain(Session& s, std::span<const std::int32_t> tokens, std::vector<std::vector<float>>* logits);
+
   /// Optional per-visit hidden-state tap for bisecting against llama.cpp: called with the
   /// visit index (0..47), a label ("l_out" or "ffn_inp") and the first token's [2304] row.
   using Tap = std::function<void(int visit, const char* what, const std::vector<float>& row)>;
