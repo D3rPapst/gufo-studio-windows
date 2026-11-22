@@ -35,6 +35,11 @@ public:
   void Reset(std::size_t pos);
   /// Context of positions [pos0, pos0 + n) from the target's last decode step (features rows 0..n-1).
   void Inject(std::size_t pos0, std::size_t n);
+  /// Engine::FeatureSink target: small steps are staged (one device copy) and injected in one batch before the next
+  /// draft; a step that starts before the staged end replaces the rejected tail; large steps (prefill) go in directly.
+  void Stage(std::size_t pos0, std::size_t n, const float* device_rows);
+  /// Injects the staged rows now (Draft does it itself).
+  void Flush();
   /// Up to k (<= 7) tokens after `anchor` at position pos0; empty when the context of pos0 - 1 is missing.
   [[nodiscard]] std::vector<std::int32_t> Draft(std::int32_t anchor, std::size_t pos0, int k);
   /// Wall time of the last Draft call (synchronised), milliseconds.

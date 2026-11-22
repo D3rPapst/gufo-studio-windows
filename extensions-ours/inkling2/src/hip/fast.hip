@@ -2229,4 +2229,64 @@ void SkinnyPrefill(hipStream_t s, const float* x, int ldx, const float* w, int r
   Chk("skinny_prefill");
 }
 
+
+// ---- gufo_windows: speculative verify helpers ----------------------------------------------------
+// argmax of every row (lowest index on ties): grid (64, rows) partials, then one block per row
+__global__ void k_argmax_rows_part(const float* x, int ld, int n, float* pv, int* pi) {
+  __shared__ float rv[256];
+  __shared__ int ri[256];
+  const int row = blockIdx.y;
+  const float* xr = x + (size_t)row * ld;
+  float best = -INFINITY;
+  int bi = n;
+  for (int i = blockIdx.x * 256 + threadIdx.x; i < n; i += gridDim.x * 256) {
+    const float v = xr[i];
+    if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+  }
+  rv[threadIdx.x] = best;
+  ri[threadIdx.x] = bi;
+  __syncthreads();
+  for (int o = 128; o > 0; o >>= 1) {
+    if ((int)threadIdx.x < o) {
+      const float a = rv[threadIdx.x], b = rv[threadIdx.x + o];
+      const int ia = ri[threadIdx.x], ib = ri[threadIdx.x + o];
+      if (b > a || (b == a && ib < ia)) { rv[threadIdx.x] = b; ri[threadIdx.x] = ib; }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) { pv[row * gridDim.x + blockIdx.x] = rv[0]; pi[row * gridDim.x + blockIdx.x] = ri[0]; }
+}
+__global__ void k_argmax_rows_final(const float* pv, const int* pi, int parts, int* out) {
+  __shared__ float rv[64];
+  __shared__ int ri[64];
+  const int row = blockIdx.x, t = threadIdx.x;
+  rv[t] = t < parts ? pv[row * parts + t] : -INFINITY;
+  ri[t] = t < parts ? pi[row * parts + t] : 1 << 30;
+  __syncthreads();
+  for (int o = 32; o > 0; o >>= 1) {
+    if (t < o) {
+      const float a = rv[t], b = rv[t + o];
+      const int ia = ri[t], ib = ri[t + o];
+      if (b > a || (b == a && ib < ia)) { rv[t] = b; ri[t] = ib; }
+    }
+    __syncthreads();
+  }
+  if (t == 0) out[row] = ri[0];
+}
+void ArgmaxRows(hipStream_t s, const float* x, int ld, int n, int rows, float* pv, int* pi, int* out) {
+  k_argmax_rows_part<<<dim3(64, rows), 256, 0, s>>>(x, ld, n, pv, pi);
+  k_argmax_rows_final<<<rows, 64, 0, s>>>(pv, pi, 64, out);
+  Chk("argmax_rows");
+}
+// conv histories of the 48 slots from a chain log row (one launch instead of 48 copies)
+__global__ void k_conv_restore(const SlotEntry* tbl, const float* log, int per) {
+  const int v = blockIdx.y;
+  float* dst = tbl[v].conv;
+  const float* src = log + (size_t)v * per;
+  for (int i = blockIdx.x * 256 + threadIdx.x; i < per; i += gridDim.x * 256) dst[i] = src[i];
+}
+void ConvRestore(hipStream_t s, const SlotEntry* tbl, const float* log, int per) {
+  k_conv_restore<<<dim3(16, 48), 256, 0, s>>>(tbl, log, per);
+  Chk("conv_restore");
+}
 }  // namespace gufo::models::inkling2::fast

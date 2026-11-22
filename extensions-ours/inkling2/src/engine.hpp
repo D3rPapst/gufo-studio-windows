@@ -154,6 +154,16 @@ public:
   /// gufo_windows: after VerifyChain of n tokens keep only the first `keep` (1..n): conv histories from the
   /// per-token log of the chain, position first + keep, logits = `logits` (the chain row keep - 1). No recompute.
   void ChainKeep(Session& s, std::size_t keep, const std::vector<float>& logits);
+  /// The same after VerifyChainArgmax: the kept row's logits are copied from the device (one row).
+  void ChainKeep(Session& s, std::size_t keep);
+  /// VerifyChain without the logits round trip: `argmax[i]` = greedy token after tokens[0..i] (GPU argmax).
+  void VerifyChainArgmax(Session& s, std::span<const std::int32_t> tokens, std::vector<std::int32_t>* argmax);
+
+  /// gufo_windows (DSpark drafter): receives the feature rows of every step on the device: decode steps (single
+  /// token, DecodeBatch per session, VerifyChain with all its rows) and prefill ubatches. Called under the engine
+  /// lock right after the step; `rows` ([n][4][2304] floats) are overwritten by the next step. Empty: off.
+  using FeatureSink = std::function<void(const Session& s, std::size_t pos0, std::size_t n, const float* rows)>;
+  void SetFeatureSink(FeatureSink sink);
 
   void SetFeatureCapture(bool on);
 
@@ -175,6 +185,9 @@ public:
 
 private:
   std::vector<float> features_;
+  void RunChain(Session& s, std::span<const std::int32_t> tokens, std::vector<std::vector<float>>* logits,
+                std::vector<std::int32_t>* argmax);
+  void ChainKeepImpl(Session& s, std::size_t keep, const std::vector<float>* logits);
 
 public:
 

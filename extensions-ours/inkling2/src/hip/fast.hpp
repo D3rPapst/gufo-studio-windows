@@ -266,4 +266,9 @@ void TopkPrefill(hipStream_t s, const float* logits, const float* bias, int* ids
 void SkinnyPrefill(hipStream_t s, const float* x, int ldx, const float* w, int rows, float* out,
                    int ldo, int t);
 
+/// gufo_windows: argmax of `rows` rows of n floats (row stride ld); scratch pv / pi [rows][64]; out [rows].
+void ArgmaxRows(hipStream_t s, const float* x, int ld, int n, int rows, float* pv, int* pi, int* out);
+/// gufo_windows: conv histories of the 48 slots of `tbl` from `log` ([48][per] floats).
+void ConvRestore(hipStream_t s, const SlotEntry* tbl, const float* log, int per);
+
 }  // namespace gufo::models::inkling2::fast

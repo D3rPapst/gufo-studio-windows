@@ -1503,6 +1503,16 @@ struct Engine::Impl {
   bool capture_feat = false;
   float* d_feat = nullptr;               // allocated by Engine::SetFeatureCapture (never inside a graph capture)
   std::vector<float>* feat_out = nullptr;  // host copy target of the last decode step
+  Engine::FeatureSink fsink;              // gufo_windows: device rows to the DSpark drafter (decode and prefill)
+  float* d_pfeat = nullptr;              // prefill feature rows [U][4][kEmbd]
+  float* d_argv = nullptr;               // GPU argmax scratch
+  int* d_argi = nullptr;
+  int* d_argo = nullptr;
+  void PTapFeature(const float* src, int j, int rows) {
+    Check(hipMemcpy2DAsync(d_pfeat + static_cast<std::size_t>(j) * kEmbd, 4 * kEmbd * 4, src, kEmbd * 4, kEmbd * 4,
+                           static_cast<std::size_t>(rows), hipMemcpyDeviceToDevice, s),
+          "prefill feature tap");
+  }
   void TapFeature(const float* src, int j) {
     for (int b = 0; b < nb; ++b)
       Check(hipMemcpyAsync(d_feat + (static_cast<std::size_t>(b) * 4 + j) * kEmbd, src + static_cast<std::size_t>(b) * kEmbd,
@@ -1542,6 +1552,7 @@ struct Engine::Impl {
     }
     const std::size_t V = cfg->n_vocab_text;
     for (int b = 0; b < n; ++b) {
+      if (!outs || !outs[b]) continue;  // gufo_windows: chain argmax mode keeps the rows on the device
       outs[b]->resize(V);
       Check(hipMemcpyAsync(outs[b]->data(), logits_d + b * V, V * 4, hipMemcpyDeviceToHost, ds), "logits copy");
     }
@@ -1551,6 +1562,13 @@ struct Engine::Impl {
     }
     Check(hipStreamSynchronize(ds), "decode sync");
     ProfFlush();
+    if (capture_feat && fsink) {
+      if (chain_mode) {
+        fsink(*sess[0], sess[0]->pos_, static_cast<std::size_t>(n), d_feat);
+      } else {
+        for (int b = 0; b < n; ++b) fsink(*sess[b], sess[b]->pos_, 1, d_feat + static_cast<std::size_t>(b) * 4 * kEmbd);
+      }
+    }
     for (int b = 0; b < n; ++b) sess[b]->pos_ += 1;
     nb = 1;
     chain = 0;
@@ -1589,6 +1607,7 @@ struct Engine::Impl {
     for (int ip = 0; ip < static_cast<int>(cfg->core_start); ++ip) {
       Layer(ss, ip, ip, nullptr);
       Tap(visit++, "l_out");
+      if (fsink && visit == 5) PTapFeature(cur, 0, T);
       MaybeYield(yr, true);  // M2 hook
     }
     kk::Copy(s, cur, prelude, T * kEmbd);
@@ -1617,6 +1636,7 @@ struct Engine::Impl {
           Layer(ss, ip, slot, msgs);
         }
         Tap(visit++, "l_out");
+        if (fsink && (visit == 23 || visit == 41)) PTapFeature(cur, visit == 23 ? 1 : 2, T);
         MaybeYield(yr, true);  // M2 hook
       }
     }
@@ -1627,11 +1647,17 @@ struct Engine::Impl {
     }
     ss.pos_ += T;
     PFlush();
-    if (!last_ubatch && !sink) return;
+    if (!last_ubatch && !sink && !fsink) return;
 
     // output: attention-residual mix, norm, lm head, soft cap, crop
     kk::Mix(s, States(cur), DF(w->output_res_query), 1, kEmbd, T, mixf, cfg->rms_eps);
     kk::RmsNorm(s, mixf, kEmbd, DF(w->output_norm), hn, kEmbd, kEmbd, T, cfg->rms_eps);
+    if (fsink) {  // gufo_windows: prefill features of this ubatch to the drafter
+      PTapFeature(hn, 3, T);
+      Check(hipStreamSynchronize(s), "prefill features");
+      fsink(ss, static_cast<std::size_t>(pos0), static_cast<std::size_t>(T), d_pfeat);
+      if (!last_ubatch && !sink) return;
+    }
     const int V = static_cast<int>(cfg->n_vocab_text);
     auto chunk = [&](int a, int n, std::vector<float>* host) {
       G(w->output, hn + static_cast<std::size_t>(a) * kEmbd, kEmbd, logits_d, V, n, V);
@@ -1780,6 +1806,15 @@ void Engine::DecodeBatch(std::span<Session* const> sessions, std::span<const std
 
 void Engine::VerifyChain(Session& s, std::span<const std::int32_t> tokens,
                          std::vector<std::vector<float>>* logits) {
+  RunChain(s, tokens, logits, nullptr);
+}
+
+void Engine::VerifyChainArgmax(Session& s, std::span<const std::int32_t> tokens, std::vector<std::int32_t>* argmax) {
+  RunChain(s, tokens, nullptr, argmax);
+}
+
+void Engine::RunChain(Session& s, std::span<const std::int32_t> tokens, std::vector<std::vector<float>>* logits,
+                      std::vector<std::int32_t>* argmax) {
   const std::size_t n = tokens.size();
   if (n < 2 || n > static_cast<std::size_t>(Impl::kMaxB)) throw std::runtime_error("inkling2: bad verify chain");
   if (!batch_capable()) throw std::runtime_error("inkling2: verify chain needs the batched decode kernels");
@@ -1789,43 +1824,83 @@ void Engine::VerifyChain(Session& s, std::span<const std::int32_t> tokens,
     if (t < 0 || static_cast<std::uint32_t>(t) >= weights_.config.n_vocab_text)
       throw std::runtime_error("inkling2: token id out of range");
   if (s.hooks_ != nullptr) s.hooks_->BeforeWrite(s.pos_, s.pos_ + n);  // M2 hook
-  logits->resize(n);
   Session* sess[Impl::kMaxB];
-  std::vector<float>* outs[Impl::kMaxB];
+  std::vector<float>* outs[Impl::kMaxB] = {};
+  if (logits) logits->resize(n);
   for (std::size_t i = 0; i < n; ++i) {
     sess[i] = &s;
-    outs[i] = &(*logits)[i];
+    outs[i] = logits ? &(*logits)[i] : nullptr;
   }
-  if (!impl_->d_convlog)
-    impl_->d_convlog = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 48 * kConvChannels * 3 * 4, "chain conv log"));
-  impl_->DecodeN(sess, tokens.data(), outs, static_cast<int>(n), /*chain_mode=*/true);
-  s.logits_ = logits->back();
+  Impl& m = *impl_;
+  if (!m.d_convlog)
+    m.d_convlog = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 48 * kConvChannels * 3 * 4, "chain conv log"));
+  if (!m.d_argv) {
+    m.d_argv = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 64 * 4, "argmax"));
+    m.d_argi = static_cast<int*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 64 * 4, "argmax"));
+    m.d_argo = static_cast<int*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 4, "argmax"));
+  }
+  m.DecodeN(sess, tokens.data(), outs, static_cast<int>(n), /*chain_mode=*/true);
+  const int V = static_cast<int>(weights_.config.n_vocab_text);
+  if (argmax) {  // rows stay on the device: argmax there, n ints back
+    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+    fast::ArgmaxRows(m.ds, m.logits_d, V, V, static_cast<int>(n), m.d_argv, m.d_argi, m.d_argo);
+    argmax->resize(n);
+    Check(hipMemcpyAsync(argmax->data(), m.d_argo, n * 4, hipMemcpyDeviceToHost, m.ds), "argmax copy");
+    Check(hipStreamSynchronize(m.ds), "argmax sync");
+    s.logits_.clear();  // filled by ChainKeep (only the kept row is copied)
+  } else {
+    s.logits_ = logits->back();
+  }
   s.chain_first_ = s.pos_ - n;
   s.chain_n_ = n;
 }
 
 void Engine::ChainKeep(Session& s, std::size_t keep, const std::vector<float>& logits) {
+  ChainKeepImpl(s, keep, &logits);
+}
+void Engine::ChainKeep(Session& s, std::size_t keep) { ChainKeepImpl(s, keep, nullptr); }
+
+void Engine::ChainKeepImpl(Session& s, std::size_t keep, const std::vector<float>* logits) {
   const std::lock_guard lock(mutex_);
   if (keep == 0 || keep > s.chain_n_ || s.pos_ != s.chain_first_ + s.chain_n_)
     throw std::runtime_error("inkling2: ChainKeep needs the last step of this session to be a chain of >= keep tokens");
+  Impl& m = *impl_;
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
   if (keep < s.chain_n_) {
-    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
-    const std::size_t per = static_cast<std::size_t>(kConvChannels) * 3;
-    for (std::size_t v = 0; v < 48; ++v)
-      Check(hipMemcpy(s.slots_[v].conv, impl_->d_convlog + ((keep - 1) * 48 + v) * per, per * 4, hipMemcpyDeviceToDevice),
-            "chain keep");
+    const int per = kConvChannels * 3;
+    fast::ConvRestore(m.ds, static_cast<const fast::SlotEntry*>(s.tbl_), m.d_convlog + (keep - 1) * 48 * static_cast<std::size_t>(per), per);
     s.pos_ = s.chain_first_ + keep;
-    s.logits_ = logits;
   }
+  if (logits) {
+    if (keep < s.chain_n_ || s.logits_.empty()) s.logits_ = *logits;
+  } else {
+    // the kept row is still in the device logits of the chain step
+    const std::size_t V = weights_.config.n_vocab_text;
+    s.logits_.resize(V);
+    Check(hipMemcpyAsync(s.logits_.data(), m.logits_d + (keep - 1) * V, V * 4, hipMemcpyDeviceToHost, m.ds), "kept logits");
+  }
+  Check(hipStreamSynchronize(m.ds), "chain keep");
   s.chain_n_ = 0;
+}
+
+void Engine::SetFeatureSink(FeatureSink sink) {
+  const std::lock_guard lock(mutex_);
+  Impl& m = *impl_;
+  if (sink) {
+    if (!m.d_feat)
+      m.d_feat = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 4 * kEmbd * 4, "dspark features"));
+    if (!m.d_pfeat) m.d_pfeat = static_cast<float*>(AllocDevice(static_cast<std::size_t>(ubatch_) * 4 * kEmbd * 4, "prefill features"));
+  }
+  m.fsink = std::move(sink);
+  m.capture_feat = static_cast<bool>(m.fsink) || m.feat_out != nullptr;
 }
 
 void Engine::SetFeatureCapture(bool on) {
   const std::lock_guard lock(mutex_);
   if (on && !impl_->d_feat)
     impl_->d_feat = static_cast<float*>(AllocDevice(static_cast<std::size_t>(Impl::kMaxB) * 4 * kEmbd * 4, "dspark features"));
-  impl_->capture_feat = on;
   impl_->feat_out = on ? &features_ : nullptr;
+  impl_->capture_feat = on || static_cast<bool>(impl_->fsink);
   if (!on) features_.clear();
 }
 

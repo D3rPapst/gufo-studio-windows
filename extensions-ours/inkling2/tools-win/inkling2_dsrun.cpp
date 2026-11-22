@@ -1,16 +1,14 @@
 // gufo_windows addition: end-to-end DSpark speculative decoding on the GPU (target chain verify + GPU drafter),
-// lossless check against plain greedy decoding, measured speed. Prototype of the runner policy.
+// lossless check against plain greedy decoding, measured speed. Prototype of the runner path.
 //
 //   inkling2_dsrun --model GGUF --drafter DSPARK.gguf --prompt FILE [--chat 1] [--gen 256] [--ctx 8192]
-//                  [--policies 3,5,7,a] [--adaptive-set 0,3,5] [--window-extra 0]
+//                  [--policies 3,5,7,a] [--window-extra 0]
 //
-// Prompt processing for both runs goes through chains of 8 tokens (decode kernels, feature capture on), so the
-// plain reference and the speculative run start from bit-identical states. Plain: single-token decode (no capture).
-// Speculative: per cycle draft K tokens after the bonus token, verify [bonus, d1..dK] as one chain, keep the
-// accepted prefix (Engine::ChainKeep, conv histories from the chain's per-token log), inject the features of the
-// kept rows into the drafter. Policy "a": per-token acceptance tracked as an EMA, K chosen from --adaptive-set by
-// the measured cost model (draft ms + chain ms of K + 1 tokens vs plain decode ms), plain decode below break-even
-// with a K=3 probe every 16 plain tokens.
+// Prompt: one prefill Forward (the drafter gets its features through Engine::SetFeatureSink). Plain reference:
+// single-token greedy decode. Speculative: per cycle draft K tokens after the bonus token, verify
+// [bonus, d1..dK] as one chain with GPU argmax (VerifyChainArgmax), keep the accepted prefix (ChainKeep: conv
+// histories from the chain's per-token log, one logits row copied back); the sink stages the chain's feature rows
+// and the drafter injects them before the next draft. Policy "a" = DSparkPolicy (src/dspark_policy.hpp).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -26,11 +24,13 @@
 #include <gufo/ext/gguf_reader.hpp>
 
 #include "src/dspark.hpp"
+#include "src/dspark_policy.hpp"
 #include "src/engine.hpp"
 #include "text/tokenizer.hpp"
 
 namespace {
 using gufo::models::inkling2::DSparkDrafter;
+using gufo::models::inkling2::DSparkPolicy;
 using gufo::models::inkling2::Engine;
 using gufo::models::inkling2::Session;
 using Clock = std::chrono::steady_clock;
@@ -48,35 +48,10 @@ std::vector<std::string> Split(const std::string& s) {
   while (std::getline(ss, t, ',')) if (!t.empty()) out.push_back(t);
   return out;
 }
-
-// prompt through chains of up to 8 tokens (decode kernels); features of every position into the drafter
-void FeedPrompt(Engine& e, Session& s, const std::vector<std::int32_t>& ids, DSparkDrafter* d) {
-  std::size_t i = 0;
-  std::vector<std::vector<float>> rows;
-  while (i < ids.size()) {
-    const std::size_t n = std::min<std::size_t>(8, ids.size() - i);
-    if (n >= 2) e.VerifyChain(s, std::span<const std::int32_t>(ids.data() + i, n), &rows);
-    else e.Forward(s, std::span<const std::int32_t>(ids.data() + i, 1));
-    if (d) d->Inject(i, n);
-    i += n;
-  }
-}
-
-struct Cost {
-  double decode_ms = 22.4;
-  std::map<int, double> chain_ms{{2, 30.2}, {3, 34.8}, {4, 39.5}, {5, 44.0}, {6, 48.5}, {7, 53.0}, {8, 57.5}};
-  std::map<int, double> draft_ms{{1, 6.0}, {3, 8.0}, {5, 10.0}, {7, 12.0}};
-  static void Ema(double* v, double x) { *v = 0.8 * *v + 0.2 * x; }
-  [[nodiscard]] double Draft(int k) const {
-    auto it = draft_ms.lower_bound(k);
-    return it == draft_ms.end() ? draft_ms.rbegin()->second : it->second;
-  }
-};
-
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, drafter_path, prompt_path, policies = "3,5,7,a", aset = "0,3,5";
+  std::string model, drafter_path, prompt_path, policies = "3,5,7,a";
   int gen = 256, chat = 1, window_extra = 0;
   unsigned ctx = 8192;
   for (int i = 1; i < argc; ++i) {
@@ -89,7 +64,6 @@ int main(int argc, char** argv) {
     else if (k == "--chat") chat = std::atoi(next().c_str());
     else if (k == "--ctx") ctx = static_cast<unsigned>(std::strtoul(next().c_str(), nullptr, 10));
     else if (k == "--policies") policies = next();
-    else if (k == "--adaptive-set") aset = next();
     else if (k == "--window-extra") window_extra = std::atoi(next().c_str());
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
@@ -118,35 +92,36 @@ int main(int argc, char** argv) {
   if (!engine) { std::fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
   if (!engine->batch_capable()) { std::fprintf(stderr, "engine not batch capable\n"); return 1; }
   const int V = static_cast<int>(engine->config().n_vocab_text);
-  engine->SetFeatureCapture(true);
   const auto tl = Clock::now();
   DSparkDrafter::Options dopt;
   dopt.window_extra = window_extra;
   auto drafter = DSparkDrafter::Create(*engine, drafter_path, dopt, &err);
   if (!drafter) { std::fprintf(stderr, "drafter: %s\n", err.c_str()); return 1; }
   std::printf("prompt %zu tokens, gen %d, drafter loaded in %.1f s\n", ids.size(), gen, Ms(tl) / 1000.0);
+  const Session* spec_session = nullptr;
+  auto sink = [&](const Session& s, std::size_t pos0, std::size_t n, const float* rows) {
+    if (&s == spec_session) drafter->Stage(pos0, n, rows);
+  };
 
-  // ---- warm-up: capture the decode graphs (single token with / without features, chains of 2..8) outside the timing
+  // ---- warm-up: decode graphs with and without features, chains of 2..8, outside the timing
   {
     auto w = engine->NewSession();
-    std::vector<std::int32_t> t(8, ids.empty() ? 0 : ids[0]);
-    std::vector<std::vector<float>> rows;
-    for (int n = 2; n <= 8; ++n) { engine->Reset(*w); engine->VerifyChain(*w, std::span<const std::int32_t>(t.data(), n), &rows); }
+    std::vector<std::int32_t> t(8, ids.empty() ? 0 : ids[0]), am;
+    engine->SetFeatureSink(sink);
+    for (int n = 2; n <= 8; ++n) { engine->Reset(*w); engine->VerifyChainArgmax(*w, std::span<const std::int32_t>(t.data(), n), &am); }
     engine->Reset(*w);
+    engine->Forward(*w, std::span<const std::int32_t>(t.data(), 2));
     engine->Forward(*w, std::span<const std::int32_t>(t.data(), 1));
+    engine->SetFeatureSink({});
     engine->Forward(*w, std::span<const std::int32_t>(t.data(), 1));
-    engine->SetFeatureCapture(false);
-    engine->Forward(*w, std::span<const std::int32_t>(t.data(), 1));
-    engine->SetFeatureCapture(true);
   }
 
-  // ---- plain reference (prompt via chains, then single-token greedy decode without capture)
+  // ---- plain reference: prefill, then single-token greedy decode (no feature capture)
   std::vector<std::int32_t> ref;
-  Cost cost;
+  double decode_ms = 22.5;
   {
     auto s = engine->NewSession();
-    FeedPrompt(*engine, *s, ids, nullptr);
-    engine->SetFeatureCapture(false);
+    engine->Forward(*s, ids);
     std::int32_t nx = Argmax(s->logits(), V);
     const auto t0 = Clock::now();
     for (int g = 0; g < gen; ++g) {
@@ -155,81 +130,80 @@ int main(int argc, char** argv) {
       engine->Forward(*s, std::span<const std::int32_t>(&nx, 1));
       nx = Argmax(s->logits(), V);
     }
-    const double ms = Ms(t0);
-    cost.decode_ms = ms / std::max(1, gen - 1);
-    std::printf("plain: %d tokens, %.2f tok/s (%.2f ms/token)\n", gen, 1000.0 / cost.decode_ms, cost.decode_ms);
-    engine->SetFeatureCapture(true);
+    decode_ms = Ms(t0) / std::max(1, gen - 1);
+    std::printf("plain: %d tokens, %.2f tok/s (%.2f ms/token)\n", gen, 1000.0 / decode_ms, decode_ms);
     std::string txt = tok->Decode(std::span<const inkling2::text::TokenId>(reinterpret_cast<const inkling2::text::TokenId*>(ref.data()), ref.size()));
     for (char& c : txt) if (c == '\n') c = ' ';
     std::printf("reference text: %.240s\n", txt.c_str());
   }
 
   // ---- speculative runs
-  const std::vector<int> adaptive_set = [&] {
-    std::vector<int> v;
-    for (const auto& x : Split(aset)) v.push_back(std::atoi(x.c_str()));
-    return v;
-  }();
+  engine->SetFeatureSink(sink);
   for (const auto& pol : Split(policies)) {
     const bool adaptive = pol == "a";
     const int fixed_k = adaptive ? 0 : std::min(7, std::atoi(pol.c_str()));
+    DSparkPolicy policy;
     auto s = engine->NewSession();
+    spec_session = s.get();
     drafter->Reset(0);
-    FeedPrompt(*engine, *s, ids, drafter.get());
+    engine->Forward(*s, ids);  // prefill: features through the sink
     std::vector<std::int32_t> out;
     std::int32_t nx = Argmax(s->logits(), V);
-    std::size_t c = s->position();
-    int cycles = 0, plain_steps = 0, drafted = 0, accepted = 0, since_probe = 0;
-    double draft_total = 0, verify_total = 0, alpha = 0.6;
+    int cycles = 0, plain_steps = 0, drafted = 0, accepted = 0, probes = 0;
+    double draft_total = 0, verify_total = 0, keep_total = 0;
     std::map<int, int> k_used;
+    // pending shadow draft (plain mode): drafted at position `probe_at` after anchor out[probe_idx]
+    std::vector<std::int32_t> probe;
+    std::size_t probe_idx = 0;
+    double probe_ms = 0;
     const auto t0 = Clock::now();
     while (static_cast<int>(out.size()) < gen) {
-      int K = fixed_k;
-      if (adaptive) {
-        double best = 1.0 / cost.decode_ms;  // tokens per ms of plain decode
-        K = 0;
-        for (int k : adaptive_set) {
-          if (k <= 0) continue;
-          double e = 0, p = 1;
-          for (int i = 0; i <= k; ++i) { e += p; p *= alpha; }
-          const double ms = cost.Draft(k) + cost.chain_ms[std::min(k + 1, 8)];
-          if (e / ms > best) { best = e / ms; K = k; }
-        }
-        if (K == 0 && ++since_probe >= 16) { K = 3; since_probe = 0; }  // probe so the estimate can recover
-      }
+      const std::size_t c = s->position();
+      int K = adaptive ? policy.Choose() : fixed_k;
       K = std::min(K, gen - static_cast<int>(out.size()) - 1);
       std::vector<std::int32_t> d;
       if (K > 0) {
         d = drafter->Draft(nx, c, K);
         draft_total += drafter->last_draft_ms();
-        Cost::Ema(&cost.draft_ms[K], drafter->last_draft_ms());
       }
-      if (d.empty()) {
+      if (d.empty()) {  // plain step (with an optional shadow draft to keep the estimate alive)
+        if (adaptive && probe.empty() && policy.ProbeDue()) {
+          probe = drafter->Draft(nx, c, policy.probe_k());
+          probe_ms = drafter->last_draft_ms();
+          probe_idx = out.size();
+          ++probes;
+        }
+        const auto tp = Clock::now();
         out.push_back(nx);
         engine->Forward(*s, std::span<const std::int32_t>(&nx, 1));
-        drafter->Inject(c, 1);
-        ++c;
         nx = Argmax(s->logits(), V);
+        policy.Plain(Ms(tp));
         ++plain_steps;
+        if (!probe.empty() && out.size() + 1 >= probe_idx + 1 + probe.size()) {  // the probe's tokens are known now
+          std::vector<std::int32_t> actual(out.begin() + static_cast<std::ptrdiff_t>(probe_idx) + 1, out.end());
+          actual.push_back(nx);
+          int a = 0;
+          while (a < static_cast<int>(probe.size()) && a < static_cast<int>(actual.size()) && probe[a] == actual[a]) ++a;
+          policy.Probe(static_cast<int>(probe.size()), a, probe_ms);
+          probe.clear();
+        }
         continue;
       }
       std::vector<std::int32_t> step{nx};
       step.insert(step.end(), d.begin(), d.end());
-      std::vector<std::vector<float>> rows;
+      std::vector<std::int32_t> am;
       const auto tv = Clock::now();
-      engine->VerifyChain(*s, step, &rows);
+      engine->VerifyChainArgmax(*s, step, &am);
+      std::size_t a = 0;
+      while (a < d.size() && am[a] == d[a]) ++a;
+      const auto tk = Clock::now();
+      engine->ChainKeep(*s, a + 1);
+      keep_total += Ms(tk);
       const double vms = Ms(tv);
       verify_total += vms;
-      Cost::Ema(&cost.chain_ms[static_cast<int>(step.size())], vms);
-      std::size_t a = 0;
-      while (a < d.size() && Argmax(rows[a], V) == d[a]) ++a;
-      for (std::size_t i = 0; i < a; ++i) Cost::Ema(&alpha, 1.0);  // per-token acceptance: a hits, then one miss
-      if (a < d.size()) Cost::Ema(&alpha, 0.0);
-      if (a + 1 < step.size()) engine->ChainKeep(*s, a + 1, rows[a]);
-      drafter->Inject(c, a + 1);
+      policy.Cycle(static_cast<int>(d.size()), static_cast<int>(a), drafter->last_draft_ms(), vms);
       for (std::size_t i = 0; i <= a; ++i) out.push_back(step[i]);
-      c += a + 1;
-      nx = Argmax(rows[a], V);
+      nx = am[a];
       ++cycles;
       ++k_used[static_cast<int>(d.size())];
       drafted += static_cast<int>(d.size());
@@ -239,19 +213,16 @@ int main(int argc, char** argv) {
     out.resize(static_cast<std::size_t>(gen));
     int same = 0;
     while (same < gen && out[same] == ref[same]) ++same;
-    std::printf("policy %s: %.2f tok/s (plain %.2f), identical to plain for %d of %d tokens%s; %d cycles + %d plain steps,"
-                " drafted %d accepted %d (%.0f%%), %.2f tokens/cycle, draft %.1f ms/cycle, verify %.1f ms/cycle, alpha %.2f, K used:",
-                pol.c_str(), gen * 1000.0 / ms, 1000.0 / cost.decode_ms, same, gen, same == gen ? " (lossless)" : " (MISMATCH)",
-                cycles, plain_steps, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
+    std::printf("policy %s: %.2f tok/s (plain %.2f), identical to plain for %d of %d tokens%s; %d cycles + %d plain steps"
+                " (%d probes), drafted %d accepted %d (%.0f%%), %.2f tokens/cycle, per cycle: draft %.1f ms, verify+keep %.1f ms"
+                " (keep %.2f ms); hit %.2f; K used:",
+                pol.c_str(), gen * 1000.0 / ms, 1000.0 / decode_ms, same, gen, same == gen ? " (lossless)" : " (MISMATCH)",
+                cycles, plain_steps, probes, drafted, accepted, drafted ? 100.0 * accepted / drafted : 0.0,
                 cycles ? static_cast<double>(gen - plain_steps) / cycles : 0.0, cycles ? draft_total / cycles : 0.0,
-                cycles ? verify_total / cycles : 0.0, alpha);
+                cycles ? verify_total / cycles : 0.0, cycles ? keep_total / cycles : 0.0, policy.Hit());
     for (const auto& [k, n] : k_used) std::printf(" %d:%d", k, n);
     std::printf("\n");
   }
-  std::printf("chain cost (EMA ms):");
-  for (const auto& [t, m] : cost.chain_ms) std::printf(" T%d=%.1f", t, m);
-  std::printf("; draft cost (EMA ms):");
-  for (const auto& [k, m] : cost.draft_ms) std::printf(" K%d=%.1f", k, m);
-  std::printf("\n");
+  engine->SetFeatureSink({});
   return 0;
 }

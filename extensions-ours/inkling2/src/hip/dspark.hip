@@ -410,19 +410,26 @@ struct DSparkDrafter::Impl {
     vv = AllocF(static_cast<std::size_t>(inject_cap) * KVD);
   }
 
-  void Inject(long long pos0, int n) {
+  // staging of small steps (Stage / Flush)
+  static constexpr int kStage = 256;
+  float* stage = nullptr;
+  long long st_first = 0;
+  int st_n = 0;
+
+  void Inject(long long pos0, int n) { InjectRows(pos0, n, tv.features); }
+  void InjectRows(long long pos0, int n, const float* rows) {
     if (n <= 0) return;
-    if (!tv.features) throw std::runtime_error("inkling2 dspark: the target has no feature capture");
+    if (!rows) throw std::runtime_error("inkling2 dspark: the target has no feature capture");
     EnsureInject(n);
     for (int l = 0; l < NL; ++l) {
       Layer& y = L[l];
-      k_fuse<<<n, 256, 0, st>>>(tv.features, fuse[l][0], fuse[l][1], fuse[l][2], fuse[l][3], y.dflare, fused, eps);
+      k_fuse<<<n, 256, 0, st>>>(rows, fuse[l][0], fuse[l][1], fuse[l][2], fuse[l][3], y.dflare, fused, eps);
       Gemm(y.kctx, fused, E, kk, KVD, n);
       Gemm(y.vctx, fused, E, vv, KVD, n);
       k_headnorm_rope<<<dim3(n, NKV), 64, 0, st>>>(kk, NKV, y.kctx_norm, static_cast<int>(pos0), theta, eps);
       k_store<<<n, 256, 0, st>>>(kk, vv, y.kc, y.vc, static_cast<int>(pos0), y.cap);
     }
-    k_fuse<<<n, 256, 0, st>>>(tv.features, fuse[3][0], fuse[3][1], fuse[3][2], fuse[3][3], dspark_norm, fused, eps);
+    k_fuse<<<n, 256, 0, st>>>(rows, fuse[3][0], fuse[3][1], fuse[3][2], fuse[3][3], dspark_norm, fused, eps);
     for (int i = std::max(0, n - HN); i < n; ++i) {
       const long long p = pos0 + i;
       Chk(hipMemcpyAsync(hn + static_cast<std::size_t>(p % HN) * E, fused + static_cast<std::size_t>(i) * E, E * 4,
@@ -433,9 +440,37 @@ struct DSparkDrafter::Impl {
     Chk(hipStreamSynchronize(st), "inject");
   }
 
+  void Flush() {
+    if (st_n == 0) return;
+    InjectRows(st_first, st_n, stage);
+    st_n = 0;
+  }
+  void Stage(long long pos0, int n, const float* rows) {
+    if (n <= 0) return;
+    if (st_n > 0) {
+      const long long end = st_first + st_n;
+      if (pos0 >= st_first && pos0 <= end) st_n = static_cast<int>(pos0 - st_first);  // rejected tail replaced
+      else if (pos0 < st_first) st_n = 0;                                             // rewound before the staged rows
+      else Flush();                                                                    // gap: inject what we have
+    }
+    if (n > kStage / 2) {  // large step (prefill ubatch): straight in
+      Flush();
+      InjectRows(pos0, n, rows);
+      return;
+    }
+    if (st_n + n > kStage) Flush();
+    if (!stage) stage = AllocF(static_cast<std::size_t>(kStage) * 4 * E);
+    if (st_n == 0) st_first = pos0;
+    Chk(hipMemcpy(stage + static_cast<std::size_t>(st_n) * 4 * E, rows, static_cast<std::size_t>(n) * 4 * E * 4,
+                  hipMemcpyDeviceToDevice),
+        "stage");
+    st_n += n;
+  }
+
   std::vector<std::int32_t> Draft(int anchor, long long pos0, int k) {
     std::vector<std::int32_t> out;
     const auto t0 = std::chrono::steady_clock::now();
+    Flush();
     if (k <= 0 || pos0 < 1 || ctx_from > pos0 - 1 || hn_pos[(pos0 - 1) % HN] != pos0 - 1) return out;
     k = std::min(k, BLOCK - 1);
     Chk(hipMemcpyAsync(d_anchor, &anchor, 4, hipMemcpyHostToDevice, st), "anchor");
@@ -508,7 +543,12 @@ DSparkDrafter::~DSparkDrafter() = default;
 void DSparkDrafter::Reset(std::size_t pos) {
   impl_->ctx_from = static_cast<long long>(pos);
   impl_->hn_pos.assign(HN, -1);
+  impl_->st_n = 0;
 }
+void DSparkDrafter::Stage(std::size_t pos0, std::size_t n, const float* device_rows) {
+  impl_->Stage(static_cast<long long>(pos0), static_cast<int>(n), device_rows);
+}
+void DSparkDrafter::Flush() { impl_->Flush(); }
 void DSparkDrafter::Inject(std::size_t pos0, std::size_t n) {
   impl_->tv.features = impl_->target->draft_target().features;
   impl_->Inject(static_cast<long long>(pos0), static_cast<int>(n));
