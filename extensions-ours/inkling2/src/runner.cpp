@@ -80,6 +80,8 @@ public:
   /// a second time); the turn ends there instead. `answer_done` is set by Advance, per request.
   bool answer_only{false};
   bool answer_done{false};
+  /// INKLING2_TOKEN_LOG: output tokens logged for this request (see CommitToken). Per request.
+  std::uint32_t tokens_logged{0};
   /// The request's images (set by SetPromptContext; null for a text-only prompt).
   std::shared_ptr<const Inkling2PromptContext> prompt;
   /// gufo_windows: DSpark (--speculative dspark): depth policy and a pending shadow draft (plain mode).
@@ -410,6 +412,7 @@ public:
     st.call_required = c != nullptr && c->call_required;
     st.answer_only = c != nullptr && c->answer_only;
     st.answer_done = false;
+    st.tokens_logged = 0;
     st.call_names = c != nullptr ? c->call_names : decltype(st.call_names){};
     st.call_prefix.clear();
   }
@@ -549,6 +552,17 @@ public:
     CommitToken(st, token);
   }
   void CommitToken(Inkling2State& st, g::TextRunnerToken token) const {
+    // INKLING2_TOKEN_LOG=1: the first 48 output tokens of a request and every block control token after
+    // that (header, thinking, text, invoke, end), to see a reply's framing (gufo_windows, budget check).
+    static const bool token_log = std::getenv("INKLING2_TOKEN_LOG") != nullptr;
+    if (token_log) {
+      const bool control = token == t_header_ || token == t_thinking_ || token == t_text_ || token == t_invoke_ ||
+                           token == t_end_message_;
+      if (st.tokens_logged < 48 || control)
+        std::fprintf(stderr, "inkling2 token %u id=%u block=%d %s\n", st.tokens_logged, static_cast<unsigned>(token),
+                     static_cast<int>(st.block), std::string(tok_->TokenBytes(token)).c_str());
+      ++st.tokens_logged;
+    }
     if (st.answer_only && st.block == Block::kText && token == t_end_message_) st.answer_done = true;
     if (token == t_header_) st.call_prefix.clear();
     else if ((st.block == Block::kAfterHeader || st.block == Block::kTool) && token != t_invoke_)

@@ -138,14 +138,11 @@ inline RenderOptions ToRenderOptions(const g::ChatRequest& request) {
     const bool tools = !request.tools.empty() && request.tool_choice != g::ChatRequest::ToolChoice::kNone;
     o.generation_prefix = tools ? RenderOptions::Prefix::kEmptyThought : RenderOptions::Prefix::kHeaderText;
     o.empty_thought_for_assistants = tools;
-  } else if (request.reasoning.budget_tokens) {
-    // gufo_windows: a thinking budget (thinking_budget_tokens / --reasoning-budget). Gufo's sampler starts counting
-    // when the output's first non-blank token is the opener <|content_thinking|>; Inkling writes the assistant
-    // header <|message_model|> before it, so the budget never started (round 11: 5500-9500 thinking tokens with a
-    // budget of 1500). The prompt now ends with the header the model writes anyway, so its first token is the
-    // opener and the host forces <|end_message|> once the budget is spent; the answer block follows.
-    o.generation_prefix = RenderOptions::Prefix::kHeader;
   }
+  // gufo_windows: a thinking budget needs no prompt change; the header the model writes opens it (BudgetTags,
+  // tool_dialect.hpp). Round 12 ended the prompt with the header instead: the budget then worked without a
+  // grammar, but the reasoning counter saw no opener (0 reasoning tokens) and a JSON grammar, whose reasoning
+  // opener starts with the header, made the model write a second header, so the budget never opened there.
   return o;
 }
 
@@ -181,7 +178,8 @@ inline std::optional<std::vector<g::TextRunnerToken>> RenderAndTokenize(
 // ---- reasoning and tool dialect ----
 
 inline g::ReasoningTags BudgetTags() {
-  return {dialect::kBudgetStart, dialect::kBudgetForcedEnd, {dialect::kBudgetForcedEnd}};
+  return {dialect::kBudgetStart, dialect::kBudgetForcedEnd,
+          {std::begin(dialect::kBudgetEnds), std::end(dialect::kBudgetEnds)}};
 }
 inline void ScanToolCalls(std::string_view text, std::span<const std::string_view>,
                           std::vector<g::ScannedToolCall>* calls,

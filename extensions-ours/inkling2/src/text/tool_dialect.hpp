@@ -27,12 +27,19 @@ inline constexpr std::string_view kInvokeJson = "<|content_invoke_tool_json|>";
 inline constexpr std::string_view kEndMessage = "<|end_message|>";
 inline constexpr std::string_view kEndSampling = "<|content_model_end_sampling|>";
 
-// Reasoning budget tags: control tokens (each one token).
-inline constexpr std::string_view kBudgetStart = "<|content_thinking|>";
-inline constexpr std::string_view kBudgetForcedEnd = "<|end_message|>";
 // Literal reasoning delimiters in the generated text.
 inline constexpr std::string_view kReasoningOpen = "<|message_model|><|content_thinking|>";
 inline constexpr std::string_view kReasoningClose = "<|end_message|><|message_model|><|content_text|>";
+// Reasoning budget tags (gufo_windows). Gufo's sampler opens the budget on the output's first non-blank token
+// and needs it to be one token; Inkling's first token is the header <|message_model|>, not <|content_thinking|>
+// (with that opener the budget never started: round 11/12, 5000-9500 thinking tokens at a budget of 1500).
+// So the header opens it; a header followed by <|content_text|> (answer, no thinking) or by a call closes it
+// again, as does the thinking block's own <|end_message|>. A spent budget forces the close *and* the answer
+// header, so the model cannot open a second thinking block. With a JSON grammar the sampler leaves the budget
+// after the forced <|end_message|> (the grammar's reasoning close); the grammar then wants the JSON directly.
+inline constexpr std::string_view kBudgetStart = kHeader;
+inline constexpr std::string_view kBudgetForcedEnd = kReasoningClose;
+inline constexpr std::string_view kBudgetEnds[] = {kEndMessage, kContentText, kInvokeJson};
 
 inline constexpr std::string_view kMarkers[] = {kHeader};
 inline constexpr std::string_view kClosers[] = {kEndMessage};

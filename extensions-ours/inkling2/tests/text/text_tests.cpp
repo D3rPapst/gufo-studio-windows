@@ -530,8 +530,12 @@ void TestDialect(const Tokenizer& tok) {
     ScanToolCalls("<|message_model|>f<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":}}<|end_message|>", false, &calls, &spans);
     CHECK(calls.empty(), "bad json rejected");
   }
-  // delimiters/tags are real control tokens (budget tags must be single tokens)
-  CHECK(tok.FindSpecial(kBudgetStart) && tok.FindSpecial(kBudgetForcedEnd) && tok.FindSpecial(kEndSampling), "tags are control tokens");
+  // delimiters/tags are real control tokens (the budget's start and ends must be single tokens; its forced end
+  // is the 3-token close + answer header)
+  bool ends_single = true;
+  for (const auto e : kBudgetEnds) ends_single = ends_single && tok.FindSpecial(e);
+  CHECK(tok.FindSpecial(kBudgetStart) && ends_single && tok.FindSpecial(kEndSampling), "tags are control tokens");
+  CHECK(tok.Encode(std::string(kBudgetForcedEnd), true).size() == 3, "budget forced end tokenizes to 3 control tokens");
   CHECK(tok.Encode(std::string(kReasoningOpen), true).size() == 2 && tok.Encode(std::string(kReasoningClose), true).size() == 3, "delimiters tokenize to control tokens");
 }
 
