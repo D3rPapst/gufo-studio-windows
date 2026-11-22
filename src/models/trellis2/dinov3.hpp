@@ -61,9 +61,11 @@ bool dinov3_encode_cpu(const Dinov3Weights& weights, const float* pixels, int im
 class Dinov3Hip {
 public:
     ~Dinov3Hip();
-    // `image` fixes the token count (512 or 1024).
+    // `image` sets the first token count (512 or 1024); Encode(pixels, image, ...) switches it.
     static std::unique_ptr<Dinov3Hip> Create(const Dinov3Weights& weights, int image, std::string* error);
-    bool Encode(const float* pixels, std::vector<float>* tokens, std::string* error);
+    bool Encode(const float* pixels, std::vector<float>* tokens, std::string* error);   // at image_size()
+    bool Encode(const float* pixels, int image, std::vector<float>* tokens, std::string* error);
+    int image_size() const;
     std::size_t device_bytes() const;
 
 private:

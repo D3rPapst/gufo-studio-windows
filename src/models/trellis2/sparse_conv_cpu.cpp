@@ -11,7 +11,7 @@
 namespace gufo::trellis2 {
 
 std::uint32_t VoxelHashMap::Hash(std::uint32_t key) {
-    // 32-bit mix (Wang); the key is 30 bits of packed coordinates.
+    // 32-bit mix (Wang) of the packed coordinates.
     key = (key ^ 61u) ^ (key >> 16);
     key += key << 3;
     key ^= key >> 4;
@@ -29,8 +29,8 @@ void VoxelHashMap::Build(const std::vector<Coord>& coords) {
     const std::uint32_t mask = static_cast<std::uint32_t>(cap - 1);
     for (std::size_t i = 0; i < coords.size(); ++i) {
         const Coord& c = coords[i];
-        if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= 1024 || c.y >= 1024 || c.z >= 1024)
-            throw std::out_of_range("VoxelHashMap: coordinate outside [0, 1024)");
+        if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= kMaxCoord || c.y >= kMaxCoord || c.z >= kMaxCoord)
+            throw std::out_of_range("VoxelHashMap: coordinate outside [0, 1536)");
         const std::uint32_t key = Pack(c.x, c.y, c.z);
         std::uint32_t slot = Hash(key) & mask;
         while (keys_[slot] != kEmpty) {
@@ -44,7 +44,7 @@ void VoxelHashMap::Build(const std::vector<Coord>& coords) {
 }
 
 std::int64_t VoxelHashMap::Find(int x, int y, int z) const {
-    if (keys_.empty() || x < 0 || y < 0 || z < 0 || x >= 1024 || y >= 1024 || z >= 1024) return -1;
+    if (keys_.empty() || x < 0 || y < 0 || z < 0 || x >= kMaxCoord || y >= kMaxCoord || z >= kMaxCoord) return -1;
     const std::uint32_t key = Pack(x, y, z);
     const std::uint32_t mask = static_cast<std::uint32_t>(keys_.size() - 1);
     std::uint32_t slot = Hash(key) & mask;

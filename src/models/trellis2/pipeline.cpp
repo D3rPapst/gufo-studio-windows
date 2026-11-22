@@ -7,6 +7,7 @@
 #include <cmath>
 #include <random>
 
+#include "src/models/trellis2/cascade.hpp"
 #include "src/models/trellis2/config.hpp"
 #include "src/models/trellis2/dinov3.hpp"
 #include "src/models/trellis2/dit.hpp"
@@ -40,42 +41,28 @@ std::vector<float> gaussian(std::size_t n, std::uint64_t seed) {
     return v;
 }
 
-// Euler flow with interval CFG and x0 rescale; x in place. `extra` columns (texture flow:
-// the normalised shape latent) are appended to x for every forward and never updated.
+// Euler flow with interval CFG and x0 rescale over one or several views (flow_sampler.hpp);
+// x in place. `extra` columns (texture flow: the normalised shape latent) are appended to x
+// for every forward and never updated.
 bool run_flow(DitHip& dit, std::vector<float>& x, int channels, const std::vector<float>* extra, int extra_channels,
-              const std::vector<Coord>& coords, const float* cond, const float* zero_cond, int cond_tokens,
-              const SamplerParams& p, int steps, const std::atomic<bool>* cancel, const std::function<void(int, int)>& tick,
-              std::string* error) {
-    const int N = static_cast<int>(coords.size());
-    const std::vector<float> times = flow_times(steps, p.rescale_t);
-    std::vector<float> input;
-    auto make_input = [&]() -> const float* {
-        if (!extra) return x.data();
-        input.resize(static_cast<std::size_t>(N) * (channels + extra_channels));
-        for (int i = 0; i < N; ++i) {
-            std::copy(x.begin() + static_cast<std::ptrdiff_t>(i) * channels, x.begin() + static_cast<std::ptrdiff_t>(i + 1) * channels,
-                      input.begin() + static_cast<std::ptrdiff_t>(i) * (channels + extra_channels));
-            std::copy(extra->begin() + static_cast<std::ptrdiff_t>(i) * extra_channels, extra->begin() + static_cast<std::ptrdiff_t>(i + 1) * extra_channels,
-                      input.begin() + static_cast<std::ptrdiff_t>(i) * (channels + extra_channels) + channels);
-        }
-        return input.data();
+              const std::vector<Coord>& coords, const std::vector<const float*>& conds, const float* zero_cond, int cond_tokens,
+              const SamplerParams& p, int steps, MultiMode mode, const std::atomic<bool>* cancel,
+              const std::function<void(int, int)>& tick, std::string* error) {
+    const FlowForward forward = [&](const float* in, const float* cond, float t_model, std::vector<float>* v, std::string* err) {
+        return dit.Forward(in, coords, cond, cond_tokens, t_model, v, nullptr, err);
     };
-    for (int i = 0; i < steps; ++i) {
-        if (cancelled(cancel)) { if (error) *error = "cancelled"; return false; }
-        const float t = times[static_cast<std::size_t>(i)], t_prev = times[static_cast<std::size_t>(i) + 1];
-        std::vector<float> pos, neg;
-        const float* in = make_input();
-        if (!dit.Forward(in, coords, cond, cond_tokens, model_timestep(t), &pos, nullptr, error)) return false;
-        if (guidance_active(t, p)) {
-            if (!dit.Forward(in, coords, zero_cond, cond_tokens, model_timestep(t), &neg, nullptr, error)) return false;
-            apply_guidance(&pos, neg, x, t, p);
-        }
-        euler_step(x, pos, t, t_prev);
-        tick(i + 1, steps);
-    }
-    return true;
+    FlowLoopHooks hooks;
+    hooks.cancelled = [cancel] { return cancelled(cancel); };
+    hooks.tick = tick;
+    return sample_flow(forward, x, static_cast<int>(coords.size()), channels, extra, extra_channels, conds, zero_cond, p, steps, mode,
+                       hooks, error);
 }
 
+std::vector<const float*> pointers(const std::vector<std::vector<float>>& v) {
+    std::vector<const float*> out;
+    for (const auto& e : v) out.push_back(e.data());
+    return out;
+}
 
 // Colours per mesh vertex from the per-voxel attributes [N, 6] (base colour 3, metallic,
 // roughness, alpha) by voxel lookup; returns RGBA [vertices * 4] and the mean metallic /
@@ -106,12 +93,35 @@ struct Pipeline::Impl {
     std::unique_ptr<SsDecHip> ss_dec;
     std::unique_ptr<SparseDecHip> shape_dec, tex_dec;
     std::size_t weight_bytes = 0;
+    // 1024 / 1536 cascade: the 1024 flows, loaded on the first such request.
+    std::filesystem::path dir;
+    bool with_texture = false, hq_available = false;
+    std::unique_ptr<DitHip> shape_flow_hq, tex_flow_hq;
+
+    bool LoadHighResolution(std::string* error) {
+        if (shape_flow_hq && (!with_texture || tex_flow_hq)) return true;
+        auto file = [&](const char* part) { return dir / (std::string("trellis2-") + part + ".safetensors"); };
+        if (!shape_flow_hq) {
+            DitShape s;
+            s.in_channels = 32; s.out_channels = 32;
+            shape_flow_hq = DitHip::Create(file("shape_flow_1024"), s, error);
+            if (!shape_flow_hq) return false;
+        }
+        if (with_texture && !tex_flow_hq) {
+            DitShape s;
+            s.in_channels = 64; s.out_channels = 32;
+            tex_flow_hq = DitHip::Create(file("tex_flow_1024"), s, error);
+            if (!tex_flow_hq) return false;
+        }
+        return true;
+    }
 };
 
 Pipeline::Pipeline(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Pipeline::~Pipeline() = default;
 std::size_t Pipeline::weight_bytes() const { return impl_->weight_bytes; }
 bool Pipeline::has_texture() const { return impl_->tex_flow != nullptr && impl_->tex_dec != nullptr; }
+bool Pipeline::has_high_resolution() const { return impl_->hq_available; }
 
 std::unique_ptr<Pipeline> Pipeline::Load(const std::filesystem::path& dir, bool with_texture, std::string* error) {
     auto impl = std::make_unique<Impl>();
@@ -149,33 +159,75 @@ std::unique_ptr<Pipeline> Pipeline::Load(const std::filesystem::path& dir, bool 
         m.tex_dec = SparseDecHip::Create(file("tex_dec"), tex_dec_shape, error);
         if (!m.tex_dec) return nullptr;
     }
+    m.dir = dir;
+    m.with_texture = with_texture;
+    std::error_code ec;
+    m.hq_available = std::filesystem::is_regular_file(file("shape_flow_1024"), ec) &&
+                     (!with_texture || std::filesystem::is_regular_file(file("tex_flow_1024"), ec));
     return std::unique_ptr<Pipeline>(new Pipeline(std::move(impl)));
 }
 
 bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const GenerateOptions& o, const GenerateProgress& progress,
                         const std::atomic<bool>* cancel, GenerateResult* result, std::string* error) {
+    return Generate(std::vector<ImageView>{{rgba, width, height}}, o, progress, cancel, result, error);
+}
+
+bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptions& o, const GenerateProgress& progress,
+                        const std::atomic<bool>* cancel, GenerateResult* result, std::string* error) {
     Impl& m = *impl_;
     auto report = [&](const std::string& phase, int done, int total) { if (progress) progress(phase, done, total); };
     auto fail_cancel = [&]() { if (error) *error = "cancelled"; return false; };
     const int steps = o.steps > 0 ? o.steps : 12;
-    if (o.resolution != 512) {
-        if (error) *error = "TRELLIS.2: only resolution 512 is supported in this stage";
+    if (!is_supported_resolution(o.resolution)) {
+        if (error) *error = "TRELLIS.2: resolution must be 512, 1024 or 1536";
         return false;
     }
-    // 1. encode
+    if (views.empty() || views.size() > static_cast<std::size_t>(kMaxViews)) {
+        if (error) *error = "TRELLIS.2: 1 to " + std::to_string(kMaxViews) + " views";
+        return false;
+    }
+    const bool cascade = o.resolution > 512;
+    if (cascade) {
+        if (!m.hq_available) {
+            if (error) *error = "TRELLIS.2: resolution " + std::to_string(o.resolution) + " needs trellis2-shape_flow_1024" +
+                                (m.with_texture ? std::string(" and trellis2-tex_flow_1024") : std::string()) + ".safetensors in " + m.dir.string();
+            return false;
+        }
+        report("load", 0, 1);
+        if (!m.LoadHighResolution(error)) return false;
+        report("load", 1, 1);
+    }
+    const int V = static_cast<int>(views.size());
+    result->views = V;
+    // 1. encode: every view at 512 px, for the cascade also at 1024 px (each view cropped to its own alpha box)
     auto t0 = Clock::now();
-    report("encode", 0, 2);
-    Preprocessed pre;
-    if (!preprocess_rgba(rgba, width, height, PipelineConfig::image_cond_512, &pre, error)) return false;
-    std::vector<float> cond;
-    if (!m.dino->Encode(pre.pixels.data(), &cond, error)) return false;
-    const int M = DinoV3Config::tokens_512;
-    const std::vector<float> zero_cond(cond.size(), 0.f);
+    const int encodes = V * (cascade ? 2 : 1);
+    report("encode", 0, encodes);
+    std::vector<std::vector<float>> cond512(static_cast<std::size_t>(V)), cond1024(cascade ? static_cast<std::size_t>(V) : 0);
+    int done = 0;
+    for (int image : {512, 1024}) {
+        if (image == 1024 && !cascade) break;
+        for (int v = 0; v < V; ++v) {
+            Preprocessed pre;
+            const ImageView& view = views[static_cast<std::size_t>(v)];
+            if (!preprocess_rgba(view.rgba, view.width, view.height, image, &pre, error)) {
+                if (error && V > 1) *error = "view " + std::to_string(v + 1) + ": " + *error;
+                return false;
+            }
+            auto& out = image == 512 ? cond512[static_cast<std::size_t>(v)] : cond1024[static_cast<std::size_t>(v)];
+            if (!m.dino->Encode(pre.pixels.data(), image, &out, error)) return false;
+            report("encode", ++done, encodes);
+            if (cancelled(cancel)) return fail_cancel();
+        }
+    }
+    const int M = DinoV3Config::tokens(512);
+    const int M_hq = DinoV3Config::tokens(1024);
+    const std::vector<float> zero_cond(static_cast<std::size_t>(M) * DinoV3Config::width, 0.f);
+    const std::vector<float> zero_cond_hq(cascade ? static_cast<std::size_t>(M_hq) * DinoV3Config::width : 0, 0.f);
+    const std::vector<const float*> conds = pointers(cond512), conds_hq = pointers(cond1024);
     result->seconds_encode = seconds_since(t0);
-    report("encode", 2, 2);
-    if (cancelled(cancel)) return fail_cancel();
 
-    // 2. sparse structure
+    // 2. sparse structure (32^3 tokens for every pipeline type, as the original)
     t0 = Clock::now();
     const int R = SsDecConfig::latent_res, Cs = 8, Ns = R * R * R;
     std::vector<float> noise_cm = gaussian(static_cast<std::size_t>(Cs) * Ns, o.seed);
@@ -183,31 +235,58 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     for (int c = 0; c < Cs; ++c)
         for (int v = 0; v < Ns; ++v) x[static_cast<std::size_t>(v) * Cs + c] = noise_cm[static_cast<std::size_t>(c) * Ns + v];
     const std::vector<Coord> grid = dense_grid_coords(R);
-    if (!run_flow(*m.ss_flow, x, Cs, nullptr, 0, grid, cond.data(), zero_cond.data(), M, kSsSampler, steps, cancel,
+    if (!run_flow(*m.ss_flow, x, Cs, nullptr, 0, grid, conds, zero_cond.data(), M, kSsSampler, steps, o.multi_mode, cancel,
                   [&](int d, int t) { report("structure", d, t); }, error))
         return false;
     std::vector<float> logits;
     if (!m.ss_dec->Forward(x.data(), &logits, error)) return false;
-    const std::vector<Coord> coords = occupancy_to_coords(logits.data(), 64, 32);
+    std::vector<Coord> coords = occupancy_to_coords(logits.data(), 64, 32);
     result->structure_voxels = coords.size();
     result->seconds_structure = seconds_since(t0);
     if (coords.empty()) { if (error) *error = "no active voxels in the sparse structure"; return false; }
     if (cancelled(cancel)) return fail_cancel();
 
-    // 3. shape flow
+    // 3. shape flow 512 (the whole shape for 512, the low-resolution stage of the cascade)
     t0 = Clock::now();
-    const int N = static_cast<int>(coords.size()), Cl = 32;
+    const int Cl = 32;
+    int N = static_cast<int>(coords.size());
     std::vector<float> slat = gaussian(static_cast<std::size_t>(N) * Cl, o.seed + 1);
-    if (!run_flow(*m.shape_flow, slat, Cl, nullptr, 0, coords, cond.data(), zero_cond.data(), M, kShapeSampler, steps, cancel,
+    if (!run_flow(*m.shape_flow, slat, Cl, nullptr, 0, coords, conds, zero_cond.data(), M, kShapeSampler, steps, o.multi_mode, cancel,
                   [&](int d, int t) { report("shape", d, t); }, error))
         return false;
+    auto denormalise = [&](std::vector<float>& s) {
+        for (std::size_t i = 0; i < s.size() / Cl; ++i)
+            for (int c = 0; c < Cl; ++c) s[i * Cl + static_cast<std::size_t>(c)] = s[i * Cl + static_cast<std::size_t>(c)] * kShapeStd[c] + kShapeMean[c];
+    };
     std::vector<float> slat_norm = slat;   // normalised (for the texture flow), slat -> denormalised
-    for (int i = 0; i < N; ++i)
-        for (int c = 0; c < Cl; ++c) slat[static_cast<std::size_t>(i) * Cl + c] = slat[static_cast<std::size_t>(i) * Cl + c] * kShapeStd[c] + kShapeMean[c];
+    denormalise(slat);
+    int res = 512;
+    if (cascade) {
+        // 3b. upsample: the shape decoder's subdivision levels give the voxels on the 512 grid
+        report("upsample", 0, 1);
+        SparseDecResult up;
+        if (!m.shape_dec->Forward(slat.data(), coords, &up, error)) return false;
+        std::vector<float>().swap(up.outputs);
+        up.masks.clear();
+        coords = cascade_coords(up.coords, o.resolution, o.max_tokens > 0 ? o.max_tokens : kCascadeMaxTokens, &res);
+        std::vector<Coord>().swap(up.coords);
+        report("upsample", 1, 1);
+        if (cancelled(cancel)) return fail_cancel();
+        // 3c. shape flow 1024 on the high-resolution tokens, DINOv3 tokens of the 1024 px views
+        N = static_cast<int>(coords.size());
+        slat = gaussian(static_cast<std::size_t>(N) * Cl, o.seed + 3);
+        if (!run_flow(*m.shape_flow_hq, slat, Cl, nullptr, 0, coords, conds_hq, zero_cond_hq.data(), M_hq, kShapeSampler, steps,
+                      o.multi_mode, cancel, [&](int d, int t) { report("shape_hq", d, t); }, error))
+            return false;
+        slat_norm = slat;
+        denormalise(slat);
+    }
+    result->resolution = res;
+    result->tokens = coords.size();
     result->seconds_shape = seconds_since(t0);
     if (cancelled(cancel)) return fail_cancel();
 
-    // 4. shape decoder
+    // 4. shape decoder (16x the token grid: 512 / 1024 / 1536)
     t0 = Clock::now();
     report("decode", 0, 1);
     SparseDecResult dec;
@@ -216,14 +295,14 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     result->seconds_decode = seconds_since(t0);
     report("decode", 1, 1);
     if (cancelled(cancel)) return fail_cancel();
-
     // 5. texture (optional): attributes per voxel of the final level
     std::vector<float> attrs;   // [M, 6] base colour, metallic, roughness, alpha
     if (o.texture && has_texture()) {
         t0 = Clock::now();
         std::vector<float> tex = gaussian(static_cast<std::size_t>(N) * Cl, o.seed + 2);
-        if (!run_flow(*m.tex_flow, tex, Cl, &slat_norm, Cl, coords, cond.data(), zero_cond.data(), M, kTexSampler, steps, cancel,
-                      [&](int d, int t) { report("texture", d, t); }, error))
+        DitHip& tex_flow = cascade ? *m.tex_flow_hq : *m.tex_flow;
+        if (!run_flow(tex_flow, tex, Cl, &slat_norm, Cl, coords, cascade ? conds_hq : conds, cascade ? zero_cond_hq.data() : zero_cond.data(),
+                      cascade ? M_hq : M, kTexSampler, steps, o.multi_mode, cancel, [&](int d, int t) { report("texture", d, t); }, error))
             return false;
         for (int i = 0; i < N; ++i)
             for (int c = 0; c < Cl; ++c) tex[static_cast<std::size_t>(i) * Cl + c] = tex[static_cast<std::size_t>(i) * Cl + c] * kTexStd[c] + kTexMean[c];
@@ -246,13 +325,14 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     decode_shape_outputs(dec.outputs.data(), dec.coords.size(), &dual, &inter, &wgt);
     DualGridInput in;
     in.coords = &dec.coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
-    in.resolution = o.resolution;
+    in.resolution = res;
     DualGridStats st;
     Mesh mesh = dual_grid_to_mesh(in, &st);
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
     result->seam_edges = st.seam_edges;
-    result->small_components_removed = remove_small_components(&mesh, 512);
+    // stray bubbles: 512 faces at 512, scaled with the surface (x4 at 1024, x9 at 1536)
+    result->small_components_removed = remove_small_components(&mesh, static_cast<std::size_t>(512.0 * (res / 512.0) * (res / 512.0)));
     const UnifyStats un = unify_orientation(&mesh);
     result->flipped_faces = un.flipped_faces;
     HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);
@@ -271,7 +351,7 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     std::vector<float> colours;
     float metallic = 0.f, roughness = 0.9f;
     std::unique_ptr<VoxelAttrSampler> sampler;
-    if (!attrs.empty()) sampler = std::make_unique<VoxelAttrSampler>(dec.coords, attrs, 6, o.resolution, 8);
+    if (!attrs.empty()) sampler = std::make_unique<VoxelAttrSampler>(dec.coords, attrs, 6, res, 8);
     const MeshStats ms = mesh_stats(to_y_up(mesh));   // topology of the closed mesh, before seam duplication
     UvMesh uvm;
     BakedTextures baked;

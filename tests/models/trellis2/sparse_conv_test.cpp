@@ -70,7 +70,29 @@ void HashMapTest() {
             for (int z = -1; z <= 12; ++z)
                 if (!present.count({x, y, z})) misses = misses && map.Find(x, y, z) == -1;
     Expect(misses, "absent coordinates (incl. negative / outside) return -1");
-    Expect(map.Find(1023, 1023, 1023) == -1 && map.Find(1024, 0, 0) == -1, "range limits");
+    Expect(map.Find(1023, 1023, 1023) == -1 && map.Find(1536, 0, 0) == -1 && map.Find(0, 0, 1536) == -1, "range limits");
+    {
+        // 1536 cascade: coordinates up to 1535 on every axis, distinct keys at the corners.
+        tr::VoxelHashMap big;
+        const std::vector<tr::Coord> corners = {{0, 0, 0}, {1535, 1535, 1535}, {1535, 0, 0}, {0, 1535, 0}, {0, 0, 1535},
+                                                {1024, 1023, 1535}, {1023, 1024, 1535}, {1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        big.Build(corners);
+        bool ok = big.size() == corners.size();
+        for (std::size_t i = 0; i < corners.size(); ++i)
+            ok = ok && big.Find(corners[i].x, corners[i].y, corners[i].z) == static_cast<std::int64_t>(i);
+        ok = ok && big.Find(1535, 1535, 1534) == -1 && big.Find(1024, 1024, 1535) == -1;
+        Expect(ok, "1536 range: corner coordinates round-trip");
+        Expect(tr::pack_coord(1535, 1535, 1535) == 1536u * 1536u * 1536u - 1u && tr::pack_coord(1535, 1535, 1535) != 0xFFFFFFFFu,
+               "packed key stays below the empty marker");
+        bool range_threw = false;
+        try {
+            tr::VoxelHashMap bad;
+            bad.Build({{1536, 0, 0}});
+        } catch (const std::out_of_range&) {
+            range_threw = true;
+        }
+        Expect(range_threw, "coordinate 1536 is rejected");
+    }
     bool threw = false;
     try {
         tr::VoxelHashMap dup;

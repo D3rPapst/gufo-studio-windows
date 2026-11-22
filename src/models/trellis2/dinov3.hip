@@ -1,7 +1,8 @@
 // TRELLIS.2: DINOv3 ViT-L/16 on HIP (FP32 rocBLAS, derived from triposg/dinov2.hip):
 // CLS + 4 register tokens + patches, 2-D RoPE on the patch rows of q/k, LayerScale,
 // final LayerNorm without affine. Weights are uploaded once from Dinov3Weights; the
-// token count is fixed per instance (512 px -> 1029, 1024 px -> 4101).
+// token count follows the input size (512 px -> 1029, 1024 px -> 4101): Encode with a size
+// re-allocates the activation buffers when the size changes (cascade: 512 and 1024).
 // AI-assisted (Claude Code), 2026-11-12.
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
@@ -193,6 +194,36 @@ struct Dinov3Hip::Impl {
         BiasActKernel<<<Blocks(count), kThreads>>>(out, b.f32(), count, rows_n, act);
         return Check(hipGetLastError(), "linear", error);
     }
+
+    // Token count, RoPE table and activation buffers for `size` px (512 -> 1029 tokens,
+    // 1024 -> 4101; attention scores 16 x T x T FP32 = 68 MB / 1.08 GB). The weights stay.
+    bool Resize(int size, std::string* error) {
+        if (size == image) return true;
+        if (size <= 0 || size % Cfg::patch != 0) {
+            SetError(error, "TRELLIS.2 DINOv3: image size must be a multiple of 16");
+            return false;
+        }
+        (void)hipDeviceSynchronize();
+        rows = DeviceBuffer(); hidden = DeviceBuffer(); normed = DeviceBuffer(); qkv = DeviceBuffer(); scores = DeviceBuffer();
+        attn = DeviceBuffer(); linear = DeviceBuffer(); mlp = DeviceBuffer(); output = DeviceBuffer(); angles = DeviceBuffer();
+        image = 0;
+        grid = size / Cfg::patch;
+        patches = grid * grid;
+        tokens = kPrefix + patches;
+        std::vector<float> table;
+        dinov3_rope_angles(grid, &table);
+        const int T = tokens;
+        const std::size_t TD = static_cast<std::size_t>(T) * kDim;
+        if (!angles.Upload(table, error) ||
+            !rows.Allocate(static_cast<std::size_t>(patches) * kPatchValues * 4, error) || !hidden.Allocate(TD * 4, error) ||
+            !normed.Allocate(TD * 4, error) || !qkv.Allocate(TD * 3 * 4, error) ||
+            !scores.Allocate(static_cast<std::size_t>(Cfg::heads) * T * T * 4, error) || !attn.Allocate(TD * 4, error) ||
+            !linear.Allocate(TD * 4, error) || !mlp.Allocate(static_cast<std::size_t>(T) * Cfg::mlp * 4, error) ||
+            !output.Allocate(TD * 4, error))
+            return false;
+        image = size;
+        return true;
+    }
 };
 
 Dinov3Hip::Dinov3Hip(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -208,10 +239,6 @@ std::unique_ptr<Dinov3Hip> Dinov3Hip::Create(const Dinov3Weights& w, int image, 
     }
     auto impl = std::make_unique<Impl>();
     Impl& m = *impl;
-    m.image = image;
-    m.grid = image / Cfg::patch;
-    m.patches = m.grid * m.grid;
-    m.tokens = kPrefix + m.patches;
     if (rocblas_create_handle(&m.blas) != rocblas_status_success) {
         SetError(error, "TRELLIS.2 DINOv3: rocBLAS handle");
         return nullptr;
@@ -223,9 +250,7 @@ std::unique_ptr<Dinov3Hip> Dinov3Hip::Create(const Dinov3Weights& w, int image, 
     };
     std::vector<float> prefix(w.cls);
     prefix.insert(prefix.end(), w.registers.begin(), w.registers.end());
-    std::vector<float> angles;
-    dinov3_rope_angles(m.grid, &angles);
-    if (!up(m.prefix, prefix) || !up(m.patch_w, w.patch_w) || !up(m.patch_b, w.patch_b) || !up(m.angles, angles))
+    if (!up(m.prefix, prefix) || !up(m.patch_w, w.patch_w) || !up(m.patch_b, w.patch_b))
         return nullptr;
     m.layers.resize(w.layers.size());
     for (std::size_t i = 0; i < w.layers.size(); ++i) {
@@ -237,19 +262,22 @@ std::unique_ptr<Dinov3Hip> Dinov3Hip::Create(const Dinov3Weights& w, int image, 
             !up(d.fc2_b, s.fc2_b) || !up(d.ls2, s.ls2))
             return nullptr;
     }
-    const int T = m.tokens;
-    const std::size_t TD = static_cast<std::size_t>(T) * kDim;
-    if (!m.rows.Allocate(static_cast<std::size_t>(m.patches) * kPatchValues * 4, error) || !m.hidden.Allocate(TD * 4, error) ||
-        !m.normed.Allocate(TD * 4, error) || !m.qkv.Allocate(TD * 3 * 4, error) ||
-        !m.scores.Allocate(static_cast<std::size_t>(Cfg::heads) * T * T * 4, error) || !m.attn.Allocate(TD * 4, error) ||
-        !m.linear.Allocate(TD * 4, error) || !m.mlp.Allocate(static_cast<std::size_t>(T) * Cfg::mlp * 4, error) ||
-        !m.output.Allocate(TD * 4, error))
-        return nullptr;
+    if (!m.Resize(image, error)) return nullptr;
     return std::unique_ptr<Dinov3Hip>(new Dinov3Hip(std::move(impl)));
+}
+
+int Dinov3Hip::image_size() const { return impl_->image; }
+
+bool Dinov3Hip::Encode(const float* pixels, int image, std::vector<float>* tokens, std::string* error) {
+    return impl_->Resize(image, error) && Encode(pixels, tokens, error);
 }
 
 bool Dinov3Hip::Encode(const float* pixels, std::vector<float>* tokens, std::string* error) {
     Impl& m = *impl_;
+    if (m.image <= 0) {
+        SetError(error, "TRELLIS.2 DINOv3: no buffers (a previous resize failed)");
+        return false;
+    }
     const int T = m.tokens;
     const std::size_t TD = static_cast<std::size_t>(T) * kDim;
     std::vector<float> rows;

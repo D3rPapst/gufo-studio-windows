@@ -71,7 +71,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (BUILD_TESTING)
-  foreach(name sparse_conv scheduler model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer mesh_post texture_bake)
+  foreach(name sparse_conv scheduler flow_sampler cascade model_description dinov3_cpu dit_cpu ss_dec_cpu preprocess sparse_dec_cpu dual_grid_mesh glb_writer mesh_post texture_bake)
     add_executable(trellis2_${name}_test
       ${PROJECT_SOURCE_DIR}/tests/models/trellis2/${name}_test.cpp)
     target_link_libraries(trellis2_${name}_test PRIVATE gufo_trellis2_cpu)

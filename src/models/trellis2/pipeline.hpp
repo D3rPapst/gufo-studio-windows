@@ -4,7 +4,11 @@
 // shape decoder (sparse engine) -> flexible dual grid -> fill holes -> decimation ->
 // y-up GLB + preview PNG. The texture branch (stage 8) hangs off the same latents; stage 9
 // unwraps (xatlas) and bakes the voxel attributes into PBR textures when texture_size > 0.
-// AI-assisted (Claude Code), 2026-11-12.
+// Resolution 1024 / 1536 = the original "1024_cascade" / "1536_cascade" (cascade.hpp): 512
+// shape flow -> shape decoder subdivision -> tokens on the 64^3 / 96^3 grid -> shape (and
+// texture) flow 1024 with DINOv3 tokens of the 1024 px image -> decoders on the 1024 /
+// 1536 grid. Several views of one object condition every flow (flow_sampler.hpp).
+// AI-assisted (Claude Code), 2026-11-12; cascade and views 2026-11-22.
 #pragma once
 
 #include <atomic>
@@ -15,12 +19,22 @@
 #include <string>
 #include <vector>
 
+#include "src/models/trellis2/flow_sampler.hpp"
+
 namespace gufo::trellis2 {
+
+// One input view: packed RGBA8 (alpha required), not owned.
+struct ImageView {
+    const std::uint8_t* rgba = nullptr;
+    int width = 0, height = 0;
+};
 
 struct GenerateOptions {
     int steps = 12;             // Euler steps for every flow (0 = sampler default 12)
     std::uint64_t seed = 42;
-    int resolution = 512;       // only 512 in this stage
+    int resolution = 512;       // 512 | 1024 (1024_cascade) | 1536 (1536_cascade)
+    int max_tokens = 49152;     // cascade token cap (1536 steps down by 128 above it)
+    MultiMode multi_mode = MultiMode::kStochastic;   // several views: stochastic | multidiffusion
     int max_faces = 500000;     // 0 = no decimation
     float hole_perimeter = 0.03f;
     bool preview = true;
@@ -41,6 +55,9 @@ struct GenerateResult {
     float bbox_min[3] = {0, 0, 0}, bbox_max[3] = {0, 0, 0};
     double volume = 0;
     bool closed = false;
+    int resolution = 512;        // grid actually used (1536 may step down under the token cap)
+    std::size_t tokens = 0;      // tokens of the last shape flow (cascade: high-resolution tokens)
+    int views = 1;
     double seconds_encode = 0, seconds_structure = 0, seconds_shape = 0, seconds_decode = 0, seconds_mesh = 0, seconds_texture = 0;
 };
 
@@ -52,12 +69,19 @@ public:
     ~Pipeline();
     // `weights_dir` holds trellis2-dinov3 / ss_flow / ss_dec / shape_flow_512 / shape_dec
     // (/ tex_flow_512 / tex_dec) .safetensors from tools/trellis2/convert_hf_to_gufo.py.
+    // shape_flow_1024 (/ tex_flow_1024) enable 1024 / 1536; they are loaded on the first such
+    // request and stay resident (+2.6 GB each).
     static std::unique_ptr<Pipeline> Load(const std::filesystem::path& weights_dir, bool with_texture, std::string* error);
     // rgba: packed RGBA8 (alpha required). One call at a time.
     bool Generate(const std::uint8_t* rgba, int width, int height, const GenerateOptions& options,
                   const GenerateProgress& progress, const std::atomic<bool>* cancel, GenerateResult* result, std::string* error);
+    // 1..kMaxViews views of the same object (each is cropped to its own alpha box).
+    bool Generate(const std::vector<ImageView>& views, const GenerateOptions& options, const GenerateProgress& progress,
+                  const std::atomic<bool>* cancel, GenerateResult* result, std::string* error);
     std::size_t weight_bytes() const;
     bool has_texture() const;
+    bool has_high_resolution() const;   // shape_flow_1024 (and tex_flow_1024 with texture) present
+    static constexpr int kMaxViews = 4;
 
 private:
     struct Impl;

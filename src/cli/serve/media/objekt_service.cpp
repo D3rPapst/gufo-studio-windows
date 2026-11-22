@@ -106,6 +106,7 @@ struct Job {
   triposg::ObjektRequest request;  // rgba is cleared after the run
   triposg::ObjektResult result;    // glb/preview cleared after writing
   std::string error_code, error_message;
+  int views = 1;   // images of the request (request.more_views is cleared after the run)
   std::filesystem::path directory;
   std::atomic<bool> cancel{false};
   bool deleted = false;
@@ -137,8 +138,15 @@ bool WriteAll(const std::filesystem::path& path, const void* data, std::size_t b
 int ProgressPercent(const std::string& phase, int completed, int total) {
   const double f = total > 0 ? std::clamp(static_cast<double>(completed) / total, 0.0, 1.0) : 0.0;
   double lo = 0, hi = 100;
-  if (phase == "encode") { lo = 1; hi = 4; }
+  if (phase == "load") { lo = 0; hi = 1; }
+  else if (phase == "encode") { lo = 1; hi = 4; }
   else if (phase == "denoise") { lo = 4; hi = 55; }
+  // TRELLIS.2 flows (the job keeps the highest value, see Run)
+  else if (phase == "structure") { lo = 4; hi = 20; }
+  else if (phase == "shape") { lo = 20; hi = 35; }
+  else if (phase == "upsample") { lo = 35; hi = 37; }
+  else if (phase == "shape_hq") { lo = 37; hi = 55; }
+  else if (phase == "texture") { lo = 60; hi = 90; }
   else if (phase == "decode") { lo = 55; hi = 90; }
   else if (phase == "mesh") { lo = 90; hi = 97; }
   else if (phase == "export") { lo = 97; hi = 99; }
@@ -198,6 +206,8 @@ struct ObjektService::Impl {
     root["max_faces"] = j.request.max_faces;
     root["texture"] = j.request.texture;
     root["texture_size"] = j.request.texture_size;
+    root["views"] = j.views;
+    if (j.views > 1) root["multi_mode"] = j.request.multi_mode;
     root["created_at"] = j.created_at;
     root["completed_at"] = j.completed_at > 0 ? json::Value(j.completed_at) : json::Value();
     root["expires_at"] = j.expires_at > 0 ? json::Value(j.expires_at) : json::Value();
@@ -219,6 +229,8 @@ struct ObjektService::Impl {
       item["faces"] = static_cast<unsigned long long>(j.result.faces);
       item["faces_before_decimation"] = static_cast<unsigned long long>(j.result.faces_before_decimation);
       item["closed"] = j.result.closed;
+      if (j.result.resolution > 0) item["resolution"] = j.result.resolution;
+      if (j.result.tokens > 0) item["tokens"] = static_cast<unsigned long long>(j.result.tokens);
       item["volume"] = j.result.volume;
       json::Value bbox = json::Value::object(), bmin = json::Value::array(), bmax = json::Value::array();
       for (int a = 0; a < 3; ++a) { bmin.push_back(static_cast<double>(j.result.bbox_min[a])); bmax.push_back(static_cast<double>(j.result.bbox_max[a])); }
@@ -274,6 +286,8 @@ struct ObjektService::Impl {
         job->request.resolution = static_cast<int>(v.member_double("resolution", 512));
         job->request.max_faces = static_cast<int>(v.member_double("max_faces", 200000));
         job->request.texture_size = static_cast<int>(v.member_double("texture_size", 1024));
+        job->views = static_cast<int>(v.member_double("views", 1));
+        job->request.multi_mode = v.member_str("multi_mode", "stochastic");
         if (const json::Value* data = v.find("data"); data && data->is_array() && !data->empty()) {
           const json::Value& item = data->items()[0];
           job->result.vertices = item.member_size("vertices");
@@ -281,6 +295,8 @@ struct ObjektService::Impl {
           job->result.faces_before_decimation = item.member_size("faces_before_decimation");
           job->result.closed = item.find("closed") && item.find("closed")->as_bool();
           job->result.volume = item.member_double("volume");
+          job->result.resolution = static_cast<int>(item.member_double("resolution", 0));
+          job->result.tokens = item.member_size("tokens");
           if (const json::Value* bbox = item.find("bbox"); bbox && bbox->find("min") && bbox->find("max"))
             for (int a = 0; a < 3; ++a) {
               job->result.bbox_min[a] = static_cast<float>(bbox->find("min")->items()[static_cast<std::size_t>(a)].as_double());
@@ -330,7 +346,7 @@ struct ObjektService::Impl {
       const auto progress = [&](const std::string& phase, int completed, int total) {
         const std::lock_guard<std::mutex> lock(mutex);
         job->phase = phase;
-        job->progress = std::clamp(ProgressPercent(phase, completed, total), 1, 99);
+        job->progress = std::max(job->progress, std::clamp(ProgressPercent(phase, completed, total), 1, 99));
       };
       const bool ok = job->runner->Run(job->request, progress, &job->cancel, &result, &error);
       std::string write_error;
@@ -347,6 +363,7 @@ struct ObjektService::Impl {
         const std::lock_guard<std::mutex> lock(mutex);
         job->request.rgba.clear();
         job->request.rgba.shrink_to_fit();
+        std::vector<triposg::ObjektView>().swap(job->request.more_views);
         job->completed_at = UnixNow();
         job->expires_at = job->completed_at + static_cast<long long>(options.artifact_ttl.count());
         if (ok && written) {
@@ -448,27 +465,23 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
       return Error(400, "Bad Request", "request body must be valid JSON", "parse_error");
     }
     if (!body.is_object()) return Error(400, "Bad Request", "request body must be a JSON object", "invalid_body");
+    // One image (`image`) or several views of the same object (`images`, TRELLIS.2).
     const json::Value* image = body.find("image");
-    if (!image || !image->is_string() || image->str().empty())
-      return Error(400, "Bad Request", "field 'image' (base64 PNG with alpha or data URL) is required", "missing_image");
-    std::string_view text = image->str();
-    if (text.starts_with("data:")) {
-      const std::size_t comma = text.find(',');
-      if (comma == std::string_view::npos) return Error(400, "Bad Request", "malformed data URL", "invalid_image");
-      text = text.substr(comma + 1);
+    const json::Value* images = body.find("images");
+    std::vector<const json::Value*> sources;
+    const bool from_array = images != nullptr && !images->is_null();
+    if (from_array) {
+      if (image != nullptr && !image->is_null())
+        return Error(400, "Bad Request", "send either 'image' or 'images', not both", "invalid_images");
+      if (!images->is_array() || images->empty())
+        return Error(400, "Bad Request", "field 'images' must be a non-empty array of base64 PNGs with alpha or data URLs", "invalid_images");
+      for (const auto& item : images->items()) sources.push_back(&item);
+    } else {
+      if (!image || !image->is_string() || image->str().empty())
+        return Error(400, "Bad Request", "field 'image' (base64 PNG with alpha or data URL) is required", "missing_image");
+      sources.push_back(image);
     }
-    if (text.size() > m.options.max_image_bytes * 4 / 3 + 4) return Error(413, "Payload Too Large", "image too large", "image_too_large");
-    const auto bytes = DecodeBase64(text);
-    if (!bytes.has_value() || bytes->size() < 8) return Error(400, "Bad Request", "image is not valid base64", "invalid_image");
     auto job = std::make_shared<Job>();
-    try {
-      const models::qwen_image_21::Image decoded = models::qwen_image_21::DecodeImage(*bytes);
-      job->request.rgba = decoded.rgba;
-      job->request.width = decoded.width;
-      job->request.height = decoded.height;
-    } catch (const std::exception& e) {
-      return Error(400, "Bad Request", std::string("cannot decode image: ") + e.what(), "invalid_image");
-    }
     job->model = body.member_str("model", m.options.model_id);
     job->runner = job->model == m.options.model_id ? m.options.runner : nullptr;
     if (!job->runner) {
@@ -476,6 +489,44 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
       if (it != m.options.runners.end()) job->runner = it->second;
     }
     if (!job->runner) return Error(400, "Bad Request", "unknown model '" + job->model + "'", "unknown_model");
+    const int max_views = std::max(1, job->runner->max_views());
+    if (sources.size() > static_cast<std::size_t>(max_views))
+      return Error(400, "Bad Request",
+                   max_views == 1 ? "model '" + job->model + "' takes one image"
+                                  : "field 'images' takes at most " + std::to_string(max_views) + " views for model '" + job->model + "'",
+                   "too_many_images");
+    for (std::size_t i = 0; i < sources.size(); ++i) {
+      const std::string label = from_array ? "images[" + std::to_string(i) + "]" : std::string("image");
+      if (!sources[i]->is_string() || sources[i]->str().empty())
+        return Error(400, "Bad Request", label + " must be a base64 PNG with alpha or a data URL", "invalid_image");
+      std::string_view text = sources[i]->str();
+      if (text.starts_with("data:")) {
+        const std::size_t comma = text.find(',');
+        if (comma == std::string_view::npos) return Error(400, "Bad Request", label + ": malformed data URL", "invalid_image");
+        text = text.substr(comma + 1);
+      }
+      if (text.size() > m.options.max_image_bytes * 4 / 3 + 4) return Error(413, "Payload Too Large", label + ": image too large", "image_too_large");
+      const auto bytes = DecodeBase64(text);
+      if (!bytes.has_value() || bytes->size() < 8) return Error(400, "Bad Request", label + " is not valid base64", "invalid_image");
+      try {
+        const models::qwen_image_21::Image decoded = models::qwen_image_21::DecodeImage(*bytes);
+        if (i == 0) {
+          job->request.rgba = decoded.rgba;
+          job->request.width = decoded.width;
+          job->request.height = decoded.height;
+        } else {
+          job->request.more_views.push_back({decoded.rgba, decoded.width, decoded.height});
+        }
+      } catch (const std::exception& e) {
+        return Error(400, "Bad Request", "cannot decode " + label + ": " + e.what(), "invalid_image");
+      }
+    }
+    job->views = static_cast<int>(sources.size());
+    if (const json::Value* mode = body.find("multi_mode"); mode != nullptr && !mode->is_null()) {
+      if (!mode->is_string() || (mode->str() != "stochastic" && mode->str() != "multidiffusion"))
+        return Error(400, "Bad Request", "multi_mode must be \"stochastic\" or \"multidiffusion\"", "invalid_multi_mode");
+      job->request.multi_mode = mode->str();
+    }
     // Numbers are range-checked as doubles before any conversion.
     if (!IntInRange(body, "steps", job->runner->default_steps(), 1, 200, &job->request.steps)) return Error(400, "Bad Request", "steps must be 1..200", "invalid_steps");
     const double guidance = body.member_double("guidance", 7.0);
@@ -484,14 +535,21 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     const double seed = body.member_double("seed", 42);
     if (!(seed >= 0.0 && seed < 18446744073709551616.0)) return Error(400, "Bad Request", "seed must be 0..2^64-1", "invalid_seed");
     job->request.seed = static_cast<std::uint64_t>(seed);
-    if (!IntInRange(body, "resolution", 512, 256, 512, &job->request.resolution) ||
-        (job->request.resolution != 256 && job->request.resolution != 512))
-      return Error(400, "Bad Request", "resolution must be 256 or 512", "invalid_resolution");
+    {
+      const std::vector<int> allowed = job->runner->resolutions();
+      const double r = body.member_double("resolution", 512);
+      const auto hit = std::find_if(allowed.begin(), allowed.end(), [r](int a) { return static_cast<double>(a) == r; });
+      if (hit == allowed.end()) {
+        std::string list;
+        for (std::size_t i = 0; i < allowed.size(); ++i) list += (i == 0 ? "" : (i + 1 == allowed.size() ? " or " : ", ")) + std::to_string(allowed[i]);
+        return Error(400, "Bad Request", "resolution must be " + list + " for model '" + job->model + "'", "invalid_resolution");
+      }
+      job->request.resolution = *hit;
+    }
     if (!IntInRange(body, "max_faces", 200000, 0, 5000000, &job->request.max_faces)) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
     if (const json::Value* p = body.find("preview"); p && p->is_bool()) job->request.preview = p->as_bool();
     if (const json::Value* p = body.find("texture"); p && p->is_bool()) job->request.texture = p->as_bool();
-    if (!IntInRange(body, "texture_size", 1024, 0, 4096, &job->request.texture_size)) return Error(400, "Bad Request", "texture_size must be 0..4096", "invalid_texture_size");
-    job->created_at = UnixNow();
+    if (!IntInRange(body, "texture_size", 1024, 0, 4096, &job->request.texture_size)) return Error(400, "Bad Request", "texture_size must be 0..4096", "invalid_texture_size");    job->created_at = UnixNow();
     {
       const std::lock_guard<std::mutex> lock(m.mutex);
       m.SweepExpiredLocked();
@@ -507,7 +565,8 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     const std::lock_guard<std::mutex> lock(m.mutex);
     HttpResponse response{.status = 202, .reason = "Accepted", .body = m.Snapshot(*job).dump(), .headers = {}, .streaming_body = {}};
     response.headers.emplace_back("Location", std::string(kObjektApiPath) + "/" + job->id);
-    response.log_details = "job=" + job->id + " steps=" + std::to_string(job->request.steps) + " res=" + std::to_string(job->request.resolution);
+    response.log_details = "job=" + job->id + " steps=" + std::to_string(job->request.steps) + " res=" + std::to_string(job->request.resolution) +
+                           " views=" + std::to_string(job->views);
     return response;
   }
   if (id.empty()) return Error(405, "Method Not Allowed", "use POST /v1/3d/generations", "method_not_allowed");

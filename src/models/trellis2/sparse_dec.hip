@@ -1,6 +1,6 @@
 // TRELLIS.2: sparse decoders on HIP, built on the qwen_image_21 runtime (BF16 hipBLASLt
 // GEMMs for conv-as-GEMM and the MLPs, runtime LayerNorm/SiLU) plus the sparse voxel
-// engine: device hashmap (atomicCAS, 30-bit packed keys), 27-tap neighbour table, gather
+// engine: device hashmap (atomicCAS, keys (x*1536 + y)*1536 + z), 27-tap neighbour table, gather
 // kernel (im2col rows in blocks of <= 512 MB), Channel2Spatial gather and the repeated
 // skip. Subdivision masks and child coordinates are computed on the host (one download
 // of the [N, 8] logits per up-block). Same maths as sparse_dec_cpu.cpp.
@@ -38,7 +38,7 @@ __device__ __forceinline__ std::uint32_t HashKey(std::uint32_t key) {
     return key;
 }
 __device__ __forceinline__ std::uint32_t Pack(int x, int y, int z) {
-    return (static_cast<std::uint32_t>(x) << 20) | (static_cast<std::uint32_t>(y) << 10) | static_cast<std::uint32_t>(z);
+    return (static_cast<std::uint32_t>(x) * kMaxCoord + static_cast<std::uint32_t>(y)) * kMaxCoord + static_cast<std::uint32_t>(z);
 }
 
 __global__ void HashInsertKernel(const std::int32_t* coords, int n, std::uint32_t* keys, std::int32_t* values, std::uint32_t mask) {
@@ -57,7 +57,7 @@ __global__ void HashInsertKernel(const std::int32_t* coords, int n, std::uint32_
 }
 
 __device__ __forceinline__ std::int32_t HashFind(const std::uint32_t* keys, const std::int32_t* values, std::uint32_t mask, int x, int y, int z) {
-    if (x < 0 || y < 0 || z < 0 || x >= 1024 || y >= 1024 || z >= 1024) return -1;
+    if (x < 0 || y < 0 || z < 0 || x >= kMaxCoord || y >= kMaxCoord || z >= kMaxCoord) return -1;
     const std::uint32_t key = Pack(x, y, z);
     std::uint32_t slot = HashKey(key) & mask;
     while (true) {

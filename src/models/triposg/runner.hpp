@@ -14,9 +14,17 @@
 
 namespace gufo::triposg {
 
-struct ObjektRequest {
+// A further view of the same object (TRELLIS.2 multi-image conditioning).
+struct ObjektView {
     std::vector<std::uint8_t> rgba;  // packed RGBA8
     int width = 0, height = 0;
+};
+
+struct ObjektRequest {
+    std::vector<std::uint8_t> rgba;  // packed RGBA8 (the first / only view)
+    int width = 0, height = 0;
+    std::vector<ObjektView> more_views;   // views 2..n (`images`), empty for one image
+    std::string multi_mode = "stochastic";   // several views: stochastic | multidiffusion
     int steps = 50;
     float guidance = 7.f;
     std::uint64_t seed = 42;
@@ -34,6 +42,8 @@ struct ObjektResult {
     double volume = 0;
     bool closed = false;
     double seconds_encode = 0, seconds_denoise = 0, seconds_decode = 0, seconds_mesh = 0;
+    int resolution = 0;       // grid actually used (TRELLIS.2 1536 may step down under the token cap; 0 = as requested)
+    std::size_t tokens = 0;   // TRELLIS.2: tokens of the last shape flow
 };
 
 using ObjektProgress = std::function<void(const std::string& phase, int completed, int total)>;
@@ -49,6 +59,10 @@ public:
     virtual std::string capability_note() const { return "shape"; }
     // Attribution the model's licences ask for, shown in /v1/models ("" = none).
     virtual std::string attribution() const { return ""; }
+    // Accepted `resolution` values (TripoSG: 256 / 512; TRELLIS.2 adds 1024 / 1536 when the
+    // 1024 flows are installed) and the most views one request may carry (`images`).
+    virtual std::vector<int> resolutions() const { return {256, 512}; }
+    virtual int max_views() const { return 1; }
 };
 
 // Loads the converted triposg.safetensors onto the GPU (HIP build) or fails with *error.

@@ -5,7 +5,8 @@
 // (im2col rows [rows, 27*Ci]) -> GEMM ([27*Ci] x [Co]) -> write. The HIP version
 // (stage 5) does the same in blocks of rows with hipBLASLt (wan22/gemm.hpp); this file
 // is the bit-for-bit reference and the test oracle for it.
-// Coordinates are 0 <= c < 1024 (10 bits each); the hashmap packs them into 30 bits.
+// Coordinates are 0 <= c < kMaxCoord (1536, the 1536 cascade); the hashmap packs them as
+// (x * 1536 + y) * 1536 + z < 1536^3 < 2^32 - 1 (the empty marker).
 // AI-assisted (Claude Code), 2026-11-12.
 #pragma once
 
@@ -21,6 +22,10 @@ struct Coord {
 };
 
 constexpr int kTaps = 27;
+constexpr int kMaxCoord = 1536;   // exclusive upper bound of every voxel coordinate (1536 cascade)
+inline std::uint32_t pack_coord(int x, int y, int z) {
+    return (static_cast<std::uint32_t>(x) * kMaxCoord + static_cast<std::uint32_t>(y)) * kMaxCoord + static_cast<std::uint32_t>(z);
+}
 constexpr int kCenterTap = 13;  // offset (0,0,0)
 
 // Tap index of an offset (dx,dy,dz) in {-1,0,1}^3, matching the converter's weight
@@ -43,9 +48,7 @@ public:
 
 private:
     static constexpr std::uint32_t kEmpty = 0xFFFFFFFFu;
-    static std::uint32_t Pack(int x, int y, int z) {
-        return (static_cast<std::uint32_t>(x) << 20) | (static_cast<std::uint32_t>(y) << 10) | static_cast<std::uint32_t>(z);
-    }
+    static std::uint32_t Pack(int x, int y, int z) { return pack_coord(x, y, z); }
     static std::uint32_t Hash(std::uint32_t key);
     std::vector<std::uint32_t> keys_;
     std::vector<std::int32_t> values_;
