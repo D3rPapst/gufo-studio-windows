@@ -46,6 +46,8 @@ public:
   [[nodiscard]] std::vector<std::int32_t> Draft(std::int32_t anchor, std::size_t pos0, int k);
   /// Wall time of the last Draft call (synchronised), milliseconds.
   [[nodiscard]] double last_draft_ms() const;
+  /// Device memory the drafter holds (weights, folded head, caches, buffers).
+  [[nodiscard]] std::size_t device_bytes() const;
 
 private:
   DSparkDrafter() = default;

@@ -254,11 +254,13 @@ struct DSparkDrafter::Impl {
   std::vector<long long> hn_pos;
   long long ctx_from = 0;
   double last_ms = 0;
+  std::size_t bytes_total = 0;
 
   void* Alloc(std::size_t bytes) {
     void* p = nullptr;
     Chk(hipMalloc(&p, std::max<std::size_t>(bytes, 256)), "alloc");
     allocs.push_back(p);
+    bytes_total += bytes;
     return p;
   }
   float* AllocF(std::size_t n) { return static_cast<float*>(Alloc(n * 4)); }
@@ -561,5 +563,6 @@ std::vector<std::int32_t> DSparkDrafter::Draft(std::int32_t anchor, std::size_t 
   return impl_->Draft(anchor, static_cast<long long>(pos0), k);
 }
 double DSparkDrafter::last_draft_ms() const { return impl_->last_ms; }
+std::size_t DSparkDrafter::device_bytes() const { return impl_->bytes_total; }
 
 }  // namespace gufo::models::inkling2

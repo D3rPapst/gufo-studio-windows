@@ -36,6 +36,8 @@
 #include <gufo/ext/transfer_pool.hpp>
 
 #include "src/cache_adapter.hpp"
+#include "src/dspark.hpp"
+#include "src/dspark_policy.hpp"
 #include "src/core/image.hpp"
 #include "src/engine.hpp"
 #include "src/vision/vision_encoder.hpp"
@@ -80,6 +82,10 @@ public:
   bool answer_done{false};
   /// The request's images (set by SetPromptContext; null for a text-only prompt).
   std::shared_ptr<const Inkling2PromptContext> prompt;
+  /// gufo_windows: DSpark (--speculative dspark): depth policy and a pending shadow draft (plain mode).
+  std::unique_ptr<DSparkPolicy> ds_policy;
+  std::vector<std::int32_t> ds_probe, ds_probe_seen;
+  double ds_probe_ms = 0;
   [[nodiscard]] g::TextRunnerMeasuredResources MeasuredResources() const noexcept override {
     return {.per_request_state_bytes = session_->allocated_bytes(), .temporary_scratch_bytes = 0};
   }
@@ -139,8 +145,13 @@ class Inkling2Runner final : public g::HipTextModelRunner {
 public:
   Inkling2Runner(std::shared_ptr<Engine> engine, std::unique_ptr<::inkling2::text::Tokenizer> tok,
                  std::uint32_t max_context, cache::Identity identity, bool durable,
-                 std::unique_ptr<vision::VisionEncoder> vision = nullptr, std::string vision_identity = {})
-      : engine_(std::move(engine)),
+                 std::unique_ptr<vision::VisionEncoder> vision = nullptr, std::string vision_identity = {},
+                 std::shared_ptr<DSparkDrafter> drafter = nullptr, std::shared_ptr<std::mutex> drafter_mutex = nullptr,
+                 int max_draft = 5)
+      : drafter_(std::move(drafter)),
+        drafter_mutex_(std::move(drafter_mutex)),
+        max_draft_(max_draft),
+        engine_(std::move(engine)),
         tok_(std::move(tok)),
         max_context_(max_context),
         identity_(std::move(identity)),
@@ -157,6 +168,10 @@ public:
     t_thinking_ = id(d::kThinking);
     t_end_message_ = id(d::kEndMessage);
     t_invoke_ = id(d::kInvokeJson);
+  }
+
+  ~Inkling2Runner() {
+    if (drafter_) engine_->SetFeatureSink({});  // the cache adapter may keep the engine alive longer
   }
 
   // ---- descriptor, claim, plans ----
@@ -193,6 +208,7 @@ public:
     c.per_request_state_bytes = engine_->session_bytes();
     // Activations and MoE staging are shared by all sessions and already allocated by the engine.
     c.temporary_scratch_bytes = 0;
+    if (drafter_) c.resident_weights_bytes = c.resident_weights_bytes.value_or(0) + drafter_->device_bytes();
     if (vision_) {  // the encoder's weights (~0.65 GB as f16) and its workspace for a 4096-token image
       c.resident_weights_bytes = c.resident_weights_bytes.value_or(0) + vision_->device_bytes();
       c.temporary_scratch_bytes = c.temporary_scratch_bytes.value_or(0) + kVisionScratchBytes;
@@ -207,7 +223,7 @@ public:
   [[nodiscard]] std::vector<g::TextExecutionPlan> SupportedPlans() const override {
     // Batched decode (M3): one weight pass for up to Engine kMaxDecodeBatch sessions (AdvanceBatch).
     std::vector<g::TextExecutionPlan> plans{{.kind = g::TextExecutionPlanKind::kSerial, .physical_width = 1}};
-    if (engine_->batch_capable())
+    if (engine_->batch_capable() && !drafter_)  // DSpark runs one session (serial plan, DecodeStep)
       for (std::size_t w = 2; w <= Engine::kMaxDecodeBatch; ++w)
         plans.push_back({.kind = g::TextExecutionPlanKind::kBatched, .physical_width = w});
     return plans;
@@ -434,6 +450,10 @@ public:
     // The adapter's Validate set the frontier; the runner only checks it agrees with the cache.
     if (Require(state).session().position() != position)
       throw std::logic_error("Inkling 2 Mini restored position does not match the cache frontier");
+    if (drafter_) {  // a restored state: the drafter has no context before it
+      const std::lock_guard<std::mutex> lock(*drafter_mutex_);
+      drafter_->Reset(position);
+    }
   }
   [[nodiscard]] bool HasDecodeFrontier(const g::TextRunnerState& state) const override {
     return !Require(state).session().logits().empty();
@@ -451,6 +471,10 @@ public:
     const std::size_t consumed = std::min<std::size_t>(
         {prompt.size() - offset, std::max<std::size_t>(max_input_tokens, 1), kMaxStepTokens});
     const auto ids = ToIds(prompt.subspan(offset, consumed));
+    if (drafter_ && offset == 0) {  // a fresh sequence: the drafter context starts again at 0
+      const std::lock_guard<std::mutex> lock(*drafter_mutex_);
+      drafter_->Reset(0);
+    }
     // Layered prefill: the host asks for `groups` groups of visits with a decode round between.
     PrefillYield yield{st.prefill_yield_groups(), [&st] { st.YieldPrefill(); }};
     // Image rows inside this chunk replace the placeholders' embeddings (encoded on first use).
@@ -561,6 +585,101 @@ public:
     return Require(state).session().position();
   }
 
+  // ---- gufo_windows: DSpark speculative decoding (greedy only, lossless) ----
+  // Speculates only when the next tokens are the raw argmax: temperature 0, no penalties, no logprobs, no grammar
+  // mask, no reasoning-off / required-call masking. Every other request decodes exactly as without DSpark. Each
+  // draft token is accepted only if it is the target's greedy choice (VerifyChainArgmax), the sampler state
+  // admits it (CanSelectArgmax on a copy that Accepts the step's earlier tokens, e.g. a reasoning budget), it is
+  // no stop token and the answer did not end; the rest of the chain is dropped (ChainKeep).
+  [[nodiscard]] g::TextDecodeStep DecodeStep(g::TextRunnerState& state, std::size_t max_tokens,
+                                             sampling::SamplerState& sampler) const override {
+    if (!drafter_) return g::TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    using Clock = std::chrono::steady_clock;
+    const auto ms_since = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+    auto& st = Require(state);
+    g::TextDecodeStep step;
+    if (max_tokens == 0) return step;
+    auto first = SelectNext(state, sampler);
+    step.stop = first.stop;
+    if (first.stop) {
+      step.terminal_logprobs = std::move(first.logprobs);
+      return step;
+    }
+    const g::TextRunnerToken token = first.token;
+    const auto& cfg = sampler.config();
+    const bool can_spec = max_tokens >= 2 && cfg.can_use_unmodified_argmax() && !cfg.logprobs &&
+                          !sampler.NeedsConstraintMask() && !st.reasoning_off && !st.call_required;
+    if (!st.ds_policy) st.ds_policy = std::make_unique<DSparkPolicy>();
+    DSparkPolicy& pol = *st.ds_policy;
+    const std::size_t pos = st.session().position();
+    int K = can_spec ? pol.Choose() : 0;
+    K = std::min<int>({K, max_draft_, static_cast<int>(max_tokens) - 1, 7});
+    if (pos + static_cast<std::size_t>(K) + 1 > max_context_) K = 0;
+    std::vector<std::int32_t> d;
+    double draft_ms = 0;
+    if (K > 0) {
+      const std::lock_guard<std::mutex> lock(*drafter_mutex_);
+      const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+      d = drafter_->Draft(static_cast<std::int32_t>(token), pos, K);
+      draft_ms = drafter_->last_draft_ms();
+    }
+    if (d.empty()) {  // plain step, with a shadow draft now and then to keep the acceptance estimate alive
+      bool new_probe = false;
+      if (can_spec && st.ds_probe.empty() && pol.ProbeDue()) {
+        const std::lock_guard<std::mutex> lock(*drafter_mutex_);
+        const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+        st.ds_probe = drafter_->Draft(static_cast<std::int32_t>(token), pos, pol.probe_k());
+        st.ds_probe_ms = drafter_->last_draft_ms();
+        st.ds_probe_seen.clear();
+        new_probe = !st.ds_probe.empty();
+      }
+      step.selections.push_back(std::move(first));
+      const auto tp = Clock::now();
+      Advance(state, token);
+      pol.Plain(ms_since(tp));
+      if (!new_probe) ObserveProbe(st, pol, token);
+      return step;
+    }
+    std::vector<std::int32_t> chain{static_cast<std::int32_t>(token)};
+    chain.insert(chain.end(), d.begin(), d.end());
+    std::vector<std::int32_t> am;
+    const auto tv = Clock::now();
+    engine_->VerifyChainArgmax(st.session(), chain, &am);
+    auto shadow = sampler;  // the scheduler Accepts the step's selections later; check each against this copy
+    shadow.Accept(token);
+    ObserveProbe(st, pol, token);
+    step.selections.push_back(std::move(first));
+    CommitToken(st, token);
+    std::size_t a = 0;
+    for (; a < d.size(); ++a) {
+      const auto t = static_cast<g::TextRunnerToken>(d[a]);
+      if (am[a] != d[a] || st.answer_done) break;
+      if (state.stop_at_eos() && tok_->IsStop(t)) break;
+      if (!shadow.CanSelectArgmax(t)) break;
+      shadow.Accept(t);
+      step.selections.push_back({.stop = false, .token = t, .piece = Piece(st.block, t)});
+      CommitToken(st, t);
+      ObserveProbe(st, pol, t);
+    }
+    engine_->ChainKeep(st.session(), a + 1);
+    pol.Cycle(static_cast<int>(d.size()), static_cast<int>(a), draft_ms, ms_since(tv));
+    step.draft_rounds = 1;
+    step.draft_tokens = d.size();
+    step.draft_accepted_tokens = a;
+    return step;
+  }
+  /// A pending shadow draft predicts the tokens after its anchor; resolve it once they are known.
+  static void ObserveProbe(Inkling2State& st, DSparkPolicy& pol, g::TextRunnerToken t) {
+    if (st.ds_probe.empty()) return;
+    st.ds_probe_seen.push_back(static_cast<std::int32_t>(t));
+    if (st.ds_probe_seen.size() < st.ds_probe.size()) return;
+    int a = 0;
+    while (a < static_cast<int>(st.ds_probe.size()) && st.ds_probe[a] == st.ds_probe_seen[a]) ++a;
+    pol.Probe(static_cast<int>(st.ds_probe.size()), a, st.ds_probe_ms);
+    st.ds_probe.clear();
+    st.ds_probe_seen.clear();
+  }
+
 private:
   static constexpr std::size_t kMaxStepTokens = 4096;
   static constexpr std::size_t kVisionDim = 2304;
@@ -598,6 +717,9 @@ private:
                    e.count, e.encode_ms);
   }
 
+  std::shared_ptr<DSparkDrafter> drafter_;           // gufo_windows: --speculative dspark (null: off)
+  std::shared_ptr<std::mutex> drafter_mutex_;
+  int max_draft_ = 5;
   std::shared_ptr<Engine> engine_;
   std::unique_ptr<::inkling2::text::Tokenizer> tok_;
   std::uint32_t max_context_;
@@ -686,8 +808,17 @@ std::shared_ptr<ext::TextModelRunner> CreateInkling2TextRunner(const ext::TextRu
       }
       reader = std::move(opened);
     }
-    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
-      if (error) *error = "inkling2: speculative decoding is not supported by this extension";
+    const bool dspark = options.speculative.backend == ext::TextSpeculativeBackend::kDSpark;
+    if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled && !dspark) {
+      if (error) *error = "inkling2: only --speculative dspark is supported";
+      return nullptr;
+    }
+    if (dspark && options.speculative.draft_model_path.empty()) {
+      if (error) *error = "inkling2: --speculative dspark needs --dspark-model";
+      return nullptr;
+    }
+    if (dspark && options.session_count > 1) {  // one drafter context (per-session drafter state: not yet)
+      if (error) *error = "inkling2: --speculative dspark needs --sessions 1";
       return nullptr;
     }
     const std::uint32_t max_context = options.max_context ? options.max_context : 32768;
@@ -732,9 +863,31 @@ std::shared_ptr<ext::TextModelRunner> CreateInkling2TextRunner(const ext::TextRu
       }
       vision_identity = "inkling2-vision-v1:" + crypto::Sha256FileHex(options.vision_model_path);
     }
-    return std::make_shared<Inkling2Runner>(std::shared_ptr<Engine>(std::move(engine)), std::move(tok),
-                                            max_context, identity, durable, std::move(vision),
-                                            std::move(vision_identity));
+    std::shared_ptr<Engine> shared_engine(std::move(engine));
+    std::shared_ptr<DSparkDrafter> drafter;
+    auto drafter_mutex = std::make_shared<std::mutex>();
+    int max_draft = 5;
+    if (dspark) {
+      auto d = DSparkDrafter::Create(*shared_engine, options.speculative.draft_model_path, {}, &why);
+      if (!d) {
+        if (error) *error = "inkling2: dspark model " + options.speculative.draft_model_path + ": " + why;
+        return nullptr;
+      }
+      drafter = std::move(d);
+      max_draft = static_cast<int>(std::clamp<std::uint32_t>(options.speculative.max_draft_tokens, 1, 7));
+      // the drafter's context: feature rows of every decode step and prefill ubatch, injected right away
+      // (round 8: batching them until the next draft lost most of the acceptance)
+      shared_engine->SetFeatureSink([d = drafter.get(), m = drafter_mutex.get()](const Session&, std::size_t pos0,
+                                                                             std::size_t n, const float* rows) {
+        const std::lock_guard<std::mutex> lock(*m);
+        d->InjectNow(pos0, n, rows);
+      });
+      std::fprintf(stderr, "inkling2: DSpark drafter %s loaded (greedy requests only, at most %d draft tokens)\n",
+                   options.speculative.draft_model_path.c_str(), max_draft);
+    }
+    return std::make_shared<Inkling2Runner>(shared_engine, std::move(tok), max_context, identity, durable,
+                                            std::move(vision), std::move(vision_identity), drafter, drafter_mutex,
+                                            max_draft);
   } catch (const std::exception& e) {
     if (error) *error = std::string("inkling2: ") + e.what();
     return nullptr;

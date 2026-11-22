@@ -16,6 +16,8 @@ void inkling2_provider_register(gufo::ext::Registry& registry) {
       .create = &gufo::models::inkling2::CreateInkling2TextRunner,
       // NVFP4 (ggml type 40) is unsized to core; the extension sizes it.
       .accepts_unsized_tensors = true,
+      // gufo_windows: --speculative dspark --dspark-model <dspark-Inkling-2-Mini-*.gguf> (greedy requests)
+      .speculative_defaults = {{.backend = "dspark", .max_draft_tokens = 5, .min_draft_tokens = 1}},
   });
 #endif
 }

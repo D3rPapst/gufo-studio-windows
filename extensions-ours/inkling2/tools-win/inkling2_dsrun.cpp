@@ -73,7 +73,7 @@ std::vector<std::string> Split(const std::string& s) {
 
 int main(int argc, char** argv) {
   std::string model, drafter_path, prompt_path, policies = "3,5,7,a", prompt_path_mode = "prefill";
-  int gen = 256, chat = 1, window_extra = 0, stage = 1, feature_diff = 0;
+  int gen = 256, chat = 1, window_extra = 0, stage = 0, feature_diff = 0;  // stage 0 = inject at once (round 8)
   double min_accept = 0;
   unsigned ctx = 8192;
   for (int i = 1; i < argc; ++i) {
