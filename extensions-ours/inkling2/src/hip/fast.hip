@@ -622,40 +622,10 @@ __device__ __forceinline__ void conv_resid_block(const ConvResidArgs& a, int tok
     }
   }
 }
-// gufo_windows: a.chain tokens are consecutive positions of one session. One thread per channel runs the
-// history through them in order (token t sees the inputs of tokens < t) and writes the conv state once.
-__device__ __forceinline__ void conv_resid_chain(const ConvResidArgs& a, int c) {
-  float* st = a.slot[0].conv + (size_t)a.conv_off * 3 + (size_t)c * 3;
-  float h0 = st[0], h1 = st[1], h2 = st[2];
-  const float w0 = a.w[(size_t)c * 4 + 0], w1 = a.w[(size_t)c * 4 + 1], w2 = a.w[(size_t)c * 4 + 2],
-              w3 = a.w[(size_t)c * 4 + 3];
-  for (int tok = 0; tok < a.chain; ++tok) {
-    const size_t to = (size_t)tok * 2304;
-    float xc;
-    if (a.nsum > 1) {
-      xc = 0.f;
-      for (int e = 0; e < a.nsum; ++e) xc += a.x[((size_t)tok * a.nsum + e) * 2304 + c];
-    } else {
-      xc = a.x[to + c];
-    }
-    const float y = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xc;
-    h0 = h1; h1 = h2; h2 = xc;
-    const float o = (xc + y) * a.scale;
-    const float cv = a.cur[to + c];
-    if (a.blk) {
-      a.blk[to + c] = cv;
-      a.cur[to + c] = o;
-    } else {
-      a.cur[to + c] = cv + o;
-    }
-  }
-  st[0] = h0; st[1] = h1; st[2] = h2;
-}
 __global__ void __launch_bounds__(256) k_conv_resid(ConvResidArgs a) {
   const int c = blockIdx.x * 256 + threadIdx.x;
   if (c >= 2304) return;
-  if (a.chain > 1) conv_resid_chain(a, c);
-  else conv_resid_elem(a, c, blockIdx.z);
+  conv_resid_elem(a, c, blockIdx.z + a.tok_base);
 }
 
 // Attention-residual mix, one block (16 waves) per query row. Optional prologue: the previous
@@ -833,56 +803,10 @@ __global__ void __launch_bounds__(256) k_tiny(TinyJobs j) {
 }
 
 // K/V conv (+ conv-state update), K clip / V rms, f16 KV write. One block per kv head.
-// gufo_windows: chain mode (a.chain consecutive positions of one session, grid z = 1): the K/V conv history runs
-// through the tokens in order, every token's row is written, the conv state once at the end.
-__device__ __forceinline__ void kvprep_chain(const KvPrepArgs& a, float* red) {
-  const int kvh = blockIdx.x, d = threadIdx.x, c = kvh * 128 + d;
-  const SlotEntry* slot = a.slot;
-  float* sk = slot->conv + (size_t)a.conv_off_k * 3 + (size_t)c * 3;
-  float* sv = slot->conv + (size_t)a.conv_off_v * 3 + (size_t)c * 3;
-  float kh[3] = {sk[0], sk[1], sk[2]}, vh[3] = {sv[0], sv[1], sv[2]};
-  for (int tk = 0; tk < a.chain; ++tk) {
-    const int pos = a.pos[tk];
-    const float kx[4] = {kh[0], kh[1], kh[2], a.k[(size_t)tk * a.ld + c]};
-    const float vx[4] = {vh[0], vh[1], vh[2], a.v[(size_t)tk * a.ld + c]};
-    float ky = 0.f, vy = 0.f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      ky += a.wk[(size_t)c * 4 + i] * kx[i];
-      vy += a.wv[(size_t)c * 4 + i] * vx[i];
-    }
-    if (a.dk) {
-      const float* dk = a.dk + (size_t)tk * a.ldd;
-      const float* dv = a.dv + (size_t)tk * a.ldd;
-#pragma unroll
-      for (int lag = 0; lag < 4; ++lag) {
-        ky += dk[kvh * 4 + lag] * kx[3 - lag];
-        vy += dv[kvh * 4 + lag] * vx[3 - lag];
-      }
-    }
-    kh[0] = kx[1]; kh[1] = kx[2]; kh[2] = kx[3];
-    vh[0] = vx[1]; vh[1] = vx[2]; vh[2] = vx[3];
-    const float kc = (kx[3] + ky) * a.scale, vc = (vx[3] + vy) * a.scale;
-    const float kss = block_sum(kc * kc, red);
-    const float vss = block_sum(vc * vc, red);
-    const float kf = fminf(1.0f, a.qk_thr / (sqrtf(kss) + 1e-6f));
-    const float vf = rsqrtf(vss * (1.0f / 128.0f) + a.eps);
-    const int cell = pos % slot->cap;
-    ((__half*)slot->k)[(size_t)cell * 1024 + c] = __float2half(kc * kf);
-    ((__half*)slot->v)[(size_t)cell * 1024 + c] = __float2half(vc * vf);
-  }
-  sk[0] = kh[0]; sk[1] = kh[1]; sk[2] = kh[2];
-  sv[0] = vh[0]; sv[1] = vh[1]; sv[2] = vh[2];
-}
-
 __global__ void __launch_bounds__(128) k_kvprep(KvPrepArgs a) {
   __shared__ float red[32];
-  if (a.chain > 1) {
-    kvprep_chain(a, red);
-    return;
-  }
   const int kvh = blockIdx.x, d = threadIdx.x, c = kvh * 128 + d;
-  const int tk = blockIdx.z;
+  const int tk = blockIdx.z + a.tok_base;
   const int pos = a.pos[tk];
   const SlotEntry* slot = a.slot + tk * 48;
   const float* ak = a.k + (size_t)tk * a.ld;
@@ -2082,7 +2006,15 @@ void Tiny(hipStream_t s, const TinyJobs& j, int nb) {
   Chk("tiny");
 }
 void KvPrep(hipStream_t s, const KvPrepArgs& a, int nb) {
-  k_kvprep<<<dim3(8, 1, a.chain > 1 ? 1 : nb), 128, 0, s>>>(a);
+  if (a.chain > 1) {  // gufo_windows: one launch per token, in order (same arithmetic as single decode)
+    for (int t = 0; t < a.chain; ++t) {
+      KvPrepArgs b = a;
+      b.tok_base = t;
+      k_kvprep<<<dim3(8, 1, 1), 128, 0, s>>>(b);
+    }
+  } else {
+    k_kvprep<<<dim3(8, 1, nb), 128, 0, s>>>(a);
+  }
   Chk("kvprep");
 }
 void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
@@ -2091,7 +2023,15 @@ void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
   Chk("attn_decode");
 }
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb) {
-  k_conv_resid<<<dim3(9, 1, a.chain > 1 ? 1 : nb), 256, 0, s>>>(a);
+  if (a.chain > 1) {  // gufo_windows: one launch per token, in order (same arithmetic as single decode)
+    for (int t = 0; t < a.chain; ++t) {
+      ConvResidArgs b = a;
+      b.tok_base = t;
+      k_conv_resid<<<dim3(9, 1, 1), 256, 0, s>>>(b);
+    }
+  } else {
+    k_conv_resid<<<dim3(9, 1, nb), 256, 0, s>>>(a);
+  }
   Chk("conv_resid");
 }
 void Prefetch(hipStream_t s, const PrefetchJob& j, float* sink, int blocks) {

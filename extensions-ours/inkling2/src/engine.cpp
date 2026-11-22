@@ -499,6 +499,9 @@ struct Engine::Impl {
       dn_in = NewInts(u / 64 + 2);
     }
     use_graph = std::getenv("INKLING2_NOGRAPH") == nullptr;
+    // gufo_windows: INKLING2_NO_CR_FUSE=1 runs every post-conv as its own launch (as the chain verify must), so a
+    // single decode step uses exactly the same kernels as a verified chain
+    no_cr_fuse = std::getenv("INKLING2_NO_CR_FUSE") != nullptr;
     no_batch = std::getenv("INKLING2_NOBATCH") != nullptr;
     ctl_half = std::getenv("INKLING2_CTL_F32") == nullptr;
     if (const char* t = std::getenv("INKLING2_DOWN_E")) down_e = std::atoi(t) != 0;
@@ -999,7 +1002,7 @@ struct Engine::Impl {
     if (nw)
       for (int q = 0; q < nq; ++q) mj.nw[q] = nw[q];
     if (pend.on) {
-      if (nq == 1 && chain <= 1) {  // gufo_windows: chain mode runs the post-conv on its own (ordered history)
+      if (nq == 1 && chain <= 1 && !no_cr_fuse) {  // gufo_windows: chain mode runs the post-conv on its own (ordered history)
         mj.has_cr = 1;
         mj.cr = pend.a;
         pend.on = false;
@@ -1477,6 +1480,7 @@ struct Engine::Impl {
   /// gufo_windows: `chain_mode` = the n entries are the SAME session at consecutive positions (speculative
   /// verify of n tokens, weights read once); conv histories run through the tokens in order.
   int chain = 0;
+  bool no_cr_fuse = false;
   void DecodeN(Session* const* sess, const std::int32_t* tokens, std::vector<float>* const* outs, int n,
                bool chain_mode = false) {
     nb = n;

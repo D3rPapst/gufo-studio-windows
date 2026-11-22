@@ -186,19 +186,34 @@ int main(int argc, char** argv) {
       std::vector<std::vector<float>> rows;
       engine->VerifyChain(*s, seq, &rows);
       for (int i = 0; i < 4; ++i) {
-        double ab = 0, aa = 0, bb = 0;
+        double ab = 0, aa = 0, bb = 0, md = 0;
         for (std::size_t j = 0; j < V; ++j) {
+          md = std::max(md, std::abs(double(rows[i][j]) - ref[i][j]));
           ab += double(rows[i][j]) * ref[i][j];
           aa += double(rows[i][j]) * rows[i][j];
           bb += double(ref[i][j]) * ref[i][j];
         }
-        std::printf("chain check row %d: argmax chain %d decode %d, cos %.6f\n", i, Argmax(rows[i].data(), V),
-                    Argmax(ref[i].data(), V), ab / std::sqrt(aa * bb + 1e-30));
+        std::printf("chain check row %d: argmax chain %d decode %d, cos %.6f, max|diff| %.3g%s\n", i,
+                    Argmax(rows[i].data(), V), Argmax(ref[i].data(), V), ab / std::sqrt(aa * bb + 1e-30), md,
+                    md == 0.0 ? " (bit-identical)" : "");
       }
-      // continuing after the chain must equal continuing after the 4 decode steps
-      const std::int32_t t5 = Argmax(rows[3].data(), V);
-      engine->Forward(*s, std::span<const std::int32_t>(&t5, 1));
-      std::printf("chain check: next token after chain %d (decode path %d)\n", Argmax(s->logits().data(), V), t);
+      // the state after the chain must equal the state after the 4 decode steps: feed the same 5th token and
+      // compare the logits of the step after it (Pause 7 check compared different steps)
+      std::vector<float> after_seq;
+      {
+        Load(*s, base);
+        for (int i = 0; i < 4; ++i) engine->Forward(*s, std::span<const std::int32_t>(&seq[i], 1));
+        engine->Forward(*s, std::span<const std::int32_t>(&t, 1));
+        after_seq = s->logits();
+        Load(*s, base);
+        std::vector<std::vector<float>> again;
+        engine->VerifyChain(*s, seq, &again);
+        engine->Forward(*s, std::span<const std::int32_t>(&t, 1));
+      }
+      double md = 0;
+      for (std::size_t j = 0; j < V; ++j) md = std::max(md, std::abs(double(s->logits()[j]) - after_seq[j]));
+      std::printf("chain check state: step after chain argmax %d, after 4 decodes %d, max|diff| %.3g%s\n",
+                  Argmax(s->logits().data(), V), Argmax(after_seq.data(), V), md, md == 0.0 ? " (bit-identical)" : "");
     }
     const auto t0 = Clock::now();
     for (int r = 0; r < 20; ++r) { Save(*s, &cyc); Load(*s, cyc); }
