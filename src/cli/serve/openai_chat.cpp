@@ -732,7 +732,11 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
     if (effort->is_number()) {
       const auto name = EffortNameFromNumber(effort->as_double());
       if (!name || !AssignReasoningEffort(options, *name, error)) {
-        if (error->empty()) *error = "
+        if (error->empty()) *error = "'reasoning_effort' as a number must be in [0, 0.99]";
+        return false;
+      }
+    } else if (!effort->is_string() ||
+        !AssignReasoningEffort(options, effort->get_str(), error)) {
       if (error->empty()) {
         *error = "'reasoning_effort' must be a string";
       }
@@ -780,7 +784,10 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
     if (effort->is_number()) {
       const auto name = EffortNameFromNumber(effort->as_double());
       if (!name || !AssignReasoningEffort(options, *name, error, options->enabled.value_or(true))) {
-        if (error->empty()) *error = "
+        if (error->empty()) *error = "'chat_template_kwargs.reasoning_effort' as a number must be in [0, 0.99]";
+        return false;
+      }
+    } else if (!effort->is_string() ||
         !AssignReasoningEffort(options, effort->get_str(), error,
                                options->enabled.value_or(true))) {
       if (error->empty()) {
