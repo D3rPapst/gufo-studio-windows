@@ -85,6 +85,10 @@ public:
   /// Open (not yet released) local jobs as (job id, owner model id).
   [[nodiscard]] std::vector<std::pair<std::string, std::string>> OpenJobs()
       const;
+  /// Open (not yet released) jobs created through the remote router, as
+  /// (job id, owner model id) (2.2.17: the remote job poll).
+  [[nodiscard]] std::vector<std::pair<std::string, std::string>>
+  OpenRemoteJobs() const;
   /// Owner model id; "" when the job is unknown.
   [[nodiscard]] std::string JobOwner(std::string_view job_id) const;
   /// True while the job is tracked and not completed.

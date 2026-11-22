@@ -139,6 +139,13 @@ struct AdapterOptions {
   /// it is parked (ParkedRunning): it keeps no GPU here busy. Lock-free
   /// enough to be asked from the poll loop; optional (unset = local).
   std::function<bool(const std::string& video_id)> video_remote;
+  /// 2.2.17: on which machine a running task's preview renders: `target`
+  /// is the preview target (Adapter::PreviewRoute: a video job id when
+  /// `video`, else the image preview id). "local", "remote" or "" (not
+  /// known yet, e.g. the request still waits in the pool). Asked by GET
+  /// /queue without any adapter lock held (it takes the router's state
+  /// mutex); optional (unset = the prompt's own machine).
+  std::function<std::string(const std::string& target, bool video)> run_side;
   std::chrono::milliseconds model_free_poll{std::chrono::seconds(1)};
 };
 
@@ -427,6 +434,13 @@ private:
   bool WatchedLocked(const std::string& client) const;
   void EmitStatusLocked();
   json::Value QueueItemLocked(const Job& job) const;
+  /// 2.2.17: extra_data.gufo_host of each running prompt in `running` (same
+  /// order): where its newest started image/video task renders, "local" or
+  /// the partner's name (partner_name_, "remote" without one); "local"
+  /// while that is not known. Takes preview_mutex_ only, then asks
+  /// AdapterOptions::run_side with no lock held.
+  std::vector<std::string> RunningHosts(
+      const std::vector<std::shared_ptr<Job>>& running);
   int QueueRemainingLocked() const;
   void PersistLocked();
   void LoadHistory();
@@ -533,6 +547,9 @@ private:
     std::string model;
     bool ended{false};
     std::chrono::steady_clock::time_point ended_at{};
+    /// When `target` was set last (2.2.17: GET /queue names the machine of
+    /// a prompt's newest started image/video task).
+    std::chrono::steady_clock::time_point target_at{};
   };
   std::mutex preview_mutex_;
   std::map<std::string, PreviewEntry, std::less<>> preview_ids_;

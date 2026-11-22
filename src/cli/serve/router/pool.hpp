@@ -33,6 +33,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -494,6 +495,48 @@ struct PoolFallbackInput {
                                                 const PoolInput& with) {
   return ChoosePool(without).choice == PoolChoice::kWait &&
          ChoosePool(with).choice == PoolChoice::kRemote;
+}
+
+/// 2.2.17: the reason a pool decision gets when the partner took a request
+/// after its B5 fallback (PoolPartnerFreedFirst): it shows in
+/// `event=pool ... reason="..."` and in /router/status "last".
+inline constexpr const char* kPartnerFreedAfterFallback =
+    "partner freed after fallback";
+
+/// 2.2.17: what the status read of a video, music or 3D job this router
+/// relayed to the partner says about that job (the router's remote job
+/// poll, every kRemoteProbeEvery): empty while it still runs there (or the
+/// answer says nothing), otherwise why it ends here and stops counting as
+/// this router's open relay. `holds_slot`: the job holds a GPU slot
+/// (gpu-slot of the remote section); only such a job also ends when the
+/// partner cannot be reached (its slot must not stay taken), a job without
+/// one waits for the partner to answer again.
+/// 22.11. 18:18 (.56): the .198 worker crashed under a relayed minimax-h3
+/// clip; its status read answered 404 from then on, but only a 2xx terminal
+/// status released the open remote job, so the .56 counted the partner as
+/// busy with it for good (RemotePoolSide "ours") and an H3 request waited
+/// 11 min behind its own clip while the .198 stood idle.
+[[nodiscard]] inline std::string RemoteJobEndOf(int status,
+                                                std::string_view body,
+                                                bool holds_slot) {
+  if (status == 404)
+    return "unknown on the remote";
+  if (status == 502 &&
+      body.find("upstream_unavailable") != std::string_view::npos)
+    return holds_slot ? "remote unreachable" : "";
+  if (status < 200 || status >= 300)
+    return "";
+  try {
+    const json::Value parsed = json::parse(body);
+    if (!parsed.is_object())
+      return "";
+    const std::string value = parsed.member_str("status");
+    if (value == "completed" || value == "failed" || value == "cancelled")
+      return value;
+  } catch (const std::exception&) {
+    // Not a job object: ask again next round.
+  }
+  return "";
 }
 
 /// "local" | "remote" from an X-Gufo-Pool header value; "" for anything
