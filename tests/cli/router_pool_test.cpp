@@ -723,6 +723,81 @@ void TestFallback() {
   CHECK(!PoolRemoteHold(PoolRemoteAnswer::kPass));
 }
 
+/// 2.2.17 (22.11. 18:18, .56): the partner's worker crashed under a clip
+/// this router relayed there; the job was gone (404) but stayed this
+/// router's open remote job, so the partner counted as busy with it
+/// ("ours") and a waiting request never went over, also after the B5
+/// fallback. The remote job poll now ends such a job (RemoteJobEndOf).
+void TestRemoteJobLeak() {
+  using gufo::router::kPartnerFreedAfterFallback;
+  using gufo::router::PoolPartnerFreedFirst;
+  using gufo::router::RemoteJobEndOf;
+  using gufo::router::RemoteObservation;
+  using gufo::router::RemotePoolSide;
+  using gufo::router::WithoutPartner;
+
+  // What a status read says (with and without a GPU slot).
+  CHECK(RemoteJobEndOf(404, R"({"error":{"code":"video_not_found"}})",
+                       false) == "unknown on the remote");
+  CHECK(RemoteJobEndOf(404, "", true) == "unknown on the remote");
+  const std::string gone = R"({"error":{"code":"upstream_unavailable"}})";
+  CHECK(RemoteJobEndOf(502, gone, true) == "remote unreachable");
+  CHECK(RemoteJobEndOf(502, gone, false).empty());  // waits for the partner
+  CHECK(RemoteJobEndOf(502, "receive failed", true).empty());
+  CHECK(RemoteJobEndOf(503, "", true).empty());
+  CHECK(RemoteJobEndOf(200, R"({"id":"v","status":"in_progress"})", false)
+            .empty());
+  CHECK(RemoteJobEndOf(200, R"({"id":"v","status":"queued"})", false).empty());
+  CHECK(RemoteJobEndOf(200, R"({"status":"completed"})", false) ==
+        "completed");
+  CHECK(RemoteJobEndOf(200, R"({"status":"failed"})", false) == "failed");
+  CHECK(RemoteJobEndOf(200, R"({"status":"cancelled"})", false) ==
+        "cancelled");
+  CHECK(RemoteJobEndOf(200, "not json", false).empty());
+  CHECK(RemoteJobEndOf(200, "[1,2]", false).empty());
+
+  // The registry lists the open remote job apart from the local ones.
+  gufo::router::Registry registry({PoolTwin()},
+                                  gufo::router::RegistryOptions{});
+  registry.TrackVideoJob("video_x", "big", /*remote=*/true);
+  CHECK(registry.RemoteRequests("big") == 1);
+  CHECK(registry.OpenJobs().empty());
+  const auto open = registry.OpenRemoteJobs();
+  CHECK(open.size() == 1 && open[0].first == "video_x" &&
+        open[0].second == "big");
+
+  // The partner itself reports the model warm and idle (its worker came
+  // back without the job), but our open job keeps it "not free".
+  RemoteObservation seen;
+  seen.reachable = true;
+  seen.view.served = true;
+  seen.view.status = "loaded";
+  seen.view.has_activity = true;
+  seen.view.activity.inflight = 0;
+  seen.ours = registry.RemoteRequests("big");
+  PoolInput in;
+  in.local = Warm(false);  // our own clip runs here
+  in.remote = RemotePoolSide(seen);
+  in.waited = std::chrono::seconds(61);
+  CHECK(!in.remote.free);
+  CHECK(ChoosePool(in).choice == PoolChoice::kWait);
+  CHECK(!PoolPartnerFreedFirst(WithoutPartner(in), in));
+
+  // The poll's 404 ends it: the partner is free, the waiting request goes
+  // there (after the fallback with the new reason).
+  registry.CompleteVideoJob("video_x");
+  CHECK(registry.RemoteRequests("big") == 0);
+  CHECK(registry.OpenRemoteJobs().empty());
+  CHECK(registry.JobRemote("video_x"));  // late reads still go there
+  seen.ours = registry.RemoteRequests("big");
+  in.remote = RemotePoolSide(seen);
+  CHECK(in.remote.free);
+  CHECK(ChoosePool(in).choice == PoolChoice::kRemote);
+  CHECK(PoolPartnerFreedFirst(WithoutPartner(in), in));
+  CHECK(std::string(kPartnerFreedAfterFallback) ==
+        "partner freed after fallback");
+}
+
 void TestPriority() {
   using gufo::router::kPoolYieldMax;
   using gufo::router::ParsePriority;
@@ -978,6 +1053,7 @@ int main() {
   TestGpuSlotIdle();
   TestRegistryCounts();
   TestFallback();
+  TestRemoteJobLeak();
   TestPriority();
   TestForwardedGpuBusyCap();
   TestComfyQueueParked();

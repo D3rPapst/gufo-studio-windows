@@ -379,6 +379,17 @@ std::vector<std::pair<std::string, std::string>> Registry::OpenJobs() const {
   return jobs;
 }
 
+std::vector<std::pair<std::string, std::string>> Registry::OpenRemoteJobs()
+    const {
+  std::vector<std::pair<std::string, std::string>> jobs;
+  for (const auto& [job, owner] : job_owners_) {
+    if (remote_jobs_.count(job) > 0) {
+      jobs.emplace_back(job, owner);
+    }
+  }
+  return jobs;
+}
+
 bool Registry::JobRemote(std::string_view job_id) const {
   return remote_jobs_.count(std::string(job_id)) > 0;
 }

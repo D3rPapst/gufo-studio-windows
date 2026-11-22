@@ -1139,6 +1139,21 @@ each other in a loop. A pipeline that waits until both machines are free
 of ComfyUI work polls one router's `GET /queue?pool=1` until both lists
 are empty and `"partner"` is not `"unreachable"`.
 
+Every item of `GET /queue` (plain and pool view, 2.2.17) also carries
+`extra_data.gufo_host`: the machine the prompt computes on, `"local"`
+or the partner's `http://host:port` (`"remote"` on a router without a
+partner name). A waiting prompt is `"local"` (it waits in this
+machine's queue). A running prompt names the machine of its newest
+started image or video task (where its live preview renders): a video
+job created through the partner, or an image request the pool sent
+there, is the partner; everything else, and a prompt whose current
+request still waits in the pool or has no image/video task, is
+`"local"`. In the pool view the partner's items are turned around
+(its `"local"` becomes its address, its partner's address becomes
+`"local"`); a partner older than 2.2.17 sends no `gufo_host`, then its
+items say the partner. `gufo_router` still names the queue a prompt is
+in; only fields were added.
+
 ### Figure check (`POST /v1/figuren`)
 
 The front answers `POST /v1/figuren` itself and asks the vision model
@@ -1880,6 +1895,36 @@ models; a busy local worker is still waited for, oldest first), and
 machine because of the partner (waited too long, unreachable, failed,
 out of memory) logs `event=pool_fallback reason="..."` and counts in the
 `pool` block's `"fallbacks"`.
+
+The fallback does not tie the request to this machine (2.2.14): while it
+still waits (this machine cannot take it yet), the pool keeps looking at
+both machines every 200 ms and sends it to the partner as soon as the
+partner can take it right now (pool.hpp `PoolPartnerFreedFirst`). Since
+2.2.17 such a pick logs `event=pool choice=remote reason="partner freed
+after fallback"` (also `"last"` in the `pool` block). A request still
+picks a side exactly once: the decision and the dispatch run in the one
+request thread under the state mutex, a local pick holds a
+`local_claims` claim until its busy count is armed, a relay counts in
+`remote_inflight` while it is open, and a job the shared queue hands to
+the partner while it waits ends here with 503 `pool_redirected` before
+anything started.
+
+**Relayed jobs end when the partner lost them (2.2.17).** A video, music
+or 3D job created through the partner counts as this router's open relay
+of its model (`remote_inflight`, the pool's "ours") until it ends. The
+remote probe thread now asks the partner about every such job every 5 s
+(`PollRemoteJobs`, pool.hpp `RemoteJobEndOf`), not only about jobs that
+hold a GPU slot: a terminal status (`completed`, `failed`, `cancelled`)
+or 404 (unknown there) ends it here, `event=remote_job_end job=<id>
+model=<m> reason=<why> slot=none`. An unreachable partner ends only a
+slot-holding job (as before); a job without a slot waits for the partner
+to answer again. Before, only a client's 2xx terminal status read ended
+such a job. 22.11. 18:18 on the .56: the .198 worker crashed under a
+relayed minimax-h3 clip, the status read answered 404 from then on, the
+.56 kept counting the partner as busy with that clip, and an H3 request
+waited `"both busy"`, fell back after 60 s and ran only 11 min later
+behind the .56's own clip while the .198 stood idle. A late read of an
+ended job still goes to the partner (`JobRemote` keeps it).
 
 **Partner out: no idle wait (2.2.0).** With the partner out of the
 decision (gone, draining, or dropped by the fallback above) a cold load

@@ -613,8 +613,9 @@ bool WantsPoolView(const HttpRequest& request) {
 }
 
 /// A queue item ([number, id, prompt, extra_data, outputs]) with
-/// extra_data.gufo_router = `router` ("local" or the partner's URL).
-json::Value TagQueueItem(const json::Value& item, const std::string& router) {
+/// extra_data's `key` = `value`.
+json::Value TagQueueItem(const json::Value& item, const char* key,
+                         const std::string& value) {
   if (!item.is_array())
     return item;
   json::Value out = json::Value::array();
@@ -622,13 +623,38 @@ json::Value TagQueueItem(const json::Value& item, const std::string& router) {
   for (const json::Value& part : item.items()) {
     if (index++ == 3 && part.is_object()) {
       json::Value extra = part;
-      extra["gufo_router"] = router;
+      extra[key] = value;
       out.push_back(std::move(extra));
     } else {
       out.push_back(part);
     }
   }
   return out;
+}
+
+/// extra_data of a queue item (nullptr when it has none).
+const json::Value* QueueItemExtra(const json::Value& item) {
+  if (!item.is_array() || item.items().size() < 4)
+    return nullptr;
+  const json::Value& extra = item.items()[3];
+  return extra.is_object() ? &extra : nullptr;
+}
+
+/// 2.2.17: a partner's queue item in this router's pool view. Its
+/// extra_data.gufo_router names the partner; its gufo_host is said from
+/// the partner's side ("local" = the partner, anything else = its partner,
+/// i.e. this machine) and is turned around. A partner older than 2.2.17
+/// sends no gufo_host: the partner's own machine, like gufo_router.
+json::Value PartnerQueueItem(const json::Value& item,
+                             const std::string& partner) {
+  std::string host = partner;
+  if (const json::Value* extra = QueueItemExtra(item); extra != nullptr) {
+    const std::string theirs = extra->member_str("gufo_host");
+    if (!theirs.empty() && theirs != "local")
+      host = "local";
+  }
+  return TagQueueItem(TagQueueItem(item, "gufo_router", partner), "gufo_host",
+                      host);
 }
 
 }  // namespace
@@ -1002,6 +1028,52 @@ json::Value Adapter::QueueItemLocked(const Job& job) const {
   return item;
 }
 
+std::vector<std::string> Adapter::RunningHosts(
+    const std::vector<std::shared_ptr<Job>>& running) {
+  struct Current {
+    std::string target;
+    bool video{false};
+  };
+  std::vector<Current> current(running.size());
+  {
+    const std::lock_guard<std::mutex> lock(preview_mutex_);
+    for (std::size_t i = 0; i < running.size(); ++i) {
+      const Job& job = *running[i];
+      std::chrono::steady_clock::time_point newest{};
+      for (const Task& task : job.plan.tasks) {
+        if (!std::holds_alternative<ImageTask>(task.spec) &&
+            !std::holds_alternative<VideoTask>(task.spec))
+          continue;
+        const auto it = preview_ids_.find(TaskPreview(job, task));
+        if (it == preview_ids_.end() || it->second.target.empty() ||
+            it->second.job.lock().get() != &job)
+          continue;
+        if (current[i].target.empty() || it->second.target_at > newest) {
+          newest = it->second.target_at;
+          current[i] = {it->second.target, it->second.video};
+        }
+      }
+    }
+  }
+  std::vector<std::string> hosts;
+  hosts.reserve(running.size());
+  for (const Current& task : current) {
+    std::string side;
+    if (!task.target.empty() && options_.run_side) {
+      try {
+        side = options_.run_side(task.target, task.video);
+      } catch (const std::exception&) {
+        side.clear();
+      }
+    }
+    hosts.push_back(side == "remote"
+                        ? (partner_name_.empty() ? std::string("remote")
+                                                 : partner_name_)
+                        : std::string("local"));
+  }
+  return hosts;
+}
+
 int Adapter::QueueRemainingLocked() const {
   return static_cast<int>(pending_.size() + running_.size());
 }
@@ -1015,24 +1087,37 @@ HttpResponse Adapter::QueueGet(const HttpRequest& request) {
     partner = PartnerQueue(&partner_state);
   json::Value running = json::Value::array();
   json::Value pending = json::Value::array();
+  std::vector<std::shared_ptr<Job>> running_jobs;
+  std::vector<json::Value> running_items;
   {
     const std::lock_guard<std::mutex> lock(mutex_);
+    running_jobs = running_;
     for (const auto& job : running_)
-      running.push_back(pool ? TagQueueItem(QueueItemLocked(*job), "local")
-                             : QueueItemLocked(*job));
+      running_items.push_back(pool ? TagQueueItem(QueueItemLocked(*job),
+                                                  "gufo_router", "local")
+                                   : QueueItemLocked(*job));
+    // 2.2.17: a waiting prompt is on this machine (its queue).
     for (const auto& job : pending_)
-      pending.push_back(pool ? TagQueueItem(QueueItemLocked(*job), "local")
-                             : QueueItemLocked(*job));
+      pending.push_back(TagQueueItem(
+          pool ? TagQueueItem(QueueItemLocked(*job), "gufo_router", "local")
+               : QueueItemLocked(*job),
+          "gufo_host", "local"));
   }
+  // 2.2.17: where each running prompt computes now (no adapter lock held
+  // while the router is asked).
+  const std::vector<std::string> hosts = RunningHosts(running_jobs);
+  for (std::size_t i = 0; i < running_items.size(); ++i)
+    running.push_back(TagQueueItem(running_items[i], "gufo_host",
+                                   i < hosts.size() ? hosts[i] : "local"));
   if (partner.has_value()) {
     if (const json::Value* items = partner->find("queue_running");
         items != nullptr && items->is_array())
       for (const json::Value& item : items->items())
-        running.push_back(TagQueueItem(item, partner_name_));
+        running.push_back(PartnerQueueItem(item, partner_name_));
     if (const json::Value* items = partner->find("queue_pending");
         items != nullptr && items->is_array())
       for (const json::Value& item : items->items())
-        pending.push_back(TagQueueItem(item, partner_name_));
+        pending.push_back(PartnerQueueItem(item, partner_name_));
   }
   json::Value body = json::Value::object();
   body["queue_running"] = std::move(running);
@@ -2125,6 +2210,7 @@ void Adapter::SetPreviewTarget(const std::string& id, std::string target,
   entry.target = std::move(target);
   entry.video = video;
   entry.model = std::move(model);
+  entry.target_at = std::chrono::steady_clock::now();
 }
 
 void Adapter::EndPreviews(const Job& job) {

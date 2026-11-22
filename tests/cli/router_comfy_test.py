@@ -1471,6 +1471,11 @@ def check_pool_view(binary, tmp, partner):
         status, queue = viewer.json("GET", "/queue?scope=pool")
         item = queue["queue_running"][0]
         assert item[3]["gufo_router"] == partner_name, item[3]
+        # 2.2.17: gufo_host names the machine the prompt computes on; the
+        # partner says "local" for its own, the pool view turns it around.
+        assert item[3]["gufo_host"] == partner_name, item[3]
+        status, own_view = partner.json("GET", "/queue")
+        assert [i[3]["gufo_host"] for i in own_view["queue_running"]] == ["local"], own_view
         # Plain /queue and a relayed one stay local.
         assert running_ids(viewer) == []
         status, payload = viewer.request("GET", "/queue?pool=1",
@@ -1485,6 +1490,10 @@ def check_pool_view(binary, tmp, partner):
         tags = {item[1]: item[3]["gufo_router"]
                 for key in ("queue_running", "queue_pending") for item in queue[key]}
         assert tags.get(own) == "local", tags
+        hosts = {item[1]: item[3]["gufo_host"]
+                 for key in ("queue_running", "queue_pending") for item in queue[key]}
+        assert hosts.get(own) == "local", hosts
+        assert hosts.get(busy) in (None, partner_name), hosts  # may be done
         partner.wait(busy)
         viewer.wait(own)
         wait_until("an idle pool", lambda: viewer.json("GET", "/prompt?pool=1")[1]

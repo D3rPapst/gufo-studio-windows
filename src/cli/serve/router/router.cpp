@@ -2249,10 +2249,13 @@ public:
       // after another on the .56 while the .198 stood idle (1362 s instead
       // of ~760 s). When this machine cannot take it yet but the partner
       // can right now, it goes there.
+      // 2.2.17: such a pick says so (kPartnerFreedAfterFallback).
+      bool partner_freed = false;
       if (fallback != nullptr) {
         router::PoolInput without = router::WithoutPartner(pool_input);
-        if (!(router::PoolPartnerFreedFirst(without, pool_input) &&
-              forced != "local"))
+        partner_freed = router::PoolPartnerFreedFirst(without, pool_input) &&
+                        forced != "local";
+        if (!partner_freed)
           pool_input = without;
       }
       // One side only (capabilities): the other is out, even when free.
@@ -2264,6 +2267,8 @@ public:
       else if (forced == "local")
         pool_input.remote.available = false;
       router::PoolDecision decision = router::ChoosePool(pool_input);
+      if (partner_freed && decision.choice == router::PoolChoice::kRemote)
+        decision.reason = router::kPartnerFreedAfterFallback;
       // Priority (2.0.3): a free machine goes to a waiting request of this
       // model with a higher priority first; this one yields, at most
       // kPoolYieldMax in a row (never stuck: the higher one may be pinned
@@ -3752,17 +3757,36 @@ public:
     }
   }
 
-  /// Asks the remote router how each slot-holding job is doing (no lock
-  /// held while asking). A terminal status, an unknown job or an
-  /// unreachable router ends the job here: its slot goes to the next
-  /// request and the registry stops counting it.
+  /// Asks the remote router how each job relayed there is doing (no lock
+  /// held while asking). A terminal status or an unknown job ends the job
+  /// here: its slot (if any) goes to the next request and the registry
+  /// stops counting it (router::RemoteJobEndOf). An unreachable router
+  /// ends only a slot-holding job. 2.2.17: also the jobs without a GPU slot
+  /// (pool models): before, only a client's 2xx terminal status read
+  /// released them, so a job the partner lost (worker crash: 404) counted
+  /// as the partner's open work for good (22.11. 18:18, minimax-h3).
   void PollRemoteJobs() {
     std::vector<std::pair<std::string, RemoteJob>> jobs;
+    std::set<std::string> slotted;
     {
       const std::lock_guard<std::mutex> lock(remote_jobs_mutex_);
-      for (const auto& [id, job] : remote_jobs_)
+      for (const auto& [id, job] : remote_jobs_) {
         jobs.emplace_back(id, RemoteJob{job.model_id, job.spec, job.music,
                                         nullptr});
+        slotted.insert(id);
+      }
+    }
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      for (const auto& [id, owner] : registry.OpenRemoteJobs()) {
+        if (slotted.count(id) > 0)
+          continue;
+        const router::PresetModel* preset = registry.Find(owner);
+        if (preset == nullptr || !preset->remote.has_value())
+          continue;
+        jobs.emplace_back(id, RemoteJob{owner, *preset->remote,
+                                        id.starts_with("music_"), nullptr});
+      }
     }
     for (const auto& [job_id, job] : jobs) {
       if (stop_requested.load())
@@ -3784,32 +3808,26 @@ public:
       };
       const router::comfy::FetchResult answer =
           CollectResponse(router::ProxyToWorker(target, status));
-      std::string end;
-      if (answer.status == 502 &&
-          answer.body.find("upstream_unavailable") != std::string::npos) {
-        end = "remote unreachable";
-      } else if (answer.status == 404) {
-        end = "unknown on the remote";
-      } else if (answer.status >= 200 && answer.status < 300) {
-        try {
-          const std::string value =
-              json::parse(answer.body).member_str("status");
-          if (value == "completed" || value == "failed" ||
-              value == "cancelled")
-            end = value;
-        } catch (const std::exception&) {
-          // Not a job object: ask again next round.
-        }
-      }
+      const bool holds_slot = slotted.count(job_id) > 0;
+      const std::string end =
+          router::RemoteJobEndOf(answer.status, answer.body, holds_slot);
       if (end.empty())
         continue;
+      bool released = false;
       {
         const std::lock_guard<std::mutex> lock(mutex);
         if (registry.JobOwner(job_id) == job.model_id &&
-            registry.JobOpen(job_id))
+            registry.JobOpen(job_id)) {
           registry.CompleteVideoJob(job_id);
+          released = true;
+        }
       }
-      ReleaseJobSlot(job_id, end);
+      if (holds_slot)
+        ReleaseJobSlot(job_id, end);
+      else if (released)
+        Logger::Info("router", "event=remote_job_end job=" + job_id +
+                                   " model=" + job.model_id + " reason=" +
+                                   end + " slot=none");
     }
   }
 
@@ -4098,6 +4116,25 @@ public:
   bool ComfyVideoRemote(const std::string& video_id) {
     const std::lock_guard<std::mutex> lock(mutex);
     return registry.JobRemote(video_id);
+  }
+
+  /// 2.2.17 (GET /queue extra_data.gufo_host): the machine a ComfyUI
+  /// prompt's task renders on. A video job: "remote" when it was created
+  /// through the partner, "local" when this router tracks it as its own.
+  /// An image: the side the pool picked for its preview id
+  /// (preview_sides_). "" when not known (not decided yet, not a pool
+  /// model's preview).
+  std::string ComfyRunSide(const std::string& target, bool video) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (video) {
+      if (registry.JobRemote(target))
+        return "remote";
+      return registry.JobOwner(target).empty() ? "" : "local";
+    }
+    const auto side = preview_sides_.find(target);
+    if (side == preview_sides_.end())
+      return "";
+    return side->second.remote ? "remote" : "local";
   }
 
   bool ComfyModelFree(const std::string& model) {
@@ -5588,6 +5625,9 @@ int RunRouter(std::span<const char* const> args) {
     };
     comfy_options.video_remote = [raw](const std::string& video_id) {
       return raw->ComfyVideoRemote(video_id);
+    };
+    comfy_options.run_side = [raw](const std::string& target, bool video) {
+      return raw->ComfyRunSide(target, video);
     };
     try {
       state->comfy =
