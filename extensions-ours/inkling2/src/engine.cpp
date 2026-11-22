@@ -14,6 +14,10 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#if defined(_WIN32)
+#include <windows.h>  // VirtualUnlock (weight upload)
+#endif
+
 #include "src/hip/fast.hpp"
 #include "src/hip/kernels.hpp"
 
@@ -87,6 +91,12 @@ public:
         Check(hipMemcpy(static_cast<char*>(dev) + off, static_cast<const char*>(t.data) + off, n,
                         hipMemcpyHostToDevice),
               "weight upload");
+#if defined(_WIN32)
+        // gufo_windows port: the host has about 15.6 GB of RAM for a 16.4 GiB file. Drop the copied
+        // file pages from the working set right away (they stay in the standby list and count as
+        // available), so the load never grows the process to the size of the model.
+        (void)VirtualUnlock(const_cast<char*>(static_cast<const char*>(t.data) + off), n);
+#endif
       }
       regions_.push_back({reinterpret_cast<std::uintptr_t>(t.data), t.size_bytes, dev});
       sum += t.size_bytes;

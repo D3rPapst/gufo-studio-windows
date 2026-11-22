@@ -413,20 +413,15 @@ public:
       cache::ResourceLedger& ledger, std::size_t) const override {
     return MakeResources(ledger, std::nullopt);
   }
-  [[nodiscard]] std::unique_ptr<g::ComponentCacheResources> CreateComponentCacheResourcesForSessions(
-      cache::ResourceLedger& ledger, std::size_t, std::size_t sessions) const override {
-    return MakeResources(ledger, gufo::hip::PlanComponentTransfers(sessions));
-  }
+  // gufo_windows port: the fork's extension API (0.3.10) has no shared transfer-stream leases
+  // (upstream 0.3.x "shared-transfer-stream-leases"), so there is no per-session resource factory
+  // and the hooks keep the fork's default stream count.
   [[nodiscard]] std::unique_ptr<g::ComponentCacheResources> MakeResources(
-      cache::ResourceLedger& ledger, std::optional<gufo::hip::ComponentTransferPlan> transfers) const {
+      cache::ResourceLedger& ledger, std::optional<int> /*transfers*/) const {
     gufo::hip::ComponentCacheHooks hooks;
     hooks.host_ceiling = [] { return g::HostSnapshotCeilingBytes(); };
     hooks.warn = [](std::string_view m) { std::fprintf(stderr, "[inkling2 cache] %.*s\n", int(m.size()), m.data()); };
     hooks.info = [](std::string_view m) { std::fprintf(stderr, "[inkling2 cache] %.*s\n", int(m.size()), m.data()); };
-    if (transfers) {
-      hooks.transfer_streams = transfers->native_streams;
-      hooks.transfer_leases = transfers->leases;
-    }
     return gufo::hip::CreateHipComponentCacheResources(
         std::make_unique<Inkling2CacheAdapter>(engine_, identity_, durable_, engine_->ubatch()), ledger,
         std::move(hooks));

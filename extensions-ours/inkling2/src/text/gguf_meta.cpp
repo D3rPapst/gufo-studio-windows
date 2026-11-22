@@ -17,7 +17,11 @@ struct File {
   explicit File(const std::string& p) : f(std::fopen(p.c_str(), "rb")) {}
   ~File() { if (f != nullptr) std::fclose(f); }
   bool Read(void* dst, std::size_t n) { return std::fread(dst, 1, n, f) == n; }
+#if defined(_WIN32)
+  bool Skip(std::uint64_t n) { return _fseeki64(f, static_cast<long long>(n), SEEK_CUR) == 0; }  // gufo_windows port
+#else
   bool Skip(std::uint64_t n) { return fseeko(f, static_cast<off_t>(n), SEEK_CUR) == 0; }
+#endif
   template <typename T> bool Get(T* v) { return Read(v, sizeof(T)); }  // little-endian host
   bool GetString(std::string* s) {
     std::uint64_t n;

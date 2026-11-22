@@ -127,3 +127,20 @@ endif()
 install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
   "${GUFO_EXTENSION_BUILD_ROOT}/THIRD_PARTY.md"
   DESTINATION share/licenses/gufo/extensions/inkling2)
+
+# gufo_windows additions: teacher-forced check and the speed bench as plain tools, only with
+# -DGUFO_INKLING2_TOOLS=ON (the pause scripts build them by name; never part of the gufo target).
+option(GUFO_INKLING2_TOOLS "Build the Inkling 2 check/bench tools" OFF)
+if(GUFO_INKLING2_TOOLS AND TARGET gufo_inkling2_hip)
+  foreach(tool IN ITEMS inkling2_force inkling2_bench_win)
+    if(tool STREQUAL inkling2_force)
+      add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tools-win/inkling2_force.cpp")
+    else()
+      add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tests/bench/bench.cpp")
+    endif()
+    target_include_directories(${tool} BEFORE PRIVATE "${GUFO_EXTENSION_BUILD_ROOT}" "${GUFO_EXTENSION_BUILD_ROOT}/src")
+    target_include_directories(${tool} SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/include")
+    target_link_libraries(${tool} PRIVATE gufo_inkling2_hip gufo_inkling2 gufo_ext_runtime gufo_ext_core gufo_ext_hip)
+    target_compile_features(${tool} PRIVATE cxx_std_20)
+  endforeach()
+endif()

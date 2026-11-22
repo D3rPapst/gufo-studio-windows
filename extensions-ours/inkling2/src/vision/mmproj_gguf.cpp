@@ -1,9 +1,13 @@
 #include "mmproj_gguf.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstring>
 
@@ -61,11 +65,33 @@ uint64_t TypeBytes(int type, uint64_t n) {
 }  // namespace
 
 MmprojGguf::~MmprojGguf() {
+#if defined(_WIN32)
+  if (map_) UnmapViewOfFile(map_);
+#else
   if (map_) munmap(map_, size_);
+#endif
 }
 
 bool MmprojGguf::Open(const std::string& path, std::string* err) {
   auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
+#if defined(_WIN32)
+  // Windows port: read-only file mapping (pages load on use).
+  const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+  std::wstring wpath(wlen > 0 ? static_cast<std::size_t>(wlen - 1) : 0, L'\0');
+  if (wlen > 1) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+  HANDLE file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return fail("cannot open " + path);
+  LARGE_INTEGER fsize{};
+  if (!GetFileSizeEx(file, &fsize)) { CloseHandle(file); return fail("stat failed"); }
+  size_ = static_cast<uint64_t>(fsize.QuadPart);
+  HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  CloseHandle(file);
+  if (!mapping) return fail("mmap failed");
+  map_ = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+  CloseHandle(mapping);
+  if (!map_) return fail("mmap failed");
+#else
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) return fail("cannot open " + path);
   struct stat st;
@@ -74,6 +100,7 @@ bool MmprojGguf::Open(const std::string& path, std::string* err) {
   map_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
   if (map_ == MAP_FAILED) { map_ = nullptr; return fail("mmap failed"); }
+#endif
   Cur c{static_cast<const uint8_t*>(map_), static_cast<const uint8_t*>(map_) + size_};
   if (c.Get<uint32_t>() != 0x46554747u) return fail("not a GGUF file");
   uint32_t ver = c.Get<uint32_t>();
