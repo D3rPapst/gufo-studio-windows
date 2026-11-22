@@ -15,21 +15,25 @@
 #include <cmath>
 #include <deque>
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace gufo::models::inkling2 {
 
+struct DSparkPolicyParams {
+  std::vector<int> depths{2, 3, 4, 5};  // candidate K (chain K + 1 <= 8)
+  int window = 8;                       // observations (cycles / probes) in the acceptance estimate
+  double enter = 1.05, leave = 0.97;    // hysteresis against plain decode
+  int probe_every = 32;                 // plain tokens between shadow drafts
+  int probe_k = 3;
+  double start_p = 0.7;                 // prior hit rate (first cycles speculate with K = 3)
+};
+
 class DSparkPolicy {
 public:
-  struct Params {
-    std::vector<int> depths{2, 3, 4, 5};  // candidate K (chain K + 1 <= 8)
-    int window = 8;                       // observations (cycles / probes) in the acceptance estimate
-    double enter = 1.05, leave = 0.97;    // hysteresis against plain decode
-    int probe_every = 32;                 // plain tokens between shadow drafts
-    int probe_k = 3;
-    double start_p = 0.7;                 // prior hit rate (first cycles speculate with K = 3)
-  };
-  explicit DSparkPolicy(Params p = {}) : p_(std::move(p)) {
+  using Params = DSparkPolicyParams;
+  DSparkPolicy() : DSparkPolicy(Params{}) {}
+  explicit DSparkPolicy(Params p) : p_(std::move(p)) {
     chain_ms_ = {{2, 30.5}, {3, 34.9}, {4, 39.9}, {5, 48.8}, {6, 55.1}, {7, 61.4}, {8, 67.0}};
     for (int k = 1; k <= 7; ++k) draft_ms_[k] = 6.0 + 0.6 * k;
     speculating_ = true;
