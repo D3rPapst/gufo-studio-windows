@@ -112,6 +112,10 @@ public:
   /// Sets the frontier after a restore: position and (when `logits` is non-null) the logits.
   static void SetFrontier(Session&, std::size_t position, const float* logits, std::size_t n);
   static void SetHooks(Session&, SessionHooks*);
+  /// gufo_windows addition (speculation rollback): copies the conv history of all 48 visits to /
+  /// from a device buffer of kConvBytes (device-to-device, synchronous).
+  static void ConvSaveDevice(const Session&, void* device_dst);
+  static void ConvLoadDevice(Session&, const void* device_src);
 };
 
 }  // namespace gufo::models::inkling2

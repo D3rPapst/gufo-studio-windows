@@ -177,5 +177,19 @@ void SessionStateAccess::SetFrontier(Session& s, std::size_t position, const flo
     s.logits_.clear();
 }
 void SessionStateAccess::SetHooks(Session& s, SessionHooks* h) { s.hooks_ = h; }
+void SessionStateAccess::ConvSaveDevice(const Session& s, void* device_dst) {
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  for (std::size_t v = 0; v < kVisits; ++v)
+    Check(hipMemcpy(static_cast<std::byte*>(device_dst) + v * kConvBytesPerVisit, s.slots_.at(v).conv,
+                    kConvBytesPerVisit, hipMemcpyDeviceToDevice),
+          "conv save");
+}
+void SessionStateAccess::ConvLoadDevice(Session& s, const void* device_src) {
+  const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+  for (std::size_t v = 0; v < kVisits; ++v)
+    Check(hipMemcpy(s.slots_.at(v).conv, static_cast<const std::byte*>(device_src) + v * kConvBytesPerVisit,
+                    kConvBytesPerVisit, hipMemcpyDeviceToDevice),
+          "conv load");
+}
 
 }  // namespace gufo::models::inkling2

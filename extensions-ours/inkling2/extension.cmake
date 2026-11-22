@@ -132,9 +132,9 @@ install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
 # -DGUFO_INKLING2_TOOLS=ON (the pause scripts build them by name; never part of the gufo target).
 option(GUFO_INKLING2_TOOLS "Build the Inkling 2 check/bench tools" OFF)
 if(GUFO_INKLING2_TOOLS AND TARGET gufo_inkling2_hip)
-  foreach(tool IN ITEMS inkling2_force inkling2_bench_win)
-    if(tool STREQUAL inkling2_force)
-      add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tools-win/inkling2_force.cpp")
+  foreach(tool IN ITEMS inkling2_force inkling2_spec inkling2_bench_win)
+    if(NOT tool STREQUAL inkling2_bench_win)
+      add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tools-win/${tool}.cpp")
     else()
       add_executable(${tool} "${GUFO_EXTENSION_BUILD_ROOT}/tests/bench/bench.cpp")
     endif()
