@@ -1,0 +1,1 @@
+Source: https://github.com/headbouyJB/inkling2-gufo commit 8bb6cd5eaa76c3aa27c74ca005622735aa294a98 (0.1.2, 2026-11-22), MIT, author headbouyJB. Copied without lab/ and flake files; Windows port changes are committed on top in the gufo_windows fork branch feat/inkling2-ext.
