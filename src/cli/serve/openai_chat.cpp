@@ -692,6 +692,19 @@ bool AssignReasoningEffort(ReasoningOptions* options, std::string_view value,
   return !enable_thinking || AssignReasoningEnabled(options, true, error);
 }
 
+// gufo_windows: a numeric reasoning_effort (Inkling 2's template takes 0..0.99) maps to the nearest named
+// level of that template's effort_map (none 0, minimal 0.1, low 0.2, medium 0.7, high 0.9, xhigh/max 0.99).
+// The request carries named levels only, so values between the levels are rounded to the nearest one.
+static std::optional<std::string> EffortNameFromNumber(double v) {
+  if (!(v >= 0.0 && v <= 0.99)) return std::nullopt;
+  if (v == 0.0) return std::string("none");
+  if (v < 0.15) return std::string("minimal");
+  if (v < 0.45) return std::string("low");
+  if (v < 0.8) return std::string("medium");
+  if (v < 0.945) return std::string("high");
+  return std::string("xhigh");
+}
+
 bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
                            std::string* error) {
   if (const json::Value* thinking = body.find("thinking")) {
@@ -716,8 +729,10 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
 
   if (const json::Value* effort = body.find("reasoning_effort");
       effort != nullptr && !effort->is_null()) {
-    if (!effort->is_string() ||
-        !AssignReasoningEffort(options, effort->get_str(), error)) {
+    if (effort->is_number()) {
+      const auto name = EffortNameFromNumber(effort->as_double());
+      if (!name || !AssignReasoningEffort(options, *name, error)) {
+        if (error->empty()) *error = "
       if (error->empty()) {
         *error = "'reasoning_effort' must be a string";
       }
@@ -762,7 +777,10 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
     }
   }
   if (const json::Value* effort = kwargs->find("reasoning_effort")) {
-    if (!effort->is_string() ||
+    if (effort->is_number()) {
+      const auto name = EffortNameFromNumber(effort->as_double());
+      if (!name || !AssignReasoningEffort(options, *name, error, options->enabled.value_or(true))) {
+        if (error->empty()) *error = "
         !AssignReasoningEffort(options, effort->get_str(), error,
                                options->enabled.value_or(true))) {
       if (error->empty()) {
