@@ -57,6 +57,10 @@ struct RemoteSpec {
   /// placement = pool: longest wait on the partner before a request this
   /// router can run falls back here (B5 "never stuck").
   int pool_wait_seconds{60};
+  /// placement = pool: `pool-accept-remote = false` starts the model
+  /// drained here (2.2.17, pool.hpp PresetDrainedModels): the partner's
+  /// relayed work of it gets 503 pool_busy and the partner runs it itself.
+  bool pool_accept_remote{true};
   /// Request body limit for this model (0 = only --max-request-bytes).
   std::size_t max_request_bytes{0};
 };

@@ -2058,6 +2058,43 @@ work without touching the placement (which only an admin may change).
   pause, and leaves it to the restart otherwise. A router older than
   2.1.8 answers `404` to the POST; the script then waits as before.
 
+#### One model (2.2.17)
+
+The same drain for a single model: the partner's new work of it stays
+off this machine, everything else (its other models, and this machine's
+own requests of the drained one) runs as before. Made for a model that
+does not fit this machine but does fit the partner: on 23.11. the .56
+(111 GB) relayed one `wan2.2-fun-vace-a14b` job after another to the .198
+(need 53.6-54.7 GB, 47.8 + 7.8 GB GPU, 63.6 GB commit), the .198 ran them
+`alone (estimate exceeds the machine)` at 0.4 GB free commit, and on
+22.11. 19:12 the machine went down.
+
+- `POST /router/pool/drain {"model": "<id>", "an": true|false, "grund":
+  "..."}` drains or releases one model served here (`404
+  model_not_found` for any other id, `400 invalid_drain` for a
+  non-string id). Same gate as the machine drain (admin or loopback,
+  never the partner). The answer and `GET /router/pool/drain` add
+  `"modelle": {"<id>": {"grund", "seit", "seit_s", "abgelehnt"}}`, also
+  in `/router/status` `"pool_drain"`. Logged as `event=pool_drain
+  model=<id> an=1 grund="..."`.
+- The remote section key `pool-accept-remote = false` starts the model
+  drained (`grund = "preset pool-accept-remote = false"`); default
+  `true`. The POST overrides it until the next restart.
+- While drained: a `POST` of that model the partner relays here
+  (`X-Gufo-Forwarded`, pool or remote placement there) gets `503
+  pool_busy`, `Retry-After: 30` (`event=pool_drain_refused model=...`);
+  the model's `"activity"` in `GET /v1/models` reports `"draining": true`
+  (and busy, for older partners), so the partner's pool leaves this
+  machine out for that model; this router pulls no job of it from the
+  partner (`may_pull`: "<id> drained"). Reads of jobs that already run
+  here, and this router's own requests, pass. `/router/capabilities` is
+  unchanged (this router's own job store keeps using the model).
+- Keep Fun-VACE off the .198 for the partner without a restart:
+  `POST http://127.0.0.1:8081/router/pool/drain {"model":
+  "wan2.2-fun-vace-a14b", "an": true, "grund": "commit"}` on the .198;
+  permanently with `pool-accept-remote = false` in its
+  `[remote/wan2.2-fun-vace-a14b]` section.
+
 ### Memory busy (2.2.3)
 
 With `--memory-guard` a cold load whose memory is held by another model
@@ -2309,6 +2346,35 @@ low` (the load was aborted) and a worker's own refusal. A model larger than
 the machine never gets the passing 507: the planner spawns it alone
 (`alone (estimate exceeds the machine)`).
 
+#### Commit beside a model spawned alone (2.2.17)
+
+Once a worker runs alone, the router has nothing left to give: the
+watchdog only stops loads and idle workers (`commit memory critical ...
+(nothing idle to stop)`), and the memory a job takes inside a running
+worker is decided by the worker. On the Strix Halo APU every device
+allocation is charged to the Windows commit, also while the DXGI budget
+still shows room, so the Wan 2.2 A14B workers (Fun VACE and I2V) count
+the free commit in their own residency checks:
+
+- The room they count on (`free_gib` in `event=resident_check`,
+  `experts_resident`, `job_memory_*`) is the device reading capped by the
+  free commit less 3 GB (`VaceCommitCappedFree`,
+  `kVaceCommitMarginBytes`); `commit_free_gib` is logged beside it. Linux
+  has no commit reading and keeps the device reading.
+- Both experts stay resident only when experts + the largest job phase
+  + 1.5 GB fit in that room; before a job beside resident experts the
+  largest phase (umT5 8.6 GB, VAE 4.5, sampling ~5-6) + 1.5 GB must fit,
+  otherwise the experts are released first
+  (`experts_released reason=low_memory_before_job`) and the worker runs
+  one expert at a time from then on (as for short device memory since
+  2.2.6). 22.11. 19:12 (47.8 GB device, ~36-40 GB commit free): one at a
+  time instead of 35.3 GB resident; 23.11. 07:18 (10.4 GB device, ~9 GB
+  commit free): experts released before umT5.
+- Cost on the .198: each job loads its two experts again (one after the
+  other) instead of reusing them. The .56 (enough commit) keeps them.
+- The per-model drain above keeps the partner's jobs of such a model off
+  the machine entirely.
+
 ### Lifecycle
 
 A worker spawns on the first request for its model; requests for the same
@@ -2370,6 +2436,7 @@ max-request-bytes = 67108864
 | `gpu-slot` | Remote models sharing the name run one GPU-starting request at a time |
 | `queue-timeout-seconds` | Longest wait for the slot and the busy check (default 900) |
 | `pool-wait-seconds` | placement = pool: longest wait on the partner before a request this router can run falls back here (default 60) |
+| `pool-accept-remote` | `false`: this router starts with the model drained for the partner (its relayed POSTs get 503 `pool_busy`, it runs them itself); own requests stay. Default `true`; `POST /router/pool/drain {"model"}` switches it at runtime (2.2.17) |
 | `busy-check-url` | Optional `http://<IPv4>:<port>/path` (a ComfyUI `/queue`); wait while it reports running or pending work |
 | `max-request-bytes` | 413 `request_too_large` above this body size |
 

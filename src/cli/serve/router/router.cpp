@@ -97,6 +97,11 @@ constexpr std::string_view kPresetGrammar =
     "      pool-wait-seconds = 60       placement = pool: longest wait on the\n"
     "                                   partner, then this machine (if it\n"
     "                                   has the model and LoRAs)\n"
+    "      pool-accept-remote = true    false: take no work of this model\n"
+    "                                   from the partner (503 pool_busy,\n"
+    "                                   it runs it itself); own requests\n"
+    "                                   stay (POST /router/pool/drain\n"
+    "                                   {\"model\"} switches it at runtime)\n"
     "      busy-check-url = http://<IPv4>:<port>/queue  optional ComfyUI\n"
     "                                   queue; wait while it runs anything\n"
     "      max-request-bytes = N        413 above N bytes\n"
@@ -135,6 +140,8 @@ constexpr std::string_view kPresetGrammar =
     "    admin or loopback): while on, new work the partner relays here\n"
     "    gets 503 pool_busy (it runs it itself) and the probe reports\n"
     "    \"draining\"; own requests run as before. Memory only.\n"
+    "    With \"model\": id (2.2.17) only that model is drained; a remote\n"
+    "    section's pool-accept-remote = false starts it drained.\n"
     "\n"
     "    [router]              users and access control (2.0.3), optional:\n"
     "      auth = off                   off (default): everyone may use\n"
@@ -1076,6 +1083,16 @@ public:
   std::string drain_reason_;
   std::chrono::system_clock::time_point drain_since_{};
   std::atomic<long long> drain_refused_{0};
+  /// 2.2.17 per-model drain (POST /router/pool/drain {"model": id}, preset
+  /// `pool-accept-remote = false`): like the drain above, for one model
+  /// only. State mutex (read by the route, the probe's activity and the
+  /// pull check, which hold it); never under drain_mutex_.
+  struct ModelDrain {
+    std::string reason;
+    std::chrono::system_clock::time_point since{};
+    long long refused{0};
+  };
+  std::map<std::string, ModelDrain> model_drains_;
   /// Where the pool put each job's request (X-Gufo-Job), state mutex:
   /// "wait" while it waits for a machine, then "local" or "remote"; the
   /// job store reads it for running_on / position and may redirect a
@@ -1402,6 +1419,27 @@ public:
       // 2.2.13: a finished local video/3D job answers from its folder; the
       // worker is not loaded for it.
       return std::move(*finished);
+    }
+    if (router::RefuseDrainedModelWork(
+            req.method, !req.header(router::kForwardedHeader).empty(),
+            ModelDrainedLocked(model_id))) {
+      // 2.2.17 per-model drain: the partner runs it itself (its pool takes
+      // the 503 as "partner failed" and holds the model off this machine).
+      ModelDrain& drain = model_drains_[model_id];
+      ++drain.refused;
+      Logger::Info("router", "event=pool_drain_refused model=" + model_id +
+                                 " path=" + req.path + " forwarded_by=" +
+                                 req.header(router::kForwardedHeader));
+      HttpResponse refused =
+          Err(503, "Service Unavailable",
+              "model '" + model_id +
+                  "' takes no work from the partner on this router" +
+                  (drain.reason.empty() ? std::string()
+                                        : " (" + drain.reason + ")") +
+                  "; run the request on your own machine",
+              "server_error", "pool_busy");
+      refused.headers.emplace_back("Retry-After", "30");
+      return refused;
     }
     if (PooledLocked(*preset, req, music_job)) {
       // placement = pool: this machine or the remote, per request.
@@ -1859,10 +1897,10 @@ public:
     out["others_busy"] =
         !cpu_model &&
         OthersBusyLocked(model_id, false, /*count_waiting=*/false);
-    if (draining_.load()) {
-      // Draining (2.1.8): a partner of this version leaves this machine
-      // out (RemotePoolSide); an older one sees it occupied and does not
-      // pick it either.
+    if (draining_.load() || ModelDrainedLocked(model_id)) {
+      // Draining (2.1.8; one model 2.2.17): a partner of this version
+      // leaves this machine out (RemotePoolSide); an older one sees it
+      // occupied and does not pick it either.
       out["draining"] = true;
       out["busy"] = true;
       out["others_busy"] = true;
@@ -1882,6 +1920,10 @@ public:
       return false;
     }
     const std::lock_guard<std::mutex> lock(mutex);
+    if (ModelDrainedLocked(model_id)) {
+      *why = model_id + " drained";
+      return false;
+    }
     if (registry.Busy(model_id)) {
       *why = model_id + " busy";
       return false;
@@ -2628,6 +2670,76 @@ public:
     return out;
   }
 
+  /// The models whose preset says `pool-accept-remote = false` start
+  /// drained (2.2.17, pool.hpp PresetDrainedModels).
+  void SeedModelDrains(const std::vector<router::PresetModel>& models) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    for (const std::string& id : router::PresetDrainedModels(models)) {
+      ModelDrain& drain = model_drains_[id];
+      drain.reason = "preset pool-accept-remote = false";
+      drain.since = std::chrono::system_clock::now();
+      Logger::Info("router", "event=pool_drain model=" + id +
+                                 " an=1 grund=\"" + drain.reason + "\"");
+    }
+  }
+
+  /// Whether `model_id` is drained for the partner (state mutex held).
+  bool ModelDrainedLocked(const std::string& model_id) const {
+    return model_drains_.contains(model_id);
+  }
+
+  /// "modelle" of GET /router/pool/drain: {id: {"grund", "seit", "seit_s",
+  /// "abgelehnt"}} of every drained model (takes the state mutex).
+  json::Value ModelDrainsJson() {
+    json::Value out = json::Value::object();
+    const auto now = std::chrono::system_clock::now();
+    const std::lock_guard<std::mutex> lock(mutex);
+    for (const auto& [id, drain] : model_drains_) {
+      json::Value entry = json::Value::object();
+      entry["grund"] = drain.reason;
+      entry["seit"] = static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::seconds>(
+              drain.since.time_since_epoch())
+              .count());
+      entry["seit_s"] = static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::seconds>(now - drain.since)
+              .count());
+      entry["abgelehnt"] = drain.refused;
+      out[id] = std::move(entry);
+    }
+    return out;
+  }
+
+  /// POST /router/pool/drain {"model": id, "an": true|false, "grund"}
+  /// (2.2.17): drains one model served here. 404 for a model this router
+  /// does not serve. Memory only.
+  std::optional<HttpResponse> ModelDrainControl(const std::string& model_id,
+                                                bool want,
+                                                const std::string& reason) {
+    bool was = false;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (registry.Find(model_id) == nullptr)
+        return Err(404, "Not Found",
+                   "model '" + model_id + "' is not served by this router",
+                   "invalid_request_error", "model_not_found");
+      was = model_drains_.contains(model_id);
+      if (want) {
+        ModelDrain& drain = model_drains_[model_id];
+        if (!was)
+          drain.since = std::chrono::system_clock::now();
+        drain.reason = reason;
+      } else {
+        model_drains_.erase(model_id);
+      }
+    }
+    if (was != want)
+      Logger::Info("router", "event=pool_drain model=" + model_id +
+                                 " an=" + (want ? "1" : "0") + " grund=\"" +
+                                 reason + "\"");
+    return std::nullopt;
+  }
+
   /// GET /router/pool/drain and the "pool_drain" of /router/status.
   json::Value DrainJson() {
     json::Value out = json::Value::object();
@@ -2651,6 +2763,7 @@ public:
       }
     }
     out["abgelehnt"] = drain_refused_.load();
+    out["modelle"] = ModelDrainsJson();
     return out;
   }
 
@@ -2658,7 +2771,8 @@ public:
   /// "grund": "..."} turns draining on or off (admin or loopback, the
   /// gate's kAdminControl rule; the partner may not); the answer is the
   /// state as GET gives it: {"an", "grund", "seit", "seit_s",
-  /// "abgelehnt"}. Not persisted.
+  /// "abgelehnt", "modelle"}. With "model": id (2.2.17) only that model
+  /// is drained ("modelle" lists them). Not persisted.
   HttpResponse DrainControl(const HttpRequest& req) {
     if (req.method == "POST") {
       json::Value body;
@@ -2676,6 +2790,16 @@ public:
       }
       const bool want = on->as_bool();
       const std::string reason = body.member_str("grund");
+      if (const json::Value* model = body.find("model"); model != nullptr) {
+        if (!model->is_string() || model->str().empty()) {
+          return Err(400, "Bad Request",
+                     "\"model\" must be a model id served here",
+                     "invalid_request_error", "invalid_drain");
+        }
+        if (auto failed = ModelDrainControl(model->str(), want, reason))
+          return std::move(*failed);
+        return JsonOk(DrainJson());
+      }
       bool was = false;
       {
         const std::lock_guard<std::mutex> lock(drain_mutex_);
@@ -5315,6 +5439,7 @@ int RunRouter(std::span<const char* const> args) {
     return 2;
   }
   auto state = std::make_shared<RouterState>(models, registry_options);
+  state->SeedModelDrains(models);
   state->exe_path = router::ExecutablePath();
   if (auto hub = std::make_unique<router::RemoteHub>(models); !hub->empty())
     state->remotes = std::move(hub);

@@ -340,6 +340,30 @@ void TestDrainingPartner() {
   CHECK(Choose(Cold(), busy, std::chrono::seconds(11)) == PoolChoice::kLocal);
 }
 
+/// 2.2.17 per-model drain: a remote section with `pool-accept-remote =
+/// false` starts the model drained; the partner's relayed POSTs of it are
+/// refused (503 pool_busy), reads and own requests pass, other models are
+/// untouched. 23.11.: Fun-VACE (53.6-54.7 GB need) relayed from the .56 ran
+/// alone on the .198 at 0.4 GB free commit.
+void TestModelDrain() {
+  using gufo::router::PresetDrainedModels;
+  using gufo::router::RefuseDrainedModelWork;
+  gufo::router::PresetModel vace = PoolTwin();
+  vace.id = "wan2.2-fun-vace-a14b";
+  gufo::router::PresetModel big = PoolTwin();
+  gufo::router::PresetModel local;
+  local.id = "local-only";
+  CHECK(PresetDrainedModels({vace, big, local}).empty());  // default: accept
+  vace.remote->pool_accept_remote = false;
+  const std::vector<std::string> drained =
+      PresetDrainedModels({vace, big, local, vace});
+  CHECK(drained.size() == 1 && drained[0] == "wan2.2-fun-vace-a14b");
+  CHECK(RefuseDrainedModelWork("POST", /*forwarded=*/true, true));
+  CHECK(!RefuseDrainedModelWork("POST", /*forwarded=*/false, true));
+  CHECK(!RefuseDrainedModelWork("GET", /*forwarded=*/true, true));
+  CHECK(!RefuseDrainedModelWork("POST", /*forwarded=*/true, false));
+}
+
 /// Regie #56-1003 (15.11., .56 on 2.1.7): a ComfyUI prompt asked for
 /// qwen-image-2.1 (cold here) while the 27B ran without a gap and the
 /// .198 drained. The prompt's own queue entry does not count for its call
@@ -1047,6 +1071,7 @@ int main() {
   TestWaitingIsNotBusy();
   TestProbeActivity();
   TestDrainingPartner();
+  TestModelDrain();
   TestNoSelfBlockadeWithPartnerOut();
   TestCpuModel();
   TestTextSessions();

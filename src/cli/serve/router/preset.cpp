@@ -242,6 +242,15 @@ bool ParseRemoteSection(const Section& section, PresetModel* model,
                             error);
       }
       spec.pool_wait_seconds = static_cast<int>(number);
+    } else if (key == "pool-accept-remote") {
+      const std::string_view text = TrimSpaces(value);
+      if (text != "true" && text != "false") {
+        return SectionError(section,
+                            "'pool-accept-remote' takes true|false, not '" +
+                                value + "'",
+                            error);
+      }
+      spec.pool_accept_remote = text == "true";
     } else if (key == "max-request-bytes") {
       if (!ParseWhole(value, 1, 1LL << 40, &number)) {
         return SectionError(section,

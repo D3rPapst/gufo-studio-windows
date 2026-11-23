@@ -211,6 +211,7 @@ void TestRemoteSection() {
       "busy-check-url = http://192.168.100.56:8085/queue\n"
       "queue-timeout-seconds = 60\n"
       "pool-wait-seconds = 20\n"
+      "pool-accept-remote = false\n"
       "max-request-bytes = 67108864\n"
       "\n"
       "[remote/tts]\n"
@@ -237,6 +238,7 @@ void TestRemoteSection() {
          spec.busy_check->path == "/queue");
   assert(spec.queue_timeout_seconds == 60);
   assert(spec.pool_wait_seconds == 20);
+  assert(!spec.pool_accept_remote);
   assert(spec.max_request_bytes == 67108864u);
   const auto& tts = *models[2].remote;
   // Defaults; a bare trailing slash is no path.
@@ -245,6 +247,7 @@ void TestRemoteSection() {
   assert(tts.gpu_slot.empty() && !tts.busy_check.has_value());
   assert(tts.queue_timeout_seconds == 900 && tts.max_request_bytes == 0);
   assert(tts.pool_wait_seconds == 60);
+  assert(tts.pool_accept_remote);
 }
 
 void TestRemoteErrors() {
@@ -254,6 +257,10 @@ void TestRemoteErrors() {
         name, ("[remote/r]\n" + keys).c_str(), "remote/r", token);
   };
   bad("gufo_router_preset_remote_no_url.conf", "modality = image\n", "url");
+  bad("gufo_router_preset_remote_bad_accept.conf",
+      "url = http://10.0.0.2:8081\nmodality = image\n"
+      "pool-accept-remote = nein\n",
+      "pool-accept-remote");
   bad("gufo_router_preset_remote_no_modality.conf",
       "url = http://10.0.0.2:8081\n", "modality");
   bad("gufo_router_preset_remote_bad_modality.conf",

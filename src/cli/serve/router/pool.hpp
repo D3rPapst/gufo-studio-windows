@@ -539,6 +539,35 @@ inline constexpr const char* kPartnerFreedAfterFallback =
   return "";
 }
 
+/// 2.2.17 per-model drain: the models whose remote section says
+/// `pool-accept-remote = false`. The router starts with them drained: it
+/// takes no new work of them from the partner (its own requests run as
+/// before). POST /router/pool/drain {"model": id, "an": ...} switches one
+/// at runtime; a restart starts from the preset again.
+/// 23.11.: wan2.2-fun-vace-a14b needs 53.6-54.7 GB on the .198 (more than
+/// its 47.8 + 7.8 GB GPU, 63.6 GB commit); the .56 (111 GB) relayed one
+/// Fun-VACE job after another, the .198 ran them alone at 0.4 GB free
+/// commit, and on 22.11. 19:12 the machine went down.
+[[nodiscard]] inline std::vector<std::string> PresetDrainedModels(
+    const std::vector<PresetModel>& models) {
+  std::vector<std::string> ids;
+  for (const PresetModel& model : models)
+    if (model.remote.has_value() && !model.remote->pool_accept_remote &&
+        std::find(ids.begin(), ids.end(), model.id) == ids.end())
+      ids.push_back(model.id);
+  return ids;
+}
+
+/// Whether a request is new work of a drained model that the partner
+/// relays here (a POST with X-Gufo-Forwarded): it gets 503 pool_busy, so
+/// the partner runs it itself. Reads, job control and anything of a model
+/// that is not drained pass.
+[[nodiscard]] inline bool RefuseDrainedModelWork(std::string_view method,
+                                                 bool forwarded,
+                                                 bool model_drained) {
+  return model_drained && forwarded && method == "POST";
+}
+
 /// "local" | "remote" from an X-Gufo-Pool header value; "" for anything
 /// else (any side).
 [[nodiscard]] inline std::string PoolSideOf(std::string_view header) {
