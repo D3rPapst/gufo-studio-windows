@@ -23,7 +23,8 @@
 //   gufo-trellis2-probe --stage shapedec --weights trellis2-shape_dec.safetensors --dumps DIR --out DIR
 //       [--device cpu|gpu] [--cpu-check] [--cpu-levels 2]
 //     DIR holds shape_latent_final.npy + shape_coords.npy; writes shape_dec_out.npy [M,7], shape_dec_coords.npy,
-//     shape_subdiv_{0..3}.npy, mesh.glb (dual grid, 512^3) and preview.png.
+//     shape_subdiv_{0..3}.npy, mesh.glb (dual grid, 512^3) and preview.png; --no-mesh stops after the .npy files
+//     (low host RAM: no dual grid, no GLB; prints children per level and the edge-flag count).
 //   gufo-trellis2-probe --stage tex --weights trellis2-tex_flow_512.safetensors --weights-dir trellis2-tex_dec.safetensors
 //       --dumps DIR --out DIR [--seed 42] [--steps 12]
 //     DIR holds dino_tokens_512, shape_latent_final, shape_coords, shape_subdiv_0..3; writes tex_noise.npy,
@@ -501,7 +502,8 @@ int run_shape(const SsRun& o) {
 }
 
 // ---------------------------------------------------------------- shape decoder + mesh
-int run_shapedec(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device, bool cpu_check, int cpu_levels) {
+int run_shapedec(const std::string& weights, const std::string& dumps, const std::string& out, const std::string& device, bool cpu_check, int cpu_levels,
+                 bool no_mesh) {
     std::string error;
     std::filesystem::create_directories(out);
     std::vector<float> latent;
@@ -566,7 +568,17 @@ int run_shapedec(const std::string& weights, const std::string& dumps, const std
     if (!save(out, "shape_dec_coords.npy", cf, {Mv, 3})) return 1;
     for (std::size_t l = 0; l < res.masks.size(); ++l) {
         std::vector<float> mf(res.masks[l].begin(), res.masks[l].end());
+        std::size_t ones = 0;
+        for (auto b : res.masks[l]) ones += b != 0;
+        std::cout << "  subdiv " << l << ": " << mf.size() / 8 << " voxels, " << ones << " children\n";
         if (!save(out, "shape_subdiv_" + std::to_string(l) + ".npy", mf, {mf.size() / 8, 8})) return 1;
+    }
+    if (no_mesh) {   // low host RAM (23.11.: the mesh of a 2M-voxel cup needs several GB)
+        std::size_t crossed = 0;
+        for (std::size_t i = 0; i < Mv; ++i)
+            for (int a = 0; a < 3; ++a) crossed += res.outputs[i * 7 + 3 + static_cast<std::size_t>(a)] > 0.f;
+        std::cout << "  edge flags " << crossed << " of " << 3 * Mv << " (no mesh)\n";
+        return 0;
     }
     // mesh
     std::vector<float> dual, wgt;
@@ -920,6 +932,7 @@ int main(int argc, char** argv) {
     std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
     std::string stage, weights, image, out, dumps, glb, device = "gpu", preset = "box";
     int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2, max_faces = 500000, texture_size = 1024;
+    bool no_mesh = false;
     std::string weights_dir, name = "objekt";
     bool texture = false;
     bool selftest = false, zero_cond = false, cpu_check = false;
@@ -947,6 +960,7 @@ int main(int argc, char** argv) {
         else if (a == "--selftest-dino") selftest = true;
         else if (a == "--zero-cond") zero_cond = true;
         else if (a == "--cpu-check") cpu_check = true;
+        else if (a == "--no-mesh") no_mesh = true;
         else return usage();
     }
     if (selftest) return selftest_dino(layers > 0 ? layers : 2, image_size);
@@ -974,7 +988,7 @@ int main(int argc, char** argv) {
     }
     if (stage == "shapedec") {
         if (weights.empty() || dumps.empty() || out.empty()) return usage();
-        return run_shapedec(weights, dumps, out, device, cpu_check, cpu_levels);
+        return run_shapedec(weights, dumps, out, device, cpu_check, cpu_levels, no_mesh);
     }
     if (stage == "tex") {
         if (weights.empty() || weights_dir.empty() || dumps.empty() || out.empty()) return usage();
