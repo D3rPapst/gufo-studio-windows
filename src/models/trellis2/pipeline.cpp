@@ -382,13 +382,20 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
     DualGridInput in;
     in.coords = &dec.coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
     in.resolution = res;
+    // Diagnostics (23.11.): the sign-field smoothing of 4630934b was never run on figures; the old
+    // production worker (6e66ed63, no smoothing) gives Lars 645k raw faces, this path 41k.
+    if (const char* s = std::getenv("GUFO_TRELLIS2_SIGN_SMOOTH")) in.sign_smooth_passes = std::max(0, std::atoi(s));
     DualGridStats st;
     Mesh mesh = dual_grid_to_mesh(in, &st);
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
     result->seam_edges = st.seam_edges;
     // stray bubbles: 512 faces at 512, scaled with the surface (x4 at 1024, x9 at 1536)
-    result->small_components_removed = remove_small_components(&mesh, static_cast<std::size_t>(512.0 * (res / 512.0) * (res / 512.0)));
+    std::size_t min_faces = static_cast<std::size_t>(512.0 * (res / 512.0) * (res / 512.0));
+    if (const char* s = std::getenv("GUFO_TRELLIS2_MIN_COMPONENT")) min_faces = static_cast<std::size_t>(std::max(0, std::atoi(s)));
+    result->small_components_removed = remove_small_components(&mesh, min_faces);
+    diag("mesh: sign smoothing passes " + std::to_string(in.sign_smooth_passes) + ", smoothed corners " + std::to_string(st.smoothed_corners) +
+         ", min component " + std::to_string(min_faces) + " faces");
     const UnifyStats un = unify_orientation(&mesh);
     result->flipped_faces = un.flipped_faces;
     HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);
