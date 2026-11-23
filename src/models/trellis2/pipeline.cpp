@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <random>
 
 #include "src/models/trellis2/cascade.hpp"
@@ -56,6 +59,32 @@ bool run_flow(DitHip& dit, std::vector<float>& x, int channels, const std::vecto
     hooks.tick = tick;
     return sample_flow(forward, x, static_cast<int>(coords.size()), channels, extra, extra_channels, conds, zero_cond, p, steps, mode,
                        hooks, error);
+}
+
+// Diagnostics: one stderr line per stage (worker log), cheap. GUFO_TRELLIS2_DEBUG_DIR also saves
+// the preprocessed square of every view as PNG (what DINOv3 sees, before the final resize).
+void diag(const std::string& line) {
+    std::fprintf(stderr, "trellis2: %s\n", line.c_str());
+    std::fflush(stderr);
+}
+std::string stats_text(const std::vector<float>& v, std::size_t stride = 0, std::size_t column = 0) {
+    double sum = 0, sq = 0;
+    float lo = 0, hi = 0;
+    std::size_t n = 0;
+    for (std::size_t i = stride ? column : 0; i < v.size(); i += stride ? stride : 1) {
+        const float x = v[i];
+        if (n == 0) lo = hi = x;
+        lo = std::min(lo, x); hi = std::max(hi, x);
+        sum += x; sq += static_cast<double>(x) * x; ++n;
+    }
+    if (n == 0) return "n=0";
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "n=%zu mean=%.4g rms=%.4g min=%.4g max=%.4g", n, sum / n, std::sqrt(sq / n), lo, hi);
+    return buf;
+}
+std::string debug_dir() {
+    const char* d = std::getenv("GUFO_TRELLIS2_DEBUG_DIR");
+    return d ? std::string(d) : std::string();
 }
 
 std::vector<const float*> pointers(const std::vector<std::vector<float>>& v) {
@@ -216,6 +245,15 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
             }
             auto& out = image == 512 ? cond512[static_cast<std::size_t>(v)] : cond1024[static_cast<std::size_t>(v)];
             if (!m.dino->Encode(pre.pixels.data(), image, &out, error)) return false;
+            diag("view " + std::to_string(v + 1) + "/" + std::to_string(V) + " " + std::to_string(view.width) + "x" + std::to_string(view.height) +
+                 " bbox " + std::to_string(pre.bbox[0]) + "," + std::to_string(pre.bbox[1]) + " " + std::to_string(pre.bbox[2]) + "x" +
+                 std::to_string(pre.bbox[3]) + " square " + std::to_string(pre.square_size) + " -> " + std::to_string(image) + " px; pixels " +
+                 stats_text(pre.pixels) + "; tokens " + stats_text(out));
+            if (const std::string dir = debug_dir(); !dir.empty() && !pre.square.empty()) {
+                const auto png = encode_png_rgb(pre.square.data(), pre.square_size, pre.square_size);
+                std::ofstream f(std::filesystem::path(dir) / ("view" + std::to_string(v + 1) + "-" + std::to_string(image) + ".png"), std::ios::binary);
+                f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+            }
             report("encode", ++done, encodes);
             if (cancelled(cancel)) return fail_cancel();
         }
@@ -243,6 +281,7 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
     std::vector<Coord> coords = occupancy_to_coords(logits.data(), 64, 32);
     result->structure_voxels = coords.size();
     result->seconds_structure = seconds_since(t0);
+    diag("structure: latent " + stats_text(x) + "; logits " + stats_text(logits) + "; tokens(32^3) " + std::to_string(coords.size()));
     if (coords.empty()) { if (error) *error = "no active voxels in the sparse structure"; return false; }
     if (cancelled(cancel)) return fail_cancel();
 
@@ -258,6 +297,7 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
         for (std::size_t i = 0; i < s.size() / Cl; ++i)
             for (int c = 0; c < Cl; ++c) s[i * Cl + static_cast<std::size_t>(c)] = s[i * Cl + static_cast<std::size_t>(c)] * kShapeStd[c] + kShapeMean[c];
     };
+    diag("shape 512: normalised latent " + stats_text(slat));
     std::vector<float> slat_norm = slat;   // normalised (for the texture flow), slat -> denormalised
     denormalise(slat);
     int res = 512;
@@ -269,6 +309,8 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
         std::vector<float>().swap(up.outputs);
         up.masks.clear();
         coords = cascade_coords(up.coords, o.resolution, o.max_tokens > 0 ? o.max_tokens : kCascadeMaxTokens, &res);
+        diag("cascade: " + std::to_string(up.coords.size()) + " voxels on the 512 grid -> " + std::to_string(coords.size()) + " tokens at " +
+             std::to_string(res));
         std::vector<Coord>().swap(up.coords);
         report("upsample", 1, 1);
         if (cancelled(cancel)) return fail_cancel();
@@ -293,6 +335,20 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
     if (!m.shape_dec->Forward(slat.data(), coords, &dec, error)) return false;
     result->shape_voxels = dec.coords.size();
     result->seconds_decode = seconds_since(t0);
+    {
+        std::string levels;
+        for (const auto& mk : dec.masks) {
+            std::size_t ones = 0;
+            for (auto b : mk) ones += b != 0;
+            levels += " " + std::to_string(mk.size() / 8) + "->" + std::to_string(ones);
+        }
+        std::size_t crossed = 0;
+        for (std::size_t i = 0; i < dec.coords.size(); ++i)
+            for (int a = 0; a < 3; ++a) crossed += dec.outputs[i * 7 + 3 + static_cast<std::size_t>(a)] > 0.f;
+        diag("decode: levels" + levels + "; voxels " + std::to_string(dec.coords.size()) + "; edge flags " + std::to_string(crossed) +
+             "; vertex logit " + stats_text(dec.outputs, 7, 0) + "; edge logit " + stats_text(dec.outputs, 7, 3) + "; weight " +
+             stats_text(dec.outputs, 7, 6));
+    }
     report("decode", 1, 1);
     if (cancelled(cancel)) return fail_cancel();
     // 5. texture (optional): attributes per voxel of the final level
@@ -340,6 +396,9 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
     result->open_loops = hf.skipped_large + hf.skipped_nonmanifold;
     hf.skipped_perimeters.resize(std::min<std::size_t>(hf.skipped_perimeters.size(), 5));
     result->largest_open_loops = std::move(hf.skipped_perimeters);
+    diag("mesh: raw " + std::to_string(result->faces_before_decimation) + " faces, seam edges " + std::to_string(st.seam_edges) +
+         ", small components removed " + std::to_string(result->small_components_removed) + ", after cleanup " +
+         std::to_string(mesh.faces.size()) + " faces, holes filled " + std::to_string(hf.filled));
     { std::vector<float>().swap(dual); std::vector<float>().swap(wgt); std::vector<std::uint8_t>().swap(inter); }   // host RAM
     std::vector<float>().swap(dec.outputs);
     report("mesh", 2, 3);
