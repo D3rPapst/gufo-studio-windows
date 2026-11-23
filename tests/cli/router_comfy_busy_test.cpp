@@ -9,6 +9,16 @@
 //    is empty and the router's memory check says the first model must wait.
 // The router is a fake fetch; no model, no GPU.
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -16,6 +26,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "src/cli/serve/http_server.hpp"
@@ -658,12 +669,184 @@ void TestMemoryWaitOf() {
   CHECK(!comfy::MemoryWaitOf({.status = 503, .body = kOverloadedBody}));
 }
 
+// 2.2.18: /history extra_data.gufo_host / gufo_hosts name the machine each
+// image or video task rendered on (AdapterOptions::run_side), also when the
+// prompt failed.
+std::string ExtraHost(const json::Value& entry, std::size_t* tasks) {
+  const json::Value* prompt = entry.find("prompt");
+  if (prompt == nullptr || !prompt->is_array() || prompt->items().size() < 4)
+    return {};
+  const json::Value& extra = prompt->items()[3];
+  if (const json::Value* by_node = extra.find("gufo_hosts");
+      by_node != nullptr && by_node->is_object()) {
+    *tasks = by_node->members().size();
+    for (const auto& [node, host] : by_node->members())
+      if (!host.is_string() || host.str() != extra.member_str("gufo_host"))
+        *tasks = 99;  // one task here: its host is the prompt's
+  }
+  return extra.member_str("gufo_host");
+}
+
+void TestHistoryHost(const std::filesystem::path& root) {
+  // A video on the partner without a partner name: "remote".
+  {
+    comfy::AdapterOptions options;
+    options.root = root / "host-video";
+    options.video_poll = std::chrono::milliseconds(10);
+    options.fetch = [&](const HttpRequest& request) {
+      if (request.method == "POST" && request.path == "/v1/videos")
+        return comfy::FetchResult{.status = 202,
+                                  .body = R"({"id":"video_host1","status":"queued"})",
+                                  .content_type = "application/json"};
+      if (request.method == "GET" && request.path == "/v1/videos/video_host1")
+        return comfy::FetchResult{
+            .status = 200,
+            .body = R"({"id":"video_host1","status":"failed","error":{"message":"fake end"}})"};
+      return comfy::FetchResult{.status = 404, .body = "{}"};
+    };
+    options.run_side = [](const std::string& target, bool video) {
+      return video && target == "video_host1" ? std::string("remote")
+                                              : std::string();
+    };
+    comfy::Adapter adapter(std::move(options));
+    adapter.Start();
+    const HttpResponse accepted =
+        Post(adapter, std::string(R"({"prompt":)") + kH3Text +
+                          R"(,"extra_data":{"mine":1}})");
+    CHECK(accepted.status == 200);
+    const auto entry =
+        History(adapter, json::parse(accepted.body).member_str("prompt_id"));
+    CHECK(entry.has_value());
+    if (entry) {
+      std::size_t tasks = 0;
+      CHECK(ExtraHost(*entry, &tasks) == "remote");
+      CHECK(tasks == 1);
+      // The client's own extra_data stays.
+      CHECK(entry->find("prompt")->items()[3].find("mine") != nullptr);
+    }
+    adapter.Stop();
+  }
+  // An image the pool sent to the named partner; then one with no side
+  // known (not a pool model): "local".
+  for (const bool remote : {true, false}) {
+    comfy::AdapterOptions options;
+    options.root = root / (remote ? "host-image-remote" : "host-image-local");
+    options.fetch = [&](const HttpRequest& request) {
+      if (request.path == "/v1/images/generations" ||
+          request.path == "/v1/images/edits")
+        return comfy::FetchResult{
+            .status = 500,
+            .body = R"({"error":{"message":"fake image end"}})",
+            .content_type = "application/json"};
+      return comfy::FetchResult{.status = 404, .body = "{}"};
+    };
+    options.run_side = [remote](const std::string&, bool video) {
+      return !video && remote ? std::string("remote") : std::string();
+    };
+    comfy::Adapter adapter(std::move(options));
+    adapter.SetPartner("http://192.168.178.56:8081",
+                       [](const HttpRequest&) {
+                         return comfy::FetchResult{.status = 404, .body = "{}"};
+                       });
+    adapter.Start();
+    const HttpResponse accepted =
+        Post(adapter, std::string(R"({"prompt":)") + kQwenText + "}");
+    CHECK(accepted.status == 200);
+    const auto entry =
+        History(adapter, json::parse(accepted.body).member_str("prompt_id"));
+    CHECK(entry.has_value());
+    if (entry) {
+      std::size_t tasks = 0;
+      CHECK(ExtraHost(*entry, &tasks) ==
+            (remote ? "http://192.168.178.56:8081" : "local"));
+      CHECK(tasks == 1);
+      CHECK(ErrorText(*entry).find("fake image end") != std::string::npos);
+    }
+    adapter.Stop();
+  }
+}
+
+// 2.2.18: this test binary is also a fake ffmpeg (FakeFfmpegMain).
+constexpr const char* kFakeFfmpegReason =
+    "[vist#0:0/h264 @ 0000] Error submitting packet to decoder: "
+    "Generic error in an external library";
+
+std::filesystem::path SelfPath() {
+#if defined(_WIN32)
+  std::wstring buffer(32768, L'\0');
+  const DWORD size = GetModuleFileNameW(nullptr, buffer.data(),
+                                        static_cast<DWORD>(buffer.size()));
+  buffer.resize(size);
+  return std::filesystem::path(buffer);
+#else
+  return std::filesystem::read_symlink("/proc/self/exe");
+#endif
+}
+
+/// Run as "ffmpeg": "fail" anywhere in the arguments writes 3 KB of lines
+/// and then kFakeFfmpegReason to stderr and exits like ffmpeg's
+/// AVERROR_EXTERNAL; otherwise one line to stdout and exit 0.
+int FakeFfmpegMain(int argc, char** argv) {
+  bool fail = false;
+  for (int i = 1; i < argc; ++i)
+    fail = fail || std::string_view(argv[i]) == "fail";
+  if (!fail) {
+    std::cout << "fake ffmpeg ok\n";
+    return 0;
+  }
+  for (int i = 0; i < 60; ++i)
+    std::cerr << "[noise " << i << "] early line that should be cut away\n";
+  std::cerr << kFakeFfmpegReason << "\r\n\n";
+  std::cerr.flush();
+  return 1;
+}
+
+void TestFfmpegErrorTail(const std::filesystem::path& root) {
+  CHECK(comfy::FfmpegErrorTail("  \r\n", 2048).empty());
+  CHECK(comfy::FfmpegErrorTail("a\r\nb\n\nc\n", 2048) == "a | b | c");
+  // Cut to the end, never inside a UTF-8 character ("ä" is 2 bytes).
+  const std::string cut = comfy::FfmpegErrorTail("xxxx\xC3\xA4yz", 3);
+  CHECK(cut == "...yz");
+  CHECK(comfy::FfmpegErrorTail("xxxx\xC3\xA4yz", 4) == "...\xC3\xA4yz");
+
+  std::filesystem::create_directories(root / "ffmpeg");
+  const std::filesystem::path self = SelfPath();
+  const std::filesystem::path log = root / "ffmpeg" / "run.log";
+  std::string error;
+  CHECK(comfy::RunFfmpegTool(self, {"-i", "x.mp4", "ok.mp4"}, log, &error,
+                             std::chrono::minutes(1)));
+  CHECK(error.empty());
+  CHECK(!std::filesystem::exists(log));  // removed again
+  CHECK(!comfy::RunFfmpegTool(self, {"-i", "x.mp4", "fail"}, log, &error,
+                              std::chrono::minutes(1)));
+  CHECK(error.find("ffmpeg exited with 1") == 0);
+  CHECK(error.find("Generic error in an external library") !=
+        std::string::npos);
+  CHECK(error.find("[noise 0]") == std::string::npos);  // only the end
+  // At most the last 2 KB of stderr: "..." plus " | " for each line break.
+  CHECK(error.find("ffmpeg exited with 1: ...") == 0);
+  CHECK(error.size() <= std::string("ffmpeg exited with 1: ...").size() +
+                            comfy::kFfmpegErrorTailBytes + 2 * 60);
+  CHECK(!std::filesystem::exists(log));
+  // Without a log file the exit code alone, as before.
+  CHECK(!comfy::RunFfmpegTool(self, {"fail"}, {}, &error,
+                              std::chrono::minutes(1)));
+  CHECK(error == "ffmpeg exited with 1");
+  CHECK(!comfy::RunFfmpegTool({}, {"fail"}, log, &error,
+                              std::chrono::minutes(1)));
+  CHECK(error.find("no ffmpeg configured") == 0);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "-hide_banner")
+    return FakeFfmpegMain(argc, argv);
   const auto root = std::filesystem::temp_directory_path() /
                     "gufo-comfy-busy-test";
   std::filesystem::remove_all(root);
+  TestFfmpegErrorTail(root);
+  TestHistoryHost(root);
   TestMemoryBusyOf();
   TestHistoryMark(root);
   TestSubmitRefused(root);

@@ -881,6 +881,15 @@ Branches (two chunks continuing one) and independent videos joined in one
 output fail validation, as do RIFE / upscale nodes behind a chain and sound
 outputs. Needs `--comfy-ffmpeg`. `comfy_graph.cpp` `I2VChain`,
 `ApplyI2VChain`, `ChainFramesOf`; `comfy_adapter.cpp` `RunI2VChain`.
+Every ffmpeg run of the adapter (joins, cuts, scaling, start frames;
+2.2.18 `RunFfmpegTool`) writes ffmpeg's stdout/stderr (`-loglevel
+error`) to a work file (`temp/.gufo-work/work-N-*.ffmpeg.log`, removed
+right after); a failure ends in "ffmpeg exited with N: <last 2 KB of that
+output, lines joined with ` | `>" in the task's error (the prompt's
+`execution_error` `exception_message`) and in the log line
+`event=ffmpeg_failed error="..." args="..."` (arguments cut at 1500
+bytes). Before, a join that failed under parallel load said only the exit
+code (21.11.: `-542398533` = `AVERROR_EXTERNAL`).
 Seam smoothing (2.2.16, off by default = ComfyUI's plain `ImageBatch`):
 `extra_data.gufo_seam` on `/prompt` = `true` (both tools, 8 blend frames)
 or `{"color_match": bool, "blend_frames": 0..32}` (400 `invalid_prompt`
@@ -1153,6 +1162,19 @@ request still waits in the pool or has no image/video task, is
 `"local"`); a partner older than 2.2.17 sends no `gufo_host`, then its
 items say the partner. `gufo_router` still names the queue a prompt is
 in; only fields were added.
+
+`GET /history` (2.2.18) keeps the answer once a prompt ended: its entry's
+`prompt[3]` (`extra_data`) carries `gufo_host`, the machine of its newest
+started image or video task by the same rule (`"local"`, the partner's
+`http://host:port`, `"remote"` without a partner name; `"local"` when no
+image/video request went out), and `gufo_hosts`, `{node id: host}` for
+every image or video task whose request went out. Both are written when
+the prompt ends (success, error or interrupt), before its preview ids are
+released, and stay in `history.json`; the client's own `extra_data`
+fields are kept. A video counts as the partner's when it was created
+through the partner (`Registry::JobRemote`, kept for the last 1024
+finished jobs), an image when the pool sent its request there
+(`preview_sides_`, kept an hour). `comfy_adapter.cpp` `TaskHosts`.
 
 ### Figure check (`POST /v1/figuren`)
 

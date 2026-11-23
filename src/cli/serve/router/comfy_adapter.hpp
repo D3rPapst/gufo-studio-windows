@@ -215,6 +215,26 @@ struct MemoryWait {
          status == 504;
 }
 
+/// 2.2.18: how much of ffmpeg's stderr (its end) goes into an error.
+constexpr std::size_t kFfmpegErrorTailBytes = 2048;
+
+/// The last `max_bytes` of `text` (ffmpeg's stderr) as one line: blanks at
+/// both ends dropped, lines joined with " | " (so the result may be a little
+/// longer than max_bytes), "..." in front when cut (never inside a UTF-8
+/// character).
+[[nodiscard]] std::string FfmpegErrorTail(std::string_view text,
+                                          std::size_t max_bytes);
+
+/// 2.2.18: runs `ffmpeg` with `args` after "-hide_banner -loglevel error
+/// -nostdin -y". Its stdout and stderr go to `log_file` (removed again;
+/// empty = not kept). false on failure with *error = "ffmpeg exited with
+/// N" (or the start/timeout error) + ": " + FfmpegErrorTail of what it
+/// wrote, so a failed join says why.
+bool RunFfmpegTool(const std::filesystem::path& ffmpeg,
+                   const std::vector<std::filesystem::path>& args,
+                   const std::filesystem::path& log_file, std::string* error,
+                   std::chrono::minutes timeout);
+
 /// The user a request acts for when it may touch only that user's
 /// prompts: X-Gufo-User from the access gate, empty for an admin, the
 /// router itself, loopback and auth = off.
@@ -441,6 +461,14 @@ private:
   /// AdapterOptions::run_side with no lock held.
   std::vector<std::string> RunningHosts(
       const std::vector<std::shared_ptr<Job>>& running);
+  /// "local", the partner's name or "remote" for a task's preview target
+  /// (AdapterOptions::run_side, no lock held; "local" when not known).
+  std::string HostOfTarget(const std::string& target, bool video) const;
+  /// 2.2.18 (/history extra_data.gufo_host / gufo_hosts): where each image
+  /// or video task of a finished prompt rendered, {node id, host}, in the
+  /// order the tasks started (newest last); tasks whose request never went
+  /// out are left out. Same rule as RunningHosts; call before EndPreviews.
+  std::vector<std::pair<std::string, std::string>> TaskHosts(const Job& job);
   int QueueRemainingLocked() const;
   void PersistLocked();
   void LoadHistory();
