@@ -19,6 +19,7 @@ public:
         o.resolution = r.resolution;
         o.max_faces = r.max_faces;
         o.preview = r.preview;
+        o.keep_mesh = r.print_ready;
         GenerateResult g;
         if (!pipeline_->Generate(r.rgba.data(), r.width, r.height, o, progress, cancel, &g, error)) return false;
         out->glb = std::move(g.glb);
@@ -33,6 +34,7 @@ public:
         out->seconds_denoise = g.seconds_denoise;
         out->seconds_decode = g.seconds_decode;
         out->seconds_mesh = g.seconds_mesh;
+        out->print_source = std::move(g.mesh);
         return true;
     }
     std::size_t weight_bytes() const override { return pipeline_->weight_bytes(); }

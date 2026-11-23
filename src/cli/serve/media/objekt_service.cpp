@@ -7,6 +7,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -15,6 +16,7 @@
 #include <thread>
 
 #include "src/core/json.hpp"
+#include "src/core/mesh/print_ready.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 
 namespace gufo::server {
@@ -107,6 +109,12 @@ struct Job {
   triposg::ObjektResult result;    // glb/preview cleared after writing
   std::string error_code, error_message;
   int views = 1;   // images of the request (request.more_views is cleared after the run)
+  // Print-ready step (request.print_ready): statistics or the error; the job itself still
+  // completes with the normal GLB when only this step fails.
+  bool print_done = false;
+  std::string print_error;
+  mesh::PrintStats print_stats;
+  bool print_stl = false, print_glb = false;
   std::filesystem::path directory;
   std::atomic<bool> cancel{false};
   bool deleted = false;
@@ -149,7 +157,8 @@ int ProgressPercent(const std::string& phase, int completed, int total) {
   else if (phase == "texture") { lo = 60; hi = 90; }
   else if (phase == "decode") { lo = 55; hi = 90; }
   else if (phase == "mesh") { lo = 90; hi = 97; }
-  else if (phase == "export") { lo = 97; hi = 99; }
+  else if (phase == "export") { lo = 97; hi = 98; }
+  else if (phase == "print") { lo = 98; hi = 99; }   // print-ready step (CPU, after the GLB)
   return static_cast<int>(lo + (hi - lo) * f);
 }
 
@@ -208,6 +217,15 @@ struct ObjektService::Impl {
     root["texture_size"] = j.request.texture_size;
     root["views"] = j.views;
     if (j.views > 1) root["multi_mode"] = j.request.multi_mode;
+    root["print_ready"] = j.request.print_ready;
+    if (j.request.print_ready) {
+      if (j.request.print_height_mm > 0) root["print_height_mm"] = j.request.print_height_mm;
+      if (j.request.print_eye_height_mm > 0) {
+        root["print_eye_height_mm"] = j.request.print_eye_height_mm;
+        root["print_eye_ratio"] = j.request.print_eye_ratio;
+      }
+      root["print_format"] = j.request.print_format;
+    }
     root["created_at"] = j.created_at;
     root["completed_at"] = j.completed_at > 0 ? json::Value(j.completed_at) : json::Value();
     root["expires_at"] = j.expires_at > 0 ? json::Value(j.expires_at) : json::Value();
@@ -243,10 +261,52 @@ struct ObjektService::Impl {
       t["decode"] = j.result.seconds_decode;
       t["mesh"] = j.result.seconds_mesh;
       item["seconds"] = t;
+      if (j.request.print_ready) item["print"] = PrintSnapshot(j);
       data.push_back(std::move(item));
     }
     root["data"] = data;
     return root;
+  }
+
+  // data[0].print: where the print files are and what they hold (sizes in mm, Z up).
+  static json::Value PrintSnapshot(const Job& j) {
+    json::Value p = json::Value::object();
+    const std::string base = std::string(kObjektApiPath) + "/" + j.id;
+    p["status"] = j.print_done ? "completed" : "failed";
+    if (!j.print_error.empty()) p["error"] = j.print_error;
+    if (!j.print_done) return p;
+    const mesh::PrintStats& s = j.print_stats;
+    if (j.print_stl) p["stl_url"] = base + "/print.stl";
+    if (j.print_glb) p["glb_url"] = base + "/print.glb";
+    p["watertight"] = s.open_edges == 0;
+    p["open_edges"] = static_cast<unsigned long long>(s.open_edges);
+    p["bodies"] = static_cast<unsigned long long>(s.bodies);
+    p["faces"] = static_cast<unsigned long long>(s.faces);
+    p["vertices"] = static_cast<unsigned long long>(s.vertices);
+    json::Value size = json::Value::array();
+    for (int a = 0; a < 3; ++a) size.push_back(s.size[a]);
+    p["size_mm"] = size;
+    p["height_mm"] = s.size[2];
+    p["volume_mm3"] = s.volume;
+    p["scale"] = s.scale;
+    json::Value grid = json::Value::array();
+    for (int a = 0; a < 3; ++a) grid.push_back(s.dims[a]);
+    p["grid"] = grid;
+    p["snapped"] = s.snapped_fraction;
+    p["open_slices"] = static_cast<unsigned long long>(s.open_slices);
+    p["patched_slices"] = static_cast<unsigned long long>(s.patched_slices);
+    p["seconds"] = s.seconds;
+    // Output check (watertight, boundary edges, winding, volume, bodies) and its one-line summary.
+    json::Value c = json::Value::object();
+    c["watertight"] = s.check.watertight;
+    c["boundary_edges"] = static_cast<unsigned long long>(s.check.boundary_edges);
+    c["nonmanifold_edges"] = static_cast<unsigned long long>(s.check.nonmanifold_edges);
+    c["winding_consistent"] = s.check.winding_consistent;
+    c["volume_positive"] = s.check.volume > 0;
+    c["bodies"] = static_cast<unsigned long long>(s.check.bodies);
+    c["line"] = mesh::check_line(s.check);
+    p["check"] = std::move(c);
+    return p;
   }
 
   void PersistLocked(const Job& j) {
@@ -288,6 +348,11 @@ struct ObjektService::Impl {
         job->request.texture_size = static_cast<int>(v.member_double("texture_size", 1024));
         job->views = static_cast<int>(v.member_double("views", 1));
         job->request.multi_mode = v.member_str("multi_mode", "stochastic");
+        if (const json::Value* p = v.find("print_ready"); p && p->is_bool()) job->request.print_ready = p->as_bool();
+        job->request.print_height_mm = v.member_double("print_height_mm", 0);
+        job->request.print_eye_height_mm = v.member_double("print_eye_height_mm", 0);
+        job->request.print_eye_ratio = v.member_double("print_eye_ratio", 0.93);
+        job->request.print_format = v.member_str("print_format", "both");
         if (const json::Value* data = v.find("data"); data && data->is_array() && !data->empty()) {
           const json::Value& item = data->items()[0];
           job->result.vertices = item.member_size("vertices");
@@ -297,6 +362,35 @@ struct ObjektService::Impl {
           job->result.volume = item.member_double("volume");
           job->result.resolution = static_cast<int>(item.member_double("resolution", 0));
           job->result.tokens = item.member_size("tokens");
+          if (const json::Value* p = item.find("print"); p && p->is_object()) {
+            job->print_done = p->member_str("status") == "completed";
+            job->print_error = p->member_str("error");
+            job->print_stl = p->find("stl_url") != nullptr;
+            job->print_glb = p->find("glb_url") != nullptr;
+            mesh::PrintStats& s = job->print_stats;
+            s.open_edges = p->member_size("open_edges");
+            s.bodies = p->member_size("bodies");
+            s.faces = p->member_size("faces");
+            s.vertices = p->member_size("vertices");
+            if (const json::Value* size = p->find("size_mm"); size && size->is_array() && size->items().size() == 3)
+              for (int a = 0; a < 3; ++a) s.size[a] = size->items()[static_cast<std::size_t>(a)].as_double();
+            if (const json::Value* grid = p->find("grid"); grid && grid->is_array() && grid->items().size() == 3)
+              for (int a = 0; a < 3; ++a) s.dims[a] = static_cast<int>(grid->items()[static_cast<std::size_t>(a)].as_double());
+            s.volume = p->member_double("volume_mm3");
+            s.scale = p->member_double("scale", 1);
+            s.snapped_fraction = p->member_double("snapped");
+            s.open_slices = p->member_size("open_slices");
+            s.patched_slices = p->member_size("patched_slices");
+            s.seconds = p->member_double("seconds");
+            if (const json::Value* c = p->find("check"); c && c->is_object()) {
+              s.check.watertight = c->find("watertight") && c->find("watertight")->as_bool();
+              s.check.winding_consistent = c->find("winding_consistent") && c->find("winding_consistent")->as_bool();
+              s.check.boundary_edges = c->member_size("boundary_edges");
+              s.check.nonmanifold_edges = c->member_size("nonmanifold_edges");
+              s.check.bodies = c->member_size("bodies");
+              s.check.volume = c->find("volume_positive") && c->find("volume_positive")->as_bool() ? s.volume : 0.0;
+            }
+          }
           if (const json::Value* bbox = item.find("bbox"); bbox && bbox->find("min") && bbox->find("max"))
             for (int a = 0; a < 3; ++a) {
               job->result.bbox_min[a] = static_cast<float>(bbox->find("min")->items()[static_cast<std::size_t>(a)].as_double());
@@ -324,6 +418,45 @@ struct ObjektService::Impl {
         ++it;
       }
     }
+  }
+
+  // Print-ready step on the CPU after the GLB was written (src/core/mesh/print_ready.hpp):
+  // print.stl (binary, mm, Z up) and print.glb (vertex colours, Y up, metres). A failure here
+  // leaves the job completed with its normal GLB and data[0].print.status "failed".
+  void RunPrint(Job& job, triposg::ObjektResult* result, const std::function<void(const std::string&, int, int)>& progress) {
+    mesh::PrintOptions po;
+    po.height_mm = job.request.print_height_mm;
+    po.eye_height_mm = job.request.print_eye_height_mm;
+    po.eye_ratio = job.request.print_eye_ratio;
+    po.cancel = &job.cancel;
+    po.progress = [&](int done, int total) { progress("print", done, total); };
+    mesh::PrintResult pr;
+    std::string error;
+    bool ok = !result->print_source.indices.empty();
+    if (!ok) error = "the model returned no mesh for the print step";
+    else ok = mesh::make_print_ready(result->print_source, po, &pr, &error);
+    result->print_source = {};
+    bool stl = false, glb = false;
+    if (ok) {
+      const std::string& f = job.request.print_format;
+      if (f != "glb") {
+        const auto bytes = mesh::write_stl(pr.mesh);
+        stl = WriteAll(job.directory / "print.stl", bytes.data(), bytes.size(), &error);
+      }
+      if (f != "stl" && error.empty()) {
+        const auto bytes = mesh::write_print_glb(pr.mesh, pr.stats.scale != 1.0 ? 0.001 : 1.0);
+        glb = WriteAll(job.directory / "print.glb", bytes.data(), bytes.size(), &error);
+      }
+      ok = error.empty();
+      if (ok && !(pr.stats.check.watertight && pr.stats.check.winding_consistent && pr.stats.check.volume > 0 && pr.stats.check.bodies == 1))
+        error = "print mesh check: " + mesh::check_line(pr.stats.check);
+    }
+    const std::lock_guard<std::mutex> lock(mutex);
+    job.print_done = ok;
+    job.print_error = error;
+    job.print_stats = pr.stats;
+    job.print_stl = stl;
+    job.print_glb = glb;
   }
 
   void Run(std::stop_token st) {
@@ -358,7 +491,9 @@ struct ObjektService::Impl {
         written = WriteAll(job->directory / "model.glb", result.glb.data(), result.glb.size(), &write_error);
         if (written && !result.preview_png.empty())
           (void)WriteAll(job->directory / "preview.png", result.preview_png.data(), result.preview_png.size(), &write_error);
+        if (written && job->request.print_ready) RunPrint(*job, &result, progress);
       }
+      result.print_source = {};   // host RAM
       {
         const std::lock_guard<std::mutex> lock(mutex);
         job->request.rgba.clear();
@@ -448,7 +583,7 @@ void ObjektService::Describe(json::Value* entry, bool ready) const {
 HttpResponse ObjektService::Handle(const HttpRequest& request) {
   Impl& m = *impl_;
   if (!ready()) return Error(503, "Service Unavailable", "3D service is not ready", "objekt_service_unavailable");
-  // Path: /v1/3d/generations[/<id>[/content|/preview]]
+  // Path: /v1/3d/generations[/<id>[/content|/preview|/print.stl|/print.glb]]
   std::string id, sub;
   if (request.path.size() > kObjektApiPath.size() + 1) {
     std::string rest = request.path.substr(kObjektApiPath.size() + 1);
@@ -549,7 +684,38 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     if (!IntInRange(body, "max_faces", 200000, 0, 5000000, &job->request.max_faces)) return Error(400, "Bad Request", "max_faces must be 0..5000000", "invalid_max_faces");
     if (const json::Value* p = body.find("preview"); p && p->is_bool()) job->request.preview = p->as_bool();
     if (const json::Value* p = body.find("texture"); p && p->is_bool()) job->request.texture = p->as_bool();
-    if (!IntInRange(body, "texture_size", 1024, 0, 4096, &job->request.texture_size)) return Error(400, "Bad Request", "texture_size must be 0..4096", "invalid_texture_size");    job->created_at = UnixNow();
+    if (!IntInRange(body, "texture_size", 1024, 0, 4096, &job->request.texture_size)) return Error(400, "Bad Request", "texture_size must be 0..4096", "invalid_texture_size");
+    // Print-ready result (druckfertig): off by default; heights in mm, 28 mm eye height when none is given.
+    if (const json::Value* p = body.find("print_ready"); p && !p->is_null()) {
+      if (!p->is_bool()) return Error(400, "Bad Request", "print_ready must be true or false", "invalid_print_ready");
+      job->request.print_ready = p->as_bool();
+    }
+    const auto mm = [&](const char* name, double* out) -> bool {
+      const json::Value* v = body.find(name);
+      if (!v || v->is_null()) return true;
+      if (!v->is_number()) return false;
+      const double x = v->as_double();
+      if (!std::isfinite(x) || x < 1.0 || x > 2000.0) return false;
+      *out = x;
+      return true;
+    };
+    if (!mm("print_height_mm", &job->request.print_height_mm)) return Error(400, "Bad Request", "print_height_mm must be 1..2000", "invalid_print_height");
+    if (!mm("print_eye_height_mm", &job->request.print_eye_height_mm)) return Error(400, "Bad Request", "print_eye_height_mm must be 1..2000", "invalid_print_height");
+    if (job->request.print_height_mm > 0 && job->request.print_eye_height_mm > 0)
+      return Error(400, "Bad Request", "send either print_height_mm or print_eye_height_mm, not both", "invalid_print_height");
+    {
+      const double ratio = body.member_double("print_eye_ratio", 0.93);
+      if (!(ratio >= 0.5 && ratio <= 1.0)) return Error(400, "Bad Request", "print_eye_ratio must be 0.5..1", "invalid_print_eye_ratio");
+      job->request.print_eye_ratio = ratio;
+    }
+    if (const json::Value* f = body.find("print_format"); f && !f->is_null()) {
+      if (!f->is_string() || (f->str() != "stl" && f->str() != "glb" && f->str() != "both"))
+        return Error(400, "Bad Request", "print_format must be \"stl\", \"glb\" or \"both\"", "invalid_print_format");
+      job->request.print_format = f->str();
+    }
+    if (job->request.print_ready && job->request.print_height_mm <= 0 && job->request.print_eye_height_mm <= 0)
+      job->request.print_eye_height_mm = 28.0;
+    job->created_at = UnixNow();
     {
       const std::lock_guard<std::mutex> lock(m.mutex);
       m.SweepExpiredLocked();
@@ -566,7 +732,7 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     HttpResponse response{.status = 202, .reason = "Accepted", .body = m.Snapshot(*job).dump(), .headers = {}, .streaming_body = {}};
     response.headers.emplace_back("Location", std::string(kObjektApiPath) + "/" + job->id);
     response.log_details = "job=" + job->id + " steps=" + std::to_string(job->request.steps) + " res=" + std::to_string(job->request.resolution) +
-                           " views=" + std::to_string(job->views);
+                           " views=" + std::to_string(job->views) + (job->request.print_ready ? " print=1" : "");
     return response;
   }
   if (id.empty()) return Error(405, "Method Not Allowed", "use POST /v1/3d/generations", "method_not_allowed");
@@ -582,18 +748,25 @@ HttpResponse ObjektService::Handle(const HttpRequest& request) {
     const std::lock_guard<std::mutex> lock(m.mutex);
     return {.status = 200, .reason = "OK", .body = m.Snapshot(*job).dump(), .headers = {}, .streaming_body = {}};
   }
-  if (request.method == "GET" && (sub == "content" || sub == "preview")) {
+  if (request.method == "GET" && (sub == "content" || sub == "preview" || sub == "print.stl" || sub == "print.glb")) {
     {
       const std::lock_guard<std::mutex> lock(m.mutex);
       if (job->status != Status::kCompleted) return Error(409, "Conflict", "3D generation is not finished", "objekt_not_ready");
+      if ((sub == "print.stl" && !job->print_stl) || (sub == "print.glb" && !job->print_glb))
+        return Error(404, "Not Found", job->request.print_ready ? "no print file of this kind (see data[0].print)" : "the job was not print_ready", "objekt_print_missing");
     }
-    const std::filesystem::path file = job->directory / (sub == "content" ? "model.glb" : "preview.png");
+    const std::filesystem::path file = job->directory / (sub == "content" ? "model.glb" : sub == "preview" ? "preview.png" : sub);
     std::ifstream in(file, std::ios::binary);
     if (!in) return Error(404, "Not Found", "result file is missing", "objekt_file_missing");
     std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     HttpResponse response{.status = 200, .reason = "OK", .body = std::move(data), .headers = {}, .streaming_body = {}};
-    response.headers.emplace_back("Content-Type", sub == "content" ? "model/gltf-binary" : "image/png");
-    response.headers.emplace_back("Content-Disposition", sub == "content" ? "attachment; filename=\"" + id + ".glb\"" : "inline; filename=\"" + id + ".png\"");
+    const char* type = sub == "preview" ? "image/png" : sub == "print.stl" ? "model/stl" : "model/gltf-binary";
+    std::string disposition = "inline; filename=\"" + id + ".png\"";
+    if (sub == "content") disposition = "attachment; filename=\"" + id + ".glb\"";
+    else if (sub == "print.stl") disposition = "attachment; filename=\"" + id + "-druck.stl\"";
+    else if (sub == "print.glb") disposition = "attachment; filename=\"" + id + "-druck.glb\"";
+    response.headers.emplace_back("Content-Type", type);
+    response.headers.emplace_back("Content-Disposition", disposition);
     response.log_details = "job=" + id + " file=" + sub;
     return response;
   }

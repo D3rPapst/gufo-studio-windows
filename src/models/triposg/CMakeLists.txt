@@ -9,8 +9,8 @@
 # probe (--stage mesh), software preview PNG (mesh_preview.cpp).
 # AI-assisted (Claude Code), 2026-11-12.
 
+# marching_cubes.cpp is compiled into gufo_mesh_print (src/core/mesh), shared with the print step.
 add_library(gufo_triposg_cpu STATIC
-  marching_cubes.cpp
   glb_writer.cpp
   preprocess.cpp
   dinov2_cpu.cpp
@@ -21,7 +21,7 @@ add_library(gufo_triposg_cpu STATIC
   mesh_decimate.cpp)
 target_include_directories(gufo_triposg_cpu PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_triposg_cpu PUBLIC cxx_std_20)
-target_link_libraries(gufo_triposg_cpu PUBLIC gufo_platform)
+target_link_libraries(gufo_triposg_cpu PUBLIC gufo_platform gufo_mesh_print)
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
   target_link_libraries(gufo_triposg_cpu PRIVATE OpenMP::OpenMP_CXX)

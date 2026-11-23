@@ -1,10 +1,12 @@
 // gufo serve objekt (ObjektService) with a fake runner, no model, no GPU:
 // numbers are range-checked before the int conversion (1e300 steps, a
 // negative seed) and a DELETE while the job runs leaves no job directory;
-// TRELLIS.2 options: `images` (views), `resolution` 1024 / 1536 per runner, `multi_mode`.
+// TRELLIS.2 options: `images` (views), `resolution` 1024 / 1536 per runner, `multi_mode`;
+// print_ready (druckfertig): validation, defaults, print.stl / print.glb, restart.
 // AI-assisted (Claude Code), 2026-11-12; views and resolutions 2026-11-22.
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -229,6 +231,114 @@ void TestViewsAndResolutions(gufo::server::ObjektService& service, ViewsRunner& 
   CHECK(runner.views == 1 && runner.resolution == 512);
 }
 
+// Runner that hands back a closed, thin bar (Y up, 1 x 0.1 x 0.1) with vertex colours when the
+// request is print_ready (as the TRELLIS.2 / TripoSG runners do).
+struct PrintRunner : gufo::triposg::ObjektRunner {
+  std::atomic<bool> last_print{false};
+  bool Run(const gufo::triposg::ObjektRequest& r, const gufo::triposg::ObjektProgress&, const std::atomic<bool>*,
+           gufo::triposg::ObjektResult* result, std::string*) override {
+    last_print = r.print_ready;
+    result->glb = {'g', 'l', 'T', 'F'};
+    if (r.print_ready) {
+      gufo::mesh::PrintMesh& m = result->print_source;
+      for (int k = 0; k < 8; ++k) {
+        m.positions.insert(m.positions.end(), {(k & 1) ? 0.05f : -0.05f, (k & 2) ? 1.0f : 0.0f, (k & 4) ? 0.05f : -0.05f});
+        m.colors.insert(m.colors.end(), {255, 0, 0, 255});
+      }
+      const int quads[6][4] = {{0, 2, 3, 1}, {4, 5, 7, 6}, {0, 1, 5, 4}, {2, 6, 7, 3}, {0, 4, 6, 2}, {1, 3, 7, 5}};
+      for (const auto& q : quads) {
+        m.indices.insert(m.indices.end(), {std::uint32_t(q[0]), std::uint32_t(q[1]), std::uint32_t(q[2])});
+        m.indices.insert(m.indices.end(), {std::uint32_t(q[0]), std::uint32_t(q[2]), std::uint32_t(q[3])});
+      }
+    }
+    return true;
+  }
+  std::size_t weight_bytes() const override { return 0; }
+};
+
+HttpResponse Get(gufo::server::ObjektService& service, const std::string& path) {
+  HttpRequest request;
+  request.method = "GET";
+  request.path = path;
+  return service.Handle(request);
+}
+
+std::string Header(const HttpResponse& response, const std::string& name) {
+  for (const auto& [k, v] : response.headers)
+    if (k == name) return v;
+  return "";
+}
+
+json::Value WaitFinished(gufo::server::ObjektService& service, const std::string& id) {
+  // The print step takes longer than the fake runs above.
+  for (int i = 0; i < 100; ++i) {
+    const json::Value v = WaitDone(service, id);
+    if (v.member_str("status") == "completed" || v.member_str("status") == "failed") return v;
+  }
+  return json::Value::object();
+}
+
+const json::Value* PrintOf(const json::Value& done) {
+  const json::Value* data = done.find("data");
+  if (!data || !data->is_array() || data->empty()) return nullptr;
+  return data->items()[0].find("print");
+}
+
+void TestPrintReady(gufo::server::ObjektService& service, PrintRunner& runner, const std::filesystem::path& root) {
+  // validation
+  CHECK(Code(Post(service, R"(,"print_ready":"yes")")) == "invalid_print_ready");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_height_mm":0.5)")) == "invalid_print_height");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_height_mm":"28")")) == "invalid_print_height");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_eye_height_mm":1e300)")) == "invalid_print_height");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_height_mm":30,"print_eye_height_mm":28)")) == "invalid_print_height");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_eye_ratio":2)")) == "invalid_print_eye_ratio");
+  CHECK(Code(Post(service, R"(,"print_ready":true,"print_format":"3mf")")) == "invalid_print_format");
+  // default off: old requests unchanged, no print files
+  HttpResponse created = Post(service, "");
+  CHECK(created.status == 202);
+  json::Value snap = json::parse(created.body);
+  CHECK(snap.find("print_ready") && !snap.find("print_ready")->as_bool() && snap.find("print_height_mm") == nullptr);
+  json::Value done = WaitFinished(service, snap.member_str("id"));
+  CHECK(done.member_str("status") == "completed" && !runner.last_print.load());
+  CHECK(done.find("data") && PrintOf(done) == nullptr);
+  CHECK(Code(Get(service, "/v1/3d/generations/" + snap.member_str("id") + "/print.stl")) == "objekt_print_missing");
+  // eye height default 28 mm when no height is given, STL only
+  created = Post(service, R"(,"print_ready":true,"print_format":"stl")");
+  CHECK(created.status == 202);
+  snap = json::parse(created.body);
+  CHECK(snap.member_double("print_eye_height_mm") == 28 && snap.member_double("print_eye_ratio") == 0.93);
+  done = WaitFinished(service, snap.member_str("id"));
+  const json::Value* print = PrintOf(done);
+  CHECK(print && print->member_str("status") == "completed" && print->find("stl_url") && !print->find("glb_url"));
+  CHECK(print && std::fabs(print->member_double("height_mm") - 28 / 0.93) < 1e-6);
+  CHECK(Code(Get(service, "/v1/3d/generations/" + snap.member_str("id") + "/print.glb")) == "objekt_print_missing");
+  // total height 40 mm, both files
+  created = Post(service, R"(,"print_ready":true,"print_height_mm":40)");
+  CHECK(created.status == 202);
+  const std::string id = json::parse(created.body).member_str("id");
+  done = WaitFinished(service, id);
+  CHECK(runner.last_print.load());
+  print = PrintOf(done);
+  CHECK(print && print->member_str("status") == "completed");
+  CHECK(print && print->find("watertight") && print->find("watertight")->as_bool() && print->member_double("bodies") == 1);
+  const json::Value* check = print ? print->find("check") : nullptr;
+  CHECK(check && check->find("watertight")->as_bool() && check->find("winding_consistent")->as_bool() &&
+        check->find("volume_positive")->as_bool() && check->member_double("bodies") == 1 && check->member_double("boundary_edges") == 0);
+  CHECK(check && check->member_str("line") ==
+                     "watertight yes, boundary edges 0, non-manifold edges 0, winding consistent yes, volume > 0 yes, bodies 1");
+  CHECK(print && print->find("error") == nullptr);
+  CHECK(print && std::fabs(print->member_double("height_mm") - 40) < 1e-6);
+  CHECK(print && print->member_str("stl_url") == "/v1/3d/generations/" + id + "/print.stl" &&
+        print->member_str("glb_url") == "/v1/3d/generations/" + id + "/print.glb");
+  const HttpResponse stl = Get(service, "/v1/3d/generations/" + id + "/print.stl");
+  CHECK(stl.status == 200 && Header(stl, "Content-Type") == "model/stl");
+  CHECK(print && stl.body.size() == 84 + 50 * static_cast<std::size_t>(print->member_double("faces")));
+  CHECK(Header(stl, "Content-Disposition").find(id + "-druck.stl") != std::string::npos);
+  const HttpResponse glb = Get(service, "/v1/3d/generations/" + id + "/print.glb");
+  CHECK(glb.status == 200 && glb.body.size() > 12 && glb.body.compare(0, 4, "glTF") == 0);
+  CHECK(std::filesystem::exists(root / id / "print.stl") && std::filesystem::exists(root / id / "print.glb"));
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +365,27 @@ int main() {
     gufo::server::ObjektService service(options);
     CHECK(service.ready());
     TestViewsAndResolutions(service, *views);
+  }
+  {
+    auto printer = std::make_shared<PrintRunner>();
+    gufo::server::ObjektServiceOptions options;
+    options.runner = printer;
+    options.storage_root = root / "print";
+    std::string id;
+    {
+      gufo::server::ObjektService service(options);
+      CHECK(service.ready());
+      TestPrintReady(service, *printer, options.storage_root);
+      HttpResponse created = Post(service, R"(,"print_ready":true,"print_height_mm":35)");
+      id = json::parse(created.body).member_str("id");
+      WaitFinished(service, id);
+    }
+    // A restarted worker still serves the print files of a finished job.
+    gufo::server::ObjektService again(options);
+    const json::Value v = json::parse(Get(again, "/v1/3d/generations/" + id).body);
+    const json::Value* print = PrintOf(v);
+    CHECK(print && print->member_str("status") == "completed" && std::fabs(print->member_double("height_mm") - 35) < 1e-6);
+    CHECK(Get(again, "/v1/3d/generations/" + id + "/print.stl").status == 200);
   }
   std::filesystem::remove_all(root);
   if (failures != 0) {

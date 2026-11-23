@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/mesh/print_ready.hpp"
+
 namespace gufo::triposg {
 
 struct GenerateOptions {
@@ -22,6 +24,7 @@ struct GenerateOptions {
     int max_faces = 200000;    // 0 = no decimation
     bool preview = true;       // render preview.png (three views)
     int preview_size = 384;
+    bool keep_mesh = false;    // hand the exported mesh back in GenerateResult::mesh (print-ready step)
 };
 
 struct GenerateResult {
@@ -32,6 +35,7 @@ struct GenerateResult {
     double volume = 0;
     bool closed = false;
     double seconds_encode = 0, seconds_denoise = 0, seconds_decode = 0, seconds_mesh = 0;
+    gufo::mesh::PrintMesh mesh;      // with keep_mesh: the exported mesh (glTF frame, no colours)
 };
 
 // phase: "encode" | "denoise" | "decode" | "mesh" | "export"; completed/total within the phase.

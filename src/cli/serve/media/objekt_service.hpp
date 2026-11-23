@@ -1,11 +1,14 @@
 // gufo serve objekt: asynchronous image -> 3D jobs (TripoSG, TRELLIS.2) behind
 //   POST   /v1/3d/generations            {model, image (base64 | data URL), steps, guidance,
 //                                         seed, resolution 256|512, max_faces, preview,
-//                                         texture, texture_size}
+//                                         texture, texture_size, print_ready, print_height_mm |
+//                                         print_eye_height_mm, print_eye_ratio, print_format}
 //                                         -> 202 {id, status, progress, ...} + Location
-//   GET    /v1/3d/generations/{id}       -> status snapshot (data[] once completed)
+//   GET    /v1/3d/generations/{id}       -> status snapshot (data[] once completed, data[0].print)
 //   GET    /v1/3d/generations/{id}/content  -> model/gltf-binary (attachment {id}.glb)
 //   GET    /v1/3d/generations/{id}/preview  -> image/png (three views)
+//   GET    /v1/3d/generations/{id}/print.stl -> model/stl (print_ready: watertight, mm, Z up)
+//   GET    /v1/3d/generations/{id}/print.glb -> model/gltf-binary (print_ready: vertex colours, metres)
 //   DELETE /v1/3d/generations/{id}       -> cancel / remove
 // One worker thread, queue capacity 1 (one running + one waiting), results persisted
 // under <storage_root>/<id>/ with a TTL like the video jobs.

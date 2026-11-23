@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/mesh/print_ready.hpp"
 #include "src/models/trellis2/flow_sampler.hpp"
 
 namespace gufo::trellis2 {
@@ -41,6 +42,7 @@ struct GenerateOptions {
     int preview_size = 384;
     bool texture = false;       // stage 8: texture flow + decoder -> vertex colours
     int texture_size = 0;       // stage 9: > 0 bakes PBR textures of this size (UV unwrap), 0 = vertex colours
+    bool keep_mesh = false;     // hand the exported mesh (Y up, vertex colours) back in GenerateResult::mesh
 };
 
 struct GenerateResult {
@@ -59,6 +61,7 @@ struct GenerateResult {
     std::size_t tokens = 0;      // tokens of the last shape flow (cascade: high-resolution tokens)
     int views = 1;
     double seconds_encode = 0, seconds_structure = 0, seconds_shape = 0, seconds_decode = 0, seconds_mesh = 0, seconds_texture = 0;
+    gufo::mesh::PrintMesh mesh;        // with keep_mesh: the exported mesh (print-ready step)
 };
 
 // phase: "encode" | "structure" | "shape" | "decode" | "texture" | "mesh" | "export".

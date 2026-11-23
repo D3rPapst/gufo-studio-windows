@@ -29,6 +29,7 @@ public:
         o.preview = r.preview;
         o.texture = r.texture && pipeline_->has_texture();
         o.texture_size = o.texture ? std::clamp(r.texture_size, 0, 4096) : 0;
+        o.keep_mesh = r.print_ready;
         GenerateResult g;
         if (!pipeline_->Generate(views, o, progress, cancel, &g, error)) return false;
         out->glb = std::move(g.glb);
@@ -45,6 +46,7 @@ public:
         out->seconds_mesh = g.seconds_mesh;
         out->resolution = g.resolution;
         out->tokens = g.tokens;
+        out->print_source = std::move(g.mesh);
         return true;
     }
     std::size_t weight_bytes() const override { return pipeline_->weight_bytes(); }

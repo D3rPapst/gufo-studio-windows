@@ -473,6 +473,23 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
         go.roughness_factor = roughness;
     }
     result->glb = write_glb(mesh, go);
+    if (o.keep_mesh) {   // print-ready step (src/core/mesh/print_ready.hpp): exported geometry + vertex colours
+        gufo::mesh::PrintMesh& pm = result->mesh;
+        pm.positions.resize(mesh.vertices.size() * 3);
+        for (std::size_t v = 0; v < mesh.vertices.size(); ++v) {
+            pm.positions[v * 3] = mesh.vertices[v].x;
+            pm.positions[v * 3 + 1] = mesh.vertices[v].y;
+            pm.positions[v * 3 + 2] = mesh.vertices[v].z;
+        }
+        pm.indices.resize(mesh.faces.size() * 3);
+        for (std::size_t f = 0; f < mesh.faces.size(); ++f)
+            for (int k = 0; k < 3; ++k) pm.indices[f * 3 + k] = mesh.faces[f][static_cast<std::size_t>(k)];
+        if (colours.size() == mesh.vertices.size() * 4) {
+            pm.colors.resize(colours.size());
+            for (std::size_t i = 0; i < colours.size(); ++i)
+                pm.colors[i] = static_cast<std::uint8_t>(std::clamp(std::lround(colours[i] * 255.f), 0l, 255l));
+        }
+    }
     if (o.preview) {
         PreviewOptions po;
         po.size = o.preview_size;

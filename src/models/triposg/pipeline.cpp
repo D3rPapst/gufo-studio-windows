@@ -170,6 +170,18 @@ bool Pipeline::Generate(const std::uint8_t* rgba, int width, int height, const G
     result->seconds_mesh = seconds_since(t0);
     report("export", 0, 1);
     result->glb = write_glb(mesh);
+    if (o.keep_mesh) {   // print-ready step (src/core/mesh/print_ready.hpp)
+        gufo::mesh::PrintMesh& pm = result->mesh;
+        pm.positions.resize(mesh.vertices.size() * 3);
+        for (std::size_t v = 0; v < mesh.vertices.size(); ++v) {
+            pm.positions[v * 3] = mesh.vertices[v].x;
+            pm.positions[v * 3 + 1] = mesh.vertices[v].y;
+            pm.positions[v * 3 + 2] = mesh.vertices[v].z;
+        }
+        pm.indices.resize(mesh.faces.size() * 3);
+        for (std::size_t f = 0; f < mesh.faces.size(); ++f)
+            for (int k = 0; k < 3; ++k) pm.indices[f * 3 + k] = mesh.faces[f][static_cast<std::size_t>(k)];
+    }
     if (o.preview) {
         PreviewOptions po;
         po.size = o.preview_size;

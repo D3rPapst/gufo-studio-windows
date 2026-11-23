@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/mesh/print_ready.hpp"
+
 namespace gufo::triposg {
 
 // A further view of the same object (TRELLIS.2 multi-image conditioning).
@@ -33,6 +35,13 @@ struct ObjektRequest {
     bool preview = true;
     bool texture = false;   // TRELLIS.2: texture flow + decoder (vertex colours)
     int texture_size = 1024;   // TRELLIS.2 with texture: 0 = vertex colours, else baked PBR textures of this size
+    // Print-ready result ("druckfertig", src/core/mesh/print_ready.hpp): the runner hands the final
+    // mesh back in ObjektResult::print_source, the service closes, smooths and scales it.
+    bool print_ready = false;
+    double print_height_mm = 0;        // total height (wins when > 0)
+    double print_eye_height_mm = 0;    // sole to eyes, eyes at print_eye_ratio of the height
+    double print_eye_ratio = 0.93;
+    std::string print_format = "both";   // stl | glb | both
 };
 
 struct ObjektResult {
@@ -44,6 +53,9 @@ struct ObjektResult {
     double seconds_encode = 0, seconds_denoise = 0, seconds_decode = 0, seconds_mesh = 0;
     int resolution = 0;       // grid actually used (TRELLIS.2 1536 may step down under the token cap; 0 = as requested)
     std::size_t tokens = 0;   // TRELLIS.2: tokens of the last shape flow
+    // With request.print_ready: the exported mesh (glTF frame, Y up) with vertex colours when the
+    // model has them; the service consumes and clears it.
+    gufo::mesh::PrintMesh print_source;
 };
 
 using ObjektProgress = std::function<void(const std::string& phase, int completed, int total)>;

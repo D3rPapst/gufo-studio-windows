@@ -35,6 +35,8 @@ add_subdirectory(src/models/qwen3_omni)
 # TripoSG and TRELLIS.2 image -> 3D (`gufo serve objekt`, feat/trellis2):
 # the GPU runners in HIP builds, stubs that report the missing GPU path
 # otherwise.
+# Print-ready meshes (`print_ready` requests) and the shared marching cubes.
+add_subdirectory(src/core/mesh)
 add_subdirectory(src/models/triposg)
 add_subdirectory(src/models/trellis2)
 
@@ -50,7 +52,7 @@ add_library(gufo_media STATIC
   src/cli/serve/media/video_upscale.cpp
 )
 target_link_libraries(gufo_media PUBLIC gufo_http gufo_core gufo_ace_step
-  gufo_mmaudio gufo_rife gufo_realesrgan_cpu gufo_qwen_image_21 PNG::PNG)
+  gufo_mmaudio gufo_rife gufo_realesrgan_cpu gufo_qwen_image_21 gufo_mesh_print PNG::PNG)
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_media PUBLIC gufo_triposg gufo_trellis2)
 else()
@@ -94,7 +96,7 @@ if (BUILD_TESTING)
   # the test needs no media / HIP libraries.
   add_executable(objekt_service_test tests/cli/objekt_service_test.cpp
     src/cli/serve/media/objekt_service.cpp)
-  target_link_libraries(objekt_service_test PRIVATE gufo_qwen_image_21)
+  target_link_libraries(objekt_service_test PRIVATE gufo_qwen_image_21 gufo_mesh_print)
   target_compile_options(objekt_service_test PRIVATE ${gufo_media_test_undebug})
   add_test(NAME objekt_service_test COMMAND objekt_service_test)
   set_tests_properties(objekt_service_test PROPERTIES
