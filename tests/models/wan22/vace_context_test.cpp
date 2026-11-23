@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -237,6 +238,32 @@ int main() {
            "2.2.6 leftovers (0.3 GB free): release the experts");
     Expect(!wan22::VaceJobFitsBesideResident(UINT64_MAX, UINT64_MAX - 1),
            "no overflow (beside resident)");
+    // Windows commit (2.2.17): every device allocation of the APU is
+    // charged to it. 22.11. 19:12 on the .198: 47.8 GiB device free, the
+    // experts loaded resident and the commit fell to 0.2 GB (crash).
+    Expect(wan22::VaceCommitCappedFree(free, std::nullopt) == free,
+           "no commit reading (Linux): the device reading");
+    Expect(wan22::VaceCommitCappedFree(free, 100 * kGb) == free,
+           "plenty of commit (.56): the device reading");
+    Expect(wan22::VaceCommitCappedFree(free, 38 * kGb) ==
+               38 * kGb - wan22::kVaceCommitMarginBytes,
+           "short commit caps the reading, less the margin");
+    Expect(wan22::VaceCommitCappedFree(free, 2 * kGb) == 0,
+           "commit below the margin: nothing");
+    Expect(!wan22::VaceExpertsFit(wan22::VaceCommitCappedFree(free, 38 * kGb),
+                                  experts, peak),
+           ".198 at 38 GiB commit free: one expert at a time");
+    // 23.11. 07:18: next job beside the resident experts, 10.4 GiB device
+    // free, ~9 GiB commit free; its umT5 (8.6) left 0.4 GB of commit.
+    const std::uint64_t free_0718 = 10 * kGb + 4 * kGb / 10;
+    Expect(wan22::VaceJobFitsBesideResident(free_0718, peak),
+           "device alone: umT5 fits beside the experts");
+    Expect(!wan22::VaceJobFitsBesideResident(
+               wan22::VaceCommitCappedFree(free_0718, 9 * kGb), peak),
+           "commit short: release the experts before umT5");
+    Expect(wan22::VaceJobFitsBesideResident(
+               wan22::VaceCommitCappedFree(12 * kGb, 40 * kGb), peak),
+           "commit enough: the experts stay");
   }
 
   // Wan 2.2 I2V A14B residency per phase: one expert sampling is the

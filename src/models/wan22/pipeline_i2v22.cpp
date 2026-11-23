@@ -10,12 +10,14 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
 
 #include "src/core/hip/admission_query.hpp"
 #include "src/core/logging/logging.hpp"
+#include "src/core/platform/os_info.hpp"
 #include "src/models/wan22/pipeline.hpp"
 #include "src/models/wan22/text_encoder.hpp"
 #include "src/models/wan22/tokenizer.hpp"
@@ -93,17 +95,29 @@ std::uint64_t DirectoryBytes(const std::filesystem::path& directory) {
   return total;
 }
 
+/// Windows commit still free (RAM + page file), nullopt elsewhere: on an
+/// APU the device allocations of the experts, umT5 and the VAE are charged
+/// to it (vace_context.hpp, VaceCommitCappedFree).
+std::optional<std::uint64_t> CommitFreeBytes() {
+  if (const auto host = gufo::platform::QueryHostMemory())
+    return host->commit_available_bytes;
+  return std::nullopt;
+}
+
 /// What this process can still allocate on the device: the admission
 /// reading, capped by the dedicated (DXGI local) budget left on a Windows
 /// iGPU, whose shared segment the next job's umT5 cannot count on (as
 /// GenerateVace21).
+/// Capped as well by the Windows commit left (VaceCommitCappedFree): the
+/// residency checks never count on device memory the commit cannot back.
 std::uint64_t DeviceFreeBytes() {
+  std::uint64_t device = 0;
   if (const auto memory = gufo::hip::QueryAdmissionMemory())
-    return VaceDeviceFreeBytes(
+    device = VaceDeviceFreeBytes(
         memory->free_bytes, memory->local.has_value(),
         memory->local ? memory->local->budget_bytes : 0,
         memory->local ? memory->local->usage_bytes : 0);
-  return 0;
+  return VaceCommitCappedFree(device, CommitFreeBytes());
 }
 
 std::string Gib(std::uint64_t bytes) {
@@ -157,6 +171,8 @@ void LogMemory(const std::string& event, const std::string& extra) {
                     ? local.budget_bytes - local.usage_bytes
                     : 0);
   }
+  if (const auto commit = CommitFreeBytes())
+    line += " commit_free_gib=" + Gib(*commit);
   LogI2V(line + " free_gib=" + Gib(DeviceFreeBytes()) + extra);
 }
 

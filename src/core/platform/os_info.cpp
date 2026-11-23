@@ -160,7 +160,8 @@ std::optional<HostMemory> QueryHostMemory() {
   status.dwLength = sizeof(status);
   if (!GlobalMemoryStatusEx(&status))
     return std::nullopt;
-  return HostMemory{status.ullTotalPhys, status.ullAvailPhys};
+  return HostMemory{status.ullTotalPhys, status.ullAvailPhys,
+                    status.ullAvailPageFile};
 #else
   const long pages = ::sysconf(_SC_PHYS_PAGES);
   const long page_size = ::sysconf(_SC_PAGESIZE);

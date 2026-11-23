@@ -133,6 +133,17 @@ std::uint64_t VaceDeviceFreeBytes(std::uint64_t admission_free, bool has_local,
   return std::min(admission_free, local_left);
 }
 
+std::uint64_t VaceCommitCappedFree(std::uint64_t device_free,
+                                   std::optional<std::uint64_t> commit_free) {
+  if (!commit_free.has_value())
+    return device_free;
+  const std::uint64_t commit_left =
+      *commit_free > kVaceCommitMarginBytes
+          ? *commit_free - kVaceCommitMarginBytes
+          : 0;
+  return std::min(device_free, commit_left);
+}
+
 bool VaceJobFitsBesideExperts(std::uint64_t free_bytes,
                               std::uint64_t job_bytes) {
   const std::uint64_t need = job_bytes + kVaceExpertMarginBytes;

@@ -6,6 +6,7 @@
 // tests/models/wan22_vace_context_test.cpp).
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -91,6 +92,23 @@ inline constexpr std::uint64_t kVaceExpertMarginBytes = std::uint64_t{6}
                                                 bool has_local,
                                                 std::uint64_t local_budget,
                                                 std::uint64_t local_usage);
+
+/// Windows commit (RAM + page file) kept free beside a Wan 2.2 A14B load or
+/// job phase: on the Strix Halo APU every device allocation is charged to
+/// the system commit, also when the DXGI budget still shows room (the
+/// router's --memory-reserve-commit-gb default, 3 GB).
+inline constexpr std::uint64_t kVaceCommitMarginBytes = std::uint64_t{3}
+                                                         << 30;
+
+/// The room the Wan 2.2 A14B residency checks count on: `device_free`
+/// (VaceDeviceFreeBytes) capped by the free commit `commit_free` less
+/// kVaceCommitMarginBytes; unchanged without a commit reading (Linux).
+/// 22.11. 19:12 (.198, 63.6 GB commit limit): the experts loaded resident
+/// at 47.8 GB device free (35.3 + 8.6 + 1.5 needed) and left 0.2 GB of
+/// commit, the machine went down; 23.11. 07:18 a job's umT5 (8.6 GB) beside
+/// the resident experts left 0.4 GB. Capped, both run one expert at a time.
+[[nodiscard]] std::uint64_t VaceCommitCappedFree(
+    std::uint64_t device_free, std::optional<std::uint64_t> commit_free);
 
 /// Before a job on resident Fun VACE experts: whether the per-job loads
 /// (`job_bytes`, umT5 + VAE) and the margin still fit in `free_bytes` (read

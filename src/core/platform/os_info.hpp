@@ -60,6 +60,10 @@ std::optional<HostCpu> QueryHostCpu();
 struct HostMemory {
   std::uint64_t total_bytes{0};
   std::uint64_t available_bytes{0};
+  /// Windows only: the commit charge still free below the commit limit
+  /// (GlobalMemoryStatusEx ullAvailPageFile: RAM + page file). On an APU
+  /// every device allocation is charged to it as well. Unset elsewhere.
+  std::optional<std::uint64_t> commit_available_bytes;
 };
 
 /// Returns nullopt when the OS cannot report its memory.
