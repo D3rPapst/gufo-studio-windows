@@ -216,6 +216,9 @@ struct FakeApi {
   /// worker), and the X-Gufo-Job header of every 3D poll and cancel.
   int objekt_flaky = 0;
   std::vector<std::string> objekt_job_headers;
+  /// print_ready (druckfertig): the completed status names print.stl and
+  /// print.glb in data[0].print.
+  bool objekt_print = false;
   int unreachable_calls{0};
   /// "POOLBUSY<n>": the router's 503 pool_busy for the first n calls.
   int poolbusy_calls{0};
@@ -564,7 +567,19 @@ struct FakeApi {
       result.body =
           release.load() || objekt_polls < 3
               ? R"({"id":"obj_1","status":"in_progress","progress":55,"phase":"decode"})"
+          : objekt_print
+              ? R"({"id":"obj_1","status":"completed","progress":100,"phase":"done","data":[{"format":"glb","vertices":4,"faces":4,"closed":true,"print":{"status":"completed","stl_url":"/v1/3d/generations/obj_1/print.stl","glb_url":"/v1/3d/generations/obj_1/print.glb","watertight":true,"height_mm":30.1}}]})"
               : R"({"id":"obj_1","status":"completed","progress":100,"phase":"done","data":[{"format":"glb","vertices":4,"faces":4,"closed":true}]})";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/print.stl") {
+      result.content_type = "model/stl";
+      result.body = "STLfake";
+      return result;
+    }
+    if (request.path == "/v1/3d/generations/obj_1/print.glb") {
+      result.content_type = "model/gltf-binary";
+      result.body = "glTFprint";
       return result;
     }
     if (request.path == "/v1/3d/generations/obj_1/content") {
@@ -1140,6 +1155,31 @@ void TestObjekt() {
   const json::Value* response = done.find("result")->find("response");
   CHECK(response->member_str("status") == "completed");
   CHECK(response->find("data")->items()[0].member_double("faces") == 4);
+}
+
+// print_ready (druckfertig): the router stores print.stl and print.glb
+// next to the GLB when the worker names them in data[0].print.
+void TestObjektPrint() {
+  Harness h("objekt-print");
+  h.api->objekt_print = true;
+  const std::string id =
+      h.Submit(R"({"request":{"path":"/v1/3d/generations","body":{"model":"triposg","image":"AAAA","print_ready":true,"print_eye_height_mm":28}}})")
+          .member_str("id");
+  const json::Value done = h.WaitFor(id, "completed");
+  const auto& files = done.find("result")->find("files")->items();
+  CHECK(files.size() == 5);
+  if (files.size() != 5)
+    return;
+  CHECK(files[0].member_str("name") == "model.glb");
+  CHECK(files[1].member_str("name") == "preview.png");
+  CHECK(files[2].member_str("name") == "print.stl");
+  CHECK(files[2].member_str("content_type") == "model/stl");
+  CHECK(h.Call("GET", files[2].member_str("url")).body == "STLfake");
+  CHECK(files[3].member_str("name") == "print.glb");
+  CHECK(files[3].member_str("content_type") == "model/gltf-binary");
+  CHECK(h.Call("GET", files[3].member_str("url")).body == "glTFprint");
+  CHECK(files[4].member_str("name") == "response.json");
+  CHECK(done.find("result")->member_str("content_type") == "model/gltf-binary");
 }
 
 void TestObjektCancel() {
@@ -3403,6 +3443,7 @@ int main() {
   TestMemoryRanLow();
   TestVideoCancel();
   TestObjekt();
+  TestObjektPrint();
   TestObjektCancel();
   TestObjektTransient();
   TestObjektTransientGivesUp();

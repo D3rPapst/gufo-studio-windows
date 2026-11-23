@@ -73,6 +73,21 @@ router-host-gb = 3
 router-idle-seconds = 900
 ```
 
+## Print-ready (druckfertig)
+
+`print_ready: true` (with `print_eye_height_mm`, default 28, or `print_height_mm`) adds a
+watertight, smooth single body in millimetres for miniature printing: `print.stl` (binary,
+Z up, feet at z = 0) and `print.glb` (vertex colours, real size in metres), next to the normal
+GLB. Fields and algorithm: [server.md](../internal/server.md) ("Print-ready 3D"). The step is
+shared with TripoSG and runs on the CPU after the GPU work; on the /objekt/ page it is the
+checkbox "druckfertig (geschlossen, glatt)" with "Augenhöhe / Gesamthöhe" in mm.
+
+Measured (23 Nov 2026, CPU of the 64 GB Strix Halo, `gufo-mesh-print` on the 1024 four-view figure,
+1 M faces): grid 398×141×729, 19 open slices closed, 1.51 M faces, watertight, one body, winding
+consistent, 4.1 s, peak host RAM 0.54 GB (process private bytes). Against the Python reference
+(`reparatur.py` v2, same parameters): volume −0.09 % (1536 figure +0.20 %), faces +0.05 %, mean surface
+distance 0.3 voxel (p99 0.76 voxel).
+
 ## Measured
 
 Strix Halo, 64 GB: GPU peak 19.3 GB with texture, host RAM 1.5-1.8 GB; 38-105 s per object

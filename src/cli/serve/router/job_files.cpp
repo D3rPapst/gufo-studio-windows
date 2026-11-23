@@ -246,7 +246,10 @@ HttpResponse ObjektFile(const fs::path& canonical_root, const fs::path& dir,
     return Error(409, "Conflict", "3D generation is not finished",
                  "objekt_not_ready");
   const bool content = part == "content";
-  const fs::path file = dir / (content ? "model.glb" : "preview.png");
+  const bool print = part == "print.stl" || part == "print.glb";
+  const fs::path file =
+      dir / (content ? std::string("model.glb")
+                     : print ? part : std::string("preview.png"));
   std::uintmax_t size = 0;
   if (!IsSafeFile(canonical_root, file, &size))
     return Error(404, "Not Found", "result file is missing",
@@ -257,12 +260,18 @@ HttpResponse ObjektFile(const fs::path& canonical_root, const fs::path& dir,
                  "objekt_file_missing");
   response.status = 200;
   response.reason = "OK";
-  response.headers.emplace_back("Content-Type",
-                                content ? "model/gltf-binary" : "image/png");
   response.headers.emplace_back(
-      "Content-Disposition", content
-                                 ? "attachment; filename=\"" + id + ".glb\""
-                                 : "inline; filename=\"" + id + ".png\"");
+      "Content-Type", part == "print.stl"        ? "model/stl"
+                      : content || print ? "model/gltf-binary"
+                                         : "image/png");
+  std::string disposition = "inline; filename=\"" + id + ".png\"";
+  if (content)
+    disposition = "attachment; filename=\"" + id + ".glb\"";
+  else if (part == "print.stl")
+    disposition = "attachment; filename=\"" + id + "-druck.stl\"";
+  else if (part == "print.glb")
+    disposition = "attachment; filename=\"" + id + "-druck.glb\"";
+  response.headers.emplace_back("Content-Disposition", disposition);
   response.log_details = "job=" + id + " from=job_files file=" + part;
   return response;
 }
@@ -298,7 +307,8 @@ std::optional<Target> ParseRead(std::string_view method,
   if (slash != std::string_view::npos) {
     const std::string_view part = rest.substr(slash + 1);
     if (part == "content" ||
-        (part == "preview" && target.kind == Kind::kObjekt)) {
+        ((part == "preview" || part == "print.stl" || part == "print.glb") &&
+         target.kind == Kind::kObjekt)) {
       target.part = std::string(part);
     } else {
       return std::nullopt;
