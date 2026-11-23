@@ -382,20 +382,27 @@ bool Pipeline::Generate(const std::vector<ImageView>& views, const GenerateOptio
     DualGridInput in;
     in.coords = &dec.coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
     in.resolution = res;
-    // Diagnostics (23.11.): the sign-field smoothing of 4630934b was never run on figures; the old
-    // production worker (6e66ed63, no smoothing) gives Lars 645k raw faces, this path 41k.
+    // Mesh construction (23.11.): by default the original fixed-order quads of the production worker
+    // (0d5b9905: quads -> orientation -> hole filling, no piece removal). The sign-field construction
+    // (135ed579 .. 4630934b, closed meshes) shreds figures and is only used with
+    // GUFO_TRELLIS2_MESH=signfield (smoothing passes GUFO_TRELLIS2_SIGN_SMOOTH, default 0; pieces below
+    // GUFO_TRELLIS2_MIN_COMPONENT faces removed, default 64 scaled with the surface).
+    const char* mesh_env = std::getenv("GUFO_TRELLIS2_MESH");
+    const bool sign_field = mesh_env != nullptr && std::string(mesh_env) == "signfield";
+    in.sign_smooth_passes = 0;
     if (const char* s = std::getenv("GUFO_TRELLIS2_SIGN_SMOOTH")) in.sign_smooth_passes = std::max(0, std::atoi(s));
     DualGridStats st;
-    Mesh mesh = dual_grid_to_mesh(in, &st);
+    Mesh mesh = sign_field ? dual_grid_to_mesh(in, &st) : dual_grid_to_mesh_quads(in, &st);
     result->faces_before_decimation = mesh.faces.size();
     report("mesh", 1, 3);
     result->seam_edges = st.seam_edges;
-    // stray bubbles: 512 faces at 512, scaled with the surface (x4 at 1024, x9 at 1536)
-    std::size_t min_faces = static_cast<std::size_t>(512.0 * (res / 512.0) * (res / 512.0));
+    std::size_t min_faces = sign_field ? static_cast<std::size_t>(64.0 * (res / 512.0) * (res / 512.0)) : 0;
     if (const char* s = std::getenv("GUFO_TRELLIS2_MIN_COMPONENT")) min_faces = static_cast<std::size_t>(std::max(0, std::atoi(s)));
-    result->small_components_removed = remove_small_components(&mesh, min_faces);
-    diag("mesh: sign smoothing passes " + std::to_string(in.sign_smooth_passes) + ", smoothed corners " + std::to_string(st.smoothed_corners) +
-         ", min component " + std::to_string(min_faces) + " faces");
+    result->small_components_removed = min_faces > 0 ? remove_small_components(&mesh, min_faces) : 0;
+    diag(std::string("mesh: ") + (sign_field ? "sign field" : "quads") + ", quads " + std::to_string(st.quads) + ", skipped edges " +
+         std::to_string(st.skipped_edges) + ", open edges " + std::to_string(st.open_edges) + ", smoothing passes " +
+         std::to_string(in.sign_smooth_passes) + ", smoothed corners " + std::to_string(st.smoothed_corners) + ", min component " +
+         std::to_string(min_faces) + " faces");
     const UnifyStats un = unify_orientation(&mesh);
     result->flipped_faces = un.flipped_faces;
     HoleFillStats hf = fill_holes(&mesh, o.hole_perimeter);

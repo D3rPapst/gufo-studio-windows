@@ -7,6 +7,7 @@
 // defect (one flag removed) becomes a seam, the mesh stays closed. Random flags: always closed.
 // AI-assisted (Claude Code), 2026-11-12.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -215,6 +216,27 @@ int main() {
             open_s += st.open_edges;
         }
         Expect(open_s == 0, "random flags with smoothing: still closed");
+    }
+    {
+        // Original construction (production 0d5b9905): one quad per flagged edge whose four voxels exist,
+        // fixed vertex order (no virtual vertices, no sign field), split by the weights.
+        std::vector<std::uint8_t> fq(n * 3, 0);
+        fq[0 * 3 + 0] = fq[0 * 3 + 1] = fq[0 * 3 + 2] = 1;   // voxel (0,0,0): all four voxels of each edge exist
+        fq[7 * 3 + 0] = 1;                                   // voxel (1,1,1): x-edge needs (1,1,2), (1,2,2), (1,2,1) -> skipped
+        std::vector<float> wq(n, 1.f), dq(n * 3, 0.5f);
+        wq[0] = 4.f;                                         // w0 * w2 > w1 * w3 for every quad through voxel 0 -> split 0-2
+        tr::DualGridInput iq;
+        iq.coords = &coords; iq.dual = dq.data(); iq.intersected = fq.data(); iq.split_weight = wq.data();
+        iq.resolution = 2;
+        tr::DualGridStats sq;
+        const tr::Mesh mq = tr::dual_grid_to_mesh_quads(iq, &sq);
+        Expect(sq.quads == 3 && sq.skipped_edges == 1 && mq.faces.size() == 6, "quads: 3 quads, 1 skipped edge, 6 triangles");
+        Expect(mq.vertices.size() == n, "quads: one vertex per voxel, no extra vertices");
+        // x-edge of voxel 0: q = (0,0,0) (0,0,1) (0,1,1) (0,1,0) = rows 0, 1, 3, 2; split 0-2 -> {0,1,3}, {0,3,2}
+        Expect(mq.faces[0] == std::array<std::uint32_t, 3>{0, 1, 3} && mq.faces[1] == std::array<std::uint32_t, 3>{0, 3, 2},
+               "quads: fixed order of the edge neighbours, weighted split");
+        Expect(std::fabs(mq.vertices[7].x - 0.25f) < 1e-6f && std::fabs(mq.vertices[0].x + 0.25f) < 1e-6f, "quads: vertex placement");
+        Expect(sq.open_edges > 0, "quads: open boundary stays open (left to fill_holes)");
     }
     if (failures == 0) std::cout << "trellis2_dual_grid_mesh_test: all checks passed\n";
     return failures == 0 ? 0 : 1;

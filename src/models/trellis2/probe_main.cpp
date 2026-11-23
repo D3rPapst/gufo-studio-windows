@@ -761,7 +761,7 @@ int run_uv(const std::string& glb_path, int texture_size, const std::string& pre
     return 0;
 }
 
-int run_mesh(const std::string& dumps, float hole_perimeter) {
+int run_mesh(const std::string& dumps, float hole_perimeter, bool quads) {
     std::string error;
     std::vector<float> out7;
     std::vector<std::size_t> shape;
@@ -778,8 +778,9 @@ int run_mesh(const std::string& dumps, float hole_perimeter) {
     in.coords = &coords; in.dual = dual.data(); in.intersected = inter.data(); in.split_weight = wgt.data();
     in.resolution = 512;
     tr::DualGridStats st;
-    tr::Mesh mesh = tr::dual_grid_to_mesh(in, &st);
+    tr::Mesh mesh = quads ? tr::dual_grid_to_mesh_quads(in, &st) : tr::dual_grid_to_mesh(in, &st);
     std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "construction: " << (quads ? "quads (0d5b9905, production)" : "sign field") << '\n';
     std::cout << "mesh: " << mesh.vertices.size() << " vertices, " << mesh.faces.size() << " triangles, " << st.quads << " quads, " << st.skipped_edges
               << " skipped edges, " << st.open_edges << " open edges, " << st.extra_vertices << " sheet-split vertices, " << st.virtual_vertices << " virtual vertices, " << st.seam_edges << " seam edges, " << st.smoothed_corners << " smoothed corners\n";
     // Edge multiplicities: undirected count and directed duplicates.
@@ -932,7 +933,7 @@ int main(int argc, char** argv) {
     std::cout << std::setprecision(6) << std::defaultfloat;   // the HIP runtime may leave cout in fixed(2)
     std::string stage, weights, image, out, dumps, glb, device = "gpu", preset = "box";
     int image_size = 512, layers = 0, seed = 42, steps = 12, cpu_levels = 2, max_faces = 500000, texture_size = 1024;
-    bool no_mesh = false;
+    bool no_mesh = false, quads = false;
     std::string weights_dir, name = "objekt";
     bool texture = false;
     bool selftest = false, zero_cond = false, cpu_check = false;
@@ -961,6 +962,7 @@ int main(int argc, char** argv) {
         else if (a == "--zero-cond") zero_cond = true;
         else if (a == "--cpu-check") cpu_check = true;
         else if (a == "--no-mesh") no_mesh = true;
+        else if (a == "--mesh") quads = next() == "quads";
         else return usage();
     }
     if (selftest) return selftest_dino(layers > 0 ? layers : 2, image_size);
@@ -997,7 +999,7 @@ int main(int argc, char** argv) {
     if (stage == "uv") return run_uv(glb, texture_size, preset);
     if (stage == "mesh") {
         if (dumps.empty()) return usage();
-        return run_mesh(dumps, 0.03f);
+        return run_mesh(dumps, 0.03f, quads);
     }
     if (stage == "full") {
         if (weights_dir.empty() || image.empty() || out.empty()) return usage();

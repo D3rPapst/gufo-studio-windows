@@ -45,6 +45,14 @@ struct DualGridStats {
 
 Mesh dual_grid_to_mesh(const DualGridInput& in, DualGridStats* stats = nullptr);
 
+// The original construction (o_voxel flexible_dual_grid_to_mesh, inference path; gufo 0d5b9905,
+// the production TRELLIS.2 worker): one quad per flagged primal edge whose four voxels are all
+// active, fixed vertex order, split by the softplus weights; parity defects stay open and are
+// left to fill_holes. The sign-field construction above (135ed579 .. 4630934b) closes the mesh
+// but shreds figures (23.11.: Lars 539k raw faces in stripes instead of 645k clean), so the
+// pipeline uses this one by default. Only quads / skipped_edges / open_edges are filled in.
+Mesh dual_grid_to_mesh_quads(const DualGridInput& in, DualGridStats* stats = nullptr);
+
 // Boundary edges (used by exactly one triangle) of a mesh.
 std::size_t count_boundary_edges(const Mesh& mesh);
 
