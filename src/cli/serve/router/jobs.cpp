@@ -4111,7 +4111,9 @@ void JobQueue::RunVideo(const std::shared_ptr<Job>& job,
 }
 
 // gufo serve objekt: poll /v1/3d/generations/<id> until completed, then fetch
-// the GLB (model.glb) and the preview (preview.png) into the job directory.
+// the GLB (model.glb) and the preview (preview.png) into the job directory;
+// a print_ready request (druckfertig) adds print.stl / print.glb when the
+// worker lists them in data[0].print.
 void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
                          const FetchResult& created) {
   std::string objekt_id;
@@ -4275,6 +4277,32 @@ void JobQueue::RunObjekt(const std::shared_ptr<Job>& job,
     if (preview.status == 200 && !preview.body.empty())
       add_file("preview.png", preview.body, "image/png");
   } catch (const std::exception&) {
+  }
+  // Print-ready files (worker feat/druckfertig): only those the worker
+  // names; a failed read leaves the job completed with the normal GLB.
+  if (const json::Value* data = final_status.find("data");
+      data != nullptr && data->is_array() && !data->empty()) {
+    const json::Value* print = data->items()[0].find("print");
+    if (print != nullptr && print->is_object()) {
+      const std::pair<const char*, const char*> parts[] = {
+          {"stl_url", "print.stl"}, {"glb_url", "print.glb"}};
+      for (const auto& [key, name] : parts) {
+        if (print->find(key) == nullptr)
+          continue;
+        try {
+          const FetchResult file =
+              Call(job, "GET", base_path + "/" + name, query, "", "");
+          if (file.status == 200 && !file.body.empty())
+            add_file(name, file.body,
+                     std::string_view(name).ends_with(".stl")
+                         ? "model/stl"
+                         : "model/gltf-binary");
+        } catch (const Cancelled&) {
+          throw;
+        } catch (const std::exception&) {
+        }
+      }
+    }
   }
   add_file("response.json", final_status.dump(), "application/json");
   json::Value result = json::Value::object();

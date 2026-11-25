@@ -13,6 +13,9 @@ wraps a `gufo serve objekt` worker as a job (see [server.md](../internal/server.
 max_faces}` answers 202 with a job; `GET /v1/3d/generations/{id}` is the status,
 `.../content` the GLB, `.../preview` a three-view PNG. The router stores `model.glb`,
 `preview.png` and `response.json` in the job and reports the capability `image_to_3d`.
+`print_ready: true` (with `print_height_mm` for objects, or `print_eye_height_mm`) adds a
+watertight, smooth body in millimetres as `print.stl` and `print.glb`, the same step as for
+[TRELLIS.2](trellis2.md#print-ready-druckfertig).
 
 ## Files
 

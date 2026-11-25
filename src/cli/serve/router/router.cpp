@@ -608,8 +608,9 @@ std::string VideoJobId(const std::string& path) {
   return std::string(remainder);
 }
 
-/// Job id from `/v1/3d/generations/<id>[/content|/preview]`, the async 3D
-/// reads and the cancel `gufo serve objekt` serves (1.4.23c); empty otherwise.
+/// Job id from `/v1/3d/generations/<id>[/content|/preview|/print.stl|
+/// /print.glb]`, the async 3D reads and the cancel `gufo serve objekt` serves
+/// (1.4.23c, print files feat/druckfertig); empty otherwise.
 std::string ObjektJobId(const std::string& path) {
   constexpr std::string_view prefix = "/v1/3d/generations/";
   std::string_view remainder(path);
@@ -617,7 +618,8 @@ std::string ObjektJobId(const std::string& path) {
     return "";
   }
   remainder.remove_prefix(prefix.size());
-  for (std::string_view suffix : {"/content", "/preview"}) {
+  for (std::string_view suffix :
+       {"/content", "/preview", "/print.stl", "/print.glb"}) {
     if (remainder.ends_with(suffix)) {
       remainder.remove_suffix(suffix.size());
       break;
@@ -4725,9 +4727,11 @@ private:
     if (const std::string objekt_id = ObjektJobId(req.path);
         !objekt_id.empty()) {
       // 3D (1.4.24): status and DELETE like a video job, /content like a
-      // music download; /preview (a PNG, written with the result) records
-      // nothing.
-      if (req.path.ends_with("/preview"))
+      // music download; /preview (a PNG, written with the result) and the
+      // print files (druckfertig) record nothing.
+      if (req.path.ends_with("/preview") ||
+          req.path.ends_with("/print.stl") ||
+          req.path.ends_with("/print.glb"))
         return nullptr;
       return std::make_shared<JobBodySniffer>(
           mutex, registry,

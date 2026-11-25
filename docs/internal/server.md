@@ -1790,6 +1790,14 @@ files. `GET /router/capabilities` reports `"capability": "image_to_3d"`
 for presets whose command line is `serve objekt`, so the pages can tell
 which router runs the worker.
 
+Print-ready (druckfertig, 2.2.20): when the worker's completed status names
+`data[0].print.stl_url` / `glb_url` (request `print_ready: true`), the router
+also fetches `GET /v1/3d/generations/{id}/print.stl` and `.../print.glb` and
+stores them as `print.stl` (`model/stl`) and `print.glb`
+(`model/gltf-binary`) between `preview.png` and `response.json`. A failed
+read leaves the job completed with the normal GLB. The print reads route like
+`/preview` (by `?model=` or the job owner) and record nothing.
+
 1.4.23c: status, content, preview reads and the cancel on `/v1/3d/generations/<id>` resolve the worker by the `model` query or, without it, by the recorded job owner (the router used to know that only for music jobs and answered 404).
 1.4.24 (2.0.1): the router records the job owner of a direct `POST /v1/3d/generations` like a video job: reads without `?model=` find the worker, the open job keeps the worker busy (not stopped for another model while it computes), the job sweep asks the 3D status path, and a 3D job stays on the machine it runs on when the placement changes. The job store's polls carry the job and pool-side headers, tolerate up to 5 transient answers in a row (5xx, connection error, no JSON) and give up after 30 minutes (`objekt_timeout`, the worker job is cancelled).
 
@@ -2267,7 +2275,8 @@ The router (`router/job_files.cpp`, `FinishedJobReadLocked` in
 worker for them:
 
 - `GET /v1/videos/<id>` and `GET /v1/videos/<id>/content`,
-- `GET /v1/3d/generations/<id>`, `.../content` and `.../preview`.
+- `GET /v1/3d/generations/<id>`, `.../content`, `.../preview`,
+  `.../print.stl` and `.../print.glb` (print-ready jobs).
 
 Conditions, all of them: the id has the worker's shape (`video_` or
 `obj_` + 24 lowercase hex digits; anything else never becomes a path and
@@ -3070,9 +3079,11 @@ areas instead of the list hiding why a tool is missing.
   `/v1/audio/music` `{model, prompt, lyrics, task text2music, duration,
   seed?, response_format, bitrate_kbps 192 for mp3}`.
 - `objekt_3d` `{bild, model?, schritte?, guidance? (1-15), seed?,
-  aufloesung? (256|512), max_dreiecke?, textur?, titel?, vorrang?}`:
+  aufloesung? (256|512), max_dreiecke?, textur?, druckfertig?,
+  druck_augenhoehe_mm? | druck_hoehe_mm? (1-2000), titel?, vorrang?}`:
   `/v1/3d/generations` `{model, image (data url), steps?, seed?,
-  resolution?, max_faces?, guidance?, texture?, preview true}`.
+  resolution?, max_faces?, guidance?, texture?, print_ready?,
+  print_eye_height_mm? | print_height_mm?, preview true}`.
 - `hochskalieren` `{datei, faktor? (2|4), variante? (allgemein|
   entrauscht|anime), ausgabe? (png|jpg), model?, titel?, vorrang?}`: an
   image (by content type) goes to `/v1/images/upscale` `{model, variant
@@ -3207,9 +3218,52 @@ the chat case answered, the child was stopped; see the C5 commit.
 | `POST` | `/v1/images/upscale` | `gufo serve upscale` (Real-ESRGAN on the NPU, GPU or CPU); sync, or `"async": true` for a job read at `/v1/images/upscale/{id}[/content]` |
 | `POST` | `/v1/videos/upscale` | `gufo serve upscale`: async video job (frames through FFmpeg, audio copied); status and MP4 (or with `"output_format": "png_zip"` a stored ZIP of lossless PNG frames) at `/v1/videos/{id}[/content]`, `DELETE` cancels. See [Real-ESRGAN](../models/realesrgan/README.md#images-and-videos-on-the-npu-gpu-or-cpu-gufo-serve-upscale) |
 | `POST` | `/v1/3d/generations` | `gufo serve objekt` (TripoSG image-to-3D, 1.4.23): JSON `{model, image (base64 or data URL, PNG with alpha), steps, guidance, seed, resolution 256\|512, max_faces, preview}` answers 202 with a job snapshot and a `Location` header |
-| `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds}}` |
+| `GET` | `/v1/3d/generations/{id}` | Snapshot `{status, progress, phase, data[0]: {vertices, faces, bbox, closed, volume, seconds, print?}}` |
 | `GET` | `/v1/3d/generations/{id}/content` | The finished GLB (`model/gltf-binary`, `Content-Disposition: attachment`) |
 | `GET` | `/v1/3d/generations/{id}/preview` | Three-view preview PNG of the mesh |
+| `GET` | `/v1/3d/generations/{id}/print.stl` | Print-ready jobs: watertight binary STL in millimetres, Z up, feet at z = 0 (`model/stl`, attachment `{id}-druck.stl`); 404 `objekt_print_missing` otherwise |
+| `GET` | `/v1/3d/generations/{id}/print.glb` | Print-ready jobs: the same body with vertex colours as GLB (Y up, metres, so it imports at its real size) |
+
+**Print-ready 3D (druckfertig, 2.2.20, worker branch `feat/druckfertig-worker`).**
+`POST /v1/3d/generations` takes, for TRELLIS.2 and TripoSG alike:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `print_ready` | `false` | Also build one watertight, smooth body for printing (CPU, after the GLB) |
+| `print_eye_height_mm` | 28 when no height is sent | Figures: sole to eyes in mm; eyes sit at `print_eye_ratio` of the body height |
+| `print_eye_ratio` | 0.93 | 0.5..1 |
+| `print_height_mm` | – | Total height in mm instead (objects without eyes); not together with `print_eye_height_mm` |
+| `print_format` | `both` | `stl`, `glb` or `both` |
+
+Heights are 1..2000 mm; bad values answer 400 (`invalid_print_ready`,
+`invalid_print_height`, `invalid_print_eye_ratio`, `invalid_print_format`).
+Old clients are unchanged (`print_ready` is off), and workers without the
+feature ignore the fields. The step (`src/core/mesh/print_ready.cpp`, a C++
+port of the proven Python reference `reparatur.py` + `stl_miniatur.py`):
+voxelise the surface (720 cells on the long axis, at most 48 M voxels; compact
+objects get coarser voxels), close 2 voxels (dilate, fill holes per Z slice so
+an open hem becomes solid; a slice whose ring is open at one spot, such as a
+robe lapel, and whose filled area is below 0.6 × the running median over 41
+slices gets a 2-D closing with a growing disk r = 2, 4, 6, 9, 12, 16, 22 until
+the area reaches 0.8 × the median, so no crack runs through the body; fill
+holes in 3-D, erode), keep the largest piece,
+Gaussian σ 1 voxel, linear zoom ×1.3, marching cubes at 0.5, snap every vertex
+within 2.5 voxels onto the original surface (face and finger detail), Taubin
+6 iterations, colours from the nearest original surface point; then Z up, feet
+at z = 0, centred in X/Y and scaled to the height. `print.glb` has a
+double-sided material (the snapping leaves ~0.2 % tiny folds that would show
+as see-through specks; reverting those snaps makes spikes). The snapshot
+reports it in `data[0].print` `{status completed|failed, error?, stl_url?,
+glb_url?, watertight, open_edges, bodies, faces, vertices, size_mm [x, y, z],
+height_mm, volume_mm3, scale, grid, snapped, open_slices, patched_slices,
+seconds, check}`; `check` is the output check `{watertight, boundary_edges,
+nonmanifold_edges, winding_consistent, volume_positive, bodies, line}` with
+`line` = "watertight yes, boundary edges 0, non-manifold edges 0, winding
+consistent yes, volume > 0 yes, bodies 1" (a failed check keeps the files and
+sets `error`). A failure of the step leaves the job completed with its normal
+GLB. Phase `print` (98-99 %) while it runs.
+Measured on a 1024 TRELLIS.2 figure (1 M faces): see
+[TRELLIS.2](../models/trellis2.md#print-ready-druckfertig).
 | `DELETE` | `/v1/3d/generations/{id}` | Cancels or removes the job |
 
 As in llama.cpp, vLLM, TEI and Ollama, these routes ignore request fields they

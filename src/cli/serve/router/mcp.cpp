@@ -536,7 +536,10 @@ std::vector<Tool> BuildTools(const Options& options) {
         "seed": {"type": "integer", "minimum": 0},
         "aufloesung": {"type": "integer", "enum": [256, 512], "description": "Gitterauflösung, nur triposg (grid resolution)"},
         "max_dreiecke": {"type": "integer", "minimum": 0, "description": "Höchstzahl Dreiecke, 0 = unbegrenzt (max faces)"},
-        "textur": {"type": "boolean", "description": "Nur trellis2: Farben als Textur (texture, trellis2 only)"}
+        "textur": {"type": "boolean", "description": "Nur trellis2: Farben als Textur (texture, trellis2 only)"},
+        "druckfertig": {"type": "boolean", "description": "Zusätzlich geschlossenes, glattes Druckmodell als STL (mm) und farbiges GLB (print_ready)"},
+        "druck_augenhoehe_mm": {"type": "number", "minimum": 1, "maximum": 2000, "description": "Figuren: Sohle bis Augen in mm, Augen = 93 % der Höhe; Standard 28 (print_eye_height_mm)"},
+        "druck_hoehe_mm": {"type": "number", "minimum": 1, "maximum": 2000, "description": "Gesamthöhe in mm statt Augenhöhe, für Nicht-Figuren (print_height_mm)"}
       }
     })json");
     t.input_schema["properties"]["titel"] = Titel();
@@ -2380,6 +2383,15 @@ json::Value McpService::RunObjekt3d(const json::Value& args,
     throw InvalidParams("arguments.aufloesung must be 256 or 512");
   const auto max_dreiecke = ArgInt(args, "max_dreiecke", 0, 100000000LL);
   const auto textur = ArgBool(args, "textur");
+  const auto druckfertig = ArgBool(args, "druckfertig");
+  const auto augenhoehe = ArgNumber(args, "druck_augenhoehe_mm", 1.0);
+  const auto hoehe = ArgNumber(args, "druck_hoehe_mm", 1.0);
+  if ((augenhoehe.has_value() && *augenhoehe > 2000.0) ||
+      (hoehe.has_value() && *hoehe > 2000.0))
+    throw InvalidParams("arguments.druck_*_mm must be between 1 and 2000");
+  if (augenhoehe.has_value() && hoehe.has_value())
+    throw InvalidParams(
+        "arguments: druck_augenhoehe_mm or druck_hoehe_mm, not both");
   const auto vorrang = ArgInt(args, "vorrang", 0, 9);
   Media media = ReadMedia(outer, bild, "arguments.bild");
   if (media.failure.has_value())
@@ -2399,6 +2411,13 @@ json::Value McpService::RunObjekt3d(const json::Value& args,
     body["guidance"] = *guidance;
   if (textur.has_value())
     body["texture"] = *textur;
+  if (druckfertig.value_or(false)) {
+    body["print_ready"] = true;
+    if (hoehe.has_value())
+      body["print_height_mm"] = *hoehe;
+    else if (augenhoehe.has_value())
+      body["print_eye_height_mm"] = *augenhoehe;
+  }
   body["preview"] = true;
   json::Value metadata = MetadataFor(
       "objekt", args,

@@ -147,6 +147,17 @@ void UnitTests(const fs::path& base) {
         preview->part == "preview");
   CHECK(!jf::ParseRead("GET", std::string("/v1/3d/generations/") + kObjektId +
                                   "/content/x"));
+  // print_ready files (druckfertig): 3D only
+  const auto print_stl = jf::ParseRead(
+      "GET", std::string("/v1/3d/generations/") + kObjektId + "/print.stl");
+  CHECK(print_stl.has_value() && print_stl->part == "print.stl");
+  CHECK(jf::ParseRead("GET", std::string("/v1/3d/generations/") + kObjektId +
+                                 "/print.glb")
+            .has_value());
+  CHECK(!jf::ParseRead("GET", std::string("/v1/3d/generations/") + kObjektId +
+                                  "/print.obj"));
+  CHECK(!jf::ParseRead("GET", std::string("/v1/videos/") + kVideoId +
+                                  "/print.stl"));
 
   // The preset's root: only `serve video` / `serve objekt`.
   const fs::path dir = base / "unit";
