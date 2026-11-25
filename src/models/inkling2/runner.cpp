@@ -45,6 +45,7 @@
 #include "src/models/inkling2/cache_adapter.hpp"
 #include "src/models/inkling2/dspark_policy.hpp"
 #include "src/models/inkling2/engine.hpp"
+#include "src/models/inkling2/image_cache.hpp"
 #include "src/models/inkling2/text/gguf_meta.hpp"
 #include "src/models/inkling2/text/gufo_adapter.hpp"
 #include "src/models/inkling2/vision/vision_encoder.hpp"
@@ -55,7 +56,7 @@ namespace {
 namespace g = ::gufo::ext;
 namespace ga = ::inkling2::text::gufo_adapter;
 
-constexpr std::string_view kStateAbi = "inkling2-hip-m2-v1";
+constexpr std::string_view kStateAbi = "inkling2-hip-m2-v2";
 /// Layer groups one pass may be split into (48 visits; the host caps it by pass
 /// length).
 constexpr std::size_t kMaxLayerGroups = 16;
@@ -75,27 +76,24 @@ public:
   /// Where the generated text stands inside the model's block structure (see
   /// Piece()). Lives in the slot: it is part of a checkpoint's metadata.
   Block& block;
-  /// The request turned reasoning off: no thinking block may open (see
-  /// SelectNext). Set per request by SetPromptContext; not part of a
-  /// checkpoint.
-  bool reasoning_off{false};
   /// A reasoning budget closed the thought: no second thinking block may open
   /// (the model reopens one right after the forced close). Per request.
   bool budget_closed{false};
-  /// Reasoning off and a call is required: after a header the model writes one
-  /// declared function name, then the invoke token (see SelectNext). Token ids
-  /// of each declared name, as the template writes it, and the name tokens
+  /// A thought of this turn closed. With a call required no second one may
+  /// open (Select): a model that decides against the call thinks again
+  /// instead, past the one reasoning span the parsers know, until the token
+  /// limit. With tools it may call, a second thought often plans the call, so
+  /// it stays. Per request.
+  bool thought_closed{false};
+  /// A call is required: after a header the model writes a thought (unless
+  /// a budget closed it) or one declared function name
+  /// (the tokens the template writes for it), then the invoke token (see
+  /// Select). Token ids of each declared name (of every request that may
+  /// call one; see Piece()), as the template writes it, and the name tokens
   /// written since the last header.
   bool call_required{false};
   std::vector<std::vector<g::TextRunnerToken>> call_names;
   std::vector<g::TextRunnerToken> call_prefix;
-  /// Reasoning off and no tools: the first answer block is the whole reply.
-  /// After its <|end_message|> the model may open another block (observed: a
-  /// thinking block, which SelectNext forbids, so it would write the answer a
-  /// second time); the turn ends there instead. `answer_done` is set by
-  /// Advance, per request.
-  bool answer_only{false};
-  bool answer_done{false};
   /// The request's images (set by SetPromptContext; null for a text-only
   /// prompt).
   std::shared_ptr<const Inkling2PromptContext> prompt;
@@ -111,7 +109,20 @@ public:
   bool history_ok{false};
   speculative::PromptLookup<std::int32_t> lookup;
   CopyBackoff copy_backoff;
+  /// Wide copies (a request decoding alone): `copy_run` when the last cycle's
+  /// copied proposals were all kept (the next cycle copies first);
+  /// `copy_rows` the rows a copy may verify (kNarrowRows, doubling to
+  /// Engine::kMaxVerifyRows after two whole copies of that width in a row,
+  /// back to kNarrowRows after any rejected copy).
+  bool copy_run{false};
+  int copy_rows{0};
+  int copy_streak{0};
   // fork: no TextRunnerState::state_account (upstream #1251 mem layer); state is allocated whole.
+  /// Polled between a prefill pass's visits (Engine::Forward).
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    cancelled = check;
+  }
+  CancellationCheck cancelled;
   [[nodiscard]] g::TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
     return {.per_request_state_bytes = session_->allocated_bytes(),
@@ -240,35 +251,19 @@ const Inkling2State& Require(const g::TextRunnerState& s) {
 }
 
 /// One image of a request: its decoded pixels and, once a prefill needs them,
-/// its encoder rows.
+/// its encoder rows (both shared through the runner's ImageCache).
 struct ImageEntry {
-  vision::ImageU8 pixels;
+  std::shared_ptr<const DecodedImage> image;
   std::size_t first = 0;  // prompt index of the first placeholder token
   std::size_t count = 0;  // rows = placeholder tokens
-  std::array<std::uint8_t, 32>
-      digest{};  // SHA-256 of the decoded RGB pixels and size
-  // Filled by Inkling2Runner::EnsureRows (under `mutex`): device [count][2304]
-  // floats.
+  // Set by Inkling2Runner::EnsureRows (under `mutex`).
   std::mutex mutex;
-  float* rows = nullptr;
-  double encode_ms = 0;
-  ImageEntry() = default;
-  ImageEntry(const ImageEntry&) = delete;
-  ~ImageEntry() {
-    if (rows != nullptr) {
-      // Same gate as the other device calls made outside the engine mutex: no
-      // graph capture may be open.
-      const std::shared_lock<std::shared_mutex> gate(CaptureGate());
-      (void)hipFree(rows);
-    }
-  }
+  std::shared_ptr<const ImageRows> rows;
 };
 
 /// What a request tells the runner beyond its tokens (SetPromptContext).
 struct Inkling2PromptContext final : g::TextPromptContext {
-  bool reasoning_off{false};
   bool call_required{false};
-  bool answer_only{false};
   std::vector<std::vector<g::TextRunnerToken>> call_names;
   std::vector<std::unique_ptr<ImageEntry>> images;
   /// The prompt's tokens, for copy drafts (a request whose whole prompt is
@@ -342,9 +337,13 @@ public:
     // visits so other sessions keep decoding. The engine splits at visit
     // boundaries (Engine::Forward, PrefillYield) and the arithmetic of every
     // visit is unchanged.
-    d.scheduling = g::TextSchedulingProfile{.pass_tokens = engine_->ubatch(),
-                                            .max_layer_groups = kMaxLayerGroups,
-                                            .max_yield_decode_width = 1};
+    // Every decoding session may step between two groups: a batched step
+    // costs little more than a lone one (inkling2_spec_test checks that
+    // decoding inside a yield equals decoding alone).
+    d.scheduling = g::TextSchedulingProfile{
+        .pass_tokens = engine_->ubatch(),
+        .max_layer_groups = kMaxLayerGroups,
+        .max_yield_decode_width = Engine::kMaxDecodeBatch};
     return d;
   }
   [[nodiscard]] g::TextRunnerResourceClaim ResourceClaim() const override {
@@ -363,8 +362,8 @@ public:
                     // for a 4096-token image
       c.resident_weights_bytes =
           c.resident_weights_bytes.value_or(0) + vision_->device_bytes();
-      c.temporary_scratch_bytes =
-          c.temporary_scratch_bytes.value_or(0) + kVisionScratchBytes;
+      c.temporary_scratch_bytes = c.temporary_scratch_bytes.value_or(0) +
+                                  kVisionScratchBytes + ImageCache::kRowsBytes;
     }
     if (const auto memory = gufo::hip::QueryAdmissionMemory())
       c.state_capacity_bytes = memory->free_bytes;
@@ -378,7 +377,7 @@ public:
   }
   [[nodiscard]] std::vector<g::TextExecutionPlan> SupportedPlans()
       const override {
-    // Batched decode (M3): one weight pass for up to Engine kMaxDecodeBatch
+    // Batched decode: one weight pass for up to Engine kMaxDecodeBatch
     // sessions (AdvanceBatch).
     std::vector<g::TextExecutionPlan> plans{
         {.kind = g::TextExecutionPlanKind::kSerial, .physical_width = 1}};
@@ -403,10 +402,23 @@ public:
   // <|end_message|>" for a call (stream_dialect.hpp). The decision uses only
   // committed state (Advance), so previewing a token twice is harmless.
   // Decode() stays literal.
-  [[nodiscard]] std::string Piece(Block block, g::TextRunnerToken token) const {
+  //
+  // A grammar sees each token's own bytes, so it never allows <|content_text|>:
+  // under a response format the model writes its answer right after the header
+  // (unless a thought came first). An ordinary token after a header is
+  // therefore a function name only when it starts a declared one; otherwise it
+  // opens a text block.
+  [[nodiscard]] bool StartsName(const Inkling2State& st,
+                                g::TextRunnerToken token) const {
+    return std::any_of(
+        st.call_names.begin(), st.call_names.end(),
+        [&](const auto& name) { return !name.empty() && name[0] == token; });
+  }
+  [[nodiscard]] std::string Piece(const Inkling2State& st,
+                                  g::TextRunnerToken token) const {
     if (token == t_header_)
       return {};
-    switch (block) {
+    switch (st.block) {
       case Block::kAfterHeader:
         if (token == t_text_)
           return {};
@@ -414,10 +426,13 @@ public:
           return std::string(::inkling2::text::dialect::kHeader) +
                  std::string(tok_->TokenBytes(token));
         // The invoke token right after a header (a call written without the
-        // first function name): the call starts here. Otherwise the first token
-        // of the function name, which is written again inside the JSON.
-        return token == t_invoke_ ? std::string(tok_->TokenBytes(token))
-                                  : std::string{};
+        // first function name): the call starts here. The first token of a
+        // function name is written again inside the JSON.
+        if (token == t_invoke_)
+          return std::string(tok_->TokenBytes(token));
+        if (token == t_end_message_ || StartsName(st, token))
+          return {};  // an empty block, or a name
+        break;
       case Block::kTool:
         return token == t_invoke_ ? std::string(tok_->TokenBytes(token))
                                   : std::string{};
@@ -430,22 +445,27 @@ public:
     }
     return std::string(tok_->TokenBytes(token));
   }
-  [[nodiscard]] Block NextBlock(Block block, g::TextRunnerToken token) const {
+  [[nodiscard]] Block NextBlock(const Inkling2State& st,
+                                g::TextRunnerToken token) const {
     if (token == t_header_)
       return Block::kAfterHeader;
-    switch (block) {
+    switch (st.block) {
       case Block::kAfterHeader:
         if (token == t_text_)
           return Block::kText;
         if (token == t_thinking_)
           return Block::kThinking;
-        return token == t_invoke_ ? Block::kToolBody : Block::kTool;
+        if (token == t_invoke_)
+          return Block::kToolBody;
+        if (token == t_end_message_)
+          return Block::kIdle;
+        return StartsName(st, token) ? Block::kTool : Block::kText;
       case Block::kTool:
         if (token == t_invoke_)
           return Block::kToolBody;
-        return token == t_end_message_ ? Block::kIdle : block;
+        return token == t_end_message_ ? Block::kIdle : st.block;
       default:
-        return token == t_end_message_ ? Block::kIdle : block;
+        return token == t_end_message_ ? Block::kIdle : st.block;
     }
   }
 
@@ -471,6 +491,18 @@ public:
     // no <|content_text|> follows the close).
     return {std::string(::inkling2::text::dialect::kReasoningOpen),
             std::string(::inkling2::text::dialect::kEndMessage)};
+  }
+  /// Grammars see the tokens' own bytes. The prompt already wrote the
+  /// thought's header, so the model opens it with <|content_thinking|> alone
+  /// (the streamed opener would make it write a second header, or skip the
+  /// thought), and closes it with the answer block's framing, which the
+  /// streamed text drops. A call written after the thought ends the phase at
+  /// its header.
+  [[nodiscard]] std::optional<ReasoningMarkup> ReasoningGrammarMarkers(
+      const g::ChatRequest&) const override {
+    return ReasoningMarkup{
+        std::string(::inkling2::text::dialect::kThinking),
+        std::string(::inkling2::text::dialect::kReasoningClose)};
   }
   [[nodiscard]] std::uint32_t VocabularySize() const override {
     return static_cast<std::uint32_t>(tok_->VocabSize());
@@ -515,24 +547,36 @@ public:
         if (!part.bytes || part.bytes->empty())
           throw std::invalid_argument("empty image");
         auto entry = std::make_unique<ImageEntry>();
-        // Gufo's decoder (PNG, JPEG, WebP; display orientation, RGB8), the one
-        // that validated the upload.
-        try {
-          const core::Image decoded = core::DecodeImage(*part.bytes);
-          entry->pixels.w = static_cast<int>(decoded.width);
-          entry->pixels.h = static_cast<int>(decoded.height);
-          entry->pixels.rgb = decoded.pixels;
-          // detail: low caps the longer side at 512 pixels (at most 13 x 13 =
-          // 169 rows), as Gufo's Qwen path does.
-          if (part.detail == g::ChatMessage::ImageDetail::kLow)
-            vision::ShrinkToFit(&entry->pixels, kLowDetailMaxSide);
-        } catch (const std::exception& e) {
-          throw std::invalid_argument(std::string("image decode failed: ") +
-                                      e.what());
-        }
+        const bool low = part.detail == g::ChatMessage::ImageDetail::kLow;
+        entry->image = image_cache_.Decoded(part.bytes, low, [&] {
+          auto out = std::make_shared<DecodedImage>();
+          // Gufo's decoder (PNG, JPEG, WebP; display orientation, RGB8), the
+          // one that validated the upload.
+          try {
+            const core::Image decoded = core::DecodeImage(*part.bytes);
+            out->pixels.w = static_cast<int>(decoded.width);
+            out->pixels.h = static_cast<int>(decoded.height);
+            out->pixels.rgb = decoded.pixels;
+            // detail: low caps the longer side at 512 pixels (at most 13 x 13
+            // = 169 rows), as Gufo's Qwen path does.
+            if (low)
+              vision::ShrinkToFit(&out->pixels, kLowDetailMaxSide);
+          } catch (const std::exception& e) {
+            throw std::invalid_argument(std::string("image decode failed: ") +
+                                        e.what());
+          }
+          crypto::Sha256Hasher h;
+          const std::uint64_t dims[2] = {
+              static_cast<std::uint64_t>(out->pixels.w),
+              static_cast<std::uint64_t>(out->pixels.h)};
+          h.Update({reinterpret_cast<const std::uint8_t*>(dims), sizeof dims});
+          h.Update(out->pixels.rgb);
+          out->digest = h.Finish();
+          return std::shared_ptr<const DecodedImage>(std::move(out));
+        });
         entry->count =
             static_cast<std::size_t>(vision::VisionEncoder::CountTokens(
-                entry->pixels.w, entry->pixels.h));
+                entry->image->pixels.w, entry->image->pixels.h));
         images.push_back(std::move(entry));
       }
     }
@@ -549,14 +593,9 @@ public:
     auto context = std::make_shared<Inkling2PromptContext>();
     if (max_draft_ > 0)
       context->tokens.assign(tokens->begin(), tokens->end());
-    context->reasoning_off = ga::ReasoningOff(request);
-    context->call_required =
-        context->reasoning_off && ga::CallRequired(request);
-    context->answer_only =
-        context->reasoning_off &&
-        (request.tools.empty() ||
-         request.tool_choice == g::ChatRequest::ToolChoice::kNone);
-    if (context->call_required) {
+    context->call_required = ga::CallRequired(request);
+    if (!request.tools.empty() &&
+        request.tool_choice != g::ChatRequest::ToolChoice::kNone) {
       for (const auto& tool : request.tools) {
         std::vector<::inkling2::text::TokenId> ids;
         tok_->EncodeOrdinary(tool.name, &ids);
@@ -572,12 +611,6 @@ public:
           throw std::logic_error("image placeholders lost");
         e->first = pt.image_positions[at];
         at += e->count;
-        crypto::Sha256Hasher h;
-        const std::uint64_t dims[2] = {static_cast<std::uint64_t>(e->pixels.w),
-                                       static_cast<std::uint64_t>(e->pixels.h)};
-        h.Update({reinterpret_cast<const std::uint8_t*>(dims), sizeof dims});
-        h.Update(e->pixels.rgb);
-        e->digest = h.Finish();
       }
       if (at != pt.image_positions.size())
         throw std::logic_error("image placeholders left over");
@@ -601,7 +634,7 @@ public:
                  : std::vector<std::uint8_t>(before.begin(), before.end())});
         const std::uint64_t pos[2] = {e->first, e->count};
         feed(pos, sizeof pos);
-        feed(e->digest.data(), e->digest.size());
+        feed(e->image->digest.data(), e->image->digest.size());
       }
       const auto full = running.Finish();
       context->cache_identity.assign(full.begin(), full.end());
@@ -629,16 +662,17 @@ public:
         c != nullptr && !c->images.empty()
             ? std::static_pointer_cast<const Inkling2PromptContext>(context)
             : nullptr;
-    st.reasoning_off = c != nullptr && c->reasoning_off;
     st.budget_closed = false;
+    st.thought_closed = false;
     st.call_required = c != nullptr && c->call_required;
-    st.answer_only = c != nullptr && c->answer_only;
-    st.answer_done = false;
     st.call_names = c != nullptr ? c->call_names : decltype(st.call_names){};
     st.call_prefix.clear();
     st.pending.reset();
     st.backoff = {};
     st.copy_backoff = {};
+    st.copy_run = false;
+    st.copy_rows = 0;
+    st.copy_streak = 0;
     st.history_ok = c != nullptr && !c->tokens.empty();
     if (st.history_ok)
       st.history = c->tokens;
@@ -648,22 +682,12 @@ public:
     st.lookup.BeginRequest();
   }
   [[nodiscard]] g::InitialOutputState InitialOutputState(
-      const g::ChatRequest& r) const override {
-    // reasoning off without tools: the prompt opened the text block (see
-    // gufo_adapter ToRenderOptions). With tools the model may still open a
-    // thinking block: let the parser see.
-    const bool tools =
-        !r.tools.empty() && r.tool_choice != g::ChatRequest::ToolChoice::kNone;
-    if (!ga::ReasoningOff(r))
-      return g::InitialOutputState::kAuto;
-    if (!tools)
-      return g::InitialOutputState::kContent;
-    // A required call: the grammar must let the model write its own header and
-    // function name before the call, or it forces a call header that has no
-    // such tokens (a different frontier than the re-render of the call). Only a
-    // reasoning phase leaves that room; the phase ends at the call.
-    return ga::CallRequired(r) ? g::InitialOutputState::kReasoning
-                               : g::InitialOutputState::kAuto;
+      const g::ChatRequest&) const override {
+    // The prompt ends with the assistant header and the model chooses the
+    // block: a thought, an answer or a call. No effort level turns thinking
+    // off (level 0 is the minimum, per the model card), so reasoning "off"
+    // only lowers the effort and the model may still think.
+    return g::InitialOutputState::kAuto;
   }
   [[nodiscard]] std::string Decode(
       std::span<const g::TextRunnerToken> tokens) const override {
@@ -728,7 +752,10 @@ public:
     const auto ids = ToIds(prompt.subspan(offset, consumed));
     // Layered prefill: the host asks for `groups` groups of visits with a
     // decode round between.
-    PrefillYield yield{st.prefill_yield_groups(), [&st] { st.YieldPrefill(); }};
+    // A cancelled request stops the pass at the next visit (tens of
+    // milliseconds) instead of finishing it.
+    PrefillYield yield{st.prefill_yield_groups(), [&st] { st.YieldPrefill(); },
+                       st.cancelled};
     // Image rows inside this chunk replace the placeholders' embeddings
     // (encoded on first use).
     std::vector<InputRows> rows;
@@ -739,12 +766,13 @@ public:
         if (lo >= hi)
           continue;
         EnsureRows(*e);
-        rows.push_back(
-            {lo - offset, hi - lo, e->rows + (lo - e->first) * kVisionDim});
+        rows.push_back({lo - offset, hi - lo,
+                        e->rows->device + (lo - e->first) * kVisionDim});
       }
     }
     engine_->Forward(st.session(), ids, {},
-                     yield.groups >= 2 ? &yield : nullptr, rows);
+                     yield.groups >= 2 || yield.cancelled ? &yield : nullptr,
+                     rows);
     // The prompt may end inside the assistant's block (reasoning off: header +
     // text token).
     st.block = Block::kIdle;
@@ -774,8 +802,7 @@ public:
       return sel;
     }
     const auto& raw = st.session().logits();
-    if (raw.empty() && st.session().position() < max_context_ &&
-        !st.answer_done)
+    if (raw.empty() && st.session().position() < max_context_)
       throw std::runtime_error("Inkling 2 Mini token selection has no logits");
     return Select(st, sampler, raw, st.session().position());
   }
@@ -785,21 +812,23 @@ public:
                                               sampling::SamplerState& sampler,
                                               std::span<const float> raw,
                                               std::size_t position) const {
-    if (position >= max_context_ || st.answer_done)
+    if (position >= max_context_)
       return {.stop = true, .piece = {}};
-    // Reasoning off: the template's effort level 0 does not stop the model from
-    // opening a thinking block, so the thinking token cannot follow a header.
-    // With a call required the block is the call: after the header one declared
-    // function name (the tokens the template writes for it), then the invoke
-    // token. That keeps the generated tokens the ones the next turn's re-render
-    // writes, which a grammar that can name the function only once could not
-    // (see docs/dev/M4-reasoning.md). Everything else is the model's own
-    // choice.
+    // After a reasoning budget closed the thought the model would reopen one
+    // right away, so the thinking token cannot follow a header. Reasoning
+    // "off" is the template's effort level 0, which, as the model card says,
+    // does not disable thinking: the model may still think, as in llama.cpp.
+    // With a call required, the block
+    // after a header is a thought (reasoning on) or the call: one
+    // declared function name (the tokens the template writes for it), then
+    // the invoke token. That keeps the generated tokens the ones the next
+    // turn's re-render writes; the host's grammar sees only the streamed call
+    // (stream_dialect.hpp), which names the function once. Everything else is
+    // the model's own choice.
     if (sampler.ForcedToken() && st.block == Block::kThinking)
       st.budget_closed = true;
     std::vector<float> masked;
-    if ((st.reasoning_off || st.budget_closed) &&
-        st.block == Block::kAfterHeader) {
+    if (st.budget_closed && st.block == Block::kAfterHeader) {
       masked.assign(raw.begin(), raw.end());
       if (t_thinking_ < masked.size())
         masked[t_thinking_] = -std::numeric_limits<float>::infinity();
@@ -810,6 +839,9 @@ public:
       const auto& prefix = st.call_prefix;
       if (prefix.empty() && t_invoke_ < raw.size())
         allowed.push_back(t_invoke_);  // a call without the first name
+      if (prefix.empty() && st.block == Block::kAfterHeader &&
+          !st.budget_closed && !st.thought_closed && t_thinking_ < raw.size())
+        allowed.push_back(t_thinking_);  // a thought before the call
       for (const auto& name : st.call_names) {
         if (name.size() < prefix.size() ||
             !std::equal(prefix.begin(), prefix.end(), name.begin()))
@@ -830,7 +862,7 @@ public:
     const bool stop = st.stop_at_eos() && tok_->IsStop(token);
     return {.stop = stop,
             .token = token,
-            .piece = stop ? std::string{} : Piece(st.block, token),
+            .piece = stop ? std::string{} : Piece(st, token),
             .logprobs = sampling::CollectLogprobs(
                 raw, token,
                 sampler.config().logprobs)};  // the model's own distribution
@@ -839,20 +871,20 @@ public:
                g::TextRunnerToken token) const override {
     auto& st = Require(state);
     const std::int32_t id = static_cast<std::int32_t>(token);
-    engine_->Forward(st.session(), std::span<const std::int32_t>(&id, 1));
+    engine_->Decode(st.session(), id);
     CommitToken(st, token);
   }
   void CommitToken(Inkling2State& st, g::TextRunnerToken token) const {
     if (st.history_ok)
       st.history.push_back(static_cast<std::int32_t>(token));
-    if (st.answer_only && st.block == Block::kText && token == t_end_message_)
-      st.answer_done = true;
+    if (st.block == Block::kThinking && token == t_end_message_)
+      st.thought_closed = true;
     if (token == t_header_)
       st.call_prefix.clear();
     else if ((st.block == Block::kAfterHeader || st.block == Block::kTool) &&
              token != t_invoke_)
       st.call_prefix.push_back(token);
-    st.block = NextBlock(st.block, token);
+    st.block = NextBlock(st, token);
   }
   /// One token for each of several sessions in a single weight pass
   /// (Engine::DecodeBatch).
@@ -892,6 +924,8 @@ public:
   /// ms a row; a selection thread woken for one row takes about 1 ms);
   /// more are spread over the selection threads.
   static constexpr std::size_t kSerialRows = 3;
+  /// Rows of an ordinary DSpark verification (the anchor and seven drafts).
+  static constexpr int kNarrowRows = Drafter::kMaxDraft + 1;
   template<class F>
   void ForEachLane(std::size_t n, std::size_t sampled, F&& f) const {
     if (sampled <= kSerialRows) {
@@ -916,8 +950,7 @@ public:
     RowMode m;
     const auto& cfg = working.config();
     m.greedy = cfg.can_use_unmodified_argmax() && !cfg.logprobs &&
-               !working.ForcedToken() && !st.reasoning_off &&
-               !st.budget_closed && !st.call_required;
+               !working.ForcedToken() && !st.budget_closed && !st.call_required;
     m.coupled = !m.greedy && cfg.temperature > 0 && !cfg.constraint &&
                 !working.ForcedToken() && cfg.top_k == 0 && cfg.top_p == 1 &&
                 !(cfg.min_p > 0 && cfg.min_keep > 1);
@@ -974,6 +1007,38 @@ public:
     return n;
   }
 
+  /// Rows a wide copy may verify now (the anchor included).
+  static int CopyRows(const Inkling2State& st) {
+    return std::max(st.copy_rows, kNarrowRows);
+  }
+
+  /// Copied proposals that continue the request's context plus `tail` (the
+  /// cycle's drafts after the committed anchor), up to `limit`, written to
+  /// `drafts`: speculative::PromptLookup's match rules (greedy requests).
+  /// Returns their count; `start` is the index of their source. Called
+  /// after the anchor was committed and lookup.Step / Extend ran.
+  int CopyAfter(Inkling2State& st, std::span<const std::int32_t> tail,
+                std::size_t limit, std::int32_t* drafts,
+                std::size_t* start) const {
+    using Lookup = speculative::PromptLookup<std::int32_t>;
+    if (limit == 0 || !st.copy_backoff.Copy())
+      return 0;
+    const auto m = st.lookup.Find(st.history, tail, Lookup::kMinMatch);
+    if (m.length == 0)
+      return 0;
+    const std::size_t have =
+        std::min(limit, st.lookup.IndexedTokens() - m.start);
+    int n = 0;
+    for (; static_cast<std::size_t>(n) < have; ++n) {
+      const std::int32_t t = st.history[m.start + static_cast<std::size_t>(n)];
+      if (tok_->IsStop(static_cast<g::TextRunnerToken>(t)))
+        break;
+      drafts[n] = t;
+    }
+    *start = m.start;
+    return n;
+  }
+
   /// The anchor of a cycle: the pending token, or a selection from the
   /// session's logits. A non-stop anchor is accepted and committed.
   [[nodiscard]] g::TextDecodeSelection TakeAnchor(
@@ -984,8 +1049,7 @@ public:
       anchor = std::move(*st.pending);
       st.pending.reset();
     } else {
-      if (ss.logits().empty() && ss.position() < max_context_ &&
-          !st.answer_done)
+      if (ss.logits().empty() && ss.position() < max_context_)
         throw std::runtime_error(
             "Inkling 2 Mini token selection has no logits");
       anchor = Select(st, working, ss.logits(), ss.position());
@@ -1022,8 +1086,7 @@ public:
         !greedy && width > 0 && cfg.temperature >= 0.1F && !cfg.constraint &&
         !working.ForcedToken() && !cfg.reasoning_budget &&
         !cfg.penalties_enabled() && cfg.top_k == 0 && cfg.top_p == 1 &&
-        cfg.min_p == 0 && !st.reasoning_off && !st.budget_closed &&
-        !st.call_required &&
+        cfg.min_p == 0 && !st.budget_closed && !st.call_required &&
         pos + static_cast<std::size_t>(width) + 1 < max_context_;
     std::array<std::uint64_t, Engine::kMaxVerifyRows + 1> draws{};
     std::array<g::TextRunnerToken, Engine::kMaxVerifyRows> sampled{};
@@ -1052,18 +1115,14 @@ public:
       const std::size_t at = pos + static_cast<std::size_t>(j) + 1;
       g::TextDecodeSelection sel;
       if (parallel) {
-        if (st.answer_done) {
-          sel = {.stop = true, .piece = {}};
-        } else {
-          const auto tk = sampled[j];
-          const auto row = out.subspan(static_cast<std::size_t>(j) * V, V);
-          const bool stop = st.stop_at_eos() && tok_->IsStop(tk);
-          sel = {.stop = stop,
-                 .token = tk,
-                 .piece = stop ? std::string{} : Piece(st.block, tk),
-                 .logprobs = sampling::CollectLogprobs(row, tk, cfg.logprobs)};
-          used = j + 1;
-        }
+        const auto tk = sampled[j];
+        const auto row = out.subspan(static_cast<std::size_t>(j) * V, V);
+        const bool stop = st.stop_at_eos() && tok_->IsStop(tk);
+        sel = {.stop = stop,
+               .token = tk,
+               .piece = stop ? std::string{} : Piece(st, tk),
+               .logprobs = sampling::CollectLogprobs(row, tk, cfg.logprobs)};
+        used = j + 1;
       } else if (greedy) {
         // A token the sampler forces (a reasoning budget's close) replaces
         // the row's argmax, as Sample would.
@@ -1072,11 +1131,11 @@ public:
           st.budget_closed = true;
         const auto tk = forced ? static_cast<g::TextRunnerToken>(*forced)
                                : static_cast<g::TextRunnerToken>(amax[j]);
-        const bool stop = at >= max_context_ || st.answer_done ||
-                          (st.stop_at_eos() && tok_->IsStop(tk));
+        const bool stop =
+            at >= max_context_ || (st.stop_at_eos() && tok_->IsStop(tk));
         sel = {.stop = stop,
                .token = tk,
-               .piece = stop ? std::string{} : Piece(st.block, tk)};
+               .piece = stop ? std::string{} : Piece(st, tk)};
       } else {
         sel = Select(st, working, out.subspan(j * V, V), at);
       }
@@ -1132,38 +1191,63 @@ public:
 
     using Clock = std::chrono::steady_clock;
     const auto t0 = Clock::now();
-    std::int32_t drafts[Drafter::kMaxDraft] = {};
-    float conf[Drafter::kMaxDraft] = {};
+    std::int32_t drafts[Engine::kMaxVerifyRows] = {};
+    float conf[Engine::kMaxVerifyRows] = {};
     int n = 0;
     const RowMode mode = ModeOf(st, working);
     const bool greedy = mode.greedy;
-    // Copied proposals first: they cost nothing, and where the output repeats
-    // its context they outlast the drafter's.
-    std::size_t copy_start = 0;
-    int copy_width = 0;
     const bool sampled = working.config().temperature > 0;
-    if (budget > 0 && max_draft_ > 0) {
-      const int c =
-          ProposeCopy(st, sampled,
-                      std::min<std::size_t>(
-                          {max_draft_, budget, engine_->VerifyRows(ss) - 1}),
-                      drafts, conf, &copy_start);
+    const std::size_t rows_room = engine_->VerifyRows(ss) - 1;
+    // Copies of earlier context (prompt lookup). While a copy keeps being
+    // accepted, the next cycle copies first, up to CopyRows() rows in one
+    // wide verification (this request decodes alone). Otherwise sampled
+    // requests copy first within the drafter's width, and greedy ones append
+    // a copy to the drafter's proposals when the context they extend
+    // continues an earlier stretch.
+    std::size_t copy_start = 0;
+    int copy_width = 0;   // copied proposals verified
+    int draft_width = 0;  // the drafter's proposals before them
+    bool copy_only = false;
+    bool copy_conf = false;  // conf[] holds the copied proposals' bins
+    bool lookup_ready = false;
+    if (budget > 0 && max_draft_ > 0 && st.history_ok &&
+        st.history.size() == ss.position() + 1 &&
+        st.lookup.Step(ss.position())) {
+      st.lookup.Extend(st.history, sampled);
+      lookup_ready = true;
+    }
+    if (lookup_ready && st.copy_run) {
+      const int c = CopyAfter(
+          st, {},
+          std::min<std::size_t>(
+              {static_cast<std::size_t>(CopyRows(st) - 1), budget, rows_room}),
+          drafts, &copy_start);
+      if (c > 0) {
+        copy_width = c;
+        copy_only = true;
+      }
+    }
+    if (copy_width == 0 && lookup_ready && sampled) {
+      const int c = ProposeCopy(
+          st, sampled,
+          std::min<std::size_t>(
+              {static_cast<std::size_t>(max_draft_), budget, rows_room}),
+          drafts, conf, &copy_start);
       if (c > 0) {
         const std::lock_guard lock(dsp_mutex_);
-        copy_width = ChooseDsparkWidth(
-            conf, c, sampled ? cal_copy_sampled_ : cal_copy_, costs_, 0.0);
-        if (copy_width > 0)
-          n = c;
+        copy_width = ChooseDsparkWidth(conf, c, cal_copy_sampled_, costs_, 0.0);
+        copy_only = copy_width > 0;
+        copy_conf = copy_only;
       }
     }
     const bool copied = copy_width > 0;
-    DsparkCalibration& cal = copied ? (sampled ? cal_copy_sampled_ : cal_copy_)
-                             : mode.coupled ? cal_coupled_
-                                            : cal_;
+    DsparkCalibration& cal = copy_only && sampled ? cal_copy_sampled_
+                             : mode.coupled       ? cal_coupled_
+                                                  : cal_;
     if (!copied && budget > 0 && engine_->DraftReady(ss) &&
         st.backoff.Draft()) {
       n = static_cast<int>(std::min<std::size_t>(
-          {max_draft_, budget, engine_->VerifyRows(ss) - 1}));
+          {static_cast<std::size_t>(max_draft_), budget, rows_room}));
       if (n > 0)  // stop once the width policy would not verify another
         n = engine_->Propose(
             ss, static_cast<std::int32_t>(a), n, drafts, conf,
@@ -1183,6 +1267,24 @@ public:
       width = copied  ? copy_width
               : n > 0 ? ChooseDsparkWidth(conf, n, cal, costs_)
                       : 0;
+    }
+    if (!copied && lookup_ready && greedy) {
+      // the drafter's proposals, then the copy their context continues
+      const std::size_t cap = std::min<std::size_t>(
+          {static_cast<std::size_t>(CopyRows(st) - 1), budget, rows_room});
+      if (cap > static_cast<std::size_t>(width)) {
+        // (the anchor is already in the history)
+        std::int32_t tail[Engine::kMaxVerifyRows];
+        std::copy(drafts, drafts + width, tail);
+        const int c = CopyAfter(st, std::span<const std::int32_t>(tail, width),
+                                cap - static_cast<std::size_t>(width),
+                                drafts + width, &copy_start);
+        if (c > 0) {
+          draft_width = width;
+          copy_width = c;
+          width += c;
+        }
+      }
     }
     std::vector<std::int32_t> rows{static_cast<std::int32_t>(a)};
     rows.insert(rows.end(), drafts, drafts + width);
@@ -1216,20 +1318,24 @@ public:
       engine_->CommitVerify(ss, keep, out);  // empty: from the device
     sampler.CopyDrawStateFrom(working);
     const auto t3 = Clock::now();
+    const int kept = static_cast<int>(keep) - 1;  // proposals kept
+    const int drafted = copied ? 0 : width - copy_width;
     {
       const std::lock_guard lock(dsp_mutex_);
-      costs_.ObserveVerify(
-          static_cast<int>(rows.size()),
-          std::chrono::duration<double, std::milli>(t2 - t1).count());
-      for (int j = 0; j < width && j < static_cast<int>(keep); ++j)
-        cal.Observe(conf[j], j + 1 < static_cast<int>(keep));
+      if (rows.size() <= static_cast<std::size_t>(DsparkCosts::kMaxRows))
+        costs_.ObserveVerify(
+            static_cast<int>(rows.size()),
+            std::chrono::duration<double, std::milli>(t2 - t1).count());
+      const int binned = copy_only ? (copy_conf ? width : 0) : drafted;
+      for (int j = 0; j < binned && j <= kept; ++j)
+        cal.Observe(conf[j], j + 1 <= kept);
       const double cycle =
           std::chrono::duration<double, std::milli>(t3 - t0).count();
       // what a plain step costs requests of this kind (host sampling included)
       double& plain = greedy ? plain_greedy_ms_ : plain_sampled_ms_;
-      if (n == 0)
+      if (n == 0 && !copied)
         plain += 0.1 * (cycle - plain);
-      else if (!copied)
+      else if (!copied && copy_width == 0)
         st.backoff.Observe(static_cast<int>(keep), cycle, plain);
     }
     if (width > 0) {
@@ -1237,11 +1343,26 @@ public:
       step.draft_tokens = static_cast<std::size_t>(width);
       step.draft_accepted_tokens = keep - 1;
     }
-    if (copied) {
-      step.lookup_tokens = static_cast<std::size_t>(width);
-      step.lookup_accepted_tokens = keep - 1;
-      st.lookup.Observe(copy_start, static_cast<std::size_t>(width), keep - 1);
-      st.copy_backoff.Observe(width, static_cast<int>(keep) - 1);
+    if (copy_width > 0) {
+      const int copy_kept = std::max(0, kept - draft_width);
+      step.lookup_tokens = static_cast<std::size_t>(copy_width);
+      step.lookup_accepted_tokens = static_cast<std::size_t>(copy_kept);
+      st.lookup.Observe(copy_start, static_cast<std::size_t>(copy_width),
+                        static_cast<std::size_t>(copy_kept));
+      st.copy_backoff.Observe(copy_width, copy_kept);
+      const bool whole = kept == width;
+      st.copy_run = whole && !step.stop;
+      if (!whole) {
+        st.copy_rows = kNarrowRows;
+        st.copy_streak = 0;
+      } else if (copy_only && width + 1 >= CopyRows(st) &&
+                 ++st.copy_streak >= 2) {
+        st.copy_rows = std::min(2 * CopyRows(st),
+                                static_cast<int>(Engine::kMaxVerifyRows));
+        st.copy_streak = 0;
+      }
+    } else {
+      st.copy_run = false;
     }
     return step;
   }
@@ -1328,7 +1449,7 @@ public:
           l.sampled = working[l.i].config().temperature > 0;
           if (l.budget == 0)
             continue;
-          const int room = static_cast<int>(Engine::kMaxVerifyRows) - B;
+          const int room = static_cast<int>(Engine::kMaxBatchVerifyRows) - B;
           const int limit = static_cast<int>(std::min<std::size_t>(
               {max_draft_, l.budget, engine_->VerifyRows(*l.ss) - 1,
                static_cast<std::size_t>(std::max(room, 0))}));
@@ -1460,12 +1581,12 @@ public:
                 l.st->budget_closed = true;
               const auto tk = forced ? static_cast<g::TextRunnerToken>(*forced)
                                      : static_cast<g::TextRunnerToken>(amax[k]);
-              const bool stop = at >= max_context_ || l.st->answer_done ||
+              const bool stop = at >= max_context_ ||
                                 (l.st->stop_at_eos() && tok_->IsStop(tk));
               l.st->pending = g::TextDecodeSelection{
                   .stop = stop,
                   .token = tk,
-                  .piece = stop ? std::string{} : Piece(l.st->block, tk)};
+                  .piece = stop ? std::string{} : Piece(*l.st, tk)};
             } else {
               l.st->pending =
                   Select(*l.st, working[l.i], out.subspan(k * V, V), at);
@@ -1614,6 +1735,17 @@ public:
       sampling::SamplerState& sampler) const override {
     return SelectNext(state, sampler);
   }
+  /// The encoder's workspace grows to the largest image seen (up to ~1 GiB)
+  /// and is needed only while one is encoded.
+  // fork: no TextModelRunner::Idle() (upstream #1274), so nothing calls this and the
+  // vision workspace stays allocated after the first image.
+  void Idle() const {
+    if (!vision_)
+      return;
+    std::lock_guard<std::mutex> lock(vision_mutex_);
+    const std::shared_lock<std::shared_mutex> gate(CaptureGate());
+    vision_->ReleaseWorkspace();
+  }
   [[nodiscard]] std::size_t CheckpointPosition(
       const g::TextRunnerState& state) const override {
     return Require(state).session().position();
@@ -1625,41 +1757,47 @@ private:
   static constexpr int kLowDetailMaxSide = 512;
   static constexpr std::size_t kVisionScratchBytes = std::size_t{1} << 30;
 
-  /// Encodes the image once (the encoder is single-threaded) into the entry's
-  /// own device rows.
+  /// The image's encoder rows: from the image cache, or encoded once (the
+  /// encoder is single-threaded) into rows of their own.
   void EnsureRows(ImageEntry& e) const {
     std::lock_guard<std::mutex> entry_lock(e.mutex);
     if (e.rows != nullptr)
       return;
+    if ((e.rows = image_cache_.FindRows(e.image->digest)) != nullptr) {
+      if (e.rows->count != e.count)
+        throw std::logic_error(
+            "inkling2: cached image rows do not match the prompt");
+      return;
+    }
     std::lock_guard<std::mutex> lock(vision_mutex_);
     const std::shared_lock<std::shared_mutex> gate(
         CaptureGate());  // no graph capture while image kernels run
-    const auto t0 = std::chrono::steady_clock::now();
     vision::VisionEncoder::Result r;
     std::string why;
     if (vision_stream_ == nullptr &&
         hipStreamCreate(&vision_stream_) != hipSuccess)
       throw std::runtime_error("inkling2: cannot create the vision stream");
-    if (!vision_->Encode(e.pixels.rgb.data(), e.pixels.w, e.pixels.h,
-                         vision_stream_, &r, &why))
+    const auto& px = e.image->pixels;
+    if (!vision_->Encode(px.rgb.data(), px.w, px.h, vision_stream_, &r, &why))
       throw std::runtime_error("inkling2: image encoding failed: " + why);
     if (static_cast<std::size_t>(r.n_tokens) != e.count ||
         r.dim != static_cast<int>(kVisionDim))
       throw std::logic_error(
           "inkling2: image encoder row count does not match the prompt");
-    float* dst = nullptr;
-    if (hipMalloc(&dst, e.count * kVisionDim * sizeof(float)) != hipSuccess)
+    auto rows = std::make_shared<ImageRows>();
+    if (hipMalloc(&rows->device, e.count * kVisionDim * sizeof(float)) !=
+        hipSuccess) {
+      rows->device = nullptr;
       throw std::runtime_error("inkling2: out of device memory for image rows");
-    if (hipMemcpyAsync(dst, r.embd, e.count * kVisionDim * sizeof(float),
-                       hipMemcpyDeviceToDevice, vision_stream_) != hipSuccess ||
-        hipStreamSynchronize(vision_stream_) != hipSuccess) {
-      (void)hipFree(dst);
-      throw std::runtime_error("inkling2: image rows copy failed");
     }
-    e.rows = dst;
-    e.encode_ms = std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - t0)
-                      .count();
+    rows->count = e.count;
+    if (hipMemcpyAsync(rows->device, r.embd,
+                       e.count * kVisionDim * sizeof(float),
+                       hipMemcpyDeviceToDevice, vision_stream_) != hipSuccess ||
+        hipStreamSynchronize(vision_stream_) != hipSuccess)
+      throw std::runtime_error("inkling2: image rows copy failed");
+    image_cache_.PutRows(e.image->digest, rows);
+    e.rows = std::move(rows);
   }
 
   std::shared_ptr<Engine> engine_;
@@ -1674,6 +1812,7 @@ private:
   mutable LanePool lane_pool_{
       std::min(7U, std::max(1U, std::thread::hardware_concurrency()) - 1)};
   mutable std::mutex vision_mutex_;
+  mutable ImageCache image_cache_;
   mutable hipStream_t vision_stream_ = nullptr;
   g::TextRunnerToken t_header_{}, t_text_{}, t_thinking_{}, t_end_message_{},
       t_invoke_{};
@@ -1705,6 +1844,7 @@ cache::Identity BuildIdentity(const ext::TextRunnerOptions& options,
                               const core::GgufReader& reader,
                               const Engine& engine,
                               const std::string& fingerprint,
+                              const std::string& draft_fingerprint,
                               std::string* error) {
   const auto& c = engine.config();
   ::inkling2::text::TokenizerData tokenizer;
@@ -1751,7 +1891,13 @@ cache::Identity BuildIdentity(const ext::TextRunnerOptions& options,
      << "numerics=ubatch:" << engine.ubatch() << " softcap:" << c.logit_softcap
      << " log_scale:" << c.log_scale_floor << '/' << c.log_scale_alpha
      << " rms_eps:" << c.rms_eps << '\n'
-     << "adapters=none\nspeculative=none\n";
+     << "adapters=none\n";
+  // A drafter's context rows are part of the checkpoints.
+  if (engine.has_drafter())
+    id << "speculative=dspark:"
+       << (draft_fingerprint.empty() ? "process" : draft_fingerprint) << '\n';
+  else
+    id << "speculative=none\n";
   const auto text = id.str();
   return {text.begin(), text.end()};
 }
@@ -1837,8 +1983,28 @@ std::shared_ptr<ext::TextModelRunner> CreateInkling2TextRunner(
         return nullptr;
       }
     }
-    const auto identity =
-        BuildIdentity(options, *reader, *engine, fingerprint, &why);
+    std::string draft_fingerprint;
+    if (dspark && !fingerprint.empty()) {
+      try {
+        core::GgufOpenOptions draft_open;
+        draft_open.allow_unsized_tensors = true;
+        const auto draft = core::GgufReader::OpenFile(
+            options.speculative.draft_model_path, &why, draft_open);
+        if (!draft) {
+          if (error)
+            *error = "inkling2: drafter: " + why;
+          return nullptr;
+        }
+        draft_fingerprint = core::GgufIdentityHex(*draft);
+      } catch (const std::exception& e) {
+        if (error)
+          *error = std::string("inkling2: drafter fingerprinting failed: ") +
+                   e.what();
+        return nullptr;
+      }
+    }
+    const auto identity = BuildIdentity(options, *reader, *engine, fingerprint,
+                                        draft_fingerprint, &why);
     if (identity.empty()) {
       if (error)
         *error = why;

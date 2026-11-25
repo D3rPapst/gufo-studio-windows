@@ -474,6 +474,14 @@ public:
   /// `close`. `open` must not begin with whitespace, which parsers skip.
   using ReasoningMarkup = ext::ReasoningMarkup;
   [[nodiscard]] virtual ReasoningMarkup ReasoningDelimiters() const;
+  /// For a runner whose model writes another reasoning spelling than the one it
+  /// publishes in ReasoningDelimiters(): the markers grammars must constrain.
+  /// std::nullopt (the default) uses the published ones. (Upstream #1303, the
+  /// reasoning half only; gufo-studio-windows backport for Inkling 2.)
+  [[nodiscard]] virtual std::optional<ReasoningMarkup> ReasoningGrammarMarkers(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
   BuildReasoningBudget(std::size_t tokens,

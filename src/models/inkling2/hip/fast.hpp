@@ -1,4 +1,4 @@
-// Fast kernels for the Inkling 2 Mini forward pass (milestone M2): the
+// Fast kernels for the Inkling 2 Mini forward pass: the
 // validated lab kernels (ext/lab: GEMV, fused projections, router, SITU MoE,
 // split-K attention, WMMA grouped GEMMs) integrated into the engine, plus the
 // small fused per-visit ops. MIT. Weight formats with a fast path: Q8_0 (dense,
@@ -46,7 +46,7 @@ struct ProjSpec {  // fused Q8_0 GEMV over up to 5 matrices of K = 2304
   float* ty[3];
   int tys[3];
 };
-/// y[yoff_i + r] for matrix i, x = [ni][2304]. Batched (M3): `nb` tokens share
+/// y[yoff_i + r] for matrix i, x = [ni][2304]. Batched: `nb` tokens share
 /// one read of the weights; token b reads x + b * ldx and writes y + b * ldy
 /// (nb = 1: ldx, ldy unused).
 void ProjMulti(hipStream_t s, const ProjSpec& p, const float* x, int ni,
@@ -69,6 +69,44 @@ void MoeGu(hipStream_t s, int fmt, const void* w, const float* escale,
 /// weighted partial outputs that the next ConvResid adds in slot order
 /// (ConvResidArgs::nsum = 8). Smaller blocks (one expert's activations to
 /// quantise).
+/// Wide steps (9 to 64 tokens) through int8 WMMA, with the outputs of
+/// ProjMulti / GemvQ8 (k = 2304 or 3072): the inputs are first quantized by
+/// QuantRows (`per` inputs a token, token stride ldt floats) into qa
+/// (kQaBytesPerVector each) and qs (kQsFloatsPerVector each).
+inline constexpr std::size_t kQaBytesPerVector = 2 * 3072 / 32 * 2 * 16;
+inline constexpr std::size_t kQsFloatsPerVector = 2 * 3072 / 16;
+void QuantRows(hipStream_t s, int k, const float* x, int per, int ldt, int nb,
+               void* qa, float* qs);
+bool ProjMma(hipStream_t s, const ProjSpec& p, const void* qa, const float* qs,
+             int per, float* y, int nb, int ldx, int ldy, const float* x);
+void GemvMma(hipStream_t s, int k, const void* w, const void* qa,
+             const float* qs, float* y, int m, float softcap, int nb);
+/// Pairs of a step grouped by expert (MoeRouteGroup), for MoeGuGrouped /
+/// MoeDownGrouped: the same outputs as MoeGu / MoeDownE, each expert's
+/// weights read once for all its pairs.
+struct MoeGroups {
+  int* sorted;  // [pairs]
+  int* ue;      // [128] used experts
+  int* ub;      // [128] start of each one's pairs in `sorted`
+  int* un;      // [128] its pair count
+  int* nd;      // [1] used experts
+  void* qx;     // the next grouped kernel's quantized inputs (MoeQuantGrouped)
+};
+void MoeRouteGroup(hipStream_t s, const int* ids, int pairs, MoeGroups g);
+/// Quantizes the nv inputs x [nv][k] (k = 2304: the tokens' MoE inputs; 1152:
+/// the pairs' activations) of the next grouped kernel into g.qx, once for all
+/// the blocks that read them. g.qx holds kMoeQuantBytes per pair.
+inline constexpr std::size_t kMoeQuantBytes = 2 * 1152 + 2 * 72 * 4;
+void MoeQuantGrouped(hipStream_t s, int fmt, const float* x, int nv, int k,
+                     MoeGroups g);
+/// a [pair][ff]: SITU(gate, up) of every pair, inputs from MoeQuantGrouped(k
+/// = 2304); `slots` >= used experts.
+void MoeGuGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
+                  MoeGroups g, int slots, float* a, int ff, float beta,
+                  float lb);
+/// yp [pair][d]: weighted outputs, inputs from MoeQuantGrouped(k = 1152).
+void MoeDownGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
+                    MoeGroups g, int slots, const float* wts, float* yp, int d);
 void MoeDownE(hipStream_t s, int fmt, const void* w, const float* escale,
               const float* a, const int* ids, const float* wts, float* yp,
               int d, int nb = 1);
@@ -97,7 +135,7 @@ struct ConvResidArgs {
   const int* ri = nullptr;
 };
 /// Rows of one verification step (Engine::kMaxVerifyRows).
-inline constexpr int kVerifyRows = 8;
+inline constexpr int kVerifyRows = 64;
 /// Batched (nb tokens): x, cur, blk are [nb][2304]; token b uses slot[b * 48].
 void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb = 1);
 /// After a verification step: every history of the session's 48 slots
@@ -221,11 +259,10 @@ struct AttnArgs {
                    // [nb][3072], sink [nb][24]
   int ws_tok = 0;  // token stride of ws_m / ws_l (floats); ws_o is ws_tok * 128
   int nrows = 0;   // attn_decode_rows: rows of the step (groups of NB per z)
-  unsigned* cnt = nullptr;  // KvAttnDecode: [nb][8] zero, self-resetting
 };
 void AttnDecode(hipStream_t s, const AttnArgs& a, int nb = 1);
-/// KvPrep then AttnDecode in one launch, for rows of distinct sessions (no
-/// verification capture): the same arithmetic.
+/// KvPrep and the attention in one launch, then the split reduction, for rows
+/// of distinct sessions (no verification capture): the same arithmetic.
 void KvAttnDecode(hipStream_t s, const KvPrepArgs& kv, const AttnArgs& a,
                   int nb = 1);
 /// AttnDecode of nb (2 to 4) rows of one session at consecutive positions

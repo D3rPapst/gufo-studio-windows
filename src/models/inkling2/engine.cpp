@@ -12,6 +12,8 @@
 #include <cstring>
 #include <functional>
 #include "src/models/inkling2/compat/state_memory.hpp"  // fork: eager state (no mem layer)
+#include <gufo/ext/experimental/weight_upload.hpp>
+#include <gufo/ext/platform/prefault.hpp>
 #include <limits>
 #include <map>
 #include <set>
@@ -51,24 +53,19 @@ void Check(hipError_t e, const char* what) {
                              hipGetErrorString(e));
 }
 
+/// Device memory only: weights and scratch are read by every step, and a
+/// managed fallback would put them in host RAM on Windows (separate from the
+/// GPU's carve-out) without saying so.
 void* AllocDevice(std::size_t bytes, const char* what) {
   void* p = nullptr;
-  hipError_t e = hipMalloc(&p, bytes);
-  if (e == hipErrorOutOfMemory) {
+  const hipError_t e = hipMalloc(&p, std::max<std::size_t>(bytes, 1));
+  if (e != hipSuccess || p == nullptr) {
     (void)hipGetLastError();
-    std::fprintf(stderr,
-                 "inkling2: hipMalloc of %s (%zu bytes) ran out of device "
-                 "memory; falling back to managed memory\n",
-                 what, bytes);
-    e = hipMallocManaged(&p, bytes, hipMemAttachGlobal);
-    if (e == hipSuccess)
-      (void)hipMemAdvise(p, bytes, hipMemAdviseSetCoarseGrain, 0);
-    (void)hipGetLastError();
+    throw std::runtime_error(
+        std::string("inkling2: cannot allocate ") + what + " (" +
+        std::to_string(bytes) +
+        " bytes of device memory): " + hipGetErrorString(e));
   }
-  if (e != hipSuccess || p == nullptr)
-    throw std::runtime_error(std::string("inkling2: cannot allocate ") + what +
-                             " (" + std::to_string(bytes) +
-                             " bytes): " + hipGetErrorString(e));
   return p;
 }
 
@@ -80,6 +77,10 @@ public:
     for (auto& r : regions_)
       (void)hipFree(r.dev);
   }
+  /// Reads the file through hip::WeightUpload, which streams it to the device
+  /// without faulting the mapping: a copy through the mapping keeps the whole
+  /// file resident in the process (on Windows in its working set), which the
+  /// RAM prompt cache, sized from free host memory, then lacks.
   void Upload(const core::GgufReader& reader, const Inkling2Weights& weights,
               std::size_t* total) {
     std::size_t sum = 0;
@@ -87,28 +88,39 @@ public:
                                              // (not in the file mapping)
       const std::size_t bytes = v->size() * sizeof(float);
       void* dev = AllocDevice(bytes, "widened weights");
-      Check(hipMemcpy(dev, v->data(), bytes, hipMemcpyHostToDevice),
-            "weight upload");
       regions_.push_back(
           {reinterpret_cast<std::uintptr_t>(v->data()), bytes, dev});
+      Check(hipMemcpy(dev, v->data(), bytes, hipMemcpyHostToDevice),
+            "weight upload");
       sum += bytes;
     }
+    std::string error;
+    auto upload =
+        ::gufo::hip::WeightUpload::Create(reader.GetMappedRegions(), &error);
+    if (!upload)
+      throw std::runtime_error("inkling2: weight upload: " + error);
+    bool ok = true;
     for (const auto& t : reader.GetTensors()) {
       if (t.size_bytes == 0)
         continue;
-      void* dev = AllocDevice(t.size_bytes, std::string(t.name).c_str());
-      constexpr std::size_t kChunk = std::size_t{64} << 20;
-      for (std::size_t off = 0; off < t.size_bytes; off += kChunk) {
-        const std::size_t n = std::min(kChunk, t.size_bytes - off);
-        Check(hipMemcpy(static_cast<char*>(dev) + off,
-                        static_cast<const char*>(t.data) + off, n,
-                        hipMemcpyHostToDevice),
-              "weight upload");
+      void* dev = nullptr;
+      try {
+        dev = AllocDevice(t.size_bytes, std::string(t.name).c_str());
+      } catch (...) {
+        (void)upload->Finish(&error);  // queued copies still target regions_
+        throw;
       }
       regions_.push_back(
           {reinterpret_cast<std::uintptr_t>(t.data), t.size_bytes, dev});
       sum += t.size_bytes;
+      if (!upload->CopyMapped(t.data, t.size_bytes, dev, &error)) {
+        ok = false;
+        break;
+      }
     }
+    // Finish waits for every queued copy, also after a failed one.
+    if (!upload->Finish(&error) || !ok)
+      throw std::runtime_error("inkling2: weight upload: " + error);
     std::sort(regions_.begin(), regions_.end(),
               [](const Region& a, const Region& b) { return a.base < b.base; });
     *total = sum;
@@ -150,6 +162,8 @@ struct Engine::Impl {
   // Prefill side stream for projections that run beside larger ones.
   hipStream_t ps = nullptr;
   hipEvent_t ev_fork = nullptr, ev_join = nullptr, ev_bank = nullptr;
+  // Cancellable passes: the last two visits' ends (see MaybeYield).
+  hipEvent_t ev_visit[2] = {};
   // Decode steps: a visit's q and output-projection weights are read on a
   // side stream while the latency-bound mixes and attention run (the DRAM is
   // mostly idle then), so their GEMVs find them in the last-level cache.
@@ -313,7 +327,21 @@ struct Engine::Impl {
       *d_moe, *d_rlog, *d_wts8, *d_act8, *d_ws_o, *d_ws_m, *d_ws_l;
   // rows per decode step: sessions of a batch (up to kMaxDecodeBatch) or one
   // session's verification rows (up to kMaxVerifyRows)
-  static constexpr int kMaxB = 8;
+  static constexpr int kMaxB = 64;
+  // rows a weight GEMV or attention launch takes; wider steps run as
+  // consecutive launches of at most this many rows (same per-row arithmetic)
+  static constexpr int kChunk = 8;
+  // steps of at least this many rows run the dense Q8 GEMVs through int8
+  // WMMA (same outputs; slower for fewer rows, whose tiles are half empty)
+  static constexpr int kMmaRows = kChunk + 1;
+  // The LM head and the three-input (global-layer) projections take the int8
+  // WMMA path from a full chunk: at 8 rows the head's per-row GEMV runs 4 to 7
+  // waves per SIMD and streams about 150 GB/s, WMMA about 195 GB/s (the
+  // one-input projections and the output matrix stay faster per row)
+  static constexpr int kMmaHeadRows = kChunk;
+  // one-session verification steps from this many rows group the MoE pairs by
+  // expert (consecutive rows share most of their experts)
+  static constexpr int kGroupedVerifyRows = 6;
   static constexpr int kMsgInvTokens = 1024;
   static constexpr int kWideTileTokens =
       256;  // ubatches at least this long use 128-token GEMM tiles
@@ -326,17 +354,19 @@ struct Engine::Impl {
   float* d_blk[16];
   int nblk_alloc = 0;
   int* d_ids8;
+  fs::MoeGroups d_groups{};  // wide steps: pairs grouped by expert
+  void* d_qa = nullptr;      // wide steps: quantized GEMV inputs
+  float* d_qs = nullptr;
   int* d_step;  // {token, position, row within its session}
   unsigned* d_counter;
-  unsigned* d_acnt;  // fused decode attention: [kMaxB][8] split counters
   unsigned* d_ccnt;  // fused controller apply + norm: [kMaxB][4]
   fs::SlotEntry* d_tbl;
   const float* d_states[16];
   int d_ns = 0;
-  // ---- M2 hook: layered prefill (spill/restore of the transient activations
+  // ---- layered prefill (spill/restore of the transient activations
   // around a yield) ----
   std::span<const InputRows>
-      input_rows;  // M5 hook: set by Forward (under the engine mutex)
+      input_rows;  // set by Forward (under the engine mutex)
   struct YieldRun {
     const PrefillYield* spec = nullptr;
     std::unique_lock<std::mutex>* lock = nullptr;
@@ -393,8 +423,29 @@ struct Engine::Impl {
     if (y == nullptr || y->spec == nullptr)
       return false;
     ++y->done;
+    if (y->spec->cancelled) {
+      // Kernels run far behind their launches (a pass is queued in a few
+      // milliseconds): keep one visit queued ahead of the device, so a
+      // cancellation stops the pass within about two visits. The device
+      // stays busy; the arithmetic is unchanged.
+      Check(hipEventRecord(ev_visit[y->done & 1], s), "visit event");
+      if (y->done >= 2)
+        Check(hipEventSynchronize(ev_visit[(y->done - 1) & 1]), "visit wait");
+      bool stop = true;
+      try {
+        stop = y->spec->cancelled();
+      } catch (...) {
+      }
+      if (stop) {
+        // No queued work of this pass may outlive it: the next Forward reuses
+        // the scratch (both streams).
+        Check(hipStreamSynchronize(s), "cancel sync");
+        Check(hipStreamSynchronize(ps), "cancel sync");
+        throw PrefillCancelled();
+      }
+    }
     const std::size_t g = y->spec->groups;
-    if (y->done >= y->total || y->k >= g)
+    if (!y->spec->yield || g < 2 || y->done >= y->total || y->k >= g)
       return false;
     if (y->done < (y->k * y->total + g - 1) / g)
       return false;
@@ -428,7 +479,7 @@ struct Engine::Impl {
     }
     return true;
   }
-  // ---- end M2 hook ----
+  // ---- end layered prefill ----
 
   float* NewBuf(std::size_t floats) {
     auto* p = static_cast<float*>(AllocDevice(floats * 4, "scratch"));
@@ -480,7 +531,8 @@ struct Engine::Impl {
       (void)hipEventDestroy(ev_fork);
     if (ev_join)
       (void)hipEventDestroy(ev_join);
-    for (hipEvent_t e : {ev_bank, ev_msg[0], ev_msg[1]})
+    for (hipEvent_t e :
+         {ev_bank, ev_msg[0], ev_msg[1], ev_visit[0], ev_visit[1]})
       if (e)
         (void)hipEventDestroy(e);
     for (void* p : scratch_allocs)
@@ -498,7 +550,7 @@ struct Engine::Impl {
     bankout = NewBuf(u * kEmbd);
     tau = NewBuf(u);
     for (auto& b : spill_buf)
-      b = NewBuf(u * kEmbd);  // M2 hook: layered prefill spill area
+      b = NewBuf(u * kEmbd);  // layered prefill spill area
     spill_tau = NewBuf(u);
     for (auto& b : blocks)
       b = NewBuf(u * kEmbd);
@@ -625,7 +677,8 @@ struct Engine::Impl {
     Check(hipEventCreateWithFlags(&ev_pf, hipEventDisableTiming), "event");
     Check(hipEventCreateWithFlags(&ev_pfj, hipEventDisableTiming), "event");
     Check(hipEventCreateWithFlags(&ev_join, hipEventDisableTiming), "event");
-    for (hipEvent_t* e : {&ev_bank, &ev_msg[0], &ev_msg[1]})
+    for (hipEvent_t* e :
+         {&ev_bank, &ev_msg[0], &ev_msg[1], &ev_visit[0], &ev_visit[1]})
       Check(hipEventCreateWithFlags(e, hipEventDisableTiming), "event");
     // Decode buffers are kMaxB tokens wide ([token][...]); a step of nb tokens
     // uses the first nb rows.
@@ -650,13 +703,22 @@ struct Engine::Impl {
     d_rlog = NewBuf(B * 128);
     d_wts8 = NewBuf(B * 8);
     d_act8 = NewBuf(B * 8 * 1152);
-    d_ws_o = NewBuf(B * kMaxSplit * 8 * 12 * 128);
-    d_ws_m = NewBuf(B * kMaxSplit * 8 * 12);
-    d_ws_l = NewBuf(B * kMaxSplit * 8 * 12);
+    // attention split workspaces: one launch's rows (kChunk)
+    d_ws_o = NewBuf(kChunk * kMaxSplit * 8 * 12 * 128);
+    d_ws_m = NewBuf(kChunk * kMaxSplit * 8 * 12);
+    d_ws_l = NewBuf(kChunk * kMaxSplit * 8 * 12);
     for (auto& b : d_blk)
       b = NewBuf(B * kEmbd);
     d_moe_part = NewBuf(B * 8 * kEmbd);
     d_ids8 = NewInts(B * 8);
+    d_qa = NewRaw(B * 3 * fs::kQaBytesPerVector);
+    d_qs = NewBuf(B * 3 * fs::kQsFloatsPerVector);
+    d_groups.sorted = NewInts(B * 8);
+    d_groups.ue = NewInts(128);
+    d_groups.ub = NewInts(128);
+    d_groups.un = NewInts(128);
+    d_groups.nd = NewInts(1);
+    d_groups.qx = NewRaw(B * 8 * fs::kMoeQuantBytes);
     d_step = NewInts(3 * B);  // tokens [B], positions [B], row in session [B]
     d_vcap =
         NewBuf(static_cast<std::size_t>(48) * kConvChannels * fs::kVerifyRows);
@@ -670,8 +732,6 @@ struct Engine::Impl {
           "pinned");
     d_counter = reinterpret_cast<unsigned*>(NewInts(B));
     Check(hipMemset(d_counter, 0, B * 4), "counter");
-    d_acnt = reinterpret_cast<unsigned*>(NewInts(B * 8));
-    Check(hipMemset(d_acnt, 0, B * 8 * 4), "attention counters");
     d_ccnt = reinterpret_cast<unsigned*>(NewInts(B * 4));
     Check(hipMemset(d_ccnt, 0, B * 4 * 4), "controller counters");
     d_tbl = static_cast<fs::SlotEntry*>(
@@ -747,7 +807,7 @@ struct Engine::Impl {
     // thread exists).
     if (BatchCapable()) {
       for (nb = 1; nb <= static_cast<int>(Engine::kMaxDecodeBatch); ++nb)
-        (void)CaptureGraph(2048, 2048 * 8 + nb);
+        (void)CaptureGraph(2048, 2048 * 128 + nb);
       nb = 1;
     }
   }
@@ -1332,7 +1392,23 @@ struct Engine::Impl {
           add(L.attn_v_conv_proj, three ? 2 : 0, d_dyn + 32, 32, 64);
         }
       }
-      fs::ProjMulti(ds, ps, d_in, three ? 3 : 1, d_proj, nb, kSIn, kSProj);
+      const int ni = three ? 3 : 1;
+      if (nb >= (three ? kChunk : kMmaRows)) {
+        // one weight read for all rows, int8 WMMA
+        fs::QuantRows(ds, kEmbd, d_in, ni, kSIn, nb, d_qa, d_qs);
+        if (!fs::ProjMma(ds, ps, d_qa, d_qs, ni, d_proj, nb, kSIn, kSProj,
+                         d_in))
+          throw std::runtime_error("inkling2: projection layout");
+      } else
+        for (int c0 = 0; c0 < nb; c0 += kChunk) {
+          fs::ProjSpec pc = ps;
+          for (int i = 0; i < pc.tn; ++i)
+            pc.ty[i] += static_cast<std::size_t>(c0) * pc.tys[i];
+          fs::ProjMulti(ds, pc, d_in + static_cast<std::size_t>(c0) * kSIn,
+                        three ? 3 : 1,
+                        d_proj + static_cast<std::size_t>(c0) * kSProj,
+                        std::min(kChunk, nb - c0), kSIn, kSProj);
+        }
     } else {
       GenericG(L.attn_q, iq, Qb);
       GenericG(L.attn_gate, iq, Gb);
@@ -1433,16 +1509,37 @@ struct Engine::Impl {
       aa.tau_alpha = cfg->log_scale_alpha;
       aa.ldp = kSProj;
       aa.ws_tok = static_cast<int>(kMaxSplit * 8 * 12);
-      aa.cnt = d_acnt;
-      if (!verify_mode)
+      if (!verify_mode) {
         fs::KvAttnDecode(ds, ka, aa, nb);
-      else if (verify_one_session && !swa && nb > 1)
-        fs::AttnDecodeRows(ds, aa, nb);
-      else
-        fs::AttnDecode(ds, aa, nb);
+      } else {
+        for (int c0 = 0; c0 < nb; c0 += kChunk) {
+          const int cn = std::min(kChunk, nb - c0);
+          const std::size_t o = static_cast<std::size_t>(c0);
+          fs::AttnArgs ac = aa;
+          ac.slot = aa.slot + o * 48;
+          ac.pos = aa.pos + o;
+          ac.q = aa.q + o * kSProj;
+          ac.r = aa.r + o * kSProj;
+          ac.gate = aa.gate + o * kSProj;
+          ac.sink = aa.sink + o * 24;
+          ac.out = aa.out + o * kQ;
+          if (verify_one_session && !swa && cn > 1)
+            fs::AttnDecodeRows(ds, ac, cn);
+          else
+            fs::AttnDecode(ds, ac, cn);
+        }
+      }
     }
     if (F.oproj)
-      fs::GemvQ8(ds, kQ, D(L.attn_output), d_ob, d_ao, kEmbd, 0.f, nb);
+      if (nb >= kMmaRows) {
+        fs::QuantRows(ds, kQ, d_ob, 1, kQ, nb, d_qa, d_qs);
+        fs::GemvMma(ds, kQ, D(L.attn_output), d_qa, d_qs, d_ao, kEmbd, 0.f, nb);
+      } else
+        for (int c0 = 0; c0 < nb; c0 += kChunk)
+          fs::GemvQ8(ds, kQ, D(L.attn_output),
+                     d_ob + static_cast<std::size_t>(c0) * kQ,
+                     d_ao + static_cast<std::size_t>(c0) * kEmbd, kEmbd, 0.f,
+                     std::min(kChunk, nb - c0));
     else
       GenericG(L.attn_output, d_ob, d_ao);
     {
@@ -1502,7 +1599,24 @@ struct Engine::Impl {
     fs::Router(ds, HW(L.ffn_gate_inp), DS(L.exp_probs_b), d_h, d_rlog,
                d_counter, d_ids8, d_wts8, cfg->expert_weights_scale, nb,
                ctl_half);
-    if (F.moe >= 0) {
+    // Many rows, a full chunk, or six or more consecutive rows of one session
+    // (which share most experts): each used expert's weights read once for all
+    // its pairs. Fewer rows, and other sessions' rows (which share fewer
+    // experts), run per pair.
+    if (F.moe >= 0 && (nb >= kChunk || (verify_mode && verify_one_session &&
+                                        nb >= kGroupedVerifyRows))) {
+      const int slots = std::min(E, 8 * nb);
+      fs::MoeRouteGroup(ds, d_ids8, 8 * nb, d_groups);
+      fs::MoeQuantGrouped(ds, F.moe, d_h, nb, kEmbd, d_groups);
+      fs::MoeGuGrouped(ds, F.moe, D(L.ffn_gate_up_exps),
+                       L.ffn_gate_up_scale ? DS(L.ffn_gate_up_scale) : nullptr,
+                       d_groups, slots, d_act8, nff, cfg->situ_beta,
+                       cfg->situ_linear_beta);
+      fs::MoeQuantGrouped(ds, F.moe, d_act8, 8 * nb, nff, d_groups);
+      fs::MoeDownGrouped(ds, F.moe, D(L.ffn_down_exps),
+                         L.ffn_down_scale ? DS(L.ffn_down_scale) : nullptr,
+                         d_groups, slots, d_wts8, d_moe_part, kEmbd);
+    } else if (F.moe >= 0) {
       fs::MoeGu(ds, F.moe, D(L.ffn_gate_up_exps),
                 L.ffn_gate_up_scale ? DS(L.ffn_gate_up_scale) : nullptr, d_h,
                 d_ids8, d_act8, nff, cfg->situ_beta, cfg->situ_linear_beta, nb);
@@ -1613,8 +1727,16 @@ struct Engine::Impl {
     PrefetchJoin();
     const int V = static_cast<int>(cfg->n_vocab_text);
     if (head_fast) {
-      fs::GemvQ8(ds, kEmbd, D(w->output), d_hn, logits_d, V, cfg->logit_softcap,
-                 nb);
+      if (nb >= kMmaHeadRows) {
+        fs::QuantRows(ds, kEmbd, d_hn, 1, kEmbd, nb, d_qa, d_qs);
+        fs::GemvMma(ds, kEmbd, D(w->output), d_qa, d_qs, logits_d, V,
+                    cfg->logit_softcap, nb);
+      } else
+        for (int c0 = 0; c0 < nb; c0 += kChunk)
+          fs::GemvQ8(ds, kEmbd, D(w->output),
+                     d_hn + static_cast<std::size_t>(c0) * kEmbd,
+                     logits_d + static_cast<std::size_t>(c0) * V, V,
+                     cfg->logit_softcap, std::min(kChunk, nb - c0));
     } else {
       kk::Gemm(ds, static_cast<int>(w->output.type), D(w->output), V, kEmbd,
                d_hn, kEmbd, logits_d, V, 1);
@@ -1647,7 +1769,7 @@ struct Engine::Impl {
             stderr,
             "inkling2: decode graph capture could not start for context bucket "
             "%d, width %d; those steps run without a graph\n",
-            ctx, key % 8);
+            ctx, key % 128);
       return map.end();
     }
     bool ok = true;
@@ -1670,7 +1792,7 @@ struct Engine::Impl {
         std::fprintf(stderr,
                      "inkling2: decode graph capture failed for context bucket "
                      "%d, width %d; those steps run without a graph\n",
-                     ctx, key % 8);
+                     ctx, key % 128);
       return map.end();
     }
     return map.emplace(key, ex).first;
@@ -1719,7 +1841,7 @@ struct Engine::Impl {
                            48 * sizeof(fs::SlotEntry), hipMemcpyDeviceToDevice,
                            ds),
             "slot table");
-    const int key = ctx * 8 + n + (decode_prefetch ? (1 << 29) : 0);
+    const int key = ctx * 128 + n + (decode_prefetch ? (1 << 29) : 0);
     auto it = graphs.find(key);
     if (it == graphs.end() && failed_graphs.count(key) == 0)
       it = CaptureGraph(ctx, key);
@@ -1817,7 +1939,7 @@ struct Engine::Impl {
       }
     } off{&verify_mode, &verify_one_session};
     // Several sessions take the per-row attention kernel: their own graphs.
-    const int key = ctx * 8 + n + (ng > 1 ? (1 << 28) : 0) +
+    const int key = ctx * 128 + n + (ng > 1 ? (1 << 28) : 0) +
                     (decode_prefetch ? (1 << 29) : 0);
     const int fkey = -key;  // failed verification captures
     auto it = vgraphs.find(key);
@@ -1897,7 +2019,7 @@ struct Engine::Impl {
     kk::RmsNorm(s, cur, kEmbd, DF(w->token_embd_norm), cur, kEmbd, kEmbd, T,
                 cfg->rms_eps);
     for (const InputRows& r :
-         input_rows) {  // M5 hook: image rows replace the (normed) embeddings
+         input_rows) {  // image rows replace the (normed) embeddings
       const std::size_t lo = std::max<std::size_t>(r.first, first_idx);
       const std::size_t hi = std::min<std::size_t>(
           r.first + r.count, first_idx + static_cast<std::size_t>(T));
@@ -1917,7 +2039,7 @@ struct Engine::Impl {
     for (int ip = 0; ip < static_cast<int>(cfg->core_start); ++ip) {
       Layer(ss, ip, ip, nullptr);
       Tap(visit++, "l_out");
-      MaybeYield(yr, true);  // M2 hook
+      MaybeYield(yr, true);
     }
     kk::Copy(s, cur, prelude, T * kEmbd);
     const int prelude_n = nblocks;
@@ -1984,7 +2106,7 @@ struct Engine::Impl {
       Tap(visit++, "l_out");
       if (visit < 48)
         MaybeYield(yr,
-                   true);  // M2 hook (the last visit is followed by the head)
+                   true);  // (the last visit is followed by the head)
     }
     ss.pos_ += T;
     if (!last_ubatch && !sink && !dsp)
@@ -2108,6 +2230,11 @@ std::unique_ptr<Engine> Engine::Create(
     e->impl_->s = nullptr;
     e->impl_->dw.Upload(*e->reader_, e->weights_, &e->weight_bytes_);
     e->impl_->Init(e.get());
+    // Init read the small tensors it converts (router, loop controllers, bias
+    // tables) through the mapping; nothing reads it again. Drop those pages
+    // from the process (a later read would refault them from the file).
+    for (const auto& region : e->reader_->GetMappedRegions())
+      platform::ReleaseMappedPages(region.data, region.size);
     e->CalibrateDecodePrefetch();
     return e;
   } catch (const std::exception& ex) {
@@ -2288,7 +2415,7 @@ void Engine::DecodeBatch(std::span<Session* const> sessions,
   for (std::size_t i = 0; i < sessions.size(); ++i) {
     Session& s = *sessions[i];
     if (s.hooks_ != nullptr)
-      s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
+      s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);
     s.BackRows(s.pos_, s.pos_ + 1);
   }
   if (sessions.size() >= 2 && batch_capable()) {
@@ -2327,7 +2454,7 @@ void Engine::DecodeBatchRows(std::span<Session* const> sessions,
   for (std::size_t i = 0; i < sessions.size(); ++i) {
     Session& s = *sessions[i];
     if (s.hooks_ != nullptr)
-      s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
+      s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);
     s.BackRows(s.pos_, s.pos_ + 1);
   }
   std::vector<float>* outs[Impl::kMaxB] = {};
@@ -2381,7 +2508,8 @@ void Engine::VerifyBatch(std::span<Session* const> sessions,
       throw std::runtime_error("inkling2: bad verification width");
     total += counts[g];
   }
-  if (total != tokens.size() || total > kMaxVerifyRows)
+  if (total != tokens.size() ||
+      total > (sessions.size() == 1 ? kMaxVerifyRows : kMaxBatchVerifyRows))
     throw std::runtime_error("inkling2: bad verification width");
   for (auto t : tokens)
     if (t < 0 || static_cast<std::uint32_t>(t) >= weights_.config.n_vocab_text)
@@ -2391,7 +2519,7 @@ void Engine::VerifyBatch(std::span<Session* const> sessions,
   for (std::size_t g = 0; g < sessions.size(); ++g) {
     Session& s = *sessions[g];
     if (s.hooks_ != nullptr)
-      s.hooks_->BeforeWrite(s.pos_, s.pos_ + counts[g]);  // M2 hook
+      s.hooks_->BeforeWrite(s.pos_, s.pos_ + counts[g]);
     s.BackRows(s.pos_, s.pos_ + counts[g]);
     cnt[g] = static_cast<int>(counts[g]);
     s.verify_rows_ = counts[g];
@@ -2548,11 +2676,24 @@ void Engine::Step(Session& s, std::int32_t token, std::int32_t* argmax) {
       static_cast<std::uint32_t>(token) >= weights_.config.n_vocab_text)
     throw std::runtime_error("inkling2: token id out of range");
   if (s.hooks_ != nullptr)
-    s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
+    s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);
   s.BackRows(s.pos_, s.pos_ + 1);
   Session* sp = &s;
   std::vector<float>* none = nullptr;
   impl_->DecodeN(&sp, &token, &none, 1, argmax);
+}
+
+void Engine::Decode(Session& s, std::int32_t token) {
+  const std::lock_guard lock(mutex_);
+  if (s.pos_ + 1 > max_context_)
+    throw std::runtime_error("inkling2: context exhausted");
+  if (token < 0 ||
+      static_cast<std::uint32_t>(token) >= weights_.config.n_vocab_text)
+    throw std::runtime_error("inkling2: token id out of range");
+  if (s.hooks_ != nullptr)
+    s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);
+  s.BackRows(s.pos_, s.pos_ + 1);
+  impl_->Decode(s, token, &s.logits_);
 }
 
 void Engine::Synchronize() {
@@ -2569,9 +2710,10 @@ void Engine::Forward(Session& s, std::span<const std::int32_t> tokens,
   for (auto t : tokens)
     if (t < 0 || static_cast<std::uint32_t>(t) >= weights_.config.n_vocab_text)
       throw std::runtime_error("inkling2: token id out of range");
-  Impl::YieldRun run;  // M2 hook: layered prefill
+  Impl::YieldRun run;
   Impl::YieldRun* yr = nullptr;
-  if (yield != nullptr && yield->groups >= 2 && yield->yield) {
+  if (yield != nullptr &&
+      ((yield->groups >= 2 && yield->yield) || yield->cancelled)) {
     const std::size_t ubatches = (tokens.size() + ubatch_ - 1) / ubatch_;
     run.spec = yield;
     run.lock = &lock;
@@ -2588,20 +2730,11 @@ void Engine::Forward(Session& s, std::span<const std::int32_t> tokens,
     ~RowsScope() { i->input_rows = saved; }
   } rows_scope{impl_.get(), impl_->input_rows};
   impl_->input_rows = rows;
-  if (tokens.size() == 1 && rows.empty()) {
-    if (s.hooks_ != nullptr)
-      s.hooks_->BeforeWrite(s.pos_, s.pos_ + 1);  // M2 hook
-    s.BackRows(s.pos_, s.pos_ + 1);
-    impl_->Decode(s, tokens[0], &s.logits_);
-    if (sink)
-      sink(0, 1, s.logits_.data());
-    return;
-  }
   std::size_t done = 0;
   while (done < tokens.size()) {
     const std::size_t n = std::min<std::size_t>(ubatch_, tokens.size() - done);
     if (s.hooks_ != nullptr)
-      s.hooks_->BeforeWrite(s.pos_, s.pos_ + n);  // M2 hook
+      s.hooks_->BeforeWrite(s.pos_, s.pos_ + n);
     s.BackRows(s.pos_, s.pos_ + n);
     impl_->Ubatch(s, tokens.subspan(done, n), static_cast<int>(done),
                   done + n == tokens.size(), sink, yr);

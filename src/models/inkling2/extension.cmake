@@ -66,6 +66,13 @@ if(TARGET gufo_inkling2_hip)
   target_include_directories(gufo_inkling2_hip PUBLIC ${PROJECT_SOURCE_DIR})
 endif()
 
+# Install model-owned license material only when this model is selected.
+install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE.inkling2"
+  DESTINATION share/licenses/gufo/third-party)
+install(FILES "${GUFO_EXTENSION_BUILD_ROOT}/THIRD_PARTY.md"
+  DESTINATION share/licenses/gufo/third-party
+  RENAME inkling2-THIRD_PARTY.md)
+
 gufo_extension_target(
   NAME inkling2_probe_test
   SOURCES
@@ -77,6 +84,13 @@ gufo_extension_target(
   NAME inkling2_text_test
   SOURCES
     tests/text/text_tests.cpp
+  LINK_LIBRARIES
+    gufo_inkling2
+)
+gufo_extension_target(
+  NAME inkling2_policy_test
+  SOURCES
+    tests/spec/policy_test.cpp
   LINK_LIBRARIES
     gufo_inkling2
 )
@@ -118,6 +132,10 @@ gufo_extension_target(
 if(TARGET inkling2_probe_test)
   add_test(NAME inkling2.probe COMMAND inkling2_probe_test)
   set_tests_properties(inkling2.probe PROPERTIES LABELS inkling2)
+endif()
+if(TARGET inkling2_policy_test)
+  add_test(NAME inkling2.policy COMMAND inkling2_policy_test)
+  set_tests_properties(inkling2.policy PROPERTIES LABELS inkling2)
 endif()
 if(TARGET inkling2_text_test)
   add_test(NAME inkling2.text COMMAND inkling2_text_test)

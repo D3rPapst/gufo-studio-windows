@@ -1,4 +1,4 @@
-// Fast kernels for Inkling 2 Mini (milestone M2). See fast.hpp.
+// Fast kernels for Inkling 2 Mini. See fast.hpp.
 // MIT. Ported from ext/lab (kern.h, kern2.h, attn/attn_kernels.h of this
 // repository).
 #include <hip/hip_fp16.h>
@@ -113,13 +113,10 @@ __device__ __forceinline__ void quant_act(const float* __restrict__ x, v4u* aq,
 }
 
 template<int B, int K, int VS = 1>
-__device__ __forceinline__ void q8_unit(const uint8_t* p, const v4u* aq,
-                                        const float* asc, int u, int vb,
-                                        float (&acc)[B]) {
+__device__ __forceinline__ void q8_unit_c(v4u w0, v4u w1, float d,
+                                          const v4u* aq, const float* asc,
+                                          int u, int vb, float (&acc)[B]) {
   constexpr int NU = K / 32;
-  v4u w0 = *(const v4u_a2*)(p + 2);
-  v4u w1 = *(const v4u_a2*)(p + 18);
-  float d = __half2float(*(const __half*)p);
 #pragma unroll
   for (int b = 0; b < B; b++) {
     v4u a0 = aq[((vb + b * VS) * 2 + 0) * NU + u],
@@ -136,23 +133,45 @@ __device__ __forceinline__ void q8_unit(const uint8_t* p, const v4u* aq,
     acc[b] += d * (sc[0] * (float)s0 + sc[1] * (float)s1);
   }
 }
-
 template<int B, int K, int VS = 1>
-__device__ __forceinline__ void nv_unit(const uint8_t* p, const v4u* aq,
+__device__ __forceinline__ void q8_unit(const uint8_t* p, const v4u* aq,
                                         const float* asc, int u, int vb,
                                         float (&acc)[B]) {
-  constexpr int NU = K / 64, NB16 = K / 16;
-  uint32_t sw = *(const uint32_t*)p;
-  v4u q0 = *(const v4u_a4*)(p + 4);
-  v4u q1 = *(const v4u_a4*)(p + 20);
+  v4u w0 = *(const v4u_a2*)(p + 2);
+  v4u w1 = *(const v4u_a2*)(p + 18);
+  float d = __half2float(*(const __half*)p);
+  q8_unit_c<B, K, VS>(w0, w1, d, aq, asc, u, vb, acc);
+}
+
+// A unit's 64 weights decoded to int8 (l0, l1, h0, h1 per 16-element block)
+// and its four block scales.
+struct NvDec {
+  uint32_t w[16];
+  float ds[4];
+};
+__device__ __forceinline__ void nv_decode(uint32_t sw, v4u q0, v4u q1,
+                                          NvDec& d) {
   uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
 #pragma unroll
   for (int s = 0; s < 4; s++) {
     uint32_t w0 = w[2 * s], w1 = w[2 * s + 1];
-    uint32_t l0 = dec4(w0 & 0x0F0F0F0Fu), l1 = dec4(w1 & 0x0F0F0F0Fu);
-    uint32_t h0 = dec4((w0 >> 4) & 0x0F0F0F0Fu),
-             h1 = dec4((w1 >> 4) & 0x0F0F0F0Fu);
-    float ds = ue4m3((sw >> (8 * s)) & 0xFFu);
+    d.w[4 * s] = dec4(w0 & 0x0F0F0F0Fu);
+    d.w[4 * s + 1] = dec4(w1 & 0x0F0F0F0Fu);
+    d.w[4 * s + 2] = dec4((w0 >> 4) & 0x0F0F0F0Fu);
+    d.w[4 * s + 3] = dec4((w1 >> 4) & 0x0F0F0F0Fu);
+    d.ds[s] = ue4m3((sw >> (8 * s)) & 0xFFu);
+  }
+}
+template<int B, int K, int VS = 1>
+__device__ __forceinline__ void nv_unit_d(const NvDec& d, const v4u* aq,
+                                          const float* asc, int u, int vb,
+                                          float (&acc)[B]) {
+  constexpr int NU = K / 64, NB16 = K / 16;
+#pragma unroll
+  for (int s = 0; s < 4; s++) {
+    const uint32_t l0 = d.w[4 * s], l1 = d.w[4 * s + 1], h0 = d.w[4 * s + 2],
+                   h1 = d.w[4 * s + 3];
+    const float ds = d.ds[s];
 #pragma unroll
     for (int b = 0; b < B; b++) {
       v4u a = aq[((vb + b * VS) * 4 + s) * NU + u];
@@ -163,6 +182,73 @@ __device__ __forceinline__ void nv_unit(const uint8_t* p, const v4u* aq,
       acc[b] += ds * asc[(vb + b * VS) * NB16 + u * 4 + s] * (float)t;
     }
   }
+}
+template<int B, int K, int VS = 1>
+__device__ __forceinline__ void nv_unit_c(uint32_t sw, v4u q0, v4u q1,
+                                          const v4u* aq, const float* asc,
+                                          int u, int vb, float (&acc)[B]) {
+  NvDec d;
+  nv_decode(sw, q0, q1, d);
+  nv_unit_d<B, K, VS>(d, aq, asc, u, vb, acc);
+}
+template<int B, int K, int VS = 1>
+__device__ __forceinline__ void nv_unit(const uint8_t* p, const v4u* aq,
+                                        const float* asc, int u, int vb,
+                                        float (&acc)[B]) {
+  uint32_t sw = *(const uint32_t*)p;
+  v4u q0 = *(const v4u_a4*)(p + 4);
+  v4u q1 = *(const v4u_a4*)(p + 20);
+  nv_unit_c<B, K, VS>(sw, q0, q1, aq, asc, u, vb, acc);
+}
+
+// A lane's units of one weight row, loaded ahead of the products (the same
+// units, products and order as row_dot).
+template<int FMT, int K, int LPR>
+struct RowRegs {
+  static constexpr int NU = K / Fm<FMT>::UEL, NI = (NU + LPR - 1) / LPR;
+  uint32_t h[NI];  // NVFP4: scale word; Q8: the f16 scale's bits
+  v4u q0[NI], q1[NI];
+};
+// TS (tail split, row_dot_g): every lane loads a last unit, lane lir the
+// unit NFULL * LPR + lir % T of the T left over.
+template<int FMT, int K, int LPR, bool TS = false>
+__device__ __forceinline__ void row_load(const uint8_t* row, int lir,
+                                         RowRegs<FMT, K, LPR>& r) {
+  using R = RowRegs<FMT, K, LPR>;
+  constexpr int BY = Fm<FMT>::BYTES, T = R::NU % LPR;
+#pragma unroll
+  for (int i = 0; i < R::NI; ++i) {
+    const int u = (TS && T > 0 && i == R::NI - 1)
+                      ? (R::NU / LPR) * LPR + lir % (T > 0 ? T : 1)
+                      : i * LPR + lir;
+    if (TS || (R::NU % LPR == 0) || u < R::NU) {
+      const uint8_t* p = row + (size_t)u * BY;
+      if (FMT == FMT_Q8) {
+        r.h[i] = *(const uint16_t*)p;
+        r.q0[i] = *(const v4u_a2*)(p + 2);
+        r.q1[i] = *(const v4u_a2*)(p + 18);
+      } else {
+        r.h[i] = *(const uint32_t*)p;
+        r.q0[i] = *(const v4u_a4*)(p + 4);
+        r.q1[i] = *(const v4u_a4*)(p + 20);
+      }
+    }
+  }
+}
+// NVFP4 rows decoded once, for all the pairs that read them.
+template<int K, int LPR>
+struct RowDec {
+  static constexpr int NU = K / 64, NI = (NU + LPR - 1) / LPR;
+  NvDec d[NI];
+};
+template<int K, int LPR, bool TS = false>
+__device__ __forceinline__ void row_decode(const RowRegs<FMT_NVFP4, K, LPR>& r,
+                                           int lir, RowDec<K, LPR>& d) {
+  using R = RowDec<K, LPR>;
+#pragma unroll
+  for (int i = 0; i < R::NI; ++i)
+    if (TS || (R::NU % LPR == 0) || i * LPR + lir < R::NU)
+      nv_decode(r.h[i], r.q0[i], r.q1[i], d.d[i]);
 }
 
 template<int FMT, int K, int LPR, int B, int VS = 1>
@@ -255,7 +341,8 @@ __device__ __forceinline__ float wsum(float v) {
 template<int NB>
 __device__ __forceinline__ void tiny_row(const MultiP& P,
                                          const float* __restrict__ x, int row,
-                                         int lane) {
+                                         int lane, int b0 = 0,
+                                         int nvalid = NB) {
   int m = 0;
   while (m < P.tn - 1 && row >= P.trows[m]) {
     row -= P.trows[m];
@@ -323,8 +410,8 @@ __device__ __forceinline__ void tiny_row(const MultiP& P,
 #pragma unroll
   for (int b = 0; b < NB; ++b) {
     const float v = wsum(acc[b]);
-    if (lane == 0)
-      P.ty[m][(size_t)b * P.tys[m] + row] = v;
+    if (lane == 0 && b < nvalid)
+      P.ty[m][(size_t)(b0 + b) * P.tys[m] + row] = v;
   }
 }
 
@@ -430,6 +517,187 @@ __global__ void __launch_bounds__(BW* WS)
 #pragma unroll
       for (int b = 0; b < NB; ++b)
         y[(size_t)b * P.ldy + yo + lr] = acc[b];
+  }
+}
+
+// The tiny matrices of a wide step (k_gemv_multi's first blocks), CB tokens
+// at a time: their own launch, so they do not raise k_gemv_wide's registers.
+template<int BW, int CB>
+__global__ void __launch_bounds__(BW* WS)
+    k_tiny_wide(MultiP P, const float* __restrict__ x, int nb) {
+  for (int c0 = 0; c0 < nb; c0 += CB)
+    tiny_row<CB>(P, x + (size_t)c0 * P.ldx, blockIdx.x * BW + threadIdx.x / WS,
+                 threadIdx.x % WS, c0, min(CB, nb - c0));
+}
+// ---------------- exact int8 WMMA GEMV (wide steps) ----------------
+// Each 16-element integer dot product of q8_unit / nv_unit is one entry of a
+// 16 x 16 x 16 int8 WMMA (integer sums are exact in any order). The float
+// work around them is replayed per output in the GEMV's own order: lane
+// `lir` of a row group accumulates units lir, lir + LPR, ... (plane 0, then
+// plane 1, per unit) and the lanes are combined by the xor butterfly whose
+// lane-0 value the GEMV writes. So every output is bit for bit the GEMV's.
+typedef int v4i __attribute__((ext_vector_type(4)));
+typedef int v8i __attribute__((ext_vector_type(8)));
+struct F8 {
+  float v[8];
+};
+// Quantized activations in global memory for the WMMA kernels: vector v
+// (input v % per of token v / per, at x + (v / per) * ldt + (v % per) * K) as
+// quant_act writes it for one vector: qa[v][2 planes][CPU * NU], qs[v][2][K /
+// 16].
+template<int K, int UEL>
+__global__ void __launch_bounds__(256)
+    k_quant_rows(const float* __restrict__ x, int per, int ldt, v4u* qa,
+                 float* qs, int res) {
+  constexpr int NG = K / 16, NU = K / UEL, CPU = UEL / 16;
+  const int v = blockIdx.x;
+  quant_act<K, 1, UEL>(x + (size_t)(v / per) * ldt + (size_t)(v % per) * K,
+                       qa + (size_t)v * 2 * CPU * NU, qs + (size_t)v * 2 * NG,
+                       res);
+}
+
+// The leaf of one output tile: Q8_0 units l, l + lpr, ... of the lane's
+// weight row `wrow` against the A rows `av` (quantized vectors), scales in
+// `ssc` ([2][16][K / 16]); q8_unit's arithmetic per entry.
+template<int K, int LPR>
+__device__ __forceinline__ F8 mma_leaf(int l, const uint8_t* wrow,
+                                       const v4u* av, const float* ssc,
+                                       int half, int res) {
+  constexpr int NU = K / 32, NG = K / 16, NI = (NU + LPR - 1) / LPR;
+  F8 acc;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    acc.v[i] = 0.f;
+  // every unit's weights and inputs are loaded before the first product
+  v4u w0[NI], w1[NI], a[NI][2][2];
+  float d[NI];
+#pragma unroll
+  for (int k = 0; k < NI; ++k) {
+    const int u = l + k * LPR;
+    if (NU % LPR == 0 || u < NU) {
+      const uint8_t* pu = wrow + (size_t)u * 34;
+      w0[k] = *(const v4u_a2*)(pu + 2);
+      w1[k] = *(const v4u_a2*)(pu + 18);
+      d[k] = __half2float(*(const __half*)pu);
+#pragma unroll
+      for (int pl = 0; pl < 2; ++pl)
+        if (pl <= res) {
+          a[k][pl][0] = av[pl * 2 * NU + u];
+          a[k][pl][1] = av[pl * 2 * NU + NU + u];
+        }
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < NI; ++k) {
+    const int u = l + k * LPR;
+    if (NU % LPR == 0 || u < NU) {
+      const v8i z = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+      for (int pl = 0; pl < 2; ++pl) {
+        if (pl > res)
+          break;
+        const v8i c0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+            true, (v4i)a[k][pl][0], true, (v4i)w0[k], z, false);
+        const v8i c1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+            true, (v4i)a[k][pl][1], true, (v4i)w1[k], z, false);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const float* sc = ssc + (pl * 16 + 2 * i + half) * NG + 2 * u;
+          acc.v[i] += d[k] * (sc[0] * (float)c0[i] + sc[1] * (float)c1[i]);
+        }
+      }
+    }
+  }
+  return acc;
+}
+
+// Q8_0 rows (P's matrices, one input per block) x 16-token tiles. Block
+// (tile, rbk) takes weight rows rbk * 16 + 0..15 (lane c16's B column) for the
+// tile's tokens (A rows; C entry i of a lane is token 2 i + half). Its NW
+// waves compute the LPR leaves (wave w: leaves w, w + NW, ...) into LDS, and
+// the block combines them in the butterfly's order.
+template<int K, int LPR, int NW>
+__global__ void __launch_bounds__(NW * 32)
+    k_gemv_mma(MultiP P, const v4u* __restrict__ qa,
+               const float* __restrict__ qs, int per, float* __restrict__ y,
+               int Mtot, int nb, float softcap) {
+  constexpr int NU = K / 32, NG = K / 16, QV = 2 * 2 * NU;
+  __shared__ float ssc[2][16][NG];
+  static_assert(LPR % NW == 0, "leaves per wave");
+  constexpr int NLW = LPR / NW;  // leaves of a wave: w, w + NW, ...
+  __shared__ float lv[NW][8][32];
+  const int t0 = blockIdx.x * 16, brow = blockIdx.y * 16;
+  int bin = P.in[0];
+#pragma unroll
+  for (int i = 1; i < 5; i++)
+    if (i < P.n && brow >= P.cum[i])
+      bin = P.in[i];
+  for (int i = threadIdx.x; i < 2 * 16 * NG; i += NW * 32) {
+    const int pl = i / (16 * NG), r = (i / NG) % 16, g = i % NG;
+    const int tok = min(t0 + r, nb - 1);
+    ssc[pl][r][g] = qs[(size_t)(tok * per + bin) * 2 * NG + pl * NG + g];
+  }
+  __syncthreads();
+  const int w = threadIdx.x / 32, lane = threadIdx.x % 32, c16 = lane & 15,
+            half = lane >> 4;
+  const int row = brow + c16;
+  const int rr = row < Mtot ? row : Mtot - 1;
+  int m = 0;
+#pragma unroll
+  for (int i = 1; i < 5; i++)
+    if (i < P.n && rr >= P.cum[i])
+      m = i;
+  const uint8_t* Wm = P.W[0];
+  int yo = P.yoff[0], cm = P.cum[0];
+#pragma unroll
+  for (int i = 1; i < 5; i++)
+    if (i == m) {
+      Wm = P.W[i];
+      yo = P.yoff[i];
+      cm = P.cum[i];
+    }
+  const int lr = rr - cm;
+  const uint8_t* wrow = Wm + (size_t)lr * NU * 34;
+  const int tokA = min(t0 + c16, nb - 1);
+  const v4u* av = qa + (size_t)(tokA * per + bin) * QV;
+  F8 lf[NLW];
+#pragma unroll
+  for (int j = 0; j < NLW; ++j)
+    lf[j] = mma_leaf<K, LPR>(w + j * NW, wrow, av, &ssc[0][0][0], half, P.res);
+  // the butterfly's steps for lane 0 (offsets LPR / 2 .. 1): leaf l += leaf
+  // l + off for l < off. Offsets of NW and more pair leaves of one wave (in
+  // registers), the others go through LDS, every entry by the block's
+  // threads in turn.
+#pragma unroll
+  for (int off = LPR / 2; off >= NW; off >>= 1)
+#pragma unroll
+    for (int j = 0; j * NW < off; ++j)
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        lf[j].v[i] += lf[j + off / NW].v[i];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    lv[w][i][lane] = lf[0].v[i];
+  __syncthreads();
+  for (int off = NW / 2; off >= 1; off >>= 1) {
+    for (int idx = threadIdx.x; idx < off * 8 * 32; idx += NW * 32) {
+      const int l = idx / 256, i = (idx / 32) % 8, ln = idx % 32;
+      lv[l][i][ln] += lv[l + off][i][ln];
+    }
+    __syncthreads();
+  }
+  if (w != 0)
+    return;
+  F8 r;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    r.v[i] = lv[0][i][lane];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int tok = t0 + 2 * i + half;
+    if (tok < nb && row < Mtot)
+      y[(size_t)tok * P.ldy + yo + lr] =
+          softcap > 0.f ? softcap * tanhf(r.v[i] / softcap) : r.v[i];
   }
 }
 
@@ -552,7 +820,12 @@ __global__ void __launch_bounds__(256)
 }
 
 // ---------------- MoE gate/up + SITU ----------------
-__device__ __forceinline__ float situ(float g, float u, float beta, float lb) {
+// The SITU constants of Inkling 2 Mini (ParseConfig refuses other values; the
+// host launchers check them). As constants, g / 4 compiles to the multiply by
+// 0.25 that equals it, which makes the MoE gate/up epilogues cheaper.
+constexpr float kSituBeta = 4.f, kSituLinearBeta = 25.f;
+__device__ __forceinline__ float situ(float g, float u) {
+  constexpr float beta = kSituBeta, lb = kSituLinearBeta;
   return beta * tanhf(g / beta) * (1.f / (1.f + expf(-g))) *
          (lb * tanhf(u / lb));
 }
@@ -560,7 +833,7 @@ template<int FMT, int K, int LPR, int NIT, int BW>
 __global__ void __launch_bounds__(BW* WS)
     k_moe_gu(const uint8_t* __restrict__ W, const float* __restrict__ escale,
              const float* __restrict__ x, const int* __restrict__ ids,
-             float* __restrict__ a, int FF, float beta, float lb, int res) {
+             float* __restrict__ a, int FF, int res) {
   constexpr int NU = K / Fm<FMT>::UEL, CPU = Fm<FMT>::UEL / 16,
                 RPP = WS / LPR / 2;
   __shared__ v4u aq[2 * CPU * NU];
@@ -590,7 +863,7 @@ __global__ void __launch_bounds__(BW* WS)
                             K / 16, res, 0, lir, acc);
     float other = __shfl_xor(acc[0], LPR, WS);
     if (!isup && lir == 0 && j < FF)
-      a[(size_t)p * FF + j] = situ(acc[0] * sc, other * sc, beta, lb);
+      a[(size_t)p * FF + j] = situ(acc[0] * sc, other * sc);
   }
 }
 
@@ -626,6 +899,450 @@ __global__ void __launch_bounds__(BW* WS)
                             K / 16, res, 0, lir, acc);
     if (row < D && lir == 0)
       yp[(size_t)p * D + row] = ew * acc[0];
+  }
+}
+
+// ---------------- MoE of many rows, grouped by expert ----------------
+// Verification steps of 8 (one session) to 64 rows: the (row, slot) pairs
+// that chose the same expert are processed by one block row, whose lanes keep
+// their weight units in registers for all those pairs, kGrp at a time. Every
+// pair's dot products are k_moe_gu's / k_moe_down_e's (row_dot over the same
+// units, lanes and shuffles), so each output is the one the per-pair kernels
+// write.
+constexpr int kGrp = 4;
+constexpr int kGgBw = 16;  // waves per grouped-kernel block
+// Blocks per row block of the grouped kernels: they loop over the distinct
+// experts (20 to 64 per step), so a grid sized for every possible slot (8 per
+// row) does not launch hundreds of empty blocks (8-row MoE 5% faster, 16-row
+// 10%).
+constexpr int kGgSlotBlocks = 24;
+// Pairs sorted by expert: ue[k] / ub[k] / un[k] = the k-th used expert, the
+// start of its pairs in `sorted` and their count; *nd = used experts.
+__global__ void __launch_bounds__(256)
+    k_route_group(const int* __restrict__ ids, int P, int* __restrict__ sorted,
+                  int* __restrict__ ue, int* __restrict__ ub,
+                  int* __restrict__ un, int* __restrict__ nd) {
+  __shared__ int cnt[128], off[129], cur[128];
+  const int t = threadIdx.x;
+  if (t < 128)
+    cnt[t] = 0;
+  __syncthreads();
+  for (int p = t; p < P; p += blockDim.x)
+    atomicAdd(&cnt[ids[p]], 1);
+  __syncthreads();
+  if (t == 0) {
+    int run = 0, k = 0;
+    for (int e = 0; e < 128; ++e) {
+      off[e] = run;
+      cur[e] = run;
+      if (cnt[e] > 0) {
+        ue[k] = e;
+        ub[k] = run;
+        un[k] = cnt[e];
+        ++k;
+      }
+      run += cnt[e];
+    }
+    *nd = k;
+  }
+  __syncthreads();
+  for (int p = t; p < P; p += blockDim.x)
+    sorted[atomicAdd(&cur[ids[p]], 1)] = p;
+}
+
+// f(B) for the first n (1..MAXB) pairs, B fixed at compile time.
+template<int FMT, int K, int LPR, int MAXB, class F>
+__device__ __forceinline__ void with_rows(int n, F&& f) {
+  if constexpr (MAXB >= 8) {
+    if (n >= 8) {
+      f(std::integral_constant<int, 8>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 7) {
+    if (n == 7) {
+      f(std::integral_constant<int, 7>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 6) {
+    if (n == 6) {
+      f(std::integral_constant<int, 6>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 5) {
+    if (n == 5) {
+      f(std::integral_constant<int, 5>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 4) {
+    if (n == 4) {
+      f(std::integral_constant<int, 4>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 3) {
+    if (n == 3) {
+      f(std::integral_constant<int, 3>{});
+      return;
+    }
+  }
+  if constexpr (MAXB >= 2) {
+    if (n == 2) {
+      f(std::integral_constant<int, 2>{});
+      return;
+    }
+  }
+  f(std::integral_constant<int, 1>{});
+}
+
+// Quantized inputs of the grouped kernels, once per step: vector v's int8
+// planes (quant_act's values, in its LDS order) and then its two planes'
+// scales at qx + v * kQB<K>.
+template<int K>
+constexpr int kQB = 2 * K + 2 * (K / 16) * 4;
+template<int K, int UEL>
+__global__ void __launch_bounds__(256)
+    k_quant_vec(const float* __restrict__ x, int nv, uint8_t* __restrict__ qx) {
+  constexpr int NG = K / 16, NU = K / UEL, CPU = UEL / 16;
+  const int it = blockIdx.x * blockDim.x + threadIdx.x;
+  if (it >= nv * NG)
+    return;
+  const int v = it / NG, g = it % NG;
+  const float4* xp = (const float4*)(x + (size_t)v * K + g * 16);
+  float f[16];
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float4 t = xp[i];
+    f[4 * i] = t.x;
+    f[4 * i + 1] = t.y;
+    f[4 * i + 2] = t.z;
+    f[4 * i + 3] = t.w;
+    amax = fmaxf(amax, fmaxf(fmaxf(fabsf(t.x), fabsf(t.y)),
+                             fmaxf(fabsf(t.z), fabsf(t.w))));
+  }
+  const float sc = amax / 127.f, id = amax > 0.f ? 127.f / amax : 0.f;
+  float r[16];
+  uint32_t q[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float q0 = rintf(f[4 * i] * id), q1 = rintf(f[4 * i + 1] * id),
+          q2 = rintf(f[4 * i + 2] * id), q3 = rintf(f[4 * i + 3] * id);
+    q[i] = pack4(q0, q1, q2, q3);
+    r[4 * i] = f[4 * i] - q0 * sc;
+    r[4 * i + 1] = f[4 * i + 1] - q1 * sc;
+    r[4 * i + 2] = f[4 * i + 2] - q2 * sc;
+    r[4 * i + 3] = f[4 * i + 3] - q3 * sc;
+  }
+  uint8_t* o = qx + (size_t)v * kQB<K>;
+  v4u* q0p = (v4u*)o;
+  v4u* q1p = (v4u*)(o + K);
+  float* s0 = (float*)(o + 2 * K);
+  const int idx = (g % CPU) * NU + g / CPU;
+  s0[g] = sc;
+  q0p[idx] = v4u{q[0], q[1], q[2], q[3]};
+  const float sc2 = sc * (1.0f / 254.0f), id2 = sc > 0.f ? 254.0f / sc : 0.f;
+  uint32_t q2p[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+    q2p[i] = pack4(r[4 * i] * id2, r[4 * i + 1] * id2, r[4 * i + 2] * id2,
+                   r[4 * i + 3] * id2);
+  s0[NG + g] = sc2;
+  q1p[idx] = v4u{q2p[0], q2p[1], q2p[2], q2p[3]};
+}
+
+// Products of the grouped kernels. Every pair's quantized input is read from
+// qx (through the vector caches): no LDS staging or barriers, and a wave runs
+// all its expert's pairs, B at a time, with its row's weights decoded once.
+// Each product and sum is nv_unit's / q8_unit's in row_dot's order.
+template<int B, int K>
+__device__ __forceinline__ void nv_unit_g(const NvDec& d,
+                                          const uint8_t* const (&qv)[B],
+                                          int plane, int u, float (&acc)[B]) {
+  constexpr int NU = K / 64, NG = K / 16;
+#pragma unroll
+  for (int s = 0; s < 4; s++) {
+    const uint32_t l0 = d.w[4 * s], l1 = d.w[4 * s + 1], h0 = d.w[4 * s + 2],
+                   h1 = d.w[4 * s + 3];
+    const float ds = d.ds[s];
+#pragma unroll
+    for (int b = 0; b < B; b++) {
+      const v4u a = ((const v4u*)(qv[b] + plane * K))[s * NU + u];
+      const float sc = ((const float*)(qv[b] + 2 * K))[plane * NG + u * 4 + s];
+      int t = dot4(l0, a.x, 0);
+      t = dot4(l1, a.y, t);
+      t = dot4(h0, a.z, t);
+      t = dot4(h1, a.w, t);
+      acc[b] += ds * sc * (float)t;
+    }
+  }
+}
+// row_dot for B pairs. The T units left after the full passes (only T of
+// the LPR lanes have one) are split over the lanes: lane lir continues pairs
+// lir / T + q * (LPR / T) of lane lir % T, its partial sums moved there and
+// back by shuffles, so every lane's sum takes the same terms in the same
+// order and the butterfly is row_dot's.
+template<int K, int LPR, int B>
+__device__ __forceinline__ void row_dot_g(const RowDec<K, LPR>& r,
+                                          const uint8_t* const (&qv)[B],
+                                          int res, int lir, float (&acc)[B]) {
+  using R = RowDec<K, LPR>;
+  constexpr int NF = R::NU / LPR, T = R::NU % LPR, PL = LPR / T,
+                TPL = (B + PL - 1) / PL;  // tail tasks per lane
+  static_assert(T > 0 && LPR % T == 0, "tail split");
+#pragma unroll
+  for (int b = 0; b < B; b++)
+    acc[b] = 0.f;
+#pragma unroll
+  for (int i = 0; i < NF; ++i) {
+    const int u = i * LPR + lir;
+    nv_unit_g<B, K>(r.d[i], qv, 0, u, acc);
+    if (res)
+      nv_unit_g<B, K>(r.d[i], qv, 1, u, acc);
+  }
+  // lane lir continues pairs lir / T + q * PL of lane lir % T
+  const int base = (threadIdx.x % WS) - lir, tl = lir % T, tb = lir / T;
+  float t1[TPL][1];
+  const uint8_t* q1[TPL][1];
+#pragma unroll
+  for (int q = 0; q < TPL; ++q) {
+    t1[q][0] = 0.f;
+    q1[q][0] = qv[0];
+  }
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const float x = __shfl(acc[b], base + tl, WS);
+    if (tb == b % PL) {
+      t1[b / PL][0] = x;
+      q1[b / PL][0] = qv[b];
+    }
+  }
+  const int u = NF * LPR + tl;
+#pragma unroll
+  for (int q = 0; q < TPL; ++q)
+    if (tb + q * PL < B) {
+      nv_unit_g<1, K>(r.d[R::NI - 1], q1[q], 0, u, t1[q]);
+      if (res)
+        nv_unit_g<1, K>(r.d[R::NI - 1], q1[q], 1, u, t1[q]);
+    }
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const float x = __shfl(t1[b / PL][0], base + (b % PL) * T + tl, WS);
+    if (lir < T)
+      acc[b] = x;
+  }
+#pragma unroll
+  for (int b = 0; b < B; b++)
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1)
+      acc[b] += __shfl_xor(acc[b], off, WS);
+}
+
+// Q8_0 counterpart of nv_unit_g / row_dot_g (q8_unit_c's products).
+template<int B, int K>
+__device__ __forceinline__ void q8_unit_g(v4u w0, v4u w1, float d,
+                                          const uint8_t* const (&qv)[B],
+                                          int plane, int u, float (&acc)[B]) {
+  constexpr int NU = K / 32, NG = K / 16;
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const v4u* aq = (const v4u*)(qv[b] + plane * K);
+    const v4u a0 = aq[u], a1 = aq[NU + u];
+    const float* sc = (const float*)(qv[b] + 2 * K) + plane * NG + 2 * u;
+    int s0 = dot4(w0.x, a0.x, 0);
+    s0 = dot4(w0.y, a0.y, s0);
+    s0 = dot4(w0.z, a0.z, s0);
+    s0 = dot4(w0.w, a0.w, s0);
+    int s1 = dot4(w1.x, a1.x, 0);
+    s1 = dot4(w1.y, a1.y, s1);
+    s1 = dot4(w1.z, a1.z, s1);
+    s1 = dot4(w1.w, a1.w, s1);
+    acc[b] += d * (sc[0] * (float)s0 + sc[1] * (float)s1);
+  }
+}
+template<int K, int LPR, int B>
+__device__ __forceinline__ void row_dot_q8g(const RowRegs<FMT_Q8, K, LPR>& r,
+                                            const uint8_t* const (&qv)[B],
+                                            int res, int lir, float (&acc)[B]) {
+  using R = RowRegs<FMT_Q8, K, LPR>;
+  constexpr int NF = R::NU / LPR, T = R::NU % LPR, PL = LPR / T,
+                TPL = (B + PL - 1) / PL;
+  static_assert(T > 0 && LPR % T == 0, "tail split");
+  auto dq = [&](int i) {
+    return __half2float(__ushort_as_half((unsigned short)(r.h[i] & 0xFFFFu)));
+  };
+#pragma unroll
+  for (int b = 0; b < B; b++)
+    acc[b] = 0.f;
+#pragma unroll
+  for (int i = 0; i < NF; ++i) {
+    const int u = i * LPR + lir;
+    const float d = dq(i);
+    q8_unit_g<B, K>(r.q0[i], r.q1[i], d, qv, 0, u, acc);
+    if (res)
+      q8_unit_g<B, K>(r.q0[i], r.q1[i], d, qv, 1, u, acc);
+  }
+  const int base = (threadIdx.x % WS) - lir, tl = lir % T, tb = lir / T;
+  float t1[TPL][1];
+  const uint8_t* q1[TPL][1];
+#pragma unroll
+  for (int q = 0; q < TPL; ++q) {
+    t1[q][0] = 0.f;
+    q1[q][0] = qv[0];
+  }
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const float x = __shfl(acc[b], base + tl, WS);
+    if (tb == b % PL) {
+      t1[b / PL][0] = x;
+      q1[b / PL][0] = qv[b];
+    }
+  }
+  const int u = NF * LPR + tl;
+  const float d = dq(R::NI - 1);
+#pragma unroll
+  for (int q = 0; q < TPL; ++q)
+    if (tb + q * PL < B) {
+      q8_unit_g<1, K>(r.q0[R::NI - 1], r.q1[R::NI - 1], d, q1[q], 0, u, t1[q]);
+      if (res)
+        q8_unit_g<1, K>(r.q0[R::NI - 1], r.q1[R::NI - 1], d, q1[q], 1, u,
+                        t1[q]);
+    }
+#pragma unroll
+  for (int b = 0; b < B; b++) {
+    const float x = __shfl(t1[b / PL][0], base + (b % PL) * T + tl, WS);
+    if (lir < T)
+      acc[b] = x;
+  }
+#pragma unroll
+  for (int b = 0; b < B; b++)
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1)
+      acc[b] += __shfl_xor(acc[b], off, WS);
+}
+
+template<int FMT, int K, int LPR, int BW>
+__global__ void __launch_bounds__(BW* WS)
+    k_moe_gu_gg(const uint8_t* __restrict__ W, const float* __restrict__ escale,
+                const uint8_t* __restrict__ qx, const int* __restrict__ sorted,
+                const int* __restrict__ ue, const int* __restrict__ ub,
+                const int* __restrict__ un, const int* __restrict__ nd,
+                float* __restrict__ a, int FF, int res) {
+  constexpr int NU = K / Fm<FMT>::UEL, RPP = WS / LPR / 2;
+  // A launch has kGgSlotBlocks blocks per row block, each looping over the
+  // step's distinct experts: most slots of a wide grid would be empty.
+  const int rbk = blockIdx.y, ndv = *nd;
+  for (int k = blockIdx.x; k < ndv; k += gridDim.x) {
+    const int e = ue[k] & 127, b0 = ub[k], n = un[k];
+    const size_t rb = (size_t)NU * Fm<FMT>::BYTES;
+    const uint8_t* We = W + (size_t)e * 2 * FF * rb;
+    const int wave = threadIdx.x / WS, lane = threadIdx.x % WS, g = lane / LPR,
+              lir = lane % LPR, isup = g & 1, pg = g >> 1;
+    const int j = (rbk * BW + wave) * RPP + pg;
+    const int jj = j < FF ? j : FF - 1;
+    RowRegs<FMT, K, LPR> wr;
+    row_load<FMT, K, LPR, true>(We + rb * (isup ? FF + jj : jj), lir, wr);
+    [[maybe_unused]] RowDec<K, LPR> wd;
+    if constexpr (FMT == FMT_NVFP4)
+      row_decode<K, LPR, true>(wr, lir, wd);
+    const float sc = escale ? escale[e] : 1.f;
+    for (int c0 = 0; c0 < n; c0 += kGrp) {
+      const int cn = min(kGrp, n - c0);
+      int ps[kGrp];
+      const uint8_t* qv[kGrp];
+#pragma unroll
+      for (int b = 0; b < kGrp; ++b) {
+        ps[b] = sorted[b0 + c0 + min(b, cn - 1)];
+        qv[b] = qx + (size_t)(ps[b] >> 3) * kQB<K>;
+      }
+      with_rows<FMT, K, LPR, kGrp>(cn, [&](auto nb_) {
+        constexpr int B = decltype(nb_)::value;
+        const uint8_t* qb[B];
+#pragma unroll
+        for (int b = 0; b < B; ++b)
+          qb[b] = qv[b];
+        float acc[B];
+        if constexpr (FMT == FMT_NVFP4)
+          row_dot_g<K, LPR, B>(wd, qb, res, lir, acc);
+        else
+          row_dot_q8g<K, LPR, B>(wr, qb, res, lir, acc);
+        // after the butterfly every lane of a row holds its sums: gate lane b
+        // takes pair b (one SITU per pair instead of one per pair and lane)
+        float gv = acc[0], uv = __shfl_xor(acc[0], LPR, WS);
+        int pb = ps[0];
+#pragma unroll
+        for (int b = 1; b < B; ++b) {
+          const float o = __shfl_xor(acc[b], LPR, WS);
+          if (lir == b) {
+            gv = acc[b];
+            uv = o;
+            pb = ps[b];
+          }
+        }
+        if (!isup && lir < B && j < FF)
+          a[(size_t)pb * FF + j] = situ(gv * sc, uv * sc);
+      });
+    }
+  }
+}
+
+template<int FMT, int K, int LPR, int BW>
+__global__ void __launch_bounds__(BW* WS)
+    k_moe_down_gg(const uint8_t* __restrict__ W,
+                  const float* __restrict__ escale,
+                  const uint8_t* __restrict__ qx,
+                  const int* __restrict__ sorted, const int* __restrict__ ue,
+                  const int* __restrict__ ub, const int* __restrict__ un,
+                  const int* __restrict__ nd, const float* __restrict__ wts,
+                  float* __restrict__ yp, int D, int res) {
+  constexpr int NU = K / Fm<FMT>::UEL, RPW = WS / LPR;
+  // A launch has kGgSlotBlocks blocks per row block, each looping over the
+  // step's distinct experts: most slots of a wide grid would be empty.
+  const int rbk = blockIdx.y, ndv = *nd;
+  for (int k = blockIdx.x; k < ndv; k += gridDim.x) {
+    const int e = ue[k] & 127, b0 = ub[k], n = un[k];
+    const size_t rb = (size_t)NU * Fm<FMT>::BYTES;
+    const int wave = threadIdx.x / WS, lane = threadIdx.x % WS, g = lane / LPR,
+              lir = lane % LPR;
+    const int row = (rbk * BW + wave) * RPW + g;
+    const int rr = row < D ? row : D - 1;
+    RowRegs<FMT, K, LPR> wr;
+    row_load<FMT, K, LPR, true>(W + ((size_t)e * D + rr) * rb, lir, wr);
+    [[maybe_unused]] RowDec<K, LPR> wd;
+    if constexpr (FMT == FMT_NVFP4)
+      row_decode<K, LPR, true>(wr, lir, wd);
+    const float es = escale ? escale[e] : 1.f;
+    for (int c0 = 0; c0 < n; c0 += kGrp) {
+      const int cn = min(kGrp, n - c0);
+      int ps[kGrp];
+      const uint8_t* qv[kGrp];
+#pragma unroll
+      for (int b = 0; b < kGrp; ++b) {
+        ps[b] = sorted[b0 + c0 + min(b, cn - 1)];
+        qv[b] = qx + (size_t)ps[b] * kQB<K>;
+      }
+      with_rows<FMT, K, LPR, kGrp>(cn, [&](auto nb_) {
+        constexpr int B = decltype(nb_)::value;
+        const uint8_t* qb[B];
+#pragma unroll
+        for (int b = 0; b < B; ++b)
+          qb[b] = qv[b];
+        float acc[B];
+        if constexpr (FMT == FMT_NVFP4)
+          row_dot_g<K, LPR, B>(wd, qb, res, lir, acc);
+        else
+          row_dot_q8g<K, LPR, B>(wr, qb, res, lir, acc);
+        if (row < D && lir == 0)
+#pragma unroll
+          for (int b = 0; b < B; ++b) {
+            const int p = ps[b];
+            yp[(size_t)p * D + row] = (wts[p] * es) * acc[b];
+          }
+      });
+    }
   }
 }
 
@@ -2235,16 +2952,15 @@ __global__ __launch_bounds__(128) void decode_reduce(AttnArgs a) {
   reduce_head(a, blockIdx.x, blockIdx.z, sc, sred);
 }
 
-// attn_decode of distinct sessions' rows with its neighbours folded in: the
-// block of the split holding the row's position first writes the kv head's
-// K/V row (k_kvprep), and the last split block of a kv head to finish
-// combines its three heads (decode_reduce). Same arithmetic as the three
-// launches.
+// attn_decode of distinct sessions' rows with k_kvprep folded in: the block of
+// the split holding the row's position first writes the kv head's K/V row.
+// decode_reduce combines the splits in its own launch (24 heads x rows blocks
+// in parallel; folded into the last split block it serialises the three heads
+// of a kv head, 0.5% slower per token). Same arithmetic as the three launches.
 template<int NW>
 __global__ __launch_bounds__(NW * 32) void attn_decode_fused(AttnArgs a,
                                                              KvPrepArgs kv) {
   __shared__ float red[32];
-  __shared__ unsigned last;
   const int kvh = blockIdx.x, split = blockIdx.y, tk = blockIdx.z;
   {
     const int p0 = a.pos[tk];
@@ -2255,21 +2971,6 @@ __global__ __launch_bounds__(NW * 32) void attn_decode_fused(AttnArgs a,
     }
   }
   attn_decode_body<NW>(a);
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0)
-    last = atomicAdd(&a.cnt[tk * NKV + kvh], 1u) == gridDim.y - 1;
-  __syncthreads();
-  if (!last)
-    return;
-  __threadfence();
-  if (threadIdx.x == 0)
-    a.cnt[tk * NKV + kvh] = 0;
-  __shared__ float sc[1024];
-  for (int r = 0; r < 3; ++r) {
-    reduce_head(a, kvh * 3 + r, tk, sc, red);
-    __syncthreads();
-  }
 }
 }  // namespace ia
 
@@ -2301,7 +3002,6 @@ struct GP3 {
   const int* pair;  // EPI 2: (token * 8 + slot) of each sorted position:
                     // deterministic, non-atomic write
   const float* posw;
-  float beta, lb;
 };
 
 __device__ __forceinline__ void nib4_to_half(uint32_t n, uint32_t& a,
@@ -2504,8 +3204,8 @@ __global__ void __launch_bounds__(64 * RG) k_gemm4(GP3 p, int rgn) {
           p.out[(size_t)pd * p.ldo + row + 16] = facc[t][1][i];
         } else if (EPI == 1) {
           int j = rgi * (16 * RG) + rg * 16 + ln;
-          p.outh[(size_t)pd * FF + j] = (_Float16)situ(
-              facc[t][0][i] * esc, facc[t][1][i] * esc, p.beta, p.lb);
+          p.outh[(size_t)pd * FF + j] =
+              (_Float16)situ(facc[t][0][i] * esc, facc[t][1][i] * esc);
         } else {
           float w = p.posw[pd] * esc;
           // One row per (token, slot) pair; MoeTail adds the 8 slots in a fixed
@@ -2652,8 +3352,8 @@ __global__ void __launch_bounds__(256) k_gu128(GP3 p, int rgn) {
           if (pl >= n)
             continue;
           const int j = rgi * 64 + (2 * cg + c) * 16 + ln;
-          p.outh[(size_t)(start + pl) * FF + j] = (_Float16)situ(
-              facc[t][c][0][i] * esc, facc[t][c][1][i] * esc, p.beta, p.lb);
+          p.outh[(size_t)(start + pl) * FF + j] =
+              (_Float16)situ(facc[t][c][0][i] * esc, facc[t][c][1][i] * esc);
         }
   }
 }
@@ -3090,22 +3790,40 @@ struct PfArgs {
   _Float16* out16;
 };
 namespace ia {
-constexpr int PF_KT = 64, PF_KS = HD + 8, PF_VS = PF_KT + 8;
+constexpr int PF_KS = HD + 8;  // K tile row stride (halves)
 __device__ __forceinline__ uint32_t as_u32(v2h v) {
   return __builtin_bit_cast(uint32_t, v);
 }
 }  // namespace ia
 
-template<int NTT>
-__global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
+namespace ia {
+// shfl_xor(v, 16) across the half-waves without LDS.
+__device__ __forceinline__ uint32_t xor16u(uint32_t v) {
+  return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false,
+                                      false);
+}
+__device__ __forceinline__ float xor16f(float v) {
+  return __builtin_bit_cast(float, xor16u(__builtin_bit_cast(uint32_t, v)));
+}
+}  // namespace ia
+
+// Prefill flash attention: a block of NTT query tiles x 3 heads (one KV head)
+// shares each K/V tile, the next tile's rows are loaded while this one
+// computes (double-buffered LDS, one barrier per KT keys), and the
+// probability exchange between half-waves uses permlanex16 / v_perm. The
+// online softmax steps over 16 keys from the block's first key (0 on global
+// layers, the window's start on window layers).
+template<int NTT, int KT>
+__global__ __launch_bounds__(NTT * 96) void attn_prefill_db(PfArgs a) {
   using namespace ia;
+  constexpr int PF_KT = KT, PF_VS = KT + 8;
   constexpr int NT = NTT * 96;
-  __shared__ __attribute__((aligned(16))) __half sK[PF_KT][PF_KS];
-  __shared__ __attribute__((aligned(16))) __half sVt[HD][PF_VS];
-  // Rows d0 .. d0 + 127 of the relative-bias table: every distance a key tile
-  // meets (the same values bias_dot reads from global memory).
+  __shared__ __attribute__((aligned(16))) __half sK2[2][PF_KT][PF_KS];
+  __shared__ __attribute__((aligned(16))) __half sVt2[2][HD][PF_VS];
+  // Rows d0 .. d0 + BTR - 1 of the relative-bias table: every distance a key
+  // tile meets (the same values bias_dot reads from global memory).
   constexpr int BTR = 16 * NTT + PF_KT;
-  __shared__ __attribute__((aligned(16))) __half sB[BTR][RD];
+  __shared__ __attribute__((aligned(16))) __half sB2[2][BTR][RD];
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   const int kvh = blockIdx.y;
   const int hh = w % 3, tt = w / 3, h = kvh * 3 + hh;
@@ -3141,48 +3859,99 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
   for (int d = 0; d < 8; d++)
     acc[d] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
 
+  const uint32_t sel_lo = half ? 0x01000504u : 0x05040100u;
+  const uint32_t sel_hi = half ? 0x03020706u : 0x07060302u;
   const int pfirst = a.p0 + tbase;
   const int plast = min(a.p0 + a.U - 1, a.p0 + tbase + 16 * NTT - 1);
-  const int kfirst = a.swa ? max(0, pfirst - (WIN - 1)) : 0;
+  // The 16-key steps start at multiples of 16 (absolute positions), so a
+  // row's softmax steps do not depend on where its prompt chunk starts.
+  const int kfirst = a.swa ? max(0, pfirst - (WIN - 1)) & ~15 : 0;
   const int ntiles = (plast - kfirst + PF_KT) / PF_KT;
   const int wmin = a.p0 + tb, wmax = a.p0 + tb + 15;
 
-  for (int tile = 0; tile < ntiles; tile++) {
+  // Tile t + 1's K / V / bias rows are loaded into registers while tile t
+  // computes, and written to the other LDS buffer after it: one barrier per
+  // tile.
+  constexpr int NK = (PF_KT * 16 + NT - 1) / NT, NV = (PF_KT * 8 + NT - 1) / NT;
+  uint4 rk[NK], rv[NV][2], rb;
+  auto gload = [&](int tile) {
     const int kbase = kfirst + tile * PF_KT;
-    // smallest distance of this tile: first query of the block, last key
     const int d0 = pfirst - (kbase + PF_KT - 1);
-    __syncthreads();
-    for (int idx = tid; idx < BTR * 2; idx += NT) {
-      const int row = idx >> 1, hf = idx & 1, d = d0 + row;
-      if (d >= 0 && d < WIN)
-        *(uint4*)&sB[row][hf * 8] =
-            *(const uint4*)(a.bt + (size_t)d * RD + hf * 8);
-    }
-    for (int idx = tid; idx < PF_KT * 16; idx += NT) {
-      const int key = idx >> 4, c = idx & 15;
-      const int pos = min(kbase + key, plast);
-      *(uint4*)&sK[key][c * 8] = *(
-          const uint4*)(a.kc + (size_t)(pos % a.cap) * CELL + kvh * HD + c * 8);
-    }
-    for (int idx = tid; idx < (PF_KT / 2) * 16; idx += NT) {
-      const int kp = idx >> 4, c = idx & 15;
-      const int p0_ = min(kbase + 2 * kp, plast),
-                p1_ = min(kbase + 2 * kp + 1, plast);
-      uint4 v0 = *(const uint4*)(a.vc + (size_t)(p0_ % a.cap) * CELL +
-                                 kvh * HD + c * 8);
-      uint4 v1 = *(const uint4*)(a.vc + (size_t)(p1_ % a.cap) * CELL +
-                                 kvh * HD + c * 8);
-      uint32_t* dst = (uint32_t*)&sVt[c * 8][2 * kp];
-      constexpr int RS = PF_VS / 2;
-      uint32_t x0[4] = {v0.x, v0.y, v0.z, v0.w},
-               x1[4] = {v1.x, v1.y, v1.z, v1.w};
 #pragma unroll
-      for (int e = 0; e < 4; e++) {
-        dst[(2 * e) * RS] = (x0[e] & 0xffffu) | (x1[e] << 16);
-        dst[(2 * e + 1) * RS] = (x0[e] >> 16) | (x1[e] & 0xffff0000u);
+    for (int j = 0; j < NK; j++) {
+      const int idx = tid + j * NT;
+      if (idx < PF_KT * 16) {
+        const int key = idx >> 4, c = idx & 15;
+        const int pos = min(kbase + key, plast);
+        rk[j] = *(const uint4*)(a.kc + (size_t)(pos % a.cap) * CELL + kvh * HD +
+                                c * 8);
       }
     }
-    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < NV; j++) {
+      const int idx = tid + j * NT;
+      if (idx < (PF_KT / 2) * 16) {
+        const int kp = idx >> 4, c = idx & 15;
+        const int p0_ = min(kbase + 2 * kp, plast),
+                  p1_ = min(kbase + 2 * kp + 1, plast);
+        rv[j][0] = *(const uint4*)(a.vc + (size_t)(p0_ % a.cap) * CELL +
+                                   kvh * HD + c * 8);
+        rv[j][1] = *(const uint4*)(a.vc + (size_t)(p1_ % a.cap) * CELL +
+                                   kvh * HD + c * 8);
+      }
+    }
+    if (tid < BTR * 2) {
+      const int row = tid >> 1, hf = tid & 1, d = d0 + row;
+      if (d >= 0 && d < WIN)
+        rb = *(const uint4*)(a.bt + (size_t)d * RD + hf * 8);
+    }
+  };
+  auto store = [&](int tile, int b) {
+    const int kbase = kfirst + tile * PF_KT;
+    const int d0 = pfirst - (kbase + PF_KT - 1);
+    if (tid < BTR * 2) {
+      const int row = tid >> 1, hf = tid & 1, d = d0 + row;
+      if (d >= 0 && d < WIN)
+        *(uint4*)&sB2[b][row][hf * 8] = rb;
+    }
+#pragma unroll
+    for (int j = 0; j < NK; j++) {
+      const int idx = tid + j * NT;
+      if (idx < PF_KT * 16) {
+        const int key = idx >> 4, c = idx & 15;
+        *(uint4*)&sK2[b][key][c * 8] = rk[j];
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < NV; j++) {
+      const int idx = tid + j * NT;
+      if (idx < (PF_KT / 2) * 16) {
+        const int kp = idx >> 4, c = idx & 15;
+        uint4 v0 = rv[j][0], v1 = rv[j][1];
+        uint32_t* dst = (uint32_t*)&sVt2[b][c * 8][2 * kp];
+        constexpr int RS = PF_VS / 2;
+        uint32_t x0[4] = {v0.x, v0.y, v0.z, v0.w},
+                 x1[4] = {v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          dst[(2 * e) * RS] = (x0[e] & 0xffffu) | (x1[e] << 16);
+          dst[(2 * e + 1) * RS] = (x0[e] >> 16) | (x1[e] & 0xffff0000u);
+        }
+      }
+    }
+  };
+  gload(0);
+  store(0, 0);
+  __syncthreads();
+  if (ntiles > 1)
+    gload(1);
+  for (int tile = 0; tile < ntiles; tile++) {
+    const int b = tile & 1;
+    const int kbase = kfirst + tile * PF_KT;
+    const int d0 = pfirst - (kbase + PF_KT - 1);
+    __half(*sK)[PF_KS] = sK2[b];
+    __half(*sVt)[PF_VS] = sVt2[b];
+    __half(*sB)[RD] = sB2[b];
 #pragma unroll
     for (int kt = 0; kt < PF_KT / 16; kt++) {
       const int pos0 = kbase + kt * 16;
@@ -3210,7 +3979,7 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
         sv[i] = ok ? s : -INFINITY;
         mx = fmaxf(mx, sv[i]);
       }
-      mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+      mx = fmaxf(mx, xor16f(mx));
       const float mn = fmaxf(m, mx);
       const float alpha = __expf(m - mn);
       float p[8], ps = 0.f;
@@ -3221,6 +3990,15 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
       }
       l = l * alpha + ps;
       m = mn;
+      // A step holding keys this row masks (its own step's later keys, the
+      // keys before a window) is summed on the VALU with those keys' V
+      // zeroed: the WMMA's sum depends on the A entries a zero probability
+      // meets, and those rows differ with the prompt's chunking (later
+      // tokens, ring rows). Its WMMA column is zero, which leaves acc exact.
+      const bool edge =
+          rowvalid &&
+          ((posq >= pos0 && posq < pos0 + 15) ||
+           (a.swa && posq - (WIN - 1) > pos0 && posq - (WIN - 1) <= pos0 + 15));
       uint32_t mine[4], theirs[4];
 #pragma unroll
       for (int i = 0; i < 4; i++) {
@@ -3228,16 +4006,36 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
         pr[0] = (h16)p[2 * i];
         pr[1] = (h16)p[2 * i + 1];
         mine[i] = as_u32(pr);
-        theirs[i] = __shfl_xor(mine[i], 16, 32);
+        theirs[i] = xor16u(mine[i]);
+      }
+      uint32_t pe[8] = {};  // edge: keys 2j, 2j + 1 of the step
+      if (edge) {
+#pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+          // key 2jj + e sits in the half e: its p is p[jj] of that half, in
+          // pair jj >> 1 (element jj & 1) of mine / theirs
+          const uint32_t a0 = half == 0 ? mine[jj >> 1] : theirs[jj >> 1];
+          const uint32_t a1 = half == 1 ? mine[jj >> 1] : theirs[jj >> 1];
+          const uint32_t lo = (jj & 1) ? (a0 >> 16) : (a0 & 0xffffu);
+          const uint32_t hi = (jj & 1) ? (a1 >> 16) : (a1 & 0xffffu);
+          pe[jj] = lo | (hi << 16);
+        }
+        // the other half holds the same row: its column is zero too
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+          mine[i] = theirs[i] = 0;
       }
       v16h pf;
 #pragma unroll
       for (int i = 0; i < 4; i++) {
-        v2h mv = as_v2h(mine[i]), tv = as_v2h(theirs[i]);
-        pf[4 * i + 0] = half ? tv[0] : mv[0];
-        pf[4 * i + 1] = half ? mv[0] : tv[0];
-        pf[4 * i + 2] = half ? tv[1] : mv[1];
-        pf[4 * i + 3] = half ? mv[1] : tv[1];
+        const v2h lo =
+            as_v2h(__builtin_amdgcn_perm(theirs[i], mine[i], sel_lo));
+        const v2h hi =
+            as_v2h(__builtin_amdgcn_perm(theirs[i], mine[i], sel_hi));
+        pf[4 * i + 0] = lo[0];
+        pf[4 * i + 1] = lo[1];
+        pf[4 * i + 2] = hi[0];
+        pf[4 * i + 3] = hi[1];
       }
 #pragma unroll
       for (int dt = 0; dt < 8; dt++) {
@@ -3246,11 +4044,46 @@ __global__ __launch_bounds__(NTT * 96) void attn_prefill(PfArgs a) {
         acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
             cat16(*(const uint4*)vp, *(const uint4*)(vp + 8)), pf, acc[dt]);
       }
+      if (edge) {
+        uint32_t vm[8];  // halves of the keys this row sees
+#pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+          uint32_t mk = 0;
+#pragma unroll
+          for (int e = 0; e < 2; e++) {
+            const int d = posq - (pos0 + 2 * jj + e);
+            if (d >= 0 && (!a.swa || d < WIN))
+              mk |= 0xffffu << (16 * e);
+          }
+          vm[jj] = mk;
+        }
+#pragma unroll
+        for (int dt = 0; dt < 8; dt++)
+#pragma unroll
+          for (int i = 0; i < 8; i++) {
+            const uint4* vr =
+                (const uint4*)&sVt[dt * 16 + 2 * i + half][kt * 16];
+            const uint4 v0 = vr[0], v1 = vr[1];
+            const uint32_t vv[8] = {v0.x, v0.y, v0.z, v0.w,
+                                    v1.x, v1.y, v1.z, v1.w};
+            float e = 0.f;
+#pragma unroll
+            for (int jj = 0; jj < 8; jj++)
+              e = __builtin_amdgcn_fdot2(as_v2h(pe[jj]),
+                                         as_v2h(vv[jj] & vm[jj]), e, false);
+            acc[dt][i] += e;
+          }
+      }
     }
+    if (tile + 1 < ntiles)
+      store(tile + 1, b ^ 1);
+    __syncthreads();
+    if (tile + 2 < ntiles)
+      gload(tile + 2);
   }
   if (!rowvalid)
     return;
-  const float inv = 1.0f / (l + __shfl_xor(l, 16, 32));
+  const float inv = 1.0f / (l + xor16f(l));
   const size_t ob = ((size_t)t * NH + h) * HD;
   const float* gp = a.gate ? a.gate + (size_t)t * (NH * HD) + h * HD : nullptr;
 #pragma unroll
@@ -3440,8 +4273,12 @@ void ProjMulti(hipStream_t s, const ProjSpec& p, const float* x, int ni,
     }
   };
   // 4+ tokens: each block's quantized inputs take most of a CU's LDS, so
-  // blocks of 16 waves keep twice the loads in flight (rows' sums unchanged)
-  if (nb >= 4)
+  // blocks of 16 waves keep twice the loads in flight (rows' sums unchanged);
+  // one input and 6+ tokens: two rows per wave (more blocks, 0.4 to 0.7% per
+  // verification step)
+  if (nb >= 6 && ni == 1)
+    run(I<16>{}, I<2>{}, I<16>{});
+  else if (nb >= 4)
     run(I<16>{}, I<4>{}, I<16>{});
   else
     run(I<16>{}, I<4>{}, I<8>{});
@@ -3558,9 +4395,16 @@ void Router(hipStream_t s, const void* w, const float* bias, const float* x,
   Chk("router");
 }
 
+// The kernels evaluate SITU with Inkling 2 Mini's constants.
+static void CheckSitu(float beta, float lb) {
+  if (beta != kSituBeta || lb != kSituLinearBeta)
+    throw std::runtime_error("inkling2 fast: unsupported SITU constants");
+}
+
 void MoeGu(hipStream_t s, int fmt, const void* w, const float* escale,
            const float* x, const int* ids, float* a, int ff, float beta,
            float lb, int nb) {
+  CheckSitu(beta, lb);
   const uint8_t* W = static_cast<const uint8_t*>(w);
   auto run = [&](auto fm, auto lpr, auto nit, auto bw) {
     constexpr int FM = decltype(fm)::value, LPR = decltype(lpr)::value,
@@ -3569,7 +4413,7 @@ void MoeGu(hipStream_t s, int fmt, const void* w, const float* escale,
     k_moe_gu<FM, 2304, LPR, NIT, BW>
         <<<nb == 1 ? dim3((ff + RPB - 1) / RPB, 8)
                    : dim3(8 * nb, (ff + RPB - 1) / RPB),
-           BW * WS, 0, s>>>(W, escale, x, ids, a, ff, beta, lb, g_res);
+           BW * WS, 0, s>>>(W, escale, x, ids, a, ff, g_res);
   };
   if (fmt == kFmtNvfp4) {
     run(I<FMT_NVFP4>{}, I<16>{}, I<1>{}, I<8>{});
@@ -3577,6 +4421,144 @@ void MoeGu(hipStream_t s, int fmt, const void* w, const float* escale,
     run(I<FMT_Q8>{}, I<16>{}, I<1>{}, I<4>{});
   }
   Chk("moe_gu");
+}
+
+void QuantRows(hipStream_t s, int k, const float* x, int per, int ldt, int nb,
+               void* qa, float* qs) {
+  if (k == 2304)
+    k_quant_rows<2304, 32><<<nb * per, 256, 0, s>>>(
+        x, per, ldt, static_cast<v4u*>(qa), qs, g_res);
+  else
+    k_quant_rows<3072, 32><<<nb * per, 256, 0, s>>>(
+        x, per, ldt, static_cast<v4u*>(qa), qs, g_res);
+  Chk("quant_rows");
+}
+namespace {
+constexpr int kMmaWaves = 8;
+MultiP OneMatrix(const void* w, int m, int ldy) {
+  MultiP mp{};
+  mp.W[0] = static_cast<const uint8_t*>(w);
+  mp.M[0] = m;
+  mp.n = 1;
+  mp.cum[1] = m;
+  mp.res = g_res;
+  mp.ldy = ldy;
+  return mp;
+}
+}  // namespace
+bool ProjMma(hipStream_t s, const ProjSpec& p, const void* qa, const float* qs,
+             int per, float* y, int nb, int ldx, int ldy, const float* x) {
+  constexpr int RPB = 16;
+  MultiP mp{};
+  mp.ldx = ldx;
+  mp.ldy = ldy;
+  int cum = 0;
+  for (int i = 0; i < p.n; ++i) {
+    mp.W[i] = static_cast<const uint8_t*>(p.w[i]);
+    mp.M[i] = p.m[i];
+    mp.in[i] = p.in[i];
+    mp.yoff[i] = cum;
+    mp.cum[i] = cum;
+    cum += p.m[i];
+  }
+  mp.cum[p.n] = cum;
+  mp.n = p.n;
+  mp.res = g_res;
+  for (int i = 1; i < mp.n; ++i)
+    if (mp.in[i] != mp.in[i - 1] && mp.cum[i] % RPB != 0)
+      return false;
+  int trows_total = 0;
+  mp.tn = p.tn;
+  for (int i = 0; i < p.tn; ++i) {
+    mp.tw[i] = p.tw[i];
+    mp.ttype[i] = p.ttype[i] == 0 ? 0 : (p.ttype[i] == 1 ? 1 : 2);
+    mp.trows[i] = p.trows[i];
+    mp.tin[i] = p.tin[i];
+    mp.ty[i] = p.ty[i];
+    mp.tys[i] = p.tys[i];
+    trows_total += p.trows[i];
+  }
+  if (mp.tn > 0) {
+    constexpr int BW = 16;
+    mp.ntb = (trows_total + BW - 1) / BW;
+    k_tiny_wide<BW, 8><<<dim3(mp.ntb), BW * WS, 0, s>>>(mp, x, nb);
+  }
+  k_gemv_mma<2304, 16, kMmaWaves>
+      <<<dim3((nb + 15) / 16, (cum + RPB - 1) / RPB), kMmaWaves * 32, 0, s>>>(
+          mp, static_cast<const v4u*>(qa), qs, per, y, cum, nb, 0.f);
+  Chk("proj_mma");
+  return true;
+}
+void GemvMma(hipStream_t s, int k, const void* w, const void* qa,
+             const float* qs, float* y, int m, float softcap, int nb) {
+  constexpr int RPB = 16;
+  const MultiP mp = OneMatrix(w, m, m);
+  const dim3 grid((nb + 15) / 16, (m + RPB - 1) / RPB);
+  if (k == 2304)
+    k_gemv_mma<2304, 32, kMmaWaves><<<grid, kMmaWaves * 32, 0, s>>>(
+        mp, static_cast<const v4u*>(qa), qs, 1, y, m, nb, softcap);
+  else
+    k_gemv_mma<3072, 16, kMmaWaves><<<grid, kMmaWaves * 32, 0, s>>>(
+        mp, static_cast<const v4u*>(qa), qs, 1, y, m, nb, softcap);
+  Chk("gemv_mma");
+}
+void MoeRouteGroup(hipStream_t s, const int* ids, int pairs, MoeGroups g) {
+  k_route_group<<<1, 256, 0, s>>>(ids, pairs, g.sorted, g.ue, g.ub, g.un, g.nd);
+  Chk("route_group");
+}
+void MoeGuGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
+                  MoeGroups g, int slots, float* a, int ff, float beta,
+                  float lb) {
+  CheckSitu(beta, lb);
+  const uint8_t* W = static_cast<const uint8_t*>(w);
+  const uint8_t* qx = static_cast<const uint8_t*>(g.qx);
+  auto run = [&](auto fm) {
+    constexpr int FM = decltype(fm)::value, RPB = kGgBw * (WS / 16 / 2);
+    k_moe_gu_gg<FM, 2304, 16, kGgBw>
+        <<<dim3(std::min(slots, kGgSlotBlocks), (ff + RPB - 1) / RPB),
+           kGgBw * WS, 0, s>>>(W, escale, qx, g.sorted, g.ue, g.ub, g.un, g.nd,
+                               a, ff, g_res);
+  };
+  if (fmt == kFmtNvfp4)
+    run(I<FMT_NVFP4>{});
+  else
+    run(I<FMT_Q8>{});
+  Chk("moe_gu_grouped");
+}
+void MoeQuantGrouped(hipStream_t s, int fmt, const float* x, int nv, int k,
+                     MoeGroups g) {
+  uint8_t* qx = static_cast<uint8_t*>(g.qx);
+  const dim3 grid((nv * (k / 16) + 255) / 256);
+  if (k == 2304) {
+    if (fmt == kFmtNvfp4)
+      k_quant_vec<2304, 64><<<grid, 256, 0, s>>>(x, nv, qx);
+    else
+      k_quant_vec<2304, 32><<<grid, 256, 0, s>>>(x, nv, qx);
+  } else {
+    if (fmt == kFmtNvfp4)
+      k_quant_vec<1152, 64><<<grid, 256, 0, s>>>(x, nv, qx);
+    else
+      k_quant_vec<1152, 32><<<grid, 256, 0, s>>>(x, nv, qx);
+  }
+  Chk("moe_quant_grouped");
+}
+void MoeDownGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
+                    MoeGroups g, int slots, const float* wts, float* yp,
+                    int d) {
+  const uint8_t* W = static_cast<const uint8_t*>(w);
+  const uint8_t* qx = static_cast<const uint8_t*>(g.qx);
+  auto run = [&](auto fm) {
+    constexpr int FM = decltype(fm)::value, RPB = kGgBw * (WS / 8);
+    k_moe_down_gg<FM, 1152, 8, kGgBw>
+        <<<dim3(std::min(slots, kGgSlotBlocks), (d + RPB - 1) / RPB),
+           kGgBw * WS, 0, s>>>(W, escale, qx, g.sorted, g.ue, g.ub, g.un, g.nd,
+                               wts, yp, d, g_res);
+  };
+  if (fmt == kFmtNvfp4)
+    run(I<FMT_NVFP4>{});
+  else
+    run(I<FMT_Q8>{});
+  Chk("moe_down_grouped");
 }
 
 void MoeDownE(hipStream_t s, int fmt, const void* w, const float* escale,
@@ -3671,6 +4653,7 @@ void AttnDecode(hipStream_t s, const AttnArgs& a, int nb) {
 void KvAttnDecode(hipStream_t s, const KvPrepArgs& kv, const AttnArgs& a,
                   int nb) {
   ia::attn_decode_fused<4><<<dim3(8, a.nsplit, nb), 128, 0, s>>>(a, kv);
+  ia::decode_reduce<<<dim3(24, 1, nb), 128, 0, s>>>(a);
   Chk("attn_decode_fused");
 }
 void AttnDecodeRows(hipStream_t s, const AttnArgs& a0, int nb) {
@@ -3708,13 +4691,14 @@ __global__ void __launch_bounds__(256)
     return;
   float* st = tbl[slot].conv + (size_t)ch * 3;
   const float* cp = cap + ((size_t)slot * 6656 + ch) * kVerifyRows + row0;
-  float seq[3 + kVerifyRows];
+  // the last three of [st[0..3), cp[0..keep)]
+  float v[3];
+  for (int i = 0; i < 3; ++i) {
+    const int j = keep + i;
+    v[i] = j < 3 ? st[j] : cp[j - 3];
+  }
   for (int i = 0; i < 3; ++i)
-    seq[i] = st[i];
-  for (int i = 0; i < keep; ++i)
-    seq[3 + i] = cp[i];
-  for (int i = 0; i < 3; ++i)
-    st[i] = seq[keep + i];
+    st[i] = v[i];
 }
 __global__ void __launch_bounds__(256)
     k_rows_argmax1(const float* x, int n, float* ws) {
@@ -3878,8 +4862,7 @@ void MoeGuPrefill(hipStream_t s, int fmt, int tile, const void* w,
   p.item_start = ws.item_start;
   p.item_n = ws.item_n;
   p.outh = static_cast<_Float16*>(act16);
-  p.beta = beta;
-  p.lb = lb;
+  CheckSitu(beta, lb);
   if (fmt == kFmtNvfp4) {
     if (tile == 32)
       gu_launch<FMT_NVFP4, 32, 2>(s, p, max_items);
@@ -3980,7 +4963,14 @@ void AttnPrefill(hipStream_t s, const PrefillAttn& a) {
   pa.bt = static_cast<const __half*>(a.bt);
   pa.out = a.out;
   pa.out16 = static_cast<_Float16*>(a.out16);
-  attn_prefill<4><<<dim3((a.n + 63) / 64, 8), 384, 0, s>>>(pa);
+  // Global visits past 1K keys with enough queries to fill the GPU take
+  // 128-query blocks (pp32K attention 33.6 -> 27.4 ms per visit). Window
+  // visits keep 64-query blocks: their first key follows the block's first
+  // query, so a larger block would regroup their softmax steps.
+  if (!a.swa && a.pos0 >= 1024 && a.n >= 512)
+    attn_prefill_db<8, 32><<<dim3((a.n + 127) / 128, 8), 768, 0, s>>>(pa);
+  else
+    attn_prefill_db<4, 32><<<dim3((a.n + 63) / 64, 8), 384, 0, s>>>(pa);
   Chk("attn_prefill");
 }
 

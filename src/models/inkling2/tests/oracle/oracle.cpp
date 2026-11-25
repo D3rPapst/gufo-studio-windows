@@ -1,4 +1,4 @@
-// Teacher-forcing oracle dump for the Inkling 2 Mini HIP engine (milestone M1).
+// Teacher-forcing oracle dump for the Inkling 2 Mini HIP engine.
 //
 //   inkling2_oracle --model GGUF --text FILE --n N --out dump.bin [--ids-out
 //   ids.bin]
@@ -8,7 +8,8 @@
 // or reads the ids from --ids, evaluates them through the engine and writes,
 // per position, the logsumexp of the soft-capped logits over the text
 // vocabulary, the top-64 (id, logit) and, when --ref is given, our logits at
-// the reference's top-64 ids. tools/compare_dumps.py scores two dumps.
+// the reference's top-64 ids. compare_dumps.py (beside this
+// file) scores two dumps.
 // llama_dump.cpp writes the same format from llama.cpp's libllama.
 #include <algorithm>
 #include <chrono>
@@ -237,11 +238,10 @@ int main(int argc, char** argv) {
   const auto t2 = std::chrono::steady_clock::now();
   if (a.single) {
     // decode path: one token per call (T = 1 kernels)
-    for (std::size_t i = 0; i < ids.size(); ++i)
-      engine->Forward(*session, std::span<const std::int32_t>(&ids[i], 1),
-                      [&](std::size_t, std::size_t count, const float* data) {
-                        sink(i, count, data);
-                      });
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      engine->Decode(*session, ids[i]);
+      sink(i, 1, session->logits().data());
+    }
   } else {
     engine->Forward(*session, ids, sink);
   }
