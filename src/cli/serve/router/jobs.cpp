@@ -94,6 +94,8 @@ struct JobQueue::Job {
   long long expired_at{0};
   /// LoRA names the wrapped request asks for (capability check).
   std::vector<std::string> loras;
+  /// Router features the wrapped request needs (FeatureNeeds, 2.2.19).
+  std::vector<std::string> features;
   /// Shared queue: the partner's url while it runs the job on its worker
   /// (POST /router/pool/pull), else empty.
   std::string pulled_by;
@@ -1659,9 +1661,54 @@ std::vector<std::string> LoraNames(const json::Value& body) {
   return names;
 }
 
+std::vector<std::string> RouterFeatures() {
+  return {"print_ready"};
+}
+
+std::vector<std::string> FeatureNeeds(const json::Value& body) {
+  std::vector<std::string> needs;
+  if (!body.is_object())
+    return needs;
+  const json::Value* ready = body.find("print_ready");
+  if (ready != nullptr && ready->is_bool() && !ready->as_bool())
+    return needs;  // explicitly off: the other print_* fields do nothing
+  for (const auto& [name, value] : body.members()) {
+    if (!name.starts_with("print_") || value.is_null())
+      continue;
+    if (value.is_bool() && !value.as_bool())
+      continue;
+    needs.push_back("print_ready");
+    break;
+  }
+  return needs;
+}
+
+bool HasFeatures(const json::Value& capabilities,
+                 const std::vector<std::string>& needs, std::string* missing) {
+  const json::Value* have = capabilities.find("features");
+  for (const std::string& need : needs) {
+    bool found = false;
+    if (have != nullptr && have->is_array())
+      for (const json::Value& name : have->items())
+        found = found || (name.is_string() && name.str() == need);
+    if (!found) {
+      if (missing != nullptr)
+        *missing = need;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool CanRun(const json::Value& capabilities, const std::string& model,
             const std::vector<std::string>& loras, std::string* why,
-            bool now) {
+            bool now, const std::vector<std::string>& features) {
+  if (std::string missing; !HasFeatures(capabilities, features, &missing)) {
+    if (why != nullptr)
+      *why = "does not support '" + missing +
+             "' (router older than 2.2.19 or without the feature)";
+    return false;
+  }
   const json::Value* models = capabilities.find("models");
   if (models == nullptr || !models->is_object())
     models = &capabilities;
@@ -1920,6 +1967,7 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
     job->content_type = "application/json";
     job->model = json_body->member_str("model");
     job->loras = LoraNames(*json_body);
+    job->features = FeatureNeeds(*json_body);
     payload = json_body->dump();
   } else {
     job->content_type = inner->member_str("content_type");
@@ -1963,6 +2011,7 @@ HttpResponse JobQueue::Submit(const HttpRequest& request) {
         const json::Value parsed = json::parse(payload);
         job->model = parsed.member_str("model");
         job->loras = LoraNames(parsed);
+        job->features = FeatureNeeds(parsed);
       } catch (const std::exception&) {
         return Err(400, "Bad Request", "request body is not valid JSON",
                    "invalid_json");
@@ -2771,6 +2820,12 @@ json::Value JobQueue::ViewLocked(const Job& job) const {
   for (const std::string& name : job.loras)
     loras.push_back(name);
   request["loras"] = std::move(loras);
+  if (!job.features.empty()) {
+    json::Value features = json::Value::array();
+    for (const std::string& name : job.features)
+      features.push_back(name);
+    request["features"] = std::move(features);
+  }
   view["request"] = std::move(request);
   // Where the work runs: here, on the partner's worker (pulled, or the
   // pool sent it there), or nowhere yet (waiting in the pool).
@@ -2920,6 +2975,10 @@ json::Value JobQueue::RecordLocked(const Job& job) const {
   for (const std::string& name : job.loras)
     loras.push_back(name);
   record["loras"] = std::move(loras);
+  json::Value features = json::Value::array();
+  for (const std::string& name : job.features)
+    features.push_back(name);
+  record["features"] = std::move(features);
   return record;
 }
 
@@ -3021,6 +3080,11 @@ void JobQueue::Load() {
       for (const json::Value& name : loras->items())
         if (name.is_string() && !name.str().empty())
           job->loras.push_back(name.str());
+    if (const json::Value* features = record.find("features");
+        features != nullptr && features->is_array())
+      for (const json::Value& name : features->items())
+        if (name.is_string() && !name.str().empty())
+          job->features.push_back(name.str());
     if (job->status == "queued") {
       InsertPendingLocked(job, /*front=*/false);
       ++requeued;
@@ -3177,6 +3241,11 @@ std::optional<std::vector<JobQueue::PartnerJob>> JobQueue::PartnerQueued() {
             for (const json::Value& name : loras->items())
               if (name.is_string())
                 job.loras.push_back(name.str());
+          if (const json::Value* features = request->find("features");
+              features != nullptr && features->is_array())
+            for (const json::Value& name : features->items())
+              if (name.is_string())
+                job.features.push_back(name.str());
         }
         if (ValidJobId(job.id) && !job.model.empty())
           list.push_back(std::move(job));
@@ -3221,7 +3290,7 @@ bool JobQueue::TryPull(int mine_priority, long long mine_created_at) {
                     mine_created_at))
       break;  // ours goes first (higher priority, or as old and ours)
     if (!CanRun(mine, candidate.model, candidate.loras, nullptr,
-                /*now=*/true))
+                /*now=*/true, candidate.features))
       continue;
     // The runner is free, but the GPU may not be (12.11.: the .56 pulled
     // while ComfyUI and the film ran there).
@@ -3424,7 +3493,10 @@ HttpResponse JobQueue::Pull(const HttpRequest& request) {
       if (entry == nullptr || !entry->is_object() ||
           entry->member_str("placement") != "pool")
         continue;
-      if (!CanRun(*caps, job->model, job->loras, nullptr, /*now=*/true))
+      // 2.2.19: a requester without a feature the job needs (an older
+      // router lists none) would run it without, and say nothing.
+      if (!CanRun(*caps, job->model, job->loras, nullptr, /*now=*/true,
+                  job->features))
         continue;
       if (waiting) {
         // The router redirects the waiting request (503 pool_redirected)
@@ -3481,15 +3553,21 @@ std::string JobQueue::SideFor(const Job& job, json::Value* refusal) {
   const json::Value mine = options_.capabilities();
   std::string why_local;
   std::string why_partner;
-  const bool local_ok = CanRun(mine, job.model, job.loras, &why_local);
+  const bool local_ok =
+      CanRun(mine, job.model, job.loras, &why_local, false, job.features);
   const bool has_partner = static_cast<bool>(options_.relay);
   std::optional<json::Value> partner;
   if (has_partner && options_.partner_capabilities)
     partner = options_.partner_capabilities();
-  // Unknown partner capabilities (unreachable, older version): it may.
-  bool partner_ok = has_partner;
+  // Unknown partner capabilities (unreachable, older version): it may,
+  // unless the job needs a router feature (2.2.19): that is never assumed.
+  bool partner_ok = has_partner && job.features.empty();
+  if (has_partner && !partner.has_value() && !job.features.empty())
+    why_partner = "does not say whether it supports '" + job.features[0] +
+                  "' (capabilities unknown)";
   if (partner.has_value()) {
-    partner_ok = CanRun(*partner, job.model, job.loras, &why_partner);
+    partner_ok = CanRun(*partner, job.model, job.loras, &why_partner, false,
+                        job.features);
     const std::string me = partner->member_str("partner");
     if (!me.empty()) {
       const std::lock_guard<std::mutex> lock(mutex_);

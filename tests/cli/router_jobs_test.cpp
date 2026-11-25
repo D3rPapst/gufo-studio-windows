@@ -2415,6 +2415,163 @@ void TestCapabilityRouting() {
   CHECK(h.api->SideOf("alone anime").empty());
 }
 
+/// Capabilities with the router features of 2.2.19 ("features").
+json::Value WithFeatures(json::Value caps) {
+  json::Value features = json::Value::array();
+  for (const std::string& name : jobs::RouterFeatures())
+    features.push_back(name);
+  caps["features"] = std::move(features);
+  return caps;
+}
+
+/// An image job whose body asks for a print-ready result (print_ready).
+std::string PrintJob(const std::string& prompt) {
+  return R"({"request":{"path":"/v1/images/generations","body":{"model":"qwen-image","prompt":")" +
+         prompt + R"(","size":"64x64","print_ready":true,"print_eye_height_mm":28}}})";
+}
+
+void TestFeatureNeedsAndCanRun() {
+  // 2.2.19: print_ready (and the print_* fields that go with it) needs the
+  // router feature "print_ready"; a router without the list has none.
+  const auto needs = [](const char* text) {
+    return jobs::FeatureNeeds(json::parse(text));
+  };
+  CHECK(needs(R"({"print_ready":true})") ==
+        std::vector<std::string>{"print_ready"});
+  CHECK(needs(R"({"print_height_mm":40})") ==
+        std::vector<std::string>{"print_ready"});
+  CHECK(needs(R"({"print_ready":false,"print_height_mm":40})").empty());
+  CHECK(needs(R"({"print_ready":null})").empty());
+  CHECK(needs(R"({"prompt":"x","loras":[]})").empty());
+  CHECK(std::find(jobs::RouterFeatures().begin(), jobs::RouterFeatures().end(),
+                  "print_ready") != jobs::RouterFeatures().end());
+  std::string why;
+  const std::vector<std::string> print{"print_ready"};
+  CHECK(!jobs::CanRun(CapsB(), "qwen-image", {}, &why, false, print));
+  CHECK(why.find("does not support 'print_ready'") != std::string::npos);
+  CHECK(jobs::CanRun(WithFeatures(CapsB()), "qwen-image", {}, &why, false,
+                     print));
+  // The feature does not replace the model and LoRA checks.
+  CHECK(!jobs::CanRun(WithFeatures(CapsB()), "qwen-image", {"anime"}, &why,
+                      false, print));
+  CHECK(why.find("no LoRA 'anime'") != std::string::npos);
+  // Without needed features nothing changes for an old partner.
+  CHECK(jobs::CanRun(CapsB(), "qwen-image", {}, &why));
+  std::string missing;
+  CHECK(!jobs::HasFeatures(json::parse(R"({"features":["other"]})"), print,
+                           &missing));
+  CHECK(missing == "print_ready");
+  CHECK(jobs::HasFeatures(CapsB(), {}));
+}
+
+void TestFeatureRouting() {
+  // 25.11.: a print_ready trellis2 job of the .198 (2.2.18) went over the
+  // pool to the .56 (2.2.17b), which ran it without print.stl and said
+  // nothing. A job needing a feature the partner does not list stays here
+  // (X-Gufo-Pool: local), and a partner that lists it may take it.
+  Harness h("features", false);
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = [] { return WithFeatures(CapsA()); };
+  // An older partner: capabilities without "features".
+  h.partner_capabilities = [] { return std::optional<json::Value>(CapsB()); };
+  h.relay = [](const HttpRequest&, std::chrono::milliseconds,
+               std::chrono::milliseconds,
+               std::string*) -> std::optional<HttpResponse> {
+    return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
+  };
+  h.Open(true);
+  const std::string old_partner =
+      h.Submit(PrintJob("print old partner")).member_str("id");
+  const json::Value done = h.WaitFor(old_partner, "completed");
+  CHECK(h.api->SideOf("print old partner") == "local");
+  const json::Value* features = done.find("request")->find("features");
+  CHECK(features != nullptr && features->is_array() &&
+        features->items().size() == 1 &&
+        features->items()[0].str() == "print_ready");
+  // The same job without print_ready may run on either machine.
+  const std::string plain = h.Submit(ImageJob("plain old partner")).member_str("id");
+  h.WaitFor(plain, "completed");
+  CHECK(h.api->SideOf("plain old partner").empty());
+  // Only the partner serves ace-step: a print job of it has no machine.
+  const std::string music_print =
+      R"({"request":{"path":"/v1/audio/music","body":{"model":"ace-step","prompt":"lied","print_ready":true}}})";
+  HttpResponse refused = h.Call("POST", "/v1/jobs", music_print);
+  CHECK(refused.status == 400);
+  CHECK(ErrorCodeOf(refused) == "no_capable_router");
+  CHECK(ErrorMessageOf(refused).find("does not support 'print_ready'") !=
+        std::string::npos);
+  // Partner capabilities unknown: never assumed for a feature.
+  h.queue->Stop();
+  h.partner_capabilities = [] { return std::optional<json::Value>(); };
+  h.Open(true);
+  const std::string unknown =
+      h.Submit(PrintJob("print unknown partner")).member_str("id");
+  h.WaitFor(unknown, "completed");
+  CHECK(h.api->SideOf("print unknown partner") == "local");
+  refused = h.Call("POST", "/v1/jobs", music_print);
+  CHECK(refused.status == 400);
+  CHECK(ErrorMessageOf(refused).find("capabilities unknown") !=
+        std::string::npos);
+  // A partner of 2.2.19 lists the feature: either machine.
+  h.queue->Stop();
+  h.partner_capabilities = [] {
+    return std::optional<json::Value>(WithFeatures(CapsB()));
+  };
+  h.Open(true);
+  const std::string new_partner =
+      h.Submit(PrintJob("print new partner")).member_str("id");
+  h.WaitFor(new_partner, "completed");
+  CHECK(h.api->SideOf("print new partner").empty());
+  const std::string music =
+      h.Submit(music_print).member_str("id");
+  h.WaitFor(music, "completed");
+  CHECK(h.api->SideOf("lied") == "remote");
+  // A restart keeps the job's features (jobs.json).
+  h.queue->Stop();
+  h.Open(false);
+  const json::Value reread =
+      json::parse(h.Call("GET", "/v1/jobs/" + old_partner).body);
+  features = reread.find("request")->find("features");
+  CHECK(features != nullptr && features->items().size() == 1);
+}
+
+void TestFeaturePullOwner() {
+  // The owner hands a print_ready job only to a requester that lists the
+  // feature (an older requester, 2.2.17b, sends capabilities without it).
+  Harness h("features-owner", false);
+  h.capabilities = [] { return WithFeatures(CapsB()); };
+  h.self_name = "http://10.0.0.2:8081";
+  h.Open(true);
+  const std::string busy = h.Submit(ImageJob("SLOW busy")).member_str("id");
+  h.WaitFor(busy, "in_progress");
+  const std::string print = h.Submit(PrintJob("print pulled")).member_str("id");
+  const auto pull = [&h](const std::string& capabilities) {
+    HttpRequest request;
+    request.method = "POST";
+    request.path = jobs::kPullPath;
+    request.body = R"({"from":"http://10.0.0.1:8081","router_id":"ra","capabilities":)" +
+                   capabilities + "}";
+    request.headers.emplace_back("Content-Type", "application/json");
+    request.headers.emplace_back(jobs::kRelayHeader, "1");
+    const auto answer = h.queue->Handle(request);
+    CHECK(answer && answer->status == 200);
+    return answer ? json::parse(answer->body) : json::Value();
+  };
+  CHECK(pull(R"({"models":{"qwen-image":{"placement":"pool","loras":[]}}})")
+            .find("job")
+            ->is_null());
+  CHECK(json::parse(h.Call("GET", "/v1/jobs/" + print).body)
+            .member_str("status") == "queued");
+  const json::Value handed = pull(
+      R"({"features":["print_ready"],"models":{"qwen-image":{"placement":"pool","loras":[]}}})");
+  CHECK(handed.member_str("job") == print);
+  h.WaitFor(print, "completed");
+  CHECK(h.api->SideOf("print pulled") == "remote");
+  h.api->release.store(true);
+  h.WaitFor(busy, "completed");
+}
+
 /// The fake partner of the pull tests (router B as seen from A).
 struct FakePartner {
   std::mutex mutex;
@@ -2494,6 +2651,35 @@ struct FakePartner {
     return JsonAnswer(404, R"({"error":{"code":"not_found"}})");
   }
 };
+
+void TestFeaturePullRequester() {
+  // A requester does not pull a partner job that needs a feature it lacks
+  // (the job view names it in "request.features").
+  auto partner = std::make_shared<FakePartner>();
+  partner->queued =
+      R"({"object":"list","data":[)"
+      R"({"id":"job_bbbbbbbbbbbbbbbbbbbbbbb2","status":"queued","created_at":1001,"request":{"model":"qwen-image","loras":[],"features":["print_ready","later"]}}]})";
+  Harness h("features-requester", false);
+  partner->api = h.api;
+  h.partner_name = "http://10.0.0.2:8081";
+  h.self_name = "http://10.0.0.1:8081";
+  h.capabilities = [] { return WithFeatures(CapsA()); };
+  h.partner_capabilities = [] {
+    return std::optional<json::Value>(WithFeatures(CapsB()));
+  };
+  h.relay = [partner](const HttpRequest& request, std::chrono::milliseconds a,
+                      std::chrono::milliseconds b, std::string* error) {
+    return (*partner)(request, a, b, error);
+  };
+  h.Open(true);
+  const std::string mine = h.Submit(ImageJob("own after skip")).member_str("id");
+  h.WaitFor(mine, "completed");
+  {
+    const std::lock_guard<std::mutex> lock(partner->mutex);
+    CHECK(partner->pulls == 0);
+    CHECK(partner->queued_reads > 0);
+  }
+}
 
 void TestPoolPullRequester() {
   // Router A: a free runner pulls the partner's oldest queued job it can
@@ -3465,6 +3651,10 @@ int main() {
   TestThumb();
   TestPoolRelay();
   TestLoraNamesAndCanRun();
+  TestFeatureNeedsAndCanRun();
+  TestFeatureRouting();
+  TestFeaturePullOwner();
+  TestFeaturePullRequester();
   TestCapabilityRouting();
   TestPoolPullRequester();
   TestPoolPullOldPartner();

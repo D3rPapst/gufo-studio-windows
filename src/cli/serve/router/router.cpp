@@ -1450,6 +1450,11 @@ public:
     }
     if (RoutesRemoteLocked(*preset, req, music_job)) {
       // Another router owns the model: no admission, load or memory here.
+      // 2.2.19: a request field it may not know (print_ready) is refused
+      // here instead of running there without it.
+      if (std::optional<HttpResponse> refused =
+              RemoteFeatureRefusalLocked(req, model_id, lock))
+        return std::move(*refused);
       return DispatchRemoteLocked(req, model_id, *preset->remote, lock);
     }
     return DispatchLocalLocked(req, model_id, *preset, music_job, lock);
@@ -2104,10 +2109,42 @@ public:
     bool local_capable = true;
     if (!forwarded && IsJsonBody(req)) {
       std::vector<std::string> needs;
+      std::vector<std::string> features;
       try {
-        needs = router::jobs::LoraNames(json::parse(req.body));
+        const json::Value body = json::parse(req.body);
+        needs = router::jobs::LoraNames(body);
+        features = router::jobs::FeatureNeeds(body);
       } catch (const std::exception&) {
         // The worker answers a malformed body itself.
+      }
+      if (!features.empty()) {
+        // 2.2.19: a request field the partner may not know (print_ready)
+        // goes there only when its capabilities list the feature; an older
+        // partner would run it without and say nothing (25.11.: trellis2
+        // print_ready on the 2.2.17b .56, no print.stl). Unknown
+        // capabilities keep an unpinned request here; a remote pin (a job
+        // the partner pulled, which the shared queue checked) still holds
+        // then. This router has the features (RouterFeatures).
+        lock.unlock();
+        const std::optional<json::Value> caps = PartnerCapabilities();
+        lock.lock();
+        std::string missing;
+        const bool partner_has =
+            caps.has_value() &&
+            router::jobs::HasFeatures(*caps, features, &missing);
+        if (forced == "remote" && caps.has_value() && !partner_has)
+          return Err(400, "Bad Request",
+                     "X-Gufo-Pool: remote, but partner " + partner_name +
+                         " does not support '" + missing +
+                         "' (router older than 2.2.19)",
+                     "invalid_request_error", "pool_side_cannot_run");
+        if (forced.empty() && !partner_has) {
+          forced = "local";
+          Logger::Info("router",
+                       "event=pool_feature_local model=" + model_id +
+                           " feature=" + features[0] + " partner=" +
+                           (caps.has_value() ? "lacks it" : "unknown"));
+        }
       }
       if (!needs.empty()) {
         const std::vector<std::string> have = router::LoraNamesOf(preset);
@@ -2126,7 +2163,8 @@ public:
         lock.lock();
         if (caps.has_value())
           partner_ok =
-              router::jobs::CanRun(*caps, model_id, needs, &why_partner);
+              router::jobs::CanRun(*caps, model_id, needs, &why_partner,
+                                   /*now=*/false, features);
         if (!local_ok && !partner_ok) {
           std::string registered;
           for (const std::string& name : have)
@@ -4198,6 +4236,12 @@ public:
     out["partner"] = partner_name.empty() ? json::Value()
                                           : json::Value(partner_name);
     out["models"] = std::move(models);
+    // 2.2.19: request fields this router understands (print_ready, ...);
+    // a partner older than this sends no list and gets no such request.
+    json::Value features = json::Value::array();
+    for (const std::string& name : router::jobs::RouterFeatures())
+      features.push_back(name);
+    out["features"] = std::move(features);
     out["draining"] = draining_.load();
     // 2.2.6: the partner's adapter runs its own number plus our free share
     // (comfy_parallel.hpp); only with --comfy-dir.
@@ -4284,6 +4328,59 @@ public:
                         .body = body.dump(),
                         .headers = {{"Content-Type", "application/json"},
                                     {"Cache-Control", "no-cache"}}};
+  }
+
+  /// 2.2.19: a request to a model placed remote (on the pool partner) that
+  /// needs a router feature (print_ready, jobs::FeatureNeeds) the partner
+  /// does not list: 400 feature_unsupported (its capabilities lack it, an
+  /// older version), 503 partner_capabilities_unknown with Retry-After 30
+  /// (not readable now). nullopt: relay as before (no feature needed, a
+  /// relayed request, or a remote that is not the pool partner). State
+  /// mutex held; released while the capabilities are read.
+  std::optional<HttpResponse> RemoteFeatureRefusalLocked(
+      const HttpRequest& req, const std::string& model_id,
+      std::unique_lock<std::mutex>& lock) {
+    if (req.method != "POST" || !req.header(router::kForwardedHeader).empty() ||
+        !IsJsonBody(req) || !partner_spec.has_value())
+      return std::nullopt;
+    const router::PresetModel* preset = registry.Find(model_id);
+    if (preset == nullptr || !preset->remote.has_value() ||
+        router::EndpointKey(preset->remote->url) !=
+            router::EndpointKey(partner_spec->url))
+      return std::nullopt;
+    std::vector<std::string> features;
+    try {
+      features = router::jobs::FeatureNeeds(json::parse(req.body));
+    } catch (const std::exception&) {
+      return std::nullopt;  // the worker answers a malformed body itself
+    }
+    if (features.empty())
+      return std::nullopt;
+    lock.unlock();
+    const std::optional<json::Value> caps = PartnerCapabilities();
+    lock.lock();
+    std::string missing;
+    if (caps.has_value() &&
+        router::jobs::HasFeatures(*caps, features, &missing))
+      return std::nullopt;
+    Logger::Warn("router", "event=remote_feature_refused model=" + model_id +
+                               " feature=" + features[0] + " partner=" +
+                               (caps.has_value() ? "lacks it" : "unknown"));
+    if (caps.has_value())
+      return Err(400, "Bad Request",
+                 "model '" + model_id + "' runs on partner " + partner_name +
+                     ", which does not support '" + missing +
+                     "' (router older than 2.2.19); the request would run "
+                     "there without it",
+                 "invalid_request_error", "feature_unsupported");
+    HttpResponse refused =
+        Err(503, "Service Unavailable",
+            "model '" + model_id + "' runs on partner " + partner_name +
+                ", whose capabilities cannot be read now; '" + features[0] +
+                "' needs a partner that lists it; retry in 30 s",
+            "server_error", "partner_capabilities_unknown");
+    refused.headers.emplace_back("Retry-After", "30");
+    return refused;
   }
 
   /// The partner's GET /router/capabilities, cached kPartnerCapsTtl;

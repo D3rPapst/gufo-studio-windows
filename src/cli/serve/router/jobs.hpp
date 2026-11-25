@@ -415,9 +415,30 @@ std::vector<std::string> LoraNames(const json::Value& body);
 /// the model `"available": false` (a load failure holds). Without it the
 /// answer is about capability only (submit, pool LoRA check), so a
 /// passing failure never refuses a job with 400.
+/// `features` (2.2.19): the router features the request needs
+/// (FeatureNeeds); each must be in the top-level "features" array of the
+/// capabilities. A router without the array (older than 2.2.19) has none.
 bool CanRun(const json::Value& capabilities, const std::string& model,
             const std::vector<std::string>& loras,
-            std::string* why = nullptr, bool now = false);
+            std::string* why = nullptr, bool now = false,
+            const std::vector<std::string>& features = {});
+
+/// Router features (2.2.19): request fields a router must understand, or
+/// the work runs without them and nothing says so (25.11.: a print_ready
+/// trellis2 job of the .198 ran on the 2.2.17b .56 without print.stl).
+/// This router's list, reported as "features" in /router/capabilities.
+std::vector<std::string> RouterFeatures();
+
+/// The features a request body needs: "print_ready" for a true
+/// `print_ready` or any other non-null `print_*` member (unless
+/// `print_ready` is false). Empty for anything else.
+std::vector<std::string> FeatureNeeds(const json::Value& body);
+
+/// Whether these capabilities report every feature in `needs`; *missing
+/// gets the first one they lack.
+bool HasFeatures(const json::Value& capabilities,
+                 const std::vector<std::string>& needs,
+                 std::string* missing = nullptr);
 
 // ------------------------------------------------- video concat helpers
 
@@ -566,6 +587,8 @@ private:
     /// "priority" of its view (0 for a partner older than 2.0.3).
     int priority{0};
     std::vector<std::string> loras;
+    /// Router features it needs ("request.features", 2.2.19).
+    std::vector<std::string> features;
     /// in_progress but waiting in the partner's pool ("pool_wait").
     bool waiting{false};
   };

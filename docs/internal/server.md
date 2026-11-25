@@ -1734,8 +1734,10 @@ job only goes to a machine that can run it.
 **Capabilities.** `GET /router/capabilities` answers what this router
 can run: `{"router_id", "self", "partner", "models": {"<id>":
 {"modality", "placement": "local|remote|pool", "switchable", "status",
-"loaded", "loras": ["winkel", ...]}}, "draining", "comfy_parallel",
-"comfy_queue_remaining"}` (the last two only with `--comfy-dir`, 2.2.6:
+"loaded", "loras": ["winkel", ...]}}, "features": ["print_ready"],
+"draining", "comfy_parallel", "comfy_queue_remaining"}` (`features`
+since 2.2.19, see *Router features* below; the last two only with
+`--comfy-dir`, 2.2.6:
 the partner's ComfyUI adapter adds the free share to its limit). The LoRA names come from the
 preset: every `lora =` line of the section, split at `;` (`lora =
 a=p1;b=p2`, the one-line form gufo 2.0's image worker needs), the name
@@ -1756,6 +1758,51 @@ request is never overridden by the LoRA check: when the side it names
 lacks a LoRA of the request the answer is `400 pool_side_cannot_run`
 (message names the LoRA and what that side has), never a silent relay
 to the other side.
+
+**Router features (2.2.19).** Some request fields are read by the
+router or its worker of a newer version only; an older partner takes such
+a request without an error and runs it without the field. 25.11. 19:21: a
+trellis2 job with `print_ready: true` on the .198 (2.2.18) could not load
+there (`gave up loading trellis2: memory busy`), the pool sent it to the
+.56 (2.2.17b), and the job completed without `print.stl`/`print.glb`.
+Since 2.2.19 `/router/capabilities` lists `"features"` (jobs.cpp
+`RouterFeatures`, now `["print_ready"]`), and a request needs a feature
+by its body (`FeatureNeeds`: `print_ready: true`, or any other non-null
+`print_*` member unless `print_ready` is `false`). The partner list is
+the cached capabilities read above (30 s, 3 s limit), no new probe. Such
+a request goes only to a router that lists every feature it needs; a
+partner without the array (older than 2.2.19) has none, and unknown
+capabilities (unreachable, no route) never count as "has it":
+
+- Job store (`SideFor`): a job the partner cannot run gets `X-Gufo-Pool:
+  local` and waits here like any pinned job: a `503 memory_busy` puts it
+  back in the queue (see *Memory busy*), it is not relayed. When this
+  router cannot run it either (model placed remote here), `POST
+  /v1/jobs` answers `400 no_capable_router` with `partner ... does not
+  support 'print_ready' (router older than 2.2.19 ...)` or `... (capabilities
+  unknown)`; a job that meets this only when it starts fails with the
+  same error. The job view and `jobs.json` carry `"request": {"features":
+  [...]}` (only when not empty).
+- Shared queue: the owner hands a job out (`POST /router/pool/pull`)
+  only when the requester's capabilities in the pull body list its
+  features (a 2.2.17b requester sends none: it gets no print job); a
+  requester skips a partner job whose `request.features` it lacks.
+- Direct pool request (not a job, `DispatchPoolLocked`): without
+  `X-Gufo-Pool` it is kept on this machine (`forced = "local"`,
+  `event=pool_feature_local feature=print_ready partner=lacks it|unknown`)
+  and waits here for the machine; `X-Gufo-Pool: remote` to a partner whose
+  capabilities lack the feature is `400 pool_side_cannot_run`; with
+  unknown capabilities a remote pin holds (a pulled job, which the pull
+  already checked).
+- Model placed `remote` (on the pool partner): `400 feature_unsupported`
+  when the partner's capabilities lack it, `503
+  partner_capabilities_unknown` with `Retry-After: 30` when they cannot be
+  read (`event=remote_feature_refused`). A `remote` section that is not
+  the pool partner is not checked.
+
+A new feature is one more name in `RouterFeatures` and one more rule in
+`FeatureNeeds`. Requests the partner relays here (`X-Gufo-Forwarded`) are
+not checked again.
 
 **Order.** A free runner (a job slot of `--jobs-parallel`) compares its
 oldest queued job with the partner's (`GET /v1/jobs?status=queued` and
