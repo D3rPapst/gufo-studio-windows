@@ -20,8 +20,14 @@ inline constexpr std::size_t kPromptEncoderKeyValueHeads = 8;
 inline constexpr std::size_t kPromptEncoderHeadDimension = 128;
 inline constexpr std::size_t kPromptEncoderVocabularySize = 151936;
 /// The most tokens (text, vision blocks and their markers together) one
-/// EncodePromptLayer50 call takes.
+/// EncodePromptLayer50 call takes unless the caller raises
+/// PromptEncoderOptions::maximum_tokens (video prompts always stay at it).
 inline constexpr std::size_t kPromptEncoderMaximumTokens = 4096;
+/// Hard ceiling of PromptEncoderOptions::maximum_tokens. The encoder sizes
+/// its activations, rotary tables and attention scratch from the actual
+/// prompt length; this only bounds what a caller may ask for (16 square
+/// references and a 4096-token prompt need about 20,600).
+inline constexpr std::size_t kPromptEncoderTokenCeiling = 32768;
 
 inline constexpr std::uint32_t kVisionStartToken = 151652;
 inline constexpr std::uint32_t kVisionEndToken = 151653;
@@ -49,7 +55,31 @@ struct PromptEncoderOptions {
   // Image blocks in prompt order. Non-empty switches the rotary positions
   // to Qwen3-VL's interleaved three-axis layout.
   std::span<const PromptVisionBlock> vision_blocks;
+  // Longest prompt this call accepts, at most kPromptEncoderTokenCeiling.
+  // MiniMax-H3-Image edits raise it from free device memory
+  // (ImageEditTokenLimit); everything else keeps 4096.
+  std::size_t maximum_tokens{kPromptEncoderMaximumTokens};
 };
+
+/// Device bytes of the grouped attention's score scratch for `tokens`
+/// (ops::CausalGqaScratchBytes with the encoder's 64/8/128 heads): 0 while
+/// the scores fit in shared memory, at most 256 MiB beyond.
+[[nodiscard]] std::uint64_t PromptEncoderScoreScratchBytes(
+    std::size_t tokens) noexcept;
+
+/// Device bytes EncodePromptLayer50 allocates for its activations, rotary
+/// tables and score scratch at `tokens` (Activations::Bytes()); about
+/// 176.5 KiB per token plus the scratch.
+[[nodiscard]] std::uint64_t PromptEncoderActivationBytes(
+    std::size_t tokens) noexcept;
+
+/// Estimated device memory of the whole prompt phase (prompt child) at
+/// `tokens`: PromptEncoderActivationBytes plus a fixed
+/// kPromptEncoderPhaseFixedBytes for the embedding table, two decoder layers
+/// in flight, the GEMM workspace, the vision tower and the HIP runtime.
+inline constexpr std::uint64_t kPromptEncoderPhaseFixedBytes = 6ULL << 30U;
+[[nodiscard]] std::uint64_t PromptEncoderPhaseBytes(
+    std::size_t tokens) noexcept;
 
 /// Qwen3-VL rope positions (temporal, height, width) of every token: text
 /// advances all three axes together, an image block spans its grid from the

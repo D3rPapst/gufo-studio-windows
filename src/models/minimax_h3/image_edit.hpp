@@ -46,19 +46,104 @@ inline constexpr std::int64_t kH3ImageVisionMinimumPixels = 65536;
 [[nodiscard]] std::pair<int, int> ImageEditVisionSize(int width, int height);
 
 /// The release puts no limit on the whole presentation (only the prompt and
-/// every label are cut to 4096 tokens), but gufo's text encoder takes at most
-/// kPromptEncoderMaximumTokens (4096) tokens in all. Every reference costs at
+/// every label are cut to 4096 tokens). gufo's text encoder always takes
+/// kPromptEncoderMaximumTokens (4096) tokens in all; more only when enough
+/// device memory is free (ImageEditTokenLimit). Every reference costs at
 /// least 1024 vision tokens (a square; its short edge is always brought to
 /// 1024 px, so smaller images cost the same) plus its "Picture i: " label (5
-/// tokens, 6 from Picture 10) and the two vision markers: four references
-/// never fit, three squares leave about 1000 tokens for the prompt.
+/// tokens, 6 from Picture 10) and the two vision markers: within 4096 tokens
+/// four references never fit, three squares leave about 1000 for the prompt.
 inline constexpr std::size_t kH3ImageEditMinimumReferenceTokens = 1024 + 5 + 2;
+/// References that always fit (the 4096-token base budget).
 inline constexpr std::size_t kH3ImageEditMaximumImages = 3;
 static_assert(kH3ImageEditMaximumImages * kH3ImageEditMinimumReferenceTokens <
                   kPromptEncoderMaximumTokens &&
               (kH3ImageEditMaximumImages + 1) *
                       kH3ImageEditMinimumReferenceTokens >
                   kPromptEncoderMaximumTokens);
+
+// --- Memory-based token limit (2.2.17) ------------------------------------
+//
+// Beyond 4096 tokens an edit is accepted only when both phases fit in the
+// device memory that is free when the request is checked, minus a reserve:
+// the prompt child (PromptEncoderPhaseBytes) and the image DiT
+// (ImageDitPhaseBytes: the resident core plus per-row buffers over
+// [text | references | image]). The phases run one after the other, so the
+// larger counts; the DiT one always dominates (about 37 GiB fixed).
+
+/// DiT phase bytes that do not grow with the sequence: the resident 50-block
+/// core (36,751 MiB of weights), heads, modulations, GEMM workspace and the
+/// HIP runtime. Calibrated on gfx1151 21.11.2026 (2.2.15, 2048 x 2048): free
+/// device memory dropped by 38.06 GiB at 6,877 rows and 38.66 GiB at 10,370
+/// rows, 36.81 GiB each after ImageDitRowBytes; rounded up.
+inline constexpr std::uint64_t kH3ImageDitFixedBytes = 37ULL << 30U;
+/// Device memory kept free besides the estimate: hipMalloc failed on this
+/// machine with 7.4 to 8.5 GiB still reported free, and other processes
+/// (dwm.exe, another model) can take memory between the check and the
+/// allocation. GUFO_H3_IMAGE_TOKEN_RESERVE_MIB overrides it.
+inline constexpr std::uint64_t kH3ImageEditDefaultReserveBytes = 10ULL << 30U;
+
+/// Rows of the image DiT's packed sequence.
+struct ImageDitRows {
+  std::size_t text{0};       // the whole text-encoder presentation
+  std::size_t condition{0};  // reference latents (2x2 patches)
+  std::size_t image{0};      // the generated image (2x2 patches)
+  [[nodiscard]] std::size_t total() const noexcept {
+    return text + condition + image;
+  }
+};
+
+/// Device bytes of the DiT's per-row buffers (shared block workspace, rotary
+/// tables, hidden state, row maps, the first block's GEMM check buffer and
+/// the patch-projection scratch); mirrors MakeSharedWorkspaceLayout,
+/// DitBlockSession::Create and AllocateIo. About 179 KiB per row (measured
+/// slope 21.11.: 180 KiB) plus 21 KiB per row of the larger patch segment;
+/// the cheaper native path from 32,768 rows is not credited.
+[[nodiscard]] std::uint64_t ImageDitRowBytes(const ImageDitRows& rows) noexcept;
+
+/// kH3ImageDitFixedBytes + ImageDitRowBytes.
+[[nodiscard]] std::uint64_t ImageDitPhaseBytes(const ImageDitRows& rows) noexcept;
+
+/// DiT rows of a width x height reference upload: its VAE copy (short edge
+/// bounded to [1024, 2048], cropped to 16-px cells) in 2x2 latent patches;
+/// 1,024 for any square up to 1024 px, 4,096 for a 2048 x 2048 one.
+[[nodiscard]] std::size_t ImageEditReferenceDitRows(int width, int height);
+
+/// What the memory-based limit is computed from.
+struct ImageEditMemory {
+  std::uint64_t free_bytes{0};  // hipMemGetInfo at the check; 0 = unknown
+  std::uint64_t reserve_bytes{kH3ImageEditDefaultReserveBytes};
+  // Hard cap (GUFO_H3_IMAGE_MAX_TOKENS), within [4096, ceiling].
+  std::size_t token_cap{kPromptEncoderTokenCeiling};
+};
+
+/// The memory settings from GUFO_H3_IMAGE_TOKEN_RESERVE_MIB (MiB, a whole
+/// number) and GUFO_H3_IMAGE_MAX_TOKENS (clamped to [4096, 32768]; 4096
+/// switches the extension off). Null, empty or malformed values keep the
+/// defaults.
+[[nodiscard]] ImageEditMemory ImageEditMemoryFromSettings(
+    std::uint64_t free_bytes, const char* reserve_mib, const char* max_tokens);
+
+/// ImageEditMemoryFromSettings with the device's free memory now
+/// (DeviceMemoryInfo; 0 without HIP) and the environment.
+[[nodiscard]] ImageEditMemory CurrentImageEditMemory();
+
+/// The most text-encoder tokens an edit may have when its DiT also carries
+/// `condition_rows` reference rows and `image_rows` image rows: the largest
+/// T in [4096, token_cap] whose prompt phase and DiT phase (T text rows)
+/// both fit in free_bytes - reserve_bytes. Never below 4096, so with too
+/// little (or unknown) free memory the limit stays exactly the old one.
+[[nodiscard]] std::size_t ImageEditTokenLimit(const ImageEditMemory& memory,
+                                              std::size_t condition_rows,
+                                              std::size_t image_rows);
+
+/// How many square references (1024 x 1024 or smaller: 1,031 tokens and
+/// 1,024 DiT rows each, 1,032 from Picture 10) fit with a one-token prompt
+/// and an image of `image_rows` rows; between kH3ImageEditMaximumImages and
+/// kH3ImageMaximumReferences. With unlimited free memory (only the token
+/// cap counts) this is what the provider reports as `max_images`.
+[[nodiscard]] std::size_t ImageEditMaximumSquareReferences(
+    const ImageEditMemory& memory, std::size_t image_rows);
 
 /// What an edit presentation costs in text-encoder tokens.
 struct ImageEditTokenBudget {
@@ -75,8 +160,8 @@ struct ImageEditTokenBudget {
     std::span<const std::pair<int, int>> image_sizes,
     std::span<const std::size_t> label_tokens, std::size_t prompt_tokens);
 
-/// True when the budget fits `limit` tokens; otherwise an English message
-/// with the numbers and what to change.
+/// True when the budget fits `limit` tokens (ImageEditTokenLimit); otherwise
+/// an English message with the numbers and what to change.
 [[nodiscard]] bool CheckImageEditTokenBudget(
     const ImageEditTokenBudget& budget, std::size_t limit, std::string* error);
 

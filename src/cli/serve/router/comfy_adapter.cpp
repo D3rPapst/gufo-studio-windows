@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #else
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -333,20 +334,76 @@ void AppendArgument(std::wstring& command, const std::wstring& argument) {
   command.push_back(L'"');
 }
 
+/// Runs `exe` with `args`. 2.2.18: with `output` set, the child's stdout and
+/// stderr go to that file (created or emptied; only these two handles and
+/// NUL as stdin are inherited, so parallel prompts' children never hold each
+/// other's handles).
 int RunProcess(const fs::path& exe, const std::vector<fs::path>& args,
-               std::chrono::minutes timeout, std::string* error) {
+               std::chrono::minutes timeout, std::string* error,
+               const fs::path& output) {
   std::wstring command;
   AppendArgument(command, exe.wstring());
   for (const fs::path& arg : args)
     AppendArgument(command, arg.wstring());
-  STARTUPINFOW startup{};
-  startup.cb = sizeof(startup);
+  struct Handles {
+    HANDLE in{INVALID_HANDLE_VALUE};
+    HANDLE out{INVALID_HANDLE_VALUE};
+    ~Handles() {
+      if (in != INVALID_HANDLE_VALUE)
+        CloseHandle(in);
+      if (out != INVALID_HANDLE_VALUE)
+        CloseHandle(out);
+    }
+  } handles;
+  if (!output.empty()) {
+    SECURITY_ATTRIBUTES inherit{};
+    inherit.nLength = sizeof(inherit);
+    inherit.bInheritHandle = TRUE;
+    handles.out = CreateFileW(output.wstring().c_str(), GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_DELETE, &inherit,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    handles.in = CreateFileW(L"NUL", GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit,
+                             OPEN_EXISTING, 0, nullptr);
+  }
+  const bool capture = handles.out != INVALID_HANDLE_VALUE &&
+                       handles.in != INVALID_HANDLE_VALUE;
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.cb = sizeof(startup);
+  std::vector<unsigned char> attributes;
+  HANDLE inherited[2] = {handles.in, handles.out};
+  if (capture) {
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    attributes.resize(size);
+    auto* list =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    if (InitializeProcThreadAttributeList(list, 1, 0, &size) &&
+        UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                  inherited, sizeof(inherited), nullptr,
+                                  nullptr)) {
+      startup.lpAttributeList = list;
+      startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+      startup.StartupInfo.hStdInput = handles.in;
+      startup.StartupInfo.hStdOutput = handles.out;
+      startup.StartupInfo.hStdError = handles.out;
+    } else {
+      attributes.clear();
+    }
+  }
+  const bool redirected = startup.lpAttributeList != nullptr;
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(exe.wstring().c_str(), command.data(), nullptr, nullptr,
-                      FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
-                      &process)) {
+  const BOOL started = CreateProcessW(
+      exe.wstring().c_str(), command.data(), nullptr, nullptr,
+      redirected ? TRUE : FALSE,
+      CREATE_NO_WINDOW | (redirected ? EXTENDED_STARTUPINFO_PRESENT : 0),
+      nullptr, nullptr, &startup.StartupInfo, &process);
+  const DWORD start_error = started ? 0 : GetLastError();
+  if (redirected)
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
+  if (!started) {
     *error = "cannot start " + PathU8(exe) + " (error " +
-             std::to_string(GetLastError()) + ")";
+             std::to_string(start_error) + ")";
     return -1;
   }
   CloseHandle(process.hThread);
@@ -378,7 +435,8 @@ void MemoryStats(std::uint64_t* total, std::uint64_t* free) {
 }
 #else
 int RunProcess(const fs::path& exe, const std::vector<fs::path>& args,
-               std::chrono::minutes timeout, std::string* error) {
+               std::chrono::minutes timeout, std::string* error,
+               const fs::path& output) {
   std::vector<std::string> storage{exe.string()};
   for (const fs::path& arg : args)
     storage.push_back(arg.string());
@@ -386,12 +444,27 @@ int RunProcess(const fs::path& exe, const std::vector<fs::path>& args,
   for (std::string& item : storage)
     argv.push_back(item.data());
   argv.push_back(nullptr);
+  const std::string output_path = output.string();
   const pid_t pid = fork();
   if (pid < 0) {
     *error = "fork failed";
     return -1;
   }
   if (pid == 0) {
+    if (!output_path.empty()) {
+      const int fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                          0600);
+      const int null_in = open("/dev/null", O_RDONLY);
+      if (fd >= 0) {
+        dup2(fd, 1);
+        dup2(fd, 2);
+        close(fd);
+      }
+      if (null_in >= 0) {
+        dup2(null_in, 0);
+        close(null_in);
+      }
+    }
     execv(argv[0], argv.data());
     _exit(127);
   }
@@ -1057,20 +1130,55 @@ std::vector<std::string> Adapter::RunningHosts(
   }
   std::vector<std::string> hosts;
   hosts.reserve(running.size());
-  for (const Current& task : current) {
-    std::string side;
-    if (!task.target.empty() && options_.run_side) {
-      try {
-        side = options_.run_side(task.target, task.video);
-      } catch (const std::exception&) {
-        side.clear();
-      }
+  for (const Current& task : current)
+    hosts.push_back(HostOfTarget(task.target, task.video));
+  return hosts;
+}
+
+std::string Adapter::HostOfTarget(const std::string& target,
+                                  bool video) const {
+  std::string side;
+  if (!target.empty() && options_.run_side) {
+    try {
+      side = options_.run_side(target, video);
+    } catch (const std::exception&) {
+      side.clear();
     }
-    hosts.push_back(side == "remote"
-                        ? (partner_name_.empty() ? std::string("remote")
-                                                 : partner_name_)
-                        : std::string("local"));
   }
+  return side == "remote" ? (partner_name_.empty() ? std::string("remote")
+                                                   : partner_name_)
+                          : std::string("local");
+}
+
+std::vector<std::pair<std::string, std::string>> Adapter::TaskHosts(
+    const Job& job) {
+  struct Started {
+    std::string node;
+    std::string target;
+    bool video{false};
+    std::chrono::steady_clock::time_point at{};
+  };
+  std::vector<Started> started;
+  {
+    const std::lock_guard<std::mutex> lock(preview_mutex_);
+    for (const Task& task : job.plan.tasks) {
+      if (!std::holds_alternative<ImageTask>(task.spec) &&
+          !std::holds_alternative<VideoTask>(task.spec))
+        continue;
+      const auto it = preview_ids_.find(TaskPreview(job, task));
+      if (it == preview_ids_.end() || it->second.target.empty() ||
+          it->second.job.lock().get() != &job)
+        continue;
+      started.push_back({task.node_id, it->second.target, it->second.video,
+                         it->second.target_at});
+    }
+  }
+  std::stable_sort(started.begin(), started.end(),
+                   [](const Started& a, const Started& b) { return a.at < b.at; });
+  std::vector<std::pair<std::string, std::string>> hosts;
+  hosts.reserve(started.size());
+  for (const Started& task : started)
+    hosts.emplace_back(task.node, HostOfTarget(task.target, task.video));
   return hosts;
 }
 
@@ -2080,11 +2188,25 @@ void Adapter::Execute(const std::shared_ptr<Job>& job) {
   status["status_str"] = ok ? "success" : "error";
   status["completed"] = ok;
   status["messages"] = std::move(messages);
+  // 2.2.18: the machine the prompt computed on, like GET /queue's
+  // gufo_host while it ran (its newest started image/video task, "local"
+  // without one), and each such task's machine by node id.
+  json::Value extra_data = job->extra_data.is_object() ? job->extra_data
+                                                       : json::Value::object();
+  {
+    const auto hosts = TaskHosts(*job);
+    json::Value by_node = json::Value::object();
+    for (const auto& [node, host] : hosts)
+      by_node[node] = host;
+    extra_data["gufo_host"] = hosts.empty() ? std::string("local")
+                                            : hosts.back().second;
+    extra_data["gufo_hosts"] = std::move(by_node);
+  }
   json::Value prompt_entry = json::Value::array();
   prompt_entry.push_back(job->number);
   prompt_entry.push_back(job->id);
   prompt_entry.push_back(job->prompt);
-  prompt_entry.push_back(job->extra_data);
+  prompt_entry.push_back(std::move(extra_data));
   json::Value outputs_to_execute = json::Value::array();
   for (const std::string& id : job->outputs)
     outputs_to_execute.push_back(id);
@@ -3560,19 +3682,102 @@ fs::path Adapter::WorkFile(std::string_view extension) {
                       NewUuid().substr(0, 8) + "." + std::string(extension));
 }
 
-bool Adapter::RunFfmpeg(const std::vector<fs::path>& args, std::string* error) {
-  if (options_.ffmpeg.empty()) {
+std::string FfmpegErrorTail(std::string_view text, std::size_t max_bytes) {
+  // Trailing and leading blanks first; then the last max_bytes, starting at
+  // a UTF-8 lead byte, lines joined with " | " (one log line).
+  const auto blank = [](char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+  };
+  while (!text.empty() && blank(text.back()))
+    text.remove_suffix(1);
+  while (!text.empty() && blank(text.front()))
+    text.remove_prefix(1);
+  bool cut = false;
+  if (text.size() > max_bytes) {
+    text = text.substr(text.size() - max_bytes);
+    while (!text.empty() &&
+           (static_cast<unsigned char>(text.front()) & 0xC0) == 0x80)
+      text.remove_prefix(1);
+    cut = true;
+  }
+  std::string out = cut ? "..." : "";
+  bool line_break = false;
+  for (const char c : text) {
+    if (c == '\r' || c == '\n') {
+      line_break = true;
+      continue;
+    }
+    if (line_break && !out.empty() && out != "...")
+      out += " | ";
+    line_break = false;
+    out.push_back(c);
+  }
+  return out;
+}
+
+bool RunFfmpegTool(const fs::path& ffmpeg, const std::vector<fs::path>& args,
+                   const fs::path& log_file, std::string* error,
+                   std::chrono::minutes timeout) {
+  if (ffmpeg.empty()) {
     *error = "no ffmpeg configured (--comfy-ffmpeg)";
     return false;
   }
   std::vector<fs::path> full = {"-hide_banner", "-loglevel", "error",
                                 "-nostdin", "-y"};
   full.insert(full.end(), args.begin(), args.end());
-  const int code =
-      RunProcess(options_.ffmpeg, full, std::chrono::minutes(20), error);
-  if (code != 0 && error->empty())
+  error->clear();
+  const int code = RunProcess(ffmpeg, full, timeout, error, log_file);
+  std::string said;
+  if (!log_file.empty()) {
+    std::error_code ignored;
+    if (std::ifstream in(log_file, std::ios::binary); in) {
+      in.seekg(0, std::ios::end);
+      const std::streamoff size = in.tellg();
+      // A little more than shown, so the cut can drop a partial character.
+      const std::streamoff keep =
+          std::min<std::streamoff>(size, kFfmpegErrorTailBytes + 8);
+      in.seekg(size - keep);
+      said.resize(static_cast<std::size_t>(std::max<std::streamoff>(keep, 0)));
+      in.read(said.data(), keep);
+      said.resize(static_cast<std::size_t>(std::max<std::streamoff>(
+          in.gcount(), 0)));
+    }
+    fs::remove(log_file, ignored);
+  }
+  if (code == 0)
+    return true;
+  if (error->empty())
     *error = "ffmpeg exited with " + std::to_string(code);
-  return code == 0;
+  // 2.2.18 (21.11. a chain join failed with only the exit code, i.e.
+  // AVERROR_EXTERNAL): what ffmpeg wrote to stderr says why.
+  const std::string tail = FfmpegErrorTail(said, kFfmpegErrorTailBytes);
+  if (!tail.empty())
+    *error += ": " + tail;
+  return false;
+}
+
+bool Adapter::RunFfmpeg(const std::vector<fs::path>& args, std::string* error) {
+  if (options_.ffmpeg.empty()) {
+    *error = "no ffmpeg configured (--comfy-ffmpeg)";
+    return false;
+  }
+  const bool ok = RunFfmpegTool(options_.ffmpeg, args, WorkFile("ffmpeg.log"),
+                                error, std::chrono::minutes(20));
+  if (!ok) {
+    // The full command (inputs and output paths) for the log; the caller
+    // puts *error into the prompt's execution_error.
+    std::string command;
+    for (const fs::path& arg : args) {
+      if (!command.empty())
+        command.push_back(' ');
+      command += PathU8(arg);
+    }
+    if (command.size() > 1500)
+      command = command.substr(0, 1500) + "...";
+    Logger::Warn("comfy", "event=ffmpeg_failed error=\"" + *error +
+                              "\" args=\"" + command + "\"");
+  }
+  return ok;
 }
 
 std::string Adapter::RenderFrameRuns(const std::vector<FrameRun>& runs,

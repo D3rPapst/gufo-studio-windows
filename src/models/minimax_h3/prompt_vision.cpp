@@ -135,7 +135,7 @@ bool EncodeKeyframeVision(const std::filesystem::path&,
 
 namespace {
 
-constexpr std::uint32_t kRequestMagic = 0x51503348U;   // "H3PQ"
+constexpr std::uint32_t kRequestMagic = 0x32503348U;   // "H3P2"
 constexpr std::uint32_t kResponseMagic = 0x52503348U;  // "H3PR"
 constexpr std::uint64_t kMaximumPayloadBytes = 1ULL << 32U;
 // Keyframes (2), Ref2VA reference images (9) and the two-frame blocks of
@@ -196,6 +196,7 @@ struct PromptRequest {
   // Second frames of two-frame video blocks (empty for stills).
   std::vector<std::vector<std::uint8_t>> second_pixels;
   std::vector<std::uint32_t> tokens;
+  std::uint64_t maximum_tokens{kPromptEncoderMaximumTokens};
 };
 
 bool WriteRequest(const std::filesystem::path& path,
@@ -213,6 +214,7 @@ bool WriteRequest(const std::filesystem::path& path,
     PutVector(output, image.second_rgb);
   }
   PutVector(output, input.tokens);
+  Put<std::uint64_t>(output, input.maximum_tokens);
   Put<std::uint32_t>(output, static_cast<std::uint32_t>(input.blocks.size()));
   for (const PromptVisionBlock& block : input.blocks) {
     Put<std::uint64_t>(output, block.begin);
@@ -255,8 +257,10 @@ bool ReadRequest(const std::filesystem::path& path, PromptRequest* request,
     request->sizes.push_back(height);
   }
   std::uint32_t count = 0;
-  if (!GetVector(input, &request->tokens) || !Get(input, &count) ||
-      count > kMaximumVisionBlocks) {
+  if (!GetVector(input, &request->tokens) ||
+      !Get(input, &request->maximum_tokens) ||
+      request->maximum_tokens > kPromptEncoderTokenCeiling ||
+      !Get(input, &count) || count > kMaximumVisionBlocks) {
     return false;
   }
   blocks->assign(count, {});
@@ -563,6 +567,7 @@ int RunPromptChild(const std::filesystem::path& request_path,
   }
   PromptEncoderOptions options;
   options.vision_blocks = blocks;
+  options.maximum_tokens = static_cast<std::size_t>(request.maximum_tokens);
   PromptEmbedding embedding;
   PromptEncoderTelemetry telemetry;
   if (!EncodePromptLayer50(*inventory, request.tokens, options, nullptr,

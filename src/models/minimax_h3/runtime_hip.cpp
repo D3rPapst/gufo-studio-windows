@@ -139,6 +139,24 @@ void ClearDeviceError() {
   (void)hipGetLastError();
 }
 
+bool DeviceMemoryInfo(std::uint64_t* free_bytes, std::uint64_t* total_bytes) {
+  std::size_t free_value = 0;
+  std::size_t total_value = 0;
+  const bool ok = hipMemGetInfo(&free_value, &total_value) == hipSuccess;
+  if (!ok) {
+    (void)hipGetLastError();
+    free_value = 0;
+    total_value = 0;
+  }
+  if (free_bytes != nullptr) {
+    *free_bytes = free_value;
+  }
+  if (total_bytes != nullptr) {
+    *total_bytes = total_value;
+  }
+  return ok;
+}
+
 void TraceStage(const char* stage) {
   static const bool enabled = std::getenv("GUFO_H3_TRACE") != nullptr;
   if (!enabled) {

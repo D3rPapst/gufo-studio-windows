@@ -216,6 +216,7 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
   std::vector<std::uint8_t> tags;
   std::vector<PromptVisionBlock> vision_blocks;
   std::vector<KeyframeImage> vision_images;
+  std::size_t prompt_token_limit = kPromptEncoderMaximumTokens;
   if (!Tokenizer::Load(request.model_root / "tokenizer" / "tokenizer.json",
                        &tokenizer, error) ||
       !tokenizer.EncodePrompt(request.prompt, &tokens, error)) {
@@ -245,19 +246,35 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
                                .height = references[index].vision_height,
                                .rgb = references[index].vision_rgb});
     }
-    // The whole presentation must fit the text encoder; checked before any
-    // GPU work (the provider already rejects such requests with HTTP 400).
+    // The whole presentation must fit the text encoder's limit for this
+    // request, checked before any GPU work (the provider already rejects
+    // such requests with HTTP 400): 4096 tokens, more when the device has
+    // memory for the longer prompt phase and the DiT's extra rows. Measured
+    // here, right before the prompt phase, and handed to the prompt child,
+    // so the check and the encoder use the same number.
     {
       std::vector<std::pair<int, int>> uploads;
       std::vector<std::size_t> label_counts;
+      std::size_t condition_rows = 0;
       for (std::size_t index = 0; index < references.size(); ++index) {
         uploads.emplace_back(request.references[index].width,
                              request.references[index].height);
         label_counts.push_back(labels[index].size());
+        condition_rows +=
+            static_cast<std::size_t>(references[index].latent_height / 2) *
+            static_cast<std::size_t>(references[index].latent_width / 2);
       }
+      const ImageEditMemory memory = CurrentImageEditMemory();
+      const std::size_t image_rows =
+          static_cast<std::size_t>(geometry->latent_height / 2) *
+          static_cast<std::size_t>(geometry->latent_width / 2);
+      prompt_token_limit =
+          ImageEditTokenLimit(memory, condition_rows, image_rows);
+      local.prompt_token_limit = prompt_token_limit;
+      local.prompt_limit_free_bytes = memory.free_bytes;
       if (!CheckImageEditTokenBudget(
               CountImageEditTokens(uploads, label_counts, tokens.size()),
-              kPromptEncoderMaximumTokens, error)) {
+              prompt_token_limit, error)) {
         return false;
       }
     }
@@ -294,7 +311,8 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
         .projector = edit ? request.vision_projector : std::filesystem::path(),
         .images = vision_images,
         .tokens = tokens,
-        .blocks = vision_blocks};
+        .blocks = vision_blocks,
+        .maximum_tokens = prompt_token_limit};
     if (!EncodePromptIsolated(isolated, cancellation, &embedding,
                               &local.prompt_encoder, &local.vision_ms,
                               error)) {
@@ -327,6 +345,7 @@ bool GenerateTextImage(const ImageGenerationRequest& request,
         request.text_encoder_root, request.text_encoder_manifest, error);
     PromptEncoderOptions prompt_options;
     prompt_options.vision_blocks = vision_blocks;
+    prompt_options.maximum_tokens = prompt_token_limit;
     if (!text_inventory ||
         !EncodePromptLayer50(*text_inventory, tokens, prompt_options,
                              cancellation, &embedding, &local.prompt_encoder,
@@ -497,6 +516,8 @@ std::string ImageGenerationTelemetryJson(
        << ",\"prompt_tokens\":" << telemetry.prompt_tokens
        << ",\"prompt_truncated\":"
        << (telemetry.prompt_truncated ? "true" : "false")
+       << ",\"prompt_token_limit\":" << telemetry.prompt_token_limit
+       << ",\"prompt_limit_free_bytes\":" << telemetry.prompt_limit_free_bytes
        << ",\"denoiser_setup_ms\":" << telemetry.denoiser.setup_ms
        << ",\"denoiser_peak_bytes\":" << telemetry.denoiser.peak_live_bytes
        << ",\"vae_tiles\":" << telemetry.vae.tile_ms.size()

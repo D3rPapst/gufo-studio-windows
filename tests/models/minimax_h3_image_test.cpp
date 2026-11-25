@@ -632,6 +632,127 @@ void TestEditTokenBudget() {
   // The prompt counts after the release's 4096 cut.
   budget = h3::CountImageEditTokens(one, std::span(labels).first(1), 9000);
   CHECK(budget.prompt_tokens == 4096);
+  // The message names the limit it was checked against.
+  error.clear();
+  budget = h3::CountImageEditTokens(four, labels, 1);
+  CHECK(!h3::CheckImageEditTokenBudget(budget, 4096, &error) &&
+        error.find("4096 now") != std::string::npos);
+  CHECK(h3::CheckImageEditTokenBudget(budget, 9000, &error));
+}
+
+void TestEditMemoryBudget() {
+  constexpr std::uint64_t kGiB = 1ULL << 30U;
+  // Prompt encoder: 180,740 bytes per token (AllocateActivations), plus the
+  // score scratch beyond the 1392 tokens that fit in shared memory (whole
+  // rows of tokens x 64 x 4 bytes, at most 256 MiB).
+  CHECK(h3::PromptEncoderScoreScratchBytes(0) == 0);
+  CHECK(h3::PromptEncoderScoreScratchBytes(1392) == 0);
+  CHECK(h3::PromptEncoderScoreScratchBytes(1393) == 752ULL * 1393U * 256U);
+  CHECK(h3::PromptEncoderScoreScratchBytes(4096) == 256ULL << 20U);
+  CHECK(h3::PromptEncoderScoreScratchBytes(32768) ==
+        32ULL * 32768U * 256U);  // 256 MiB / 8 MiB rows
+  CHECK(h3::PromptEncoderActivationBytes(1) == 180740U);
+  CHECK(h3::PromptEncoderActivationBytes(4096) ==
+        4096ULL * 180740U + (256ULL << 20U));
+  CHECK(h3::PromptEncoderPhaseBytes(4096) ==
+        h3::kPromptEncoderPhaseFixedBytes +
+            h3::PromptEncoderActivationBytes(4096));
+
+  // DiT rows of reference uploads: VAE copy short edge in [1024, 2048],
+  // cropped to 16-px cells and 2x2 patches.
+  CHECK(h3::ImageEditReferenceDitRows(1024, 1024) == 1024);
+  CHECK(h3::ImageEditReferenceDitRows(64, 64) == 1024);
+  CHECK(h3::ImageEditReferenceDitRows(2048, 2048) == 4096);
+  CHECK(h3::ImageEditReferenceDitRows(4096, 4096) == 4096);
+  CHECK(h3::ImageEditReferenceDitRows(1500, 1100) == 46U * 34U);
+  CHECK(h3::ImageEditReferenceDitRows(1000, 557) == 57U * 32U);
+  CHECK(h3::ImageEditReferenceDitRows(0, 10) == 0);
+
+  // DiT phase against the GPU test of 21.11.2026 (free device memory before
+  // the denoiser minus free after AllocateIo): 38.06 GiB at 6,877 rows (one
+  // 1024^2 reference) and 38.66 GiB at 10,370 rows (three). The estimate
+  // stays above both, by less than 0.3 GiB.
+  const double one_reference =
+      static_cast<double>(h3::ImageDitPhaseBytes(
+          {.text = 1757, .condition = 1024, .image = 4096})) /
+      static_cast<double>(kGiB);
+  const double three_references =
+      static_cast<double>(h3::ImageDitPhaseBytes(
+          {.text = 3202, .condition = 3072, .image = 4096})) /
+      static_cast<double>(kGiB);
+  CHECK(one_reference >= 38.06 && one_reference < 38.36);
+  CHECK(three_references >= 38.66 && three_references < 38.96);
+  // About 179 KiB per row: 3,493 more rows cost about 0.6 GiB.
+  CHECK(three_references - one_reference > 0.55 &&
+        three_references - one_reference < 0.65);
+  CHECK(h3::ImageDitRowBytes({.text = 1}) == 182988U);
+
+  // Unknown or short memory keeps exactly the old 4096.
+  h3::ImageEditMemory memory;
+  CHECK(memory.free_bytes == 0 &&
+        memory.reserve_bytes == h3::kH3ImageEditDefaultReserveBytes &&
+        memory.token_cap == h3::kPromptEncoderTokenCeiling);
+  CHECK(h3::ImageEditTokenLimit(memory, 0, 4096) == 4096);
+  for (const std::uint64_t free_gib : {20U, 30U, 40U, 48U}) {
+    memory.free_bytes = free_gib * kGiB;
+    CHECK(h3::ImageEditTokenLimit(memory, 3U * 1024U, 4096) == 4096);
+    CHECK(h3::ImageEditMaximumSquareReferences(memory, 4096) == 3);
+  }
+  // An idle 64 GB Strix Halo in a production pause (53.57 GiB free): 15
+  // square 1024^2 references, six 2048^2 ones; a 2048^2 canvas.
+  memory.free_bytes = static_cast<std::uint64_t>(53.57 * kGiB);
+  CHECK(h3::ImageEditMaximumSquareReferences(memory, 4096) == 15);
+  const std::size_t six_large =
+      h3::ImageEditTokenLimit(memory, 6U * 4096U, 4096);
+  CHECK(six_large == 6990);
+  CHECK(6U * 1031U + 100U <= six_large);
+  CHECK(h3::ImageEditTokenLimit(memory, 7U * 4096U, 4096) <
+        7U * 1031U + 100U);
+  // The limit is the largest token count whose DiT phase fits.
+  const std::uint64_t budget =
+      memory.free_bytes - h3::kH3ImageEditDefaultReserveBytes;
+  CHECK(h3::ImageDitPhaseBytes(
+            {.text = six_large, .condition = 6U * 4096U, .image = 4096}) <=
+        budget);
+  CHECK(h3::ImageDitPhaseBytes({.text = six_large + 1,
+                                .condition = 6U * 4096U,
+                                .image = 4096}) > budget);
+  CHECK(h3::PromptEncoderPhaseBytes(six_large) <= budget);
+  // Plenty of memory: the hard cap.
+  memory.free_bytes = 200ULL * kGiB;
+  CHECK(h3::ImageEditTokenLimit(memory, 16U * 4096U, 4096) == 32768);
+  CHECK(h3::ImageEditMaximumSquareReferences(memory, 4096) == 16);
+
+  // Settings: reserve in MiB, the cap clamped to [4096, 32768]; malformed
+  // values keep the defaults.
+  auto settings = h3::ImageEditMemoryFromSettings(123, nullptr, nullptr);
+  CHECK(settings.free_bytes == 123 &&
+        settings.reserve_bytes == h3::kH3ImageEditDefaultReserveBytes &&
+        settings.token_cap == 32768);
+  settings = h3::ImageEditMemoryFromSettings(0, "2048", "10000");
+  CHECK(settings.reserve_bytes == 2048ULL << 20U &&
+        settings.token_cap == 10000);
+  settings = h3::ImageEditMemoryFromSettings(0, "", "100");
+  CHECK(settings.reserve_bytes == h3::kH3ImageEditDefaultReserveBytes &&
+        settings.token_cap == 4096);
+  settings = h3::ImageEditMemoryFromSettings(0, "-5", "99999999");
+  CHECK(settings.reserve_bytes == h3::kH3ImageEditDefaultReserveBytes &&
+        settings.token_cap == 32768);
+  settings = h3::ImageEditMemoryFromSettings(0, "8 GiB", "4k");
+  CHECK(settings.reserve_bytes == h3::kH3ImageEditDefaultReserveBytes &&
+        settings.token_cap == 32768);
+  // GUFO_H3_IMAGE_MAX_TOKENS=4096 switches the extension off; 10000 allows
+  // nine squares (1 + 9 x 1031 tokens), however much memory is free.
+  settings = h3::ImageEditMemoryFromSettings(200ULL * kGiB, nullptr, "4096");
+  CHECK(h3::ImageEditTokenLimit(settings, 0, 4096) == 4096);
+  CHECK(h3::ImageEditMaximumSquareReferences(settings, 4096) == 3);
+  settings = h3::ImageEditMemoryFromSettings(200ULL * kGiB, nullptr, "10000");
+  CHECK(h3::ImageEditTokenLimit(settings, 0, 4096) == 10000);
+  CHECK(h3::ImageEditMaximumSquareReferences(settings, 4096) == 9);
+  // A smaller reserve lets more through (2048^2 squares at 53.57 GiB).
+  settings = h3::ImageEditMemoryFromSettings(
+      static_cast<std::uint64_t>(53.57 * kGiB), "8192", nullptr);
+  CHECK(h3::ImageEditTokenLimit(settings, 6U * 4096U, 4096) > six_large);
 }
 
 void TestReleaseTokenizer(const std::filesystem::path& root) {
@@ -707,6 +828,7 @@ int main() {
   TestEditPresentation();
   TestEditPlan();
   TestEditTokenBudget();
+  TestEditMemoryBudget();
   if (const char* root = std::getenv("GUFO_H3_IMAGE_ROOT")) {
     TestReleaseConfig(root);
     TestReleaseTokenizer(root);
